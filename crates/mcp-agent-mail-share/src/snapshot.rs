@@ -1103,7 +1103,9 @@ mod tests {
         let err = create_real_directory_all(&linked_var.join("out"))
             .expect_err("fixture var symlink is not a platform firmlink");
         match err {
-            RealDirError::Symlink(component) => assert_eq!(component, linked_var),
+            RealDirError::Symlink(component) => {
+                assert_eq!(component, dir.path().canonicalize().unwrap().join("var"));
+            }
             _ => panic!("expected symlink refusal"),
         }
     }

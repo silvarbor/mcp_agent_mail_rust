@@ -789,6 +789,14 @@ fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
                 match std::fs::symlink_metadata(&current) {
                     Ok(metadata) => {
                         if metadata.file_type().is_symlink() {
+                            if let Ok(resolved) = std::fs::canonicalize(&current)
+                                && mcp_agent_mail_core::disk::is_platform_temp_firmlink(
+                                    &current, &resolved,
+                                )
+                            {
+                                current = resolved;
+                                continue;
+                            }
                             return Err(ShareError::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 format!(
