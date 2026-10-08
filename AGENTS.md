@@ -102,7 +102,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
-| `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
+| `fastmcp-rust` (`0.10.0`, immutable Git revision `03b52745`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
 | `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `db458bfba780e79d099d9f8986da5a1f7b360901` for SQL binding, schema-prefix, NOCASE, INSERT SELECT UPSERT, and Linux descriptor-retention repairs. Embedded Beads still uses a separate patched 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
