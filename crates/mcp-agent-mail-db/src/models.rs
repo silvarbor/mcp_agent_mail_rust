@@ -154,6 +154,10 @@ pub struct AgentRow {
     #[serde(default)]
     #[sqlmodel(nullable)]
     pub retired_at: Option<i64>,
+    /// Optional presentation label; neither unique nor an identity key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[sqlmodel(nullable)]
+    pub display_name: Option<String>,
 }
 
 /// Compact agent projection used to hydrate the in-process ATC population.
@@ -188,6 +192,7 @@ impl Default for AgentRow {
             reaper_exempt: 0,
             registration_token: None,
             retired_at: None,
+            display_name: None,
         }
     }
 }
@@ -211,6 +216,7 @@ impl AgentRow {
             reaper_exempt: 0,
             registration_token: None,
             retired_at: None,
+            display_name: None,
         }
     }
 
@@ -786,6 +792,13 @@ mod tests {
         assert_eq!(agent.name, agent2.name);
         assert_eq!(agent.program, agent2.program);
         assert_eq!(agent.attachments_policy, agent2.attachments_policy);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap()
+                .get("display_name")
+                .is_none()
+        );
+        assert!(agent2.display_name.is_none());
     }
 
     #[test]

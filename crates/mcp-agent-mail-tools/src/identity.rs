@@ -1301,7 +1301,7 @@ pub(crate) fn agent_archive_profile_json(
     agent: &mcp_agent_mail_db::AgentRow,
     deregistered_at: Option<i64>,
 ) -> serde_json::Value {
-    json!({
+    let mut profile = json!({
         "name": agent.name,
         "program": agent.program,
         "model": agent.model,
@@ -1313,7 +1313,11 @@ pub(crate) fn agent_archive_profile_json(
         "reaper_exempt": agent.reaper_exempt != 0,
         "retired_at": agent.retired_at.map(micros_to_iso),
         "deregistered_at": deregistered_at.map(micros_to_iso),
-    })
+    });
+    if let Some(display_name) = &agent.display_name {
+        profile["display_name"] = json!(display_name);
+    }
+    profile
 }
 
 /// If the project root is ephemeral and the current storage root is the
@@ -1736,6 +1740,9 @@ pub const DEFAULT_AGENT_CAPABILITIES: &[&str] = &[
 pub struct AgentResponse {
     pub id: i64,
     pub name: String,
+    /// Human-readable label; the name remains the routing address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -2423,6 +2430,9 @@ Check that all parameters have valid values."
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `reaper_exempt`: Optional bool to exempt agent from the inactivity reaper (default: false)
+/// - `display_name`: Optional Unicode label, trimmed to at most 128 characters.
+///   Omission preserves the label; blank input clears it. Control characters
+///   are rejected. Duplicate labels are allowed; routing always uses `name`.
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
 ///   caller pane explicitly; stdio callers may omit it.
 /// - `tmux_socket_path`: Optional absolute socket path of the tmux server
@@ -2440,7 +2450,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenLake\", \"BlueDog\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- The whole point: names should be memorable identifiers, not role descriptions\n- Best practice: Omit the `name` parameter to auto-generate a valid name\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    MUST be a valid adjective+noun combination if provided (e.g., \"BlueLake\").\n    If omitted, a random valid name is auto-generated (RECOMMENDED).\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit valid name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"BlueLake\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Names MUST match the adjective+noun format or an error will be raised\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
+    description = "Create or update an agent identity within a project and persist its profile to Git. Call at session start or to update profile metadata.\n\nUse the same project_key (project slug or absolute working-directory path) across cooperating agents. Supply nonempty program and model, and optionally task_description and attachments_policy (auto, inline, file, or none).\n\nThe unique routing name must be an adjective+noun combination, such as BlueLake or RedStone. Omit name to generate a fresh address. Reusing a name updates that identity's profile and last_active_ts. Names are case-insensitive unique within a project. Messages, permissions, contacts, and reservations always use this address.\n\nOptional display_name is a human-readable Unicode label, such as Officer Alpha. Duplicate labels are allowed and never resolve recipients. Surrounding whitespace is trimmed; blank input clears the label; omission preserves an existing label. Labels have a limit of 128 Unicode characters and reject control characters. Interfaces show Officer Alpha <BlueLake>, or BlueLake when unlabeled.\n\nReturns the agent profile including id, name, program, model, task_description, inception_ts, last_active_ts, project_id, and display_name when present. The archive profile remains under agents/<Name>/profile.json.\n\nExample arguments: {\"project_key\":\"/data/projects/backend\",\"program\":\"test-client\",\"model\":\"test-model\",\"name\":\"BlueLake\",\"display_name\":\"Officer Alpha\"}.\n\nRegistration rotates the registration_token using the existing registration behavior. By default registration is self-asserted. When [registration.proof_gate] is enabled, registration_proof must be a JSON string containing a signed proof bundle binding identity, project_key, program, model, capability scope, issued_at, expires_at, and a nonce to a configured trust-anchor Ed25519 key. Missing, malformed, untrusted, expired, replayed, or mismatched proofs fail closed."
 )]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -2460,6 +2470,7 @@ pub async fn register_agent(
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
+    display_name: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -2488,6 +2499,20 @@ pub async fn register_agent(
         ));
     }
 
+    // Validate before any registration or project mutation. An omitted label
+    // retains existing metadata; an explicitly blank label clears it.
+    let display_name = display_name
+        .as_deref()
+        .map(mcp_agent_mail_core::models::normalize_display_name)
+        .transpose()
+        .map_err(|error| {
+            legacy_tool_error(
+                "INVALID_DISPLAY_NAME",
+                &error.to_string(),
+                true,
+                json!({ "field": "display_name" }),
+            )
+        })?;
     let pool = get_db_pool()?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -2643,6 +2668,18 @@ Check that all parameters have valid values."
             row
         }
     };
+    if let Some(display_name) = display_name {
+        row = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::set_agent_display_name(
+                ctx.cx(),
+                &pool,
+                project_id,
+                &row.name,
+                display_name.as_deref(),
+            )
+            .await,
+        )?;
+    }
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
@@ -2728,6 +2765,7 @@ Check that all parameters have valid values."
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
         name: row.name,
+        display_name: row.display_name,
         program: row.program,
         model: row.model,
         task_description: row.task_description,
@@ -3038,6 +3076,7 @@ Choose a different name (or omit the name to auto-generate one)."
     let response = AgentResponse {
         id: row.id.unwrap_or(0),
         name: row.name,
+        display_name: row.display_name,
         program: row.program,
         model: row.model,
         task_description: row.task_description,
@@ -3390,6 +3429,7 @@ pub async fn whois(
         agent: AgentResponse {
             id: agent_row.id.unwrap_or(0),
             name: agent_row.name,
+            display_name: agent_row.display_name,
             program: agent_row.program,
             model: agent_row.model,
             task_description: agent_row.task_description,
@@ -3645,7 +3685,7 @@ pub async fn list_agents(
     let entries: Vec<serde_json::Value> = agents
         .into_iter()
         .map(|a| {
-            json!({
+            let mut entry = json!({
                 "name": a.name,
                 "program": a.program,
                 "model": a.model,
@@ -3653,7 +3693,11 @@ pub async fn list_agents(
                 "inception_ts": micros_to_iso(a.inception_ts),
                 "last_active_ts": micros_to_iso(a.last_active_ts),
                 "contact_policy": a.contact_policy,
-            })
+            });
+            if let Some(display_name) = a.display_name {
+                entry["display_name"] = json!(display_name);
+            }
+            entry
         })
         .collect();
 
@@ -4325,6 +4369,7 @@ mod tests {
         let r = AgentResponse {
             id: 42,
             name: "BlueLake".into(),
+            display_name: None,
             program: "claude-code".into(),
             model: "opus-4.5".into(),
             task_description: "Testing".into(),
@@ -4356,6 +4401,7 @@ mod tests {
         let original = AgentResponse {
             id: 42,
             name: "BlueLake".into(),
+            display_name: Some("Reviewer".into()),
             program: "claude-code".into(),
             model: "opus-4.5".into(),
             task_description: "Testing".into(),
@@ -4377,6 +4423,7 @@ mod tests {
         assert_eq!(deserialized.name, original.name);
         assert_eq!(deserialized.id, original.id);
         assert_eq!(deserialized.program, original.program);
+        assert_eq!(deserialized.display_name, original.display_name);
     }
 
     #[test]
@@ -4385,6 +4432,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "RedFox".into(),
+                display_name: None,
                 program: "codex-cli".into(),
                 model: "gpt-5".into(),
                 task_description: String::new(),
@@ -4422,6 +4470,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "BlueLake".into(),
+                display_name: None,
                 program: "claude-code".into(),
                 model: "opus-4.5".into(),
                 task_description: String::new(),

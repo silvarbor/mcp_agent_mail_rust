@@ -72,6 +72,9 @@ pub struct Agent {
     pub id: Option<i64>,
     pub project_id: i64,
     pub name: String,
+    /// Optional presentation label; routing always uses `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -90,6 +93,7 @@ impl Default for Agent {
             id: None,
             project_id: 0,
             name: String::new(),
+            display_name: None,
             program: String::new(),
             model: String::new(),
             task_description: String::new(),
@@ -99,6 +103,42 @@ impl Default for Agent {
             contact_policy: "auto".to_string(),
         }
     }
+}
+
+/// Maximum display-label length in Unicode scalar values after trimming.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 128;
+
+/// Invalid human-readable agent label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DisplayNameError {
+    #[error("display_name must not contain control characters")]
+    ControlCharacter,
+    #[error("display_name must be at most {MAX_DISPLAY_NAME_CHARS} characters")]
+    TooLong,
+}
+
+/// Validate and trim a label. Blank input clears the label.
+///
+/// Controls are rejected before trimming so tabs/newlines cannot bypass validation.
+///
+/// # Errors
+/// Returns an error for control characters or more than 128 Unicode scalar
+/// values after trimming.
+pub fn normalize_display_name(value: &str) -> Result<Option<String>, DisplayNameError> {
+    if value.chars().any(char::is_control) {
+        return Err(DisplayNameError::ControlCharacter);
+    }
+    let value = value.trim();
+    if value.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(DisplayNameError::TooLong);
+    }
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+/// Format an identity for presentation. HTML callers must escape the result.
+#[must_use]
+pub fn format_agent_label(name: &str, display_name: Option<&str>) -> String {
+    display_name.map_or_else(|| name.to_string(), |label| format!("{label} <{name}>"))
 }
 
 // =============================================================================
@@ -963,6 +1003,63 @@ pub fn generate_agent_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_normalization_accepts_unicode_and_clears_blank() {
+        assert_eq!(
+            normalize_display_name("  Réviseur 東京  ")
+                .unwrap()
+                .as_deref(),
+            Some("Réviseur 東京")
+        );
+        assert_eq!(normalize_display_name("\u{2003}  \u{2003}").unwrap(), None);
+        assert_eq!(normalize_display_name("").unwrap(), None);
+        assert_eq!(
+            normalize_display_name(&"é".repeat(MAX_DISPLAY_NAME_CHARS))
+                .unwrap()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_DISPLAY_NAME_CHARS
+        );
+        assert_eq!(
+            normalize_display_name(&"é".repeat(MAX_DISPLAY_NAME_CHARS + 1)),
+            Err(DisplayNameError::TooLong)
+        );
+        assert_eq!(
+            normalize_display_name("Reviewer\n"),
+            Err(DisplayNameError::ControlCharacter)
+        );
+        assert_eq!(
+            normalize_display_name("\tReviewer"),
+            Err(DisplayNameError::ControlCharacter)
+        );
+        assert_eq!(
+            normalize_display_name("Review\0er"),
+            Err(DisplayNameError::ControlCharacter)
+        );
+        assert_eq!(
+            normalize_display_name("Review\u{7f}er"),
+            Err(DisplayNameError::ControlCharacter)
+        );
+    }
+
+    #[test]
+    fn display_name_formats_address_and_old_profiles_omit_label() {
+        assert_eq!(
+            format_agent_label("BlueLake", Some("Officer Alpha")),
+            "Officer Alpha <BlueLake>"
+        );
+        assert_eq!(format_agent_label("BlueLake", None), "BlueLake");
+        let serialized = serde_json::to_value(Agent::default()).unwrap();
+        assert!(serialized.get("display_name").is_none());
+        assert!(
+            serde_json::from_value::<Agent>(serialized)
+                .unwrap()
+                .display_name
+                .is_none()
+        );
+    }
 
     /// Strip non-alphabetic characters, returning `None` if nothing remains.
     /// Truncates to 128 chars.

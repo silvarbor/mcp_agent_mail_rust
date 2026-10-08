@@ -1011,7 +1011,7 @@ fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, D
 /// Decode `AgentRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `project_id`, `name`, `program`, `model`, `task_description`,
 /// `inception_ts`, `last_active_ts`, `attachments_policy`, `contact_policy`, `reaper_exempt`,
-/// `registration_token`, `retired_at`.
+/// `registration_token`, `retired_at`, `display_name`.
 fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
     fn get_i64(row: &SqlRow, idx: usize) -> i64 {
         row.get(idx).and_then(value_as_i64).unwrap_or(0)
@@ -1054,6 +1054,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
         reaper_exempt: get_opt_i64(row, 10).unwrap_or(0),
         registration_token: get_opt_string(row, 11),
         retired_at: get_opt_i64(row, 12),
+        display_name: get_opt_string(row, 13),
     }
 }
 
@@ -2076,7 +2077,7 @@ async fn verify_agent_visible_after_commit(
     // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at \
+               registration_token, retired_at, display_name \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -5873,7 +5874,7 @@ pub async fn register_agent(
                 );
                 let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                                  inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                                 registration_token, retired_at \
+                                 registration_token, retired_at, display_name \
                                  FROM agents \
                                  WHERE project_id = ? AND name = ? COLLATE NOCASE \
                                  ORDER BY id ASC LIMIT 1";
@@ -6092,7 +6093,7 @@ pub async fn create_agent(
             // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                             registration_token, retired_at \
+                             registration_token, retired_at, display_name \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                              ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -6240,6 +6241,96 @@ pub async fn create_agent(
     Outcome::Ok(final_agent)
 }
 
+/// Set or clear presentation metadata without changing the routing identity.
+pub async fn set_agent_display_name(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    display_name: Option<&str>,
+) -> Outcome<AgentRow, DbError> {
+    let display_name = match display_name
+        .map(mcp_agent_mail_core::models::normalize_display_name)
+        .transpose()
+    {
+        Ok(value) => value.flatten(),
+        Err(error) => return Outcome::Err(DbError::invalid("display_name", error.to_string())),
+    };
+    let agent = match run_with_mvcc_retry(cx, "set_agent_display_name", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                         registration_token, retired_at, display_name \
+                         FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                         ORDER BY id ASC LIMIT 1";
+        let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+        let rows = try_in_tx!(cx, &tracked, map_sql_outcome(
+            traw_query(cx, &tracked, fetch_sql, &fetch_params).await
+        ));
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+        };
+        let agent = decode_agent_row_indexed(row);
+        let agent_id = agent.id.unwrap_or_default();
+        if try_in_tx!(cx, &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        ).is_some() {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::invalid(
+                "agent_deregistered", "deregistered agents cannot change display name"
+            ));
+        }
+        let affected = try_in_tx!(cx, &tracked, map_sql_outcome(traw_execute(
+            cx, &tracked,
+            "UPDATE agents SET display_name = ? WHERE id = ?",
+            &[
+                display_name.clone().map_or(Value::Null, Value::Text),
+                Value::BigInt(agent_id),
+            ],
+        ).await));
+        if affected == 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Sqlite(format!(
+                "display_name update did not affect agent {agent_id}"
+            )));
+        }
+        let rows = try_in_tx!(cx, &tracked, map_sql_outcome(
+            traw_query(cx, &tracked, fetch_sql, &fetch_params).await
+        ));
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+        };
+        let updated = decode_agent_row_indexed(row);
+        if updated.display_name != display_name || updated.id != agent.id {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Sqlite(format!(
+                "display_name update failed verification for agent {agent_id}"
+            )));
+        }
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(updated)
+    }).await {
+        Outcome::Ok(agent) => agent,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let cache = crate::cache::read_cache();
+    let scope = cache_scope_for_pool(pool);
+    cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+    cache.put_agent_scoped(&scope, &agent);
+    Outcome::Ok(agent)
+}
+
 /// Get agent by project and name (cache-first)
 pub async fn get_agent(
     cx: &Cx,
@@ -6274,7 +6365,7 @@ pub async fn get_agent(
     // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at \
+               registration_token, retired_at, display_name \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -6314,7 +6405,7 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
     // Use raw SQL with explicit column order to avoid ORM decoding issues
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at \
+               registration_token, retired_at, display_name \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -6353,7 +6444,7 @@ pub async fn get_agent_by_id_fresh(
 
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at \
+               registration_token, retired_at, display_name \
                FROM agents WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(agent_id)];
 
@@ -6401,7 +6492,7 @@ pub async fn list_agent_roster(
     // lifecycle ledger value from the same statement as the agent profile.
     let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
                a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
-               a.reaper_exempt, a.registration_token, a.retired_at, d.agent_id \
+               a.reaper_exempt, a.registration_token, a.retired_at, a.display_name, d.agent_id \
                FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
                WHERE a.project_id = ? ORDER BY a.id ASC";
     match map_sql_outcome(traw_query(cx, &tracked, sql, &[Value::BigInt(project_id)]).await) {
@@ -6412,7 +6503,7 @@ pub async fn list_agent_roster(
                 .filter_map(|row| {
                     let agent = decode_agent_row_indexed(row);
                     if !seen_names.insert(agent.name.to_ascii_lowercase())
-                        || row.get(13).and_then(value_as_i64).is_some()
+                        || row.get(14).and_then(value_as_i64).is_some()
                     {
                         return None;
                     }
@@ -6558,7 +6649,7 @@ async fn list_agents_bounded_inner(
     // duplicate while sends resolve to a retired canonical identity.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at \
+               registration_token, retired_at, display_name \
                FROM agents \
                WHERE project_id = ? \
                ORDER BY last_active_ts DESC, id DESC";
@@ -6685,7 +6776,7 @@ pub async fn get_agents_by_ids(
         let sql = format!(
             "SELECT id, project_id, name, program, model, task_description, \
              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-             registration_token, retired_at \
+             registration_token, retired_at, display_name \
              FROM agents WHERE id IN ({placeholders})"
         );
 
@@ -7122,7 +7213,7 @@ pub async fn set_agent_contact_policy(
         // Fetch updated agent using raw SQL with explicit column order.
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token, retired_at \
+                         registration_token, retired_at, display_name \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(agent_id)];
         let rows = try_in_tx!(
@@ -7293,7 +7384,7 @@ pub async fn set_agent_retired_at(
                     &tracked,
                     "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                     registration_token, retired_at \
+                     registration_token, retired_at, display_name \
                      FROM agents WHERE id = ? LIMIT 1",
                     &[Value::BigInt(agent_id)],
                 )
@@ -7349,7 +7440,7 @@ pub async fn deregister_agent(
                     &tracked,
                     "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                     registration_token, retired_at \
+                     registration_token, retired_at, display_name \
                      FROM agents WHERE id = ? LIMIT 1",
                     &[Value::BigInt(agent_id)],
                 )
@@ -7411,7 +7502,7 @@ pub async fn deregister_agent(
                     &tracked,
                     "SELECT id, project_id, name, program, model, task_description, \
                      inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                     registration_token, retired_at \
+                     registration_token, retired_at, display_name \
                      FROM agents WHERE id = ? LIMIT 1",
                     &[Value::BigInt(agent_id)],
                 )
@@ -7474,7 +7565,7 @@ pub async fn set_agent_contact_policy_by_name(
         // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                           registration_token, retired_at \
+                           registration_token, retired_at, display_name \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                            ORDER BY id ASC LIMIT 1";
         let current_params = [
@@ -7528,7 +7619,7 @@ pub async fn set_agent_contact_policy_by_name(
 
         let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                          inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                         registration_token, retired_at \
+                         registration_token, retired_at, display_name \
                          FROM agents WHERE id = ? LIMIT 1";
         let fetch_params = [Value::BigInt(current_id)];
         let rows = try_in_tx!(
@@ -17005,7 +17096,7 @@ pub async fn insert_system_agent(
         // and treat a UNIQUE failure from a concurrent insert as "exists".
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                          registration_token, retired_at \
+                          registration_token, retired_at, display_name \
                           FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                           ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
@@ -20901,6 +20992,217 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    #[test]
+    fn display_name_update_rejects_suppressed_write() {
+        let (cx, pool, _dir) = setup_test_pool("display_name_suppressed.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw("CREATE TRIGGER suppress_display_name BEFORE UPDATE OF display_name ON agents BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+            drop(conn);
+            let project = ensure_project(&cx, &pool, "/tmp/display-name-suppressed").await.into_result().unwrap();
+            let agent = register_agent(&cx, &pool, project.id.unwrap(), "BlueLake", "test", "test", None, None, None).await.into_result().unwrap();
+            assert!(set_agent_display_name(&cx, &pool, project.id.unwrap(), "BlueLake", Some("Reviewer")).await.into_result().is_err());
+            assert!(get_agent_by_id_fresh(&cx, &pool, agent.id.unwrap()).await.into_result().unwrap().display_name.is_none());
+            assert!(get_agent(&cx, &pool, project.id.unwrap(), "BlueLake").await.into_result().unwrap().display_name.is_none());
+        });
+    }
+
+    #[test]
+    fn display_name_changes_preserve_routing_and_relationships() {
+        let (cx, pool, _dir) = setup_test_pool("display_name_relationships.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/display-name-proof")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let blue = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            update_agent_registration_token(
+                &cx,
+                &pool,
+                blue.id.unwrap(),
+                "display-name-proof-token",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let blue = set_agent_contact_policy(&cx, &pool, blue.id.unwrap(), "contacts_only")
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                blue.registration_token.as_deref(),
+                Some("display-name-proof-token")
+            );
+            assert_eq!(blue.contact_policy, "contacts_only");
+            let green = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenCastle",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert!(blue.display_name.is_none());
+            assert!(green.display_name.is_none());
+            let blue_labeled =
+                set_agent_display_name(&cx, &pool, project_id, "BlueLake", Some("Reviewer"))
+                    .await
+                    .into_result()
+                    .unwrap();
+            let green_labeled =
+                set_agent_display_name(&cx, &pool, project_id, "GreenCastle", Some("Reviewer"))
+                    .await
+                    .into_result()
+                    .unwrap();
+            assert_eq!(blue_labeled.display_name, green_labeled.display_name);
+            assert_ne!(blue_labeled.id, green_labeled.id);
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                green.id.unwrap(),
+                "Review",
+                "Please review",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(blue.id.unwrap(), "to")],
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let reservations = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                blue.id.unwrap(),
+                &["src/lib.rs"],
+                3600,
+                true,
+                "review",
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let contact = request_contact(
+                &cx,
+                &pool,
+                project_id,
+                blue.id.unwrap(),
+                project_id,
+                green.id.unwrap(),
+                "review",
+                3600,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let renamed =
+                set_agent_display_name(&cx, &pool, project_id, "BlueLake", Some(" Officer Alpha "))
+                    .await
+                    .into_result()
+                    .unwrap();
+            assert_eq!(renamed.display_name.as_deref(), Some("Officer Alpha"));
+            assert_eq!(renamed.id, blue.id);
+            assert_eq!(renamed.name, blue.name);
+            assert_eq!(renamed.inception_ts, blue.inception_ts);
+            assert_eq!(renamed.registration_token, blue.registration_token);
+            assert_eq!(renamed.contact_policy, blue.contact_policy);
+            assert!(
+                get_agent(&cx, &pool, project_id, "Reviewer")
+                    .await
+                    .into_result()
+                    .is_err()
+            );
+            let refreshed = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(refreshed.display_name.as_deref(), Some("Officer Alpha"));
+            let cleared = set_agent_display_name(&cx, &pool, project_id, "BlueLake", Some("   "))
+                .await
+                .into_result()
+                .unwrap();
+            assert!(cleared.display_name.is_none());
+            assert_eq!(cleared.id, blue.id);
+            assert_eq!(cleared.name, blue.name);
+            assert_eq!(cleared.inception_ts, blue.inception_ts);
+            assert_eq!(cleared.registration_token, blue.registration_token);
+            assert_eq!(cleared.contact_policy, blue.contact_policy);
+            let inbox = fetch_inbox(&cx, &pool, project_id, blue.id.unwrap(), false, None, 10)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].message.id, message.id);
+            assert_eq!(inbox[0].sender_name, green.name);
+            let preserved_reservations = list_file_reservations(&cx, &pool, project_id, true)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(preserved_reservations.len(), 1);
+            assert_eq!(preserved_reservations[0].id, reservations[0].id);
+            assert_eq!(preserved_reservations[0].agent_id, blue.id.unwrap());
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let links = conn
+                .query_sync(
+                    "SELECT id, a_agent_id, b_agent_id, status FROM agent_links",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].get_named::<Option<i64>>("id").unwrap(), contact.id);
+            assert_eq!(
+                links[0].get_named::<String>("status").unwrap(),
+                contact.status
+            );
+            assert_eq!(
+                links[0].get_named::<i64>("a_agent_id").unwrap(),
+                blue.id.unwrap()
+            );
+            assert_eq!(
+                links[0].get_named::<i64>("b_agent_id").unwrap(),
+                green.id.unwrap()
+            );
+            drop(conn);
+            assert!(
+                set_agent_display_name(&cx, &pool, project_id, "BlueLake", Some("Invalid\n"))
+                    .await
+                    .into_result()
+                    .is_err()
+            );
+            assert!(
+                get_agent_by_id_fresh(&cx, &pool, blue.id.unwrap())
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .display_name
+                    .is_none()
+            );
+        });
     }
 
     #[test]

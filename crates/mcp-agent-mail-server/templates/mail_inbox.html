@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{{ agent }} — Inbox{% endblock %}
+{% block title %}{{ agent_label }} — Inbox{% endblock %}
 
 {% block breadcrumbs %}
 <nav class="flex items-center gap-2 text-sm">
@@ -12,7 +12,7 @@
     {{ project.human_key }}
   </a>
   <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <span class="text-slate-900 dark:text-white font-medium">{{ agent }} Inbox</span>
+  <span class="text-slate-900 dark:text-white font-medium">{{ agent_label }} Inbox</span>
 </nav>
 {% endblock %}
 
@@ -28,7 +28,7 @@
         </div>
         <div>
           <h1 class="text-3xl font-bold text-slate-900 dark:text-white mb-1">
-            {{ agent }}
+            {{ agent_label }}
           </h1>
           <p class="text-slate-600 dark:text-slate-400">
             Inbox
@@ -201,7 +201,7 @@
                   <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400 flex-wrap">
                     <div class="flex items-center gap-1.5">
                       <i data-lucide="user" class="w-4 h-4"></i>
-                      <span class="font-medium" x-text="item.sender"></span>
+                      <span class="font-medium" x-text="item.sender_label"></span>
                     </div>
                     <div class="flex items-center gap-1.5">
                       <i data-lucide="calendar" class="w-4 h-4"></i>

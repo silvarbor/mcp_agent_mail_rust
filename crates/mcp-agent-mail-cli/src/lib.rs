@@ -3062,6 +3062,9 @@ pub enum AgentsCommand {
         /// Agent name (adjective+noun, e.g. "BlueLake"). Auto-generated if omitted.
         #[arg(long, short = 'n')]
         name: Option<String>,
+        /// Human-readable label (up to 128 Unicode characters). Blank clears it.
+        #[arg(long)]
+        display_name: Option<String>,
         /// Short description of the agent's current task.
         #[arg(long, short = 't')]
         task: Option<String>,
@@ -39180,6 +39183,7 @@ fn build_server_register_agent_arguments(
     name: Option<&str>,
     task: Option<&str>,
     attachments_policy: &str,
+    display_name: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -39195,6 +39199,9 @@ fn build_server_register_agent_arguments(
     }
     if let Some(task) = task {
         arguments.insert("task_description".to_string(), serde_json::json!(task));
+    }
+    if let Some(display_name) = display_name {
+        arguments.insert("display_name".to_string(), serde_json::json!(display_name));
     }
     serde_json::Value::Object(arguments)
 }
@@ -39562,6 +39569,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             program,
             model,
             name,
+            display_name,
             task,
             attachments_policy,
             format,
@@ -39588,6 +39596,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     name.as_deref(),
                     task.as_deref(),
                     &attachments_policy,
+                    display_name.as_deref(),
                 ),
             )
             .await
@@ -39651,6 +39660,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 None,
                 None,
                 None,
+                display_name,
             )
             .await
             .map_err(mcp_error_to_cli_error)?;
@@ -39921,7 +39931,13 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             let data = agent_row_to_json(&row);
             output::emit_output(&data, fmt, || {
-                output::section(&format!("Agent: {}", row.name));
+                output::section(&format!(
+                    "Agent: {}",
+                    mcp_agent_mail_core::models::format_agent_label(
+                        &row.name,
+                        row.display_name.as_deref(),
+                    )
+                ));
                 output::kv("ID", &row.id.unwrap_or(0).to_string());
                 output::kv("Program", &row.program);
                 output::kv("Model", &row.model);
@@ -40310,7 +40326,7 @@ async fn resolve_project_async(
 }
 
 fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "id": a.id.unwrap_or(0),
         "name": a.name,
         "program": a.program,
@@ -40322,7 +40338,11 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
         "attachments_policy": a.attachments_policy,
         "contact_policy": a.contact_policy,
         "retired_at": a.retired_at.map(mcp_agent_mail_db::micros_to_iso),
-    })
+    });
+    if let Some(display_name) = &a.display_name {
+        payload["display_name"] = serde_json::json!(display_name);
+    }
+    payload
 }
 
 fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, format: output::CliOutputFormat) {
@@ -40347,7 +40367,13 @@ fn agent_payload_i64(payload: &serde_json::Value, key: &str) -> i64 {
 
 fn render_agent_payload(payload: &serde_json::Value, format: output::CliOutputFormat) {
     output::emit_output(payload, format, || {
-        output::success(&format!("Agent: {}", agent_payload_string(payload, "name")));
+        let label = mcp_agent_mail_core::models::format_agent_label(
+            &agent_payload_string(payload, "name"),
+            payload
+                .get("display_name")
+                .and_then(serde_json::Value::as_str),
+        );
+        output::success(&format!("Agent: {label}"));
         output::kv("ID", &agent_payload_i64(payload, "id").to_string());
         output::kv("Program", &agent_payload_string(payload, "program"));
         output::kv("Model", &agent_payload_string(payload, "model"));
@@ -40376,7 +40402,12 @@ fn render_agent_list_payload(payload: &serde_json::Value, format: output::CliOut
             output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
         for agent in &agents {
             table.add_row(vec![
-                agent_payload_string(agent, "name"),
+                mcp_agent_mail_core::models::format_agent_label(
+                    &agent_payload_string(agent, "name"),
+                    agent
+                        .get("display_name")
+                        .and_then(serde_json::Value::as_str),
+                ),
                 agent_payload_string(agent, "program"),
                 agent_payload_string(agent, "model"),
                 truncate_str(&agent_payload_string(agent, "task_description"), 40),
@@ -41903,9 +41934,11 @@ mod mail_server_cli_bridge_tests {
             Some("BlueLake"),
             Some("Coordination"),
             "auto",
+            Some("Officer Alpha"),
         );
 
         let object = args.as_object().expect("object arguments");
+        assert_eq!(object["display_name"], "Officer Alpha");
         assert_eq!(
             object
                 .get("project_key")
@@ -41928,6 +41961,56 @@ mod mail_server_cli_bridge_tests {
                 .and_then(serde_json::Value::as_str),
             Some("auto")
         );
+    }
+
+    #[test]
+    fn offline_agent_profiles_preserve_optional_display_names() {
+        let labeled = super::agent_row_to_json(&mcp_agent_mail_db::AgentRow {
+            id: Some(7),
+            name: "BlueLake".to_string(),
+            display_name: Some("Officer Alpha".to_string()),
+            registration_token: Some("private-registration-token".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(labeled["id"], 7);
+        assert_eq!(labeled["name"], "BlueLake");
+        assert_eq!(labeled["display_name"], "Officer Alpha");
+        assert!(labeled.get("registration_token").is_none());
+
+        let unlabeled = super::agent_row_to_json(&mcp_agent_mail_db::AgentRow {
+            id: Some(7),
+            name: "BlueLake".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(unlabeled["id"], 7);
+        assert_eq!(unlabeled["name"], "BlueLake");
+        assert!(unlabeled.get("display_name").is_none());
+    }
+
+    #[test]
+    fn register_agent_server_arguments_preserve_display_name_omission_and_clear() {
+        let omitted = build_server_register_agent_arguments(
+            "/tmp/project",
+            "test-client",
+            "test-model",
+            Some("BlueLake"),
+            None,
+            "auto",
+            None,
+        );
+        assert_eq!(omitted["name"], "BlueLake");
+        assert!(omitted.get("display_name").is_none());
+        let cleared = build_server_register_agent_arguments(
+            "/tmp/project",
+            "test-client",
+            "test-model",
+            Some("BlueLake"),
+            None,
+            "auto",
+            Some(""),
+        );
+        assert_eq!(cleared["name"], "BlueLake");
+        assert_eq!(cleared["display_name"], "");
     }
 
     #[test]
@@ -68625,6 +68708,38 @@ startup_timeout_sec = 42
             } => {
                 assert_eq!(id, "br-123");
                 assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_agents_register_display_name() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "agents",
+            "register",
+            "--project",
+            "/tmp/project",
+            "--program",
+            "test-client",
+            "--model",
+            "test-model",
+            "--name",
+            "BlueLake",
+            "--display-name",
+            "Réviseur Alpha",
+        ])
+        .expect("failed to parse display name");
+        match cli.command.expect("expected command") {
+            Commands::Agents {
+                action:
+                    AgentsCommand::Register {
+                        name, display_name, ..
+                    },
+            } => {
+                assert_eq!(name.as_deref(), Some("BlueLake"));
+                assert_eq!(display_name.as_deref(), Some("Réviseur Alpha"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

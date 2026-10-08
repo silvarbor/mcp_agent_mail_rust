@@ -243,6 +243,7 @@ fn send_message_null_auto_contact_contract() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("register_agent");

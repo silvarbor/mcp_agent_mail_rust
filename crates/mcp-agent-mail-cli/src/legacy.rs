@@ -3894,7 +3894,10 @@ mod tests {
         for migration in schema::schema_migrations_base() {
             if matches!(
                 migration.id.as_str(),
-                "v20_agents_registration_token" | "v20_idx_agents_registration_token"
+                "v20_agents_registration_token"
+                    | "v20_idx_agents_registration_token"
+                    | "v32_add_display_name_to_agents"
+                    | "v33_materialize_display_name_on_agents"
             ) {
                 continue;
             }

@@ -850,6 +850,8 @@ pub struct AgentSummary {
 pub struct AgentListEntry {
     pub id: i64,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -926,6 +928,7 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         let entry = AgentListEntry {
             id: agent_id,
             name: agent.name,
+            display_name: agent.display_name,
             program: agent.program,
             model: agent.model,
             task_description: agent.task_description,
@@ -2583,6 +2586,8 @@ pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<S
 pub struct ProjectAgentEntry {
     pub id: i64,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -2632,6 +2637,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
             .map(|a| ProjectAgentEntry {
                 id: a.id.unwrap_or(0),
                 name: a.name,
+                display_name: a.display_name,
                 program: a.program,
                 model: a.model,
                 task_description: a.task_description,
@@ -6555,6 +6561,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -6639,6 +6646,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -6649,6 +6657,7 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -8138,6 +8147,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -8149,6 +8159,7 @@ mod resource_shape_tests {
                     "sonnet-4.5".to_string(),
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
+                    None,
                     None,
                     None,
                     None,

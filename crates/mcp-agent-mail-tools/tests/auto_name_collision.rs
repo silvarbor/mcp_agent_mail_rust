@@ -87,6 +87,7 @@ async fn register_explicit(
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("explicit register_agent should succeed");
@@ -294,6 +295,7 @@ fn register_agent_without_name_never_reuses_existing_row() {
                 "opus-4.5".to_string(),
                 None,
                 Some("phase1 R2-25".to_string()),
+                None,
                 None,
                 None,
                 None,
