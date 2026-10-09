@@ -9,7 +9,7 @@
 //! # Safety posture
 //!
 //! - **Dry-run by default.** `--apply` required to actually delete.
-//! - **Protected refs** (HEAD, main, master, origin/HEAD, etc.)
+//! - **Protected refs** (HEAD, main, origin/HEAD, etc.)
 //!   never auto-prune even with `--force`.
 //! - **Unknown-namespace refs** (refs/heads/custom, refs/tags/*)
 //!   refuse without `--force`.
