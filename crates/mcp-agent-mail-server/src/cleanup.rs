@@ -1238,6 +1238,13 @@ mod tests {
     use mcp_agent_mail_core::Config;
     use mcp_agent_mail_db::{DbPoolConfig, create_pool, queries};
 
+    fn isolated_test_config(tmp: &tempfile::TempDir) -> Config {
+        Config {
+            storage_root: tmp.path().join("archive"),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn collect_matching_literal_path() {
         let tmp = std::env::temp_dir().join("cleanup_test_literal");
@@ -1516,7 +1523,7 @@ mod tests {
         assert_eq!(created.len(), 1);
         let id = created[0].id.expect("reservation id");
 
-        let config = Config::from_env();
+        let config = isolated_test_config(&tmp);
         let (projects_scanned, released) = run_cleanup_cycle(&config, &pool).expect("run cleanup");
         assert_eq!(projects_scanned, 1);
         assert_eq!(released, 1);
@@ -1535,13 +1542,35 @@ mod tests {
             row.released_ts.is_some(),
             "expired reservation should be released"
         );
+        assert!(matches!(
+            mcp_agent_mail_storage::wbq_flush_status(),
+            mcp_agent_mail_storage::WbqFlushOutcome::Drained
+                | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue
+        ));
+        let archive_path = config
+            .storage_root
+            .join("projects")
+            .join(&project.slug)
+            .join("file_reservations")
+            .join(format!("id-{id}.json"));
+        assert!(archive_path.starts_with(tmp.path()));
+        let archived: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&archive_path)
+                .expect("released reservation archive exists in test store"),
+        )
+        .expect("reservation archive is valid JSON");
+        assert_eq!(archived["id"], id);
+        assert_eq!(
+            archived["released_ts"],
+            mcp_agent_mail_db::micros_to_iso(row.released_ts.expect("release timestamp"))
+        );
     }
 
     #[test]
     fn cleanup_cycle_with_no_active_reservations_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
-        let config = Config::from_env();
+        let config = isolated_test_config(&tmp);
 
         let (projects_scanned, released) = run_cleanup_cycle(&config, &pool).expect("run cleanup");
         assert_eq!(projects_scanned, 0);
@@ -1857,7 +1886,7 @@ mod tests {
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
 
-        let mut config = Config::from_env();
+        let mut config = isolated_test_config(&tmp);
         config.file_reservation_inactivity_seconds = 86_400; // one day
         config.file_reservation_activity_grace_seconds = 900;
 
@@ -1888,7 +1917,7 @@ mod tests {
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
 
-        let mut config = Config::from_env();
+        let mut config = isolated_test_config(&tmp);
         config.file_reservation_inactivity_seconds = 0;
         config.file_reservation_activity_grace_seconds = 0;
 
@@ -1922,7 +1951,7 @@ mod tests {
 
         std::fs::remove_dir_all(&human_key).expect("remove workspace");
 
-        let mut config = Config::from_env();
+        let mut config = isolated_test_config(&tmp);
         config.file_reservation_inactivity_seconds = 0;
         config.file_reservation_activity_grace_seconds = 0;
 
@@ -1960,7 +1989,7 @@ mod tests {
             other => panic!("release_reservations_by_ids failed: {other:?}"),
         }
 
-        let config = Config::from_env();
+        let config = isolated_test_config(&tmp);
         let metrics = mcp_agent_mail_core::global_metrics();
         let previous_pressure = metrics.system.disk_pressure_level.load();
         metrics
@@ -2002,7 +2031,7 @@ mod tests {
         .expect("delete agent");
         drop(conn);
 
-        let config = Config::from_env();
+        let config = isolated_test_config(&tmp);
         let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
         assert!(
             result
@@ -2017,7 +2046,7 @@ mod tests {
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
 
-        let config = Config::from_env();
+        let config = isolated_test_config(&tmp);
         let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
         assert!(
             result
@@ -2028,10 +2057,9 @@ mod tests {
 
     fn stale_cleanup_test_config(tmp: &tempfile::TempDir) -> Config {
         Config {
-            storage_root: tmp.path().join("storage"),
             file_reservation_inactivity_seconds: 0,
             file_reservation_activity_grace_seconds: 0,
-            ..Config::default()
+            ..isolated_test_config(tmp)
         }
     }
 
