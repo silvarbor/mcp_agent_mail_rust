@@ -16,7 +16,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="flex flex-col page-transition" x-data="unifiedInboxManager()" x-init="init()">
+<div class="flex flex-col page-transition" x-data="unifiedInboxManager()">
 
   <!-- Fullscreen Backdrop -->
   <div x-show="isFullscreen"
@@ -308,7 +308,7 @@
       <div class="flex-1 overflow-y-auto">
         <template x-if="filteredMessages.length > 0">
           <div>
-            <template x-for="(msg, index) in filteredMessages" :key="msg.id">
+            <template x-for="(msg, index) in pagedMessages" :key="msg.id">
               <!-- Gmail-style Message Item -->
               <div @click="handleMessageClick(msg)"
                    @keydown.enter="handleMessageClick(msg)"
@@ -411,6 +411,11 @@
             </button>
           </div>
         </template>
+      </div>
+      <div x-show="filteredMessages.length > 0" class="flex items-center justify-between gap-2 px-4 py-3 border-t border-slate-200 dark:border-slate-700 text-sm">
+        <button @click="messagePage--" :disabled="messagePage === 0" class="px-3 py-2 rounded-lg border disabled:opacity-40">Previous</button>
+        <span x-text="`${messagePage * pageSize + 1}–${Math.min((messagePage + 1) * pageSize, filteredMessages.length)} of ${filteredMessages.length}`"></span>
+        <button @click="messagePage++" :disabled="(messagePage + 1) * pageSize >= filteredMessages.length" class="px-3 py-2 rounded-lg border disabled:opacity-40">Next</button>
       </div>
     </aside>
 
@@ -668,6 +673,8 @@ function unifiedInboxManager() {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
     filteredMessages: [],
+    messagePage: 0,
+    pageSize: 50,
     selectedMessage: null,
     selectedMessages: [],
     searchQuery: '',
@@ -681,6 +688,9 @@ function unifiedInboxManager() {
     isRefreshing: false,
     lastRefreshTime: null,
     refreshError: null,
+    refreshFailures: 0,
+    refreshController: null,
+    destroyed: false,
 
     // Filters
     filters: {
@@ -692,6 +702,10 @@ function unifiedInboxManager() {
     },
 
     // Computed
+    get pagedMessages() {
+      return this.filteredMessages.slice(this.messagePage * this.pageSize, (this.messagePage + 1) * this.pageSize);
+    },
+
     get uniqueProjects() {
       return [...new Set(
         this.allMessages
@@ -774,7 +788,6 @@ function unifiedInboxManager() {
     },
 
     init() {
-      this.filteredMessages = [...this.allMessages];
       this.filterMessages();
       if (!staticExport) {
         this.lastRefreshTime = new Date();
@@ -837,23 +850,15 @@ function unifiedInboxManager() {
         }
       }
 
-      // Auto-select first message if in split view
-      if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
-        this.selectMessage(this.filteredMessages[0]);
-      }
-
       this.scheduleAutoRefresh();
+    },
 
-      // Return cleanup function for Alpine.js v3
-      return () => {
-        if (this._keydownHandler) {
-          document.removeEventListener('keydown', this._keydownHandler);
-        }
-        if (this.autoRefreshHandle) {
-          clearInterval(this.autoRefreshHandle);
-          this.autoRefreshHandle = null;
-        }
-      };
+    destroy() {
+      this.destroyed = true;
+      document.removeEventListener('keydown', this._keydownHandler);
+      clearTimeout(this.autoRefreshHandle);
+      this.autoRefreshHandle = null;
+      this.refreshController?.abort();
     },
 
     // Filtering
@@ -997,6 +1002,8 @@ function unifiedInboxManager() {
       }
 
       this.filteredMessages = filtered;
+      const selectionIndex = filtered.findIndex(msg => msg.id === this.selectedMessage?.id);
+      this.messagePage = selectionIndex >= 0 ? Math.floor(selectionIndex / this.pageSize) : 0;
 
       const visibleIds = new Set(filtered.map((msg) => msg.id));
       if (this.selectedMessages.length > 0) {
@@ -1014,12 +1021,7 @@ function unifiedInboxManager() {
         this.selectMessage(filtered[0]);
       }
 
-      // Re-render icons
-      this.$nextTick(() => {
-        if (typeof lucide !== 'undefined') {
-          lucide.createIcons();
-        }
-      });
+      // The shared placeholder observer initializes icons added by Alpine.
     },
 
     // Refresh helpers
@@ -1029,15 +1031,17 @@ function unifiedInboxManager() {
         return;
       }
       if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
+        clearTimeout(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
-      if (!this.autoRefreshEnabled) {
+      if (!this.autoRefreshEnabled || this.destroyed) {
         return;
       }
-      this.autoRefreshHandle = setInterval(() => {
+      const delay = Math.min(this.autoRefreshSeconds * 1000 * (2 ** this.refreshFailures), 300000);
+      this.autoRefreshHandle = setTimeout(() => {
+        this.autoRefreshHandle = null;
         this.fetchLatestMessages({ silent: true });
-      }, this.autoRefreshSeconds * 1000);
+      }, delay);
     },
 
     handleAutoRefreshToggle() {
@@ -1048,7 +1052,7 @@ function unifiedInboxManager() {
       if (this.autoRefreshEnabled) {
         this.scheduleAutoRefresh();
       } else if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
+        clearTimeout(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
     },
@@ -1069,11 +1073,16 @@ function unifiedInboxManager() {
         }
         return;
       }
-      if (this.isRefreshing) {
+      if (this.isRefreshing || this.destroyed) {
         return;
       }
       this.isRefreshing = true;
       this.refreshError = null;
+      clearTimeout(this.autoRefreshHandle);
+      this.autoRefreshHandle = null;
+      const controller = new AbortController();
+      this.refreshController = controller;
+      const requestTimeout = setTimeout(() => controller.abort(), 30000);
 
       const previouslySelectedId = this.selectedMessage?.id ?? null;
       const previouslySelectedSet = new Set(this.selectedMessages || []);
@@ -1088,21 +1097,41 @@ function unifiedInboxManager() {
         }
         const response = await fetch(window.agentMailAppendAuth(`/mail/api/unified-inbox?${params.toString()}`), {
           headers: { Accept: 'application/json' },
-          cache: 'no-store'
+          cache: 'no-store',
+          signal: controller.signal
         });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const payload = await response.json();
+        if (this.destroyed) return;
         const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
-
-        this.allMessages = incomingMessages;
-        this.filterMessages();
+        const previousById = new Map(this.allMessages.map(message => [message.id, message]));
+        const stableContent = message => JSON.stringify(Object.fromEntries(
+          Object.keys(message).filter(key => key !== 'created_relative' && key !== 'body_length')
+            .sort().map(key => [key, message[key]])
+        ));
+        const nextMessages = incomingMessages.map(message => {
+          const previous = previousById.get(message.id);
+          if (previous && stableContent(previous) === stableContent(message)) {
+            if (previous.created_relative !== message.created_relative) {
+              previous.created_relative = message.created_relative;
+            }
+            return previous;
+          }
+          return message;
+        });
+        const changed = nextMessages.length !== this.allMessages.length ||
+          nextMessages.some((message, index) => message !== this.allMessages[index]);
+        if (changed) {
+          this.allMessages = nextMessages;
+          this.filterMessages();
+        }
 
         if (previouslySelectedId) {
           const nextSelection = this.filteredMessages.find((m) => m.id === previouslySelectedId);
           if (nextSelection) {
-            this.selectMessage(nextSelection);
+            if (this.selectedMessage !== nextSelection) this.selectMessage(nextSelection);
           } else if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
             this.selectMessage(this.filteredMessages[0]);
           } else {
@@ -1112,30 +1141,33 @@ function unifiedInboxManager() {
           this.selectMessage(this.filteredMessages[0]);
         }
 
-        if (previouslySelectedSet.size > 0) {
+        if (changed && previouslySelectedSet.size > 0) {
           this.selectedMessages = this.filteredMessages
             .filter((m) => previouslySelectedSet.has(m.id))
             .map((m) => m.id);
-        } else if (this.selectedMessages.length > 0) {
+        } else if (changed && this.selectedMessages.length > 0) {
           this.selectedMessages = [];
         }
 
         this.lastRefreshTime = new Date();
+        this.refreshFailures = 0;
 
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Inbox refreshed', 'success');
         }
       } catch (error) {
+        if (this.destroyed) return;
+        this.refreshFailures++;
         console.error('Unified inbox refresh failed:', error);
         this.refreshError = 'Refresh failed. Retrying soon.';
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Failed to refresh inbox', 'error');
         }
       } finally {
+        clearTimeout(requestTimeout);
+        this.refreshController = null;
         this.isRefreshing = false;
-        if (!silent) {
-          this.scheduleAutoRefresh();
-        }
+        this.scheduleAutoRefresh();
       }
     },
 
@@ -1185,6 +1217,8 @@ function unifiedInboxManager() {
       }
 
       this.selectedMessage = msg;
+      const index = this.filteredMessages.findIndex(message => message.id === msg.id);
+      if (index >= 0) this.messagePage = Math.floor(index / this.pageSize);
 
       // Scroll message into view in left pane (for keyboard navigation)
       this.$nextTick(() => {
@@ -1235,9 +1269,6 @@ function unifiedInboxManager() {
                 }
                 setTimeout(() => {
                   button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-                  if (typeof lucide !== 'undefined') {
-                    lucide.createIcons();
-                  }
                 }, 2000);
               } else {
                 // Fallback for browsers without clipboard API
@@ -1256,9 +1287,6 @@ function unifiedInboxManager() {
           wrapper.appendChild(button);
         });
 
-        if (typeof lucide !== 'undefined') {
-          lucide.createIcons();
-        }
       });
     },
 

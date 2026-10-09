@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" x-data="darkModeController()" x-init="init()"
+<html lang="en" x-data="darkModeController()"
       :class="{ 'dark': darkMode }" x-cloak>
   <head>
     <meta charset="utf-8" />
@@ -1119,7 +1119,6 @@
 
     <!-- Interactive Tutorial / Onboarding -->
     <div x-data="tutorialManager()"
-         x-init="init()"
          x-show="isActive"
          x-cloak
          class="fixed inset-0 z-[200] flex items-center justify-center p-4"
@@ -2907,9 +2906,17 @@
         if (typeof lucide !== 'undefined') {
           lucide.createIcons();
 
-          // Re-initialize on Alpine mutations with throttling for performance
+          // SVG replacements retain data-lucide. Only new placeholders need work.
           let iconUpdateTimeout;
-          const observer = new MutationObserver(() => {
+          const placeholderSelector = '[data-lucide]:not(svg)';
+          const observer = new MutationObserver((records) => {
+            const hasPlaceholder = records.some(record =>
+              Array.from(record.addedNodes).some(node =>
+                node instanceof Element &&
+                (node.matches(placeholderSelector) || node.querySelector(placeholderSelector))
+              )
+            );
+            if (!hasPlaceholder) return;
             clearTimeout(iconUpdateTimeout);
             iconUpdateTimeout = setTimeout(() => {
               if (typeof lucide !== 'undefined') {

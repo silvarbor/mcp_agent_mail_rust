@@ -1948,6 +1948,8 @@ fn block_on_outcome<T>(
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
                 404
+            } else if e.is_retryable() {
+                503
             } else {
                 500
             };
@@ -1956,6 +1958,7 @@ fn block_on_outcome<T>(
                 status,
                 match status {
                     404 => "Not found".to_string(),
+                    503 => "Database temporarily busy; retry the request".to_string(),
                     _ => "Internal server error".to_string(),
                 },
             ))
@@ -3631,70 +3634,152 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    // Applying the importance filter after a tight per-agent inbox window can
-    // hide matching messages behind newer non-matching rows. Over-fetch when a
-    // server-side importance filter is active so the filtered unified view stays
-    // complete and then truncate after aggregation.
-    let per_agent_limit = if filter_importance.is_some() {
-        limit.max(10_000)
-    } else {
-        limit.max(1)
-    };
-    let mut messages: BTreeMap<i64, UnifiedMessageAggregate> = BTreeMap::new();
-
-    for project in projects_rows {
-        let pid = project.id.unwrap_or(0);
-        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        let mut project_inbox_rows = Vec::new();
-        let mut candidate_root_ids = Vec::new();
-        for agent in &agents_rows {
-            let aid = agent.id.unwrap_or(0);
-            let inbox = block_on_outcome(
+    const MIN_CANDIDATE_WINDOW: usize = 64;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let projects = projects_rows
+        .iter()
+        .filter_map(|project| project.id.map(|id| (id, project)))
+        .collect::<BTreeMap<_, _>>();
+    let profiles = block_on_outcome(cx, queries::list_mail_ui_agent_profiles(cx, pool))?;
+    // Preserve list_agents' case-insensitive recipient selection while keeping
+    // every historical sender available by its exact ID.
+    let mut names = HashSet::new();
+    let recipient_ids = profiles
+        .iter()
+        .filter(|agent| names.insert((agent.project_id, agent.name.to_ascii_lowercase())))
+        .filter_map(|agent| agent.id)
+        .collect::<HashSet<_>>();
+    let agents = profiles
+        .iter()
+        .filter_map(|agent| agent.id.map(|id| (id, agent)))
+        .collect::<BTreeMap<_, _>>();
+    let mut out = Vec::new();
+    let mut before = None;
+    while out.len() < limit {
+        let candidates = block_on_outcome(
+            cx,
+            queries::list_mail_ui_message_window(
                 cx,
-                queries::fetch_inbox(cx, pool, pid, aid, false, None, per_agent_limit),
-            )?;
-            for row in inbox {
-                let message = &row.message;
-                if !matches_importance_filter(&message.importance, filter_importance) {
-                    continue;
-                }
-                if explicit_thread_ref(message.thread_id.as_deref()).is_none()
-                    && let Some(message_id) = message.id
-                    && message_id > 0
-                {
-                    candidate_root_ids.push(message_id);
-                }
-                project_inbox_rows.push((agent, row));
+                pool,
+                before,
+                filter_importance,
+                limit.max(MIN_CANDIDATE_WINDOW),
+            ),
+        )?;
+        if candidates.is_empty() {
+            break;
+        }
+        before = candidates
+            .last()
+            .and_then(|message| message.id.map(|id| (message.created_ts, id)));
+        let ids = candidates
+            .iter()
+            .filter_map(|message| message.id)
+            .collect::<Vec<_>>();
+        let receipts = block_on_outcome(cx, queries::list_mail_ui_receipts(cx, pool, &ids))?;
+        let mut deliveries = BTreeMap::<i64, Vec<queries::MailUiReceiptRow>>::new();
+        for receipt in receipts {
+            if recipient_ids.contains(&receipt.agent_id) {
+                deliveries
+                    .entry(receipt.message_id)
+                    .or_default()
+                    .push(receipt);
             }
         }
-
-        let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
-        for (agent, row) in project_inbox_rows {
-            let message = &row.message;
-            let Some(message_id) = message.id else {
+        for message in candidates {
+            if !matches_importance_filter(&message.importance, filter_importance) {
+                continue;
+            }
+            let Some(project) = projects.get(&message.project_id) else {
                 continue;
             };
-            if let Some(entry) = messages.get_mut(&message_id) {
-                entry.absorb(agent, &row);
+            let Some(receipts) = message.id.and_then(|id| deliveries.remove(&id)) else {
                 continue;
+            };
+            if let Some(aggregate) =
+                aggregate_unified_deliveries(project, message, receipts, &agents)
+            {
+                out.push(aggregate);
+                if out.len() == limit {
+                    break;
+                }
             }
-
-            let aggregate =
-                UnifiedMessageAggregate::from_inbox_row(project, agent, &row, &reply_root_ids);
-            messages.insert(message_id, aggregate);
         }
     }
-
-    let mut out: Vec<UnifiedMessageAggregate> = messages.into_values().collect();
-    out.sort_by(|a, b| b.created_ts.cmp(&a.created_ts).then(b.id.cmp(&a.id)));
-    out.truncate(limit);
-    let sender_labels = load_agent_labels(cx, pool, out.iter().map(|message| message.sender_id))?;
-    for message in &mut out {
-        if let Some(label) = sender_labels.get(&message.sender_id) {
-            message.sender_label.clone_from(label);
-        }
-    }
+    resolve_unified_root_refs(cx, pool, &projects, &mut out)?;
     Ok(out)
+}
+
+fn aggregate_unified_deliveries(
+    project: &ProjectRow,
+    message: mcp_agent_mail_db::models::MessageRow,
+    receipts: Vec<queries::MailUiReceiptRow>,
+    agents: &BTreeMap<i64, &AgentRow>,
+) -> Option<UnifiedMessageAggregate> {
+    let sender = agents.get(&message.sender_id);
+    let mut row = queries::InboxRow {
+        sender_name: sender.map_or_else(
+            || queries::UNKNOWN_SENDER_DISPLAY.to_string(),
+            |agent| agent.name.clone(),
+        ),
+        message,
+        kind: String::new(),
+        read_ts: None,
+        ack_ts: None,
+    };
+    let mut aggregate: Option<UnifiedMessageAggregate> = None;
+    for receipt in receipts {
+        let Some(agent) = agents
+            .get(&receipt.agent_id)
+            .filter(|agent| agent.project_id == row.message.project_id)
+        else {
+            continue;
+        };
+        row.read_ts = receipt.read_ts;
+        row.ack_ts = receipt.ack_ts;
+        if let Some(aggregate) = &mut aggregate {
+            aggregate.absorb(agent, &row);
+        } else {
+            aggregate = Some(UnifiedMessageAggregate::from_inbox_row(
+                project,
+                agent,
+                &row,
+                &HashSet::new(),
+            ));
+        }
+    }
+    if let (Some(aggregate), Some(sender)) = (&mut aggregate, sender) {
+        aggregate.sender_label = format_agent_label(&sender.name, sender.display_name.as_deref());
+    }
+    aggregate
+}
+
+/// Probe numeric thread roots only after selecting the bounded message view.
+fn resolve_unified_root_refs(
+    cx: &Cx,
+    pool: &DbPool,
+    projects: &BTreeMap<i64, &ProjectRow>,
+    messages: &mut [UnifiedMessageAggregate],
+) -> Result<(), (u16, String)> {
+    for (&project_id, project) in projects {
+        let root_ids = messages
+            .iter()
+            .filter(|message| message.project_slug == project.slug && message.thread_id.is_empty())
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        if root_ids.is_empty() {
+            continue;
+        }
+        let roots = root_ids_with_replies(cx, pool, project_id, &root_ids)?;
+        for message in messages.iter_mut() {
+            if message.project_slug == project.slug && roots.contains(&message.id) {
+                message.thread_id = message.id.to_string();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve labels by stable agent ID, including senders from another project.
@@ -6417,6 +6502,224 @@ mod fresh_eyes_regression_tests {
             .expect("project creation should seed the canonical sibling suggestion");
         assert_eq!(row.status, queries::ProjectSiblingStatus::Suggested);
         assert!(row.score >= queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
+    }
+
+    #[test]
+    fn unified_inbox_query_count_does_not_grow_with_agent_population() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(120));
+        let pool = make_test_pool("unified-query-bound");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/unified-query-bound",
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "RedFox",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            sender.id.unwrap(),
+            "Bounded queries",
+            "Retained body",
+            Some("bounded-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap(), "to")],
+        )));
+        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
+        let tracker = std::sync::Arc::new(mcp_agent_mail_db::tracking::QueryTracker::new());
+        tracker.enable(None);
+        let _tracking = mcp_agent_mail_db::tracking::set_active_tracker(tracker.clone());
+        let first = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
+            .expect("initial inbox");
+        let first_count = tracker.snapshot().total;
+        for name in mcp_agent_mail_core::models::VALID_ADJECTIVES
+            .iter()
+            .flat_map(|adjective| {
+                mcp_agent_mail_core::models::VALID_NOUNS
+                    .iter()
+                    .map(move |noun| format!("{adjective}{noun}"))
+            })
+            .filter(|name| name != "RedFox" && name != "BlueLake")
+            .take(155)
+        {
+            outcome_ok(block_on(queries::register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                &name,
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )));
+        }
+        tracker.reset();
+        let second = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
+            .expect("large directory inbox");
+        assert!(first_count > 0, "actual SQL tracking must be active");
+        assert_eq!(
+            tracker.snapshot().total,
+            first_count,
+            "155 additional agents must not add inbox queries"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].id, message.id.unwrap());
+        assert_eq!(second[0].id, message.id.unwrap());
+        assert_eq!(second[0].body_md, "Retained body");
+    }
+
+    #[test]
+    fn unified_inbox_sparse_windows_preserve_order_filter_and_global_cap() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(120));
+        let pool = make_test_pool("unified-sparse-windows");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/unified-sparse-windows",
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "RedFox",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let foreign_project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/unified-sparse-foreign",
+        )));
+        let foreign_recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            foreign_project.id.unwrap(),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let conn = match block_on(pool.acquire(&cx)) {
+            asupersync::Outcome::Ok(conn) => conn,
+            asupersync::Outcome::Err(error) => panic!("acquire fixture connection: {error}"),
+            asupersync::Outcome::Cancelled(reason) => {
+                panic!("fixture connection cancelled: {reason}")
+            }
+            asupersync::Outcome::Panicked(payload) => {
+                panic!("fixture connection panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync("BEGIN IMMEDIATE", &[])
+            .expect("start fixture transaction");
+        for id in 1..=1100 {
+            conn.execute_sync("INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (?, ?, ?, 'Bounded mail', 'Preserved body', ?, 0, 100, '[]', '[]')", &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project.id.unwrap()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(sender.id.unwrap()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(if id == 1 { "high" } else { "normal" }.to_string()),
+            ]).expect("insert real message fixture");
+            if id <= 1001 {
+                conn.execute_sync("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')", &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(recipient.id.unwrap()),
+                ]).expect("insert real delivery fixture");
+            }
+            if id == 1100 {
+                conn.execute_sync("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')", &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(foreign_recipient.id.unwrap()),
+                ]).expect("insert foreign-project delivery fixture");
+            }
+        }
+        conn.execute_sync("COMMIT", &[]).expect("commit fixtures");
+        drop(conn);
+        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
+        let first = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
+            .expect("skip undelivered candidate pages");
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].id, 1001,
+            "newer undelivered messages must not consume result slots"
+        );
+        let filtered = collect_unified_message_aggregates(&cx, &pool, &projects, 1, Some("HIGH"))
+            .expect("filter before limiting");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0].id, 1,
+            "filter must reach the older high-priority message"
+        );
+        let capped = collect_unified_message_aggregates(&cx, &pool, &projects, 1000, None)
+            .expect("global result cap");
+        assert_eq!(capped.len(), 1000);
+        assert_eq!(capped.first().unwrap().id, 1001);
+        assert_eq!(capped.last().unwrap().id, 2);
+        assert!(
+            capped.windows(2).all(|pair| pair[0].id > pair[1].id),
+            "equal timestamps must order by descending stable ID"
+        );
+        assert!(
+            capped
+                .iter()
+                .all(|message| message.recipients.contains("BlueLake")
+                    && !message.all_read
+                    && message.body_md == "Preserved body")
+        );
+    }
+
+    #[test]
+    fn unified_inbox_busy_error_is_retryable_http_503() {
+        let cx = Cx::for_testing();
+        let error = block_on_outcome::<()>(&cx, async {
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(
+                "database is busy".to_string(),
+            ))
+        })
+        .expect_err("busy read must remain retryable");
+        assert_eq!(error.0, 503);
+        assert_eq!(error.1, "Database temporarily busy; retry the request");
     }
 
     #[test]
