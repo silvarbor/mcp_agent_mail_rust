@@ -85,6 +85,7 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "reaper_exempt",
             "registration_token",
             "retired_at",
+            "display_name",
         ],
     },
     KnownTable {
@@ -1103,7 +1104,9 @@ mod tests {
         let err = create_real_directory_all(&linked_var.join("out"))
             .expect_err("fixture var symlink is not a platform firmlink");
         match err {
-            RealDirError::Symlink(component) => assert_eq!(component, linked_var),
+            RealDirError::Symlink(component) => {
+                assert_eq!(component, dir.path().canonicalize().unwrap().join("var"));
+            }
             _ => panic!("expected symlink refusal"),
         }
     }
@@ -1852,14 +1855,15 @@ mod tests {
                 project_id INTEGER NOT NULL, \
                 name TEXT NOT NULL, \
                 reaper_exempt INTEGER NOT NULL DEFAULT 0, \
-                registration_token TEXT\
+                registration_token TEXT, \
+                display_name TEXT\
             )",
         )
         .unwrap();
         conn.execute_raw(
             "INSERT INTO agents \
-             (id, project_id, name, reaper_exempt, registration_token) \
-             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret')",
+             (id, project_id, name, reaper_exempt, registration_token, display_name) \
+             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret', 'Reviewer 東京')",
         )
         .unwrap();
         drop(conn);
@@ -1869,7 +1873,7 @@ mod tests {
         let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
         let rows = copy_conn
             .query_sync(
-                "SELECT reaper_exempt, registration_token FROM agents WHERE id = 7",
+                "SELECT reaper_exempt, registration_token, display_name FROM agents WHERE id = 7",
                 &[],
             )
             .unwrap();
@@ -1881,6 +1885,10 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("registration-secret")
+        );
+        assert_eq!(
+            rows[0].get_named::<String>("display_name").unwrap(),
+            "Reviewer 東京"
         );
     }
 

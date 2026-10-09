@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use std::future::Future;
@@ -19,6 +19,7 @@ use asupersync::time::wall_now;
 #[cfg(test)]
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
+use mcp_agent_mail_core::models::format_agent_label;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
@@ -1049,6 +1050,164 @@ first body
             .expect("attachments route should return html");
         assert!(html.contains("artifact.txt"), "{html}");
         assert!(html.contains("Orphaned attachment delivery"), "{html}");
+    }
+
+    #[test]
+    fn display_names_are_escaped_without_changing_mail_routes() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("display-names");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-names-{}", unique_nonce()),
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            &sender.name,
+            Some("Réviseur <img src=x onerror=alert(1)> & \"Alpha\""),
+        )));
+        assert!(matches!(
+            block_on(queries::set_agent_display_name(
+                &cx,
+                &pool,
+                project.id.unwrap_or(0),
+                &sender.name,
+                Some("Invalid\u{0007}label"),
+            )),
+            Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { .. })
+        ));
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            sender.id.unwrap_or(0),
+            "Display-name routing",
+            "Message sent to a stable address",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let directory = render_project(&cx, &pool, &project.slug, false)
+            .expect("render agent directory")
+            .expect("directory HTML");
+        assert!(directory.contains(
+            "Réviseur &lt;img src=x onerror=alert(1)&gt; &amp; &quot;Alpha&quot; &lt;BlueLake&gt;"
+        ));
+        assert!(!directory.contains("<img src=x onerror=alert(1)>"));
+        assert!(directory.contains(&format!("href=\"/mail/{}/inbox/BlueLake\"", project.slug)));
+        assert!(directory.contains("data-agent-name=\"BlueLake\""));
+        assert!(directory.contains("\n                  GreenCastle\n"));
+        assert!(!directory.contains("GreenCastle&gt;"));
+
+        let detail = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+            .expect("render message")
+            .expect("message HTML");
+        assert!(detail.contains(
+            "Réviseur &lt;img src=x onerror=alert(1)&gt; &amp; &quot;Alpha&quot; &lt;BlueLake&gt;"
+        ));
+        assert!(!detail.contains("<img src=x onerror=alert(1)>"));
+
+        let inbox = render_inbox(&cx, &pool, &project.slug, &recipient.name, 50, 1, false)
+            .expect("render inbox by canonical recipient")
+            .expect("inbox HTML");
+        assert!(inbox.contains("Réviseur \\u003cimg src=x onerror=alert(1)\\u003e"));
+        assert!(!inbox.contains("<img src=x onerror=alert(1)>"));
+        assert!(inbox.contains("\"sender\":\"BlueLake\""));
+        assert!(inbox.contains("x-text=\"item.sender_label\""));
+    }
+
+    #[test]
+    fn cross_project_sender_display_name_is_rendered_by_identity() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("foreign-display-name");
+        let local = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-local-{}", unique_nonce()),
+        )));
+        let foreign = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-foreign-{}", unique_nonce()),
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            foreign.id.unwrap(),
+            "RedStone",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        assert_ne!(sender.project_id, recipient.project_id);
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            foreign.id.unwrap(),
+            &sender.name,
+            Some("Reviewer"),
+        )));
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            sender.id.unwrap(),
+            "Foreign sender",
+            "Delivered across projects",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap(), "to")],
+        )));
+        let inbox = render_inbox(&cx, &pool, &local.slug, &recipient.name, 50, 1, false)
+            .expect("render foreign sender")
+            .expect("inbox HTML");
+        assert!(inbox.contains("\"sender_label\":\"Reviewer \\u003cRedStone\\u003e\""));
+        assert!(inbox.contains("\"sender\":\"RedStone\""));
+        assert!(inbox.contains("x-text=\"item.sender_label\""));
     }
 
     #[test]
@@ -3407,6 +3566,7 @@ struct ProjectView {
 struct AgentView {
     id: i64,
     name: String,
+    label: String,
     program: String,
     model: String,
     task_description: String,
@@ -3450,6 +3610,7 @@ fn agent_view(a: &AgentRow) -> AgentView {
     AgentView {
         id: a.id.unwrap_or(0),
         name: a.name.clone(),
+        label: format_agent_label(&a.name, a.display_name.as_deref()),
         program: a.program.clone(),
         model: a.model.clone(),
         task_description: a.task_description.clone(),
@@ -3483,6 +3644,7 @@ fn render_project(
 struct InboxCtx {
     project: ProjectView,
     agent: String,
+    agent_label: String,
     items: Vec<InboxMessage>,
     page: usize,
     limit: usize,
@@ -3498,6 +3660,7 @@ struct InboxMessage {
     subject: String,
     body_html: String,
     sender: String,
+    sender_label: String,
     importance: String,
     thread_id: String,
     thread_url: String,
@@ -3543,6 +3706,26 @@ fn render_inbox(
     // Offset-based pagination (Python: offset = (page - 1) * limit).
     let page = page.max(1);
     let offset = (page - 1).saturating_mul(limit.max(1));
+    let sender_ids: Vec<i64> = inbox
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| row.message.sender_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let sender_labels: BTreeMap<i64, String> =
+        block_on_outcome(cx, queries::get_agents_by_ids(cx, pool, &sender_ids))?
+            .into_iter()
+            .filter_map(|agent| {
+                agent.id.map(|id| {
+                    (
+                        id,
+                        format_agent_label(&agent.name, agent.display_name.as_deref()),
+                    )
+                })
+            })
+            .collect();
     let mut items = Vec::new();
     for row in inbox.iter().skip(offset).take(limit) {
         let m = &row.message;
@@ -3556,6 +3739,10 @@ fn render_inbox(
             subject: m.subject.clone(),
             body_html: markdown::render_markdown_to_safe_html(&m.body_md),
             sender: row.sender_name.clone(),
+            sender_label: sender_labels
+                .get(&m.sender_id)
+                .cloned()
+                .unwrap_or_else(|| row.sender_name.clone()),
             importance: m.importance.clone(),
             thread_id: thread_id.clone(),
             thread_url: if thread_id.is_empty() {
@@ -3581,6 +3768,7 @@ fn render_inbox(
         "mail_inbox.html",
         InboxCtx {
             project: project_view(&p),
+            agent_label: format_agent_label(&a.name, a.display_name.as_deref()),
             agent: a.name,
             items,
             page,
@@ -3620,6 +3808,7 @@ struct MessageView {
     created: String,
     ack_required: bool,
     sender: String,
+    sender_label: String,
 }
 
 #[derive(Serialize)]
@@ -3648,9 +3837,16 @@ fn render_message(
         return Err((404, "Message not found".to_string()));
     }
     let current_message_id = m.id.unwrap_or(0);
-    let sender = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, m.sender_id))
-        .map(|agent| agent.name)
-        .unwrap_or_else(|_| format!("[unknown-agent-{}]", m.sender_id));
+    let (sender, sender_label) =
+        block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, m.sender_id))
+            .map(|agent| {
+                let label = format_agent_label(&agent.name, agent.display_name.as_deref());
+                (agent.name, label)
+            })
+            .unwrap_or_else(|_| {
+                let placeholder = format!("[unknown-agent-{}]", m.sender_id);
+                (placeholder.clone(), placeholder)
+            });
     let recipients = block_on_outcome(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
@@ -3701,6 +3897,7 @@ fn render_message(
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
                 sender,
+                sender_label,
             },
             recipients: recipients
                 .into_iter()

@@ -217,6 +217,7 @@ pub async fn macro_start_session(
         pane_id,
         tmux_socket_path,
         registration_proof,
+        None,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -387,6 +388,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             registration_proof,
+            None,
         )
         .await?;
         parse_json(agent_json, "agent")?
@@ -1014,6 +1016,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "BlueLake".into(),
+                display_name: None,
                 program: "claude-code".into(),
                 model: "opus-4.5".into(),
                 task_description: "testing".into(),
@@ -1184,6 +1187,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "GoldHawk".into(),
+                display_name: None,
                 program: "codex-cli".into(),
                 model: "gpt-5".into(),
                 task_description: String::new(),
@@ -1372,6 +1376,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "TestAgent".into(),
+                display_name: None,
                 program: "test".into(),
                 model: "test".into(),
                 task_description: String::new(),
@@ -1419,6 +1424,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "A".into(),
+                display_name: None,
                 program: "p".into(),
                 model: "m".into(),
                 task_description: String::new(),
@@ -1483,6 +1489,7 @@ mod tests {
             agent: AgentResponse {
                 id: 1,
                 name: "A".into(),
+                display_name: None,
                 program: "p".into(),
                 model: "m".into(),
                 task_description: String::new(),

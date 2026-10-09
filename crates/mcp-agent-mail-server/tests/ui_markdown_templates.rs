@@ -111,6 +111,7 @@ struct ProjectView {
 struct AgentView {
     id: i64,
     name: String,
+    label: String,
     program: String,
     model: String,
     task_description: String,
@@ -129,6 +130,7 @@ fn templates_render_mail_project() {
         agents: vec![AgentView {
             id: 10,
             name: "GreenLake".to_string(),
+            label: "GreenLake".to_string(),
             program: "claude-code".to_string(),
             model: "opus-4.6".to_string(),
             task_description: "Working on tests".to_string(),
@@ -139,6 +141,10 @@ fn templates_render_mail_project() {
     let out =
         templates::render_template("mail_project.html", ctx).expect("render mail_project.html");
     assert!(out.contains("GreenLake"), "should contain agent name");
+    assert!(
+        out.contains("\n                  GreenLake\n"),
+        "directory heading should show the canonical name when no label exists"
+    );
     assert!(out.contains("my-proj"), "should contain project slug");
     assert!(
         !out.contains("Prioritize subject matches in rankings"),

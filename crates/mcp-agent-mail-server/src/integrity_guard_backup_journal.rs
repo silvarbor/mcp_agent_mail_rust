@@ -289,6 +289,8 @@ impl AutomaticBackupLease {
             self.leaf.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
+        // Preserve the u64 device representation for signed Unix stat fields.
+        let named_device = i128::from(named.st_dev) & i128::from(u64::MAX);
         if !opened.is_file()
             || opened.nlink() != 1
             || opened.mode() & 0o077 != 0
@@ -296,7 +298,7 @@ impl AutomaticBackupLease {
             || named.st_nlink != 1
             || named.st_mode & 0o077 != 0
             || named.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFREG.bits()
-            || opened.dev() != named.st_dev as u64
+            || i128::from(opened.dev()) != named_device
             || opened.ino() != named.st_ino as u64
         {
             return Err(invalid(

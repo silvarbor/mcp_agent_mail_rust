@@ -1,4 +1,4 @@
-//! Golden-output capture and normalization helpers.
+//! Golden-output commands, capture and normalization.
 //!
 //! These utilities are intentionally small and deterministic so they can be
 //! reused by native `am golden` workflows and golden snapshot tests.
@@ -9,9 +9,11 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+
+use crate::{CliError, CliResult, GoldenCommand, output};
 
 /// Captured stdout/stderr plus exit code for a command invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +377,658 @@ pub fn compare_text(expected: &str, actual: &str) -> GoldenComparison {
         actual_sha256,
         matches,
         inline_diff,
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct GoldenRow {
+    filename: String,
+    status: String,
+    command: Vec<String>,
+    expected_exit_code: i32,
+    exit_code: Option<i32>,
+    expected_sha256: Option<String>,
+    actual_sha256: Option<String>,
+    note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<String>,
+}
+
+fn golden_default_dir(dir: Option<PathBuf>) -> PathBuf {
+    dir.unwrap_or_else(|| PathBuf::from("benches/golden"))
+}
+
+fn compile_golden_filter(filter: Option<&str>) -> CliResult<Option<glob::Pattern>> {
+    filter
+        .map(|raw| {
+            glob::Pattern::new(raw).map_err(|err| {
+                CliError::InvalidArgument(format!("invalid --filter pattern '{raw}': {err}"))
+            })
+        })
+        .transpose()
+}
+
+fn golden_matches_filter(name: &str, pattern: Option<&glob::Pattern>) -> bool {
+    pattern.is_none_or(|p| p.matches(name))
+}
+
+pub(super) fn seed_golden_capture_checksums(
+    dir: &Path,
+    filtered: bool,
+) -> CliResult<BTreeMap<String, String>> {
+    if !filtered {
+        return Ok(BTreeMap::new());
+    }
+
+    let checksums_path = dir.join("checksums.sha256");
+    if !checksums_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    read_checksums_file(&checksums_path).map_err(|err| {
+        CliError::Other(format!(
+            "failed to read existing {} before filtered capture: {err}",
+            checksums_path.display()
+        ))
+    })
+}
+
+fn resolve_sibling_binary(current_exe: &Path, sibling_name: &str) -> PathBuf {
+    current_exe
+        .parent()
+        .map(|dir| dir.join(sibling_name))
+        .filter(|candidate| candidate.exists())
+        .unwrap_or_else(|| PathBuf::from(sibling_name))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn build_golden_specs(pattern: Option<&glob::Pattern>) -> Vec<GoldenCommandSpec> {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("am"));
+    let am_bin = current_exe.to_string_lossy().to_string();
+    let mcp_bin = resolve_sibling_binary(&current_exe, "mcp-agent-mail")
+        .to_string_lossy()
+        .to_string();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stub_bin = workspace_root.join("scripts/toon_stub_encoder.sh");
+    let stub_bin_str = stub_bin.to_string_lossy().to_string();
+
+    let mut specs = Vec::new();
+    let mut maybe_push = |spec: GoldenCommandSpec| {
+        if golden_matches_filter(&spec.filename, pattern) {
+            specs.push(spec);
+        }
+    };
+
+    maybe_push(GoldenCommandSpec::new(
+        "am_help.txt",
+        vec![am_bin.clone(), "--help".to_string()],
+    ));
+    maybe_push(GoldenCommandSpec::new(
+        "am_version.txt",
+        vec![am_bin.clone(), "--version".to_string()],
+    ));
+
+    const HELP_SUBCOMMANDS: &[&str] = &[
+        "serve-http",
+        "serve-stdio",
+        "guard",
+        "share",
+        "doctor",
+        "config",
+        "mail",
+        "agents",
+        "tooling",
+        "macros",
+        "contacts",
+        "products",
+        "archive",
+        "projects",
+        "file_reservations",
+        "legacy",
+        "upgrade",
+    ];
+    for subcmd in HELP_SUBCOMMANDS {
+        maybe_push(GoldenCommandSpec::new(
+            format!("am_{subcmd}_help.txt"),
+            vec![am_bin.clone(), (*subcmd).to_string(), "--help".to_string()],
+        ));
+    }
+
+    const MCP_DENIAL_COMMANDS: &[&str] = &["share", "guard", "doctor", "archive", "migrate"];
+    for denied in MCP_DENIAL_COMMANDS {
+        maybe_push(
+            GoldenCommandSpec::new(
+                format!("mcp_deny_{denied}.txt"),
+                vec![mcp_bin.clone(), (*denied).to_string()],
+            )
+            .expected_exit_code(2)
+            .stream(GoldenStream::Combined)
+            .env("AM_INTERFACE_MODE", "mcp"),
+        );
+    }
+
+    if is_executable_file(&stub_bin) {
+        let cmd = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+            ]
+        } else {
+            vec![stub_bin_str.clone(), "--encode".to_string()]
+        };
+
+        maybe_push(GoldenCommandSpec::new("stub_encode.txt", cmd).stdin("{\"id\":1}\n"));
+
+        let cmd_stats = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+                "--stats".to_string(),
+            ]
+        } else {
+            vec![
+                stub_bin_str.clone(),
+                "--encode".to_string(),
+                "--stats".to_string(),
+            ]
+        };
+
+        maybe_push(
+            GoldenCommandSpec::new("stub_encode_stats_stdout.txt", cmd_stats.clone())
+                .stdin("{\"id\":1}\n")
+                .stream(GoldenStream::Stdout),
+        );
+        maybe_push(
+            GoldenCommandSpec::new("stub_encode_stats_stderr.txt", cmd_stats)
+                .stdin("{\"id\":1}\n")
+                .stream(GoldenStream::Stderr),
+        );
+
+        let cmd_help = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec!["sh".to_string(), stub_bin_str.clone(), "--help".to_string()]
+        } else {
+            vec![stub_bin_str.clone(), "--help".to_string()]
+        };
+        maybe_push(GoldenCommandSpec::new("stub_help.txt", cmd_help));
+
+        let cmd_version = if cfg!(windows) && stub_bin_str.ends_with(".sh") {
+            vec![
+                "sh".to_string(),
+                stub_bin_str.clone(),
+                "--version".to_string(),
+            ]
+        } else {
+            vec![stub_bin_str, "--version".to_string()]
+        };
+        maybe_push(GoldenCommandSpec::new("stub_version.txt", cmd_version));
+    }
+
+    specs
+}
+
+fn handle_golden_capture(
+    dir: Option<PathBuf>,
+    filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    verbose: bool,
+) -> CliResult<()> {
+    let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let filter_pattern = compile_golden_filter(filter.as_deref())?;
+    let specs = build_golden_specs(filter_pattern.as_ref());
+    if specs.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no golden definitions matched the current --filter".to_string(),
+        ));
+    }
+    std::fs::create_dir_all(&dir)?;
+
+    let mut rows = Vec::new();
+    let mut checksums = seed_golden_capture_checksums(&dir, filter_pattern.is_some())?;
+    let mut failures = 0usize;
+
+    for spec in specs {
+        match run_golden_command(&spec, &[], None) {
+            Ok(run) => {
+                let path = dir.join(&spec.filename);
+                if let Err(err) = std::fs::write(&path, &run.normalized_output) {
+                    failures += 1;
+                    rows.push(GoldenRow {
+                        filename: spec.filename,
+                        status: "error".to_string(),
+                        command: spec.command,
+                        expected_exit_code: spec.expected_exit_code,
+                        exit_code: Some(run.exit_code),
+                        expected_sha256: None,
+                        actual_sha256: None,
+                        note: Some(format!("write failed: {err}")),
+                        diff: None,
+                    });
+                    continue;
+                }
+
+                let sha = sha256_hex(&run.normalized_output);
+                checksums.insert(run.filename.clone(), sha.clone());
+                let exit_matches = run.exit_code == run.expected_exit_code;
+                if !exit_matches {
+                    failures += 1;
+                }
+                rows.push(GoldenRow {
+                    filename: run.filename,
+                    status: if exit_matches {
+                        "ok".to_string()
+                    } else {
+                        "error".to_string()
+                    },
+                    command: spec.command,
+                    expected_exit_code: run.expected_exit_code,
+                    exit_code: Some(run.exit_code),
+                    expected_sha256: Some(sha.clone()),
+                    actual_sha256: Some(sha),
+                    note: (!exit_matches).then(|| {
+                        format!(
+                            "unexpected exit code: expected {}, got {}",
+                            run.expected_exit_code, run.exit_code
+                        )
+                    }),
+                    diff: None,
+                });
+            }
+            Err(err) => {
+                failures += 1;
+                rows.push(GoldenRow {
+                    filename: spec.filename,
+                    status: "error".to_string(),
+                    command: spec.command,
+                    expected_exit_code: spec.expected_exit_code,
+                    exit_code: None,
+                    expected_sha256: None,
+                    actual_sha256: None,
+                    note: Some(err.to_string()),
+                    diff: None,
+                });
+            }
+        }
+    }
+
+    if failures == 0 {
+        write_checksums_file(&dir.join("checksums.sha256"), &checksums)
+            .map_err(|err| CliError::Other(err.to_string()))?;
+    }
+
+    let payload = serde_json::json!({
+        "mode": "capture",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "passed": rows.len().saturating_sub(failures),
+        "failed": failures,
+        "checksums_written": failures == 0,
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
+        output::section("Golden capture");
+        for row in &rows {
+            let marker = match row.status.as_str() {
+                "ok" => "OK",
+                _ => "ERROR",
+            };
+            ftui_runtime::ftui_println!("  {:<30} {}", row.filename, marker);
+            if verbose {
+                ftui_runtime::ftui_println!("    cmd: {}", row.command.join(" "));
+                if let Some(exit) = row.exit_code {
+                    ftui_runtime::ftui_println!(
+                        "    exit: {} (expected {})",
+                        exit,
+                        row.expected_exit_code
+                    );
+                }
+                if let Some(hash) = &row.actual_sha256 {
+                    ftui_runtime::ftui_println!("    sha256: {hash}");
+                }
+            }
+            if let Some(note) = &row.note {
+                ftui_runtime::ftui_println!("    note: {note}");
+            }
+        }
+        ftui_runtime::ftui_println!("");
+        if failures == 0 {
+            ftui_runtime::ftui_println!(
+                "Result: {}/{} captured (checksums updated)",
+                rows.len(),
+                rows.len()
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "Result: {}/{} captured, {} errors (checksums not updated)",
+                rows.len().saturating_sub(failures),
+                rows.len(),
+                failures
+            );
+        }
+    });
+
+    if failures > 0 {
+        return Err(CliError::ExitCode(1));
+    }
+    Ok(())
+}
+
+fn handle_golden_verify(
+    dir: Option<PathBuf>,
+    filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    verbose: bool,
+) -> CliResult<()> {
+    let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let checksums_path = dir.join("checksums.sha256");
+    let checksums = read_checksums_file(&checksums_path).map_err(|err| {
+        CliError::Other(format!(
+            "failed to read {}: {err}",
+            checksums_path.display()
+        ))
+    })?;
+    let filter_pattern = compile_golden_filter(filter.as_deref())?;
+    let spec_map: std::collections::BTreeMap<String, GoldenCommandSpec> = build_golden_specs(None)
+        .into_iter()
+        .map(|spec| (spec.filename.clone(), spec))
+        .collect();
+
+    let selected_files: Vec<(String, String)> = checksums
+        .into_iter()
+        .filter(|(filename, _)| golden_matches_filter(filename, filter_pattern.as_ref()))
+        .collect();
+    if selected_files.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no checksum entries matched the current --filter".to_string(),
+        ));
+    }
+
+    let mut rows = Vec::new();
+    let mut failures = 0usize;
+    for (filename, expected_hash) in selected_files {
+        let Some(spec) = spec_map.get(&filename).cloned() else {
+            failures += 1;
+            rows.push(GoldenRow {
+                filename,
+                status: "error".to_string(),
+                command: Vec::new(),
+                expected_exit_code: 0,
+                exit_code: None,
+                expected_sha256: Some(expected_hash),
+                actual_sha256: None,
+                note: Some("no command definition for checksum entry".to_string()),
+                diff: None,
+            });
+            continue;
+        };
+
+        let golden_path = dir.join(&filename);
+        let expected_text = match std::fs::read_to_string(&golden_path) {
+            Ok(text) => text,
+            Err(err) => {
+                failures += 1;
+                rows.push(GoldenRow {
+                    filename,
+                    status: "missing".to_string(),
+                    command: spec.command,
+                    expected_exit_code: spec.expected_exit_code,
+                    exit_code: None,
+                    expected_sha256: Some(expected_hash),
+                    actual_sha256: None,
+                    note: Some(format!("failed to read {}: {err}", golden_path.display())),
+                    diff: None,
+                });
+                continue;
+            }
+        };
+
+        let run = match run_golden_command(&spec, &[], None) {
+            Ok(run) => run,
+            Err(err) => {
+                failures += 1;
+                rows.push(GoldenRow {
+                    filename,
+                    status: "error".to_string(),
+                    command: spec.command,
+                    expected_exit_code: spec.expected_exit_code,
+                    exit_code: None,
+                    expected_sha256: Some(expected_hash),
+                    actual_sha256: None,
+                    note: Some(err.to_string()),
+                    diff: None,
+                });
+                continue;
+            }
+        };
+
+        let comparison = compare_text(&expected_text, &run.normalized_output);
+        let checksum_matches = comparison.actual_sha256 == expected_hash;
+        let exit_matches = run.exit_code == run.expected_exit_code;
+        let passed = comparison.matches && checksum_matches && exit_matches;
+        if !passed {
+            failures += 1;
+        }
+        rows.push(GoldenRow {
+            filename,
+            status: if passed {
+                "ok".to_string()
+            } else {
+                "mismatch".to_string()
+            },
+            command: spec.command,
+            expected_exit_code: run.expected_exit_code,
+            exit_code: Some(run.exit_code),
+            expected_sha256: Some(expected_hash),
+            actual_sha256: Some(comparison.actual_sha256),
+            note: (!exit_matches).then(|| {
+                format!(
+                    "unexpected exit code: expected {}, got {}",
+                    run.expected_exit_code, run.exit_code
+                )
+            }),
+            diff: (!passed).then(|| comparison.inline_diff.unwrap_or_default()),
+        });
+    }
+
+    let payload = serde_json::json!({
+        "mode": "verify",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "passed": rows.len().saturating_sub(failures),
+        "failed": failures,
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
+        output::section("Golden output verification");
+        let width = rows
+            .iter()
+            .map(|row| row.filename.chars().count())
+            .max()
+            .unwrap_or(0);
+        for row in &rows {
+            let status = match row.status.as_str() {
+                "ok" => "OK",
+                "missing" => "MISSING",
+                "mismatch" => "MISMATCH",
+                _ => "ERROR",
+            };
+            ftui_runtime::ftui_println!("  {:<width$}  {}", row.filename, status, width = width);
+            if verbose && row.status != "ok" {
+                if let Some(expected) = &row.expected_sha256 {
+                    ftui_runtime::ftui_println!("    expected_sha256: {expected}");
+                }
+                if let Some(actual) = &row.actual_sha256 {
+                    ftui_runtime::ftui_println!("    actual_sha256:   {actual}");
+                }
+                if let Some(note) = &row.note {
+                    ftui_runtime::ftui_println!("    note: {note}");
+                }
+                if let Some(diff) = &row.diff
+                    && !diff.is_empty()
+                {
+                    ftui_runtime::ftui_println!("    diff:\n{diff}");
+                }
+            }
+        }
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!(
+            "Result: {}/{} passed, {} failed",
+            rows.len().saturating_sub(failures),
+            rows.len(),
+            failures
+        );
+    });
+
+    if failures > 0 {
+        return Err(CliError::ExitCode(1));
+    }
+    Ok(())
+}
+
+fn handle_golden_list(
+    dir: Option<PathBuf>,
+    filter: Option<String>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    let dir = golden_default_dir(dir);
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let filter_pattern = compile_golden_filter(filter.as_deref())?;
+    let specs = build_golden_specs(filter_pattern.as_ref());
+    if specs.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no golden definitions matched the current --filter".to_string(),
+        ));
+    }
+
+    let checksums_path = dir.join("checksums.sha256");
+    let checksum_map = if checksums_path.exists() {
+        read_checksums_file(&checksums_path)
+            .map_err(|err| CliError::Other(format!("failed to parse checksums: {err}")))?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let mut rows = Vec::new();
+    for spec in specs {
+        let file_path = dir.join(&spec.filename);
+        let expected_hash = checksum_map.get(&spec.filename).cloned();
+        if !file_path.exists() {
+            rows.push(GoldenRow {
+                filename: spec.filename,
+                status: "missing".to_string(),
+                command: spec.command,
+                expected_exit_code: spec.expected_exit_code,
+                exit_code: None,
+                expected_sha256: expected_hash,
+                actual_sha256: None,
+                note: Some("golden file not found".to_string()),
+                diff: None,
+            });
+            continue;
+        }
+
+        let actual_hash = std::fs::read_to_string(&file_path)
+            .map(|txt| sha256_hex(&txt))
+            .map_err(CliError::Io)?;
+        let status = match expected_hash.as_deref() {
+            Some(expected) if expected == actual_hash => "present",
+            _ => "stale",
+        };
+        rows.push(GoldenRow {
+            filename: spec.filename,
+            status: status.to_string(),
+            command: spec.command,
+            expected_exit_code: spec.expected_exit_code,
+            exit_code: None,
+            expected_sha256: expected_hash,
+            actual_sha256: Some(actual_hash),
+            note: None,
+            diff: None,
+        });
+    }
+
+    let payload = serde_json::json!({
+        "mode": "list",
+        "directory": dir.display().to_string(),
+        "total": rows.len(),
+        "rows": rows,
+    });
+    output::emit_output(&payload, fmt, || {
+        output::section("Golden files");
+        let width = rows
+            .iter()
+            .map(|row| row.filename.chars().count())
+            .max()
+            .unwrap_or(0);
+        for row in &rows {
+            ftui_runtime::ftui_println!(
+                "  {:<width$}  {}",
+                row.filename,
+                row.status.to_uppercase(),
+                width = width
+            );
+        }
+        ftui_runtime::ftui_println!("");
+        let present = rows.iter().filter(|row| row.status == "present").count();
+        let missing = rows.iter().filter(|row| row.status == "missing").count();
+        let stale = rows.iter().filter(|row| row.status == "stale").count();
+        ftui_runtime::ftui_println!(
+            "Result: {} present, {} missing, {} stale (total {})",
+            present,
+            missing,
+            stale,
+            rows.len()
+        );
+    });
+
+    Ok(())
+}
+
+pub(super) fn handle_golden(action: GoldenCommand) -> CliResult<()> {
+    match action {
+        GoldenCommand::Capture {
+            dir,
+            filter,
+            format,
+            json,
+            verbose,
+        } => handle_golden_capture(dir, filter, format, json, verbose),
+        GoldenCommand::Verify {
+            dir,
+            filter,
+            format,
+            json,
+            verbose,
+        } => handle_golden_verify(dir, filter, format, json, verbose),
+        GoldenCommand::List {
+            dir,
+            filter,
+            format,
+            json,
+        } => handle_golden_list(dir, filter, format, json),
     }
 }
 

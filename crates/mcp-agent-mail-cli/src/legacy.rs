@@ -3337,7 +3337,6 @@ mod tests {
             assert!(error.to_string().contains("not valid UTF-8"));
         }
         let non_unicode_base = root.path().join(&raw);
-        fs::create_dir(&non_unicode_base).unwrap();
         let error = normalize_explicit_legacy_path(
             "DATABASE_URL",
             Path::new("relative.sqlite3"),
@@ -3894,7 +3893,10 @@ mod tests {
         for migration in schema::schema_migrations_base() {
             if matches!(
                 migration.id.as_str(),
-                "v20_agents_registration_token" | "v20_idx_agents_registration_token"
+                "v20_agents_registration_token"
+                    | "v20_idx_agents_registration_token"
+                    | "v32_add_display_name_to_agents"
+                    | "v33_materialize_display_name_on_agents"
             ) {
                 continue;
             }

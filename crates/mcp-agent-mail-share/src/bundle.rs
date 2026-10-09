@@ -1346,7 +1346,7 @@ fn collect_entries_ctx(
 
     let base = base.canonicalize()?;
     let root = current.canonicalize()?;
-    let mut stack = vec![(current.to_path_buf(), vec![root])];
+    let mut stack = vec![(root.clone(), vec![root])];
 
     while let Some((current_dir, ancestry)) = stack.pop() {
         for entry in std::fs::read_dir(current_dir)? {

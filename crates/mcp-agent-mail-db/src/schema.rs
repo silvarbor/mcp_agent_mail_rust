@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS agents (
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
     registration_token TEXT,
     retired_at INTEGER,
+    display_name TEXT,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
@@ -2480,6 +2481,22 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // Display labels are optional metadata; the existing name remains unique.
+    migrations.push(Migration::new(
+        "v32_add_display_name_to_agents".to_string(),
+        "add optional human-readable agent display label".to_string(),
+        "ALTER TABLE agents ADD COLUMN display_name TEXT".to_string(),
+        String::new(),
+    ));
+    // As with v31, materialize appended NULL fields through canonical SQLite
+    // before the runtime engine reads records written with the older schema.
+    migrations.push(Migration::new(
+        "v33_materialize_display_name_on_agents".to_string(),
+        "rewrite agent rows with the appended optional display label".to_string(),
+        "UPDATE agents SET display_name = NULL WHERE display_name IS NULL".to_string(),
+        String::new(),
+    ));
+
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
     // however, their columns do not exist until the explicit evolution
@@ -2589,6 +2606,7 @@ fn is_runtime_canonical_followup_migration(id: &str) -> bool {
                 | "v15b_backfill_recipients_json"
                 | "v15c_trg_messages_default_recipients_json"
                 | "v31_materialize_archive_metadata_json_on_messages"
+                | "v33_materialize_display_name_on_agents"
         )
 }
 
@@ -6016,6 +6034,68 @@ mod tests {
         );
         conn.execute_raw("ALTER TABLE messages ADD COLUMN topic TEXT COLLATE NOCASE")
             .expect("canonical ADD COLUMN on a runtime-engine-created table");
+    }
+
+    #[test]
+    fn display_name_migrations_preserve_populated_legacy_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("display_name_legacy.db");
+        let conn = crate::CanonicalDbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, inception_ts INTEGER NOT NULL); INSERT INTO agents VALUES (17, 7, 'BlueLake', 424242), (19, 7, 'GreenCastle', 434343)").unwrap();
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap();
+                for migration in schema_migrations().into_iter().filter(|migration| {
+                    migration.id == "v32_add_display_name_to_agents"
+                        || migration.id == "v33_materialize_display_name_on_agents"
+                }) {
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    run_single_migration_with_lock_retry(&cx, conn, &migration)
+                        .await
+                        .into_result()
+                        .unwrap();
+                }
+            }
+        });
+        drop(conn);
+        let runtime_conn = DbConn::open_file(db_path.display().to_string()).unwrap();
+        let rows = runtime_conn
+            .query_sync(
+                "SELECT id, project_id, name, inception_ts, display_name FROM agents ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 17);
+        assert_eq!(rows[0].get_named::<i64>("project_id").unwrap(), 7);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "BlueLake");
+        assert_eq!(rows[0].get_named::<i64>("inception_ts").unwrap(), 424_242);
+        assert_eq!(
+            rows[0].get_named::<Option<String>>("display_name").unwrap(),
+            None
+        );
+        assert_eq!(rows[1].get_named::<i64>("id").unwrap(), 19);
+        assert_eq!(
+            rows[1].get_named::<Option<String>>("display_name").unwrap(),
+            None
+        );
+        runtime_conn
+            .execute_raw("UPDATE agents SET display_name = 'Reviewer'")
+            .unwrap();
+        assert_eq!(
+            runtime_conn
+                .query_sync("SELECT id FROM agents WHERE display_name = 'Reviewer'", &[])
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

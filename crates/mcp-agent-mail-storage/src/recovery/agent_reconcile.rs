@@ -161,7 +161,7 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
     let rows = conn.query_sync(
         "SELECT a.id, a.name, a.program, a.model, a.task_description, \
                 a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
-                a.reaper_exempt, a.retired_at, d.deregistered_at, \
+                a.reaper_exempt, a.retired_at, a.display_name, d.deregistered_at, \
                 p.slug AS project_slug, p.human_key AS project_key \
          FROM agents a JOIN projects p ON p.id = a.project_id \
          LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
@@ -169,6 +169,7 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
                length(CAST(a.name AS BLOB)) + length(CAST(a.program AS BLOB)) + \
                length(CAST(a.model AS BLOB)) + length(CAST(a.task_description AS BLOB)) + \
                length(CAST(a.attachments_policy AS BLOB)) + length(CAST(a.contact_policy AS BLOB)) + \
+               COALESCE(length(CAST(a.display_name AS BLOB)), 0) + \
                length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) <= ? \
                AND NOT EXISTS (SELECT 1 FROM agents other WHERE other.project_id = a.project_id \
                    AND other.id != a.id AND other.name = a.name COLLATE NOCASE)",
@@ -204,7 +205,10 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
     if !matches!(reaper_exempt, 0 | 1) {
         return Err("agent reaper exemption is not boolean".into());
     }
-    let profile = json!({
+    let display_name = row
+        .get_named::<Option<String>>("display_name")
+        .map_err(source_error)?;
+    let mut profile = json!({
         "name": name,
         "program": text("program")?,
         "model": text("model")?,
@@ -217,6 +221,9 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
         "retired_at": retired_at.map(timestamp).transpose()?,
         "deregistered_at": deregistered_at.map(timestamp).transpose()?,
     });
+    if let Some(label) = display_name {
+        profile["display_name"] = label.into();
+    }
     if serde_json::to_vec(&profile)
         .map_err(|error| error.to_string())?
         .len()
@@ -398,6 +405,11 @@ fn merge_metadata(
                 .expect("validated working object")
                 .clone(),
         );
+    }
+    // The canonical profile omits cleared labels. Preserve unknown metadata,
+    // while removing this known field when the database records no label.
+    if profile && authoritative.get("display_name").is_none() {
+        object.remove("display_name");
     }
     let activity_only = profile
         && authoritative.as_object().is_some_and(|fields| {
@@ -636,11 +648,67 @@ pub fn reconcile_agent_batch(
 mod tests {
     use super::*;
 
+    #[test]
+    fn reconciliation_preserves_display_name_changes_and_clear() {
+        with_mailbox(|cx, pool, config, _| {
+            outcome(block_on(
+                mcp_agent_mail_db::queries::set_agent_display_name(
+                    cx,
+                    pool,
+                    101,
+                    "BlueLake",
+                    Some("Reviewer 東京"),
+                ),
+            ))
+            .unwrap();
+            let labeled_report = reconcile(cx, pool, config);
+            assert_eq!(labeled_report.repaired, 1, "{labeled_report:?}");
+            assert_eq!(
+                assert_profile_committed(config)["display_name"],
+                "Reviewer 東京"
+            );
+            outcome(block_on(
+                mcp_agent_mail_db::queries::set_agent_display_name(
+                    cx,
+                    pool,
+                    101,
+                    "BlueLake",
+                    Some("Officer Alpha"),
+                ),
+            ))
+            .unwrap();
+            let renamed_report = reconcile(cx, pool, config);
+            assert_eq!(renamed_report.repaired, 1, "{renamed_report:?}");
+            assert_eq!(
+                assert_profile_committed(config)["display_name"],
+                "Officer Alpha"
+            );
+            outcome(block_on(
+                mcp_agent_mail_db::queries::set_agent_display_name(
+                    cx,
+                    pool,
+                    101,
+                    "BlueLake",
+                    Some("  "),
+                ),
+            ))
+            .unwrap();
+            let cleared_report = reconcile(cx, pool, config);
+            assert_eq!(cleared_report.repaired, 1, "{cleared_report:?}");
+            assert!(
+                assert_profile_committed(config)
+                    .get("display_name")
+                    .is_none()
+            );
+        });
+    }
+
     fn with_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &Path)) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
-            let db_path = temp.path().join("mail.sqlite3");
-            let storage_root = temp.path().join("archive");
+            let scratch = fs::canonicalize(temp.path()).unwrap();
+            let db_path = scratch.join("mail.sqlite3");
+            let storage_root = scratch.join("archive");
             fs::create_dir_all(&storage_root).unwrap();
             let config = Config {
                 database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
@@ -661,7 +729,7 @@ mod tests {
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts, registration_token) \
                 VALUES(101, 101, 'BlueLake', 'test', 'test', 'coordination', 1000000, 2000000, 'never-archive-this-secret')").unwrap();
             drop(conn);
-            test(&cx, &pool, &config, temp.path());
+            test(&cx, &pool, &config, &scratch);
         });
     }
 
