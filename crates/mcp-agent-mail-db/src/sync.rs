@@ -1464,8 +1464,6 @@ mod tests {
         let project_id = insert_project(&conn);
         let sender_id = insert_agent(&conn, project_id, "BlueLake");
         let recipient_id = insert_agent(&conn, project_id, "GreenLake");
-        conn.execute_raw("DROP INDEX idx_agents_project_name_nocase")
-            .expect("allow legacy case variants in isolated test store");
         let alias_id = insert_agent(&conn, project_id, "bluelake");
         conn.execute_sync(
             "UPDATE agents SET display_name = 'Reviewer' WHERE id IN (?, ?)",
