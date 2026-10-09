@@ -191,6 +191,8 @@ impl Importance {
 pub struct RecipientEntry {
     /// Agent name.
     pub name: String,
+    /// Human-readable label; never used for recipient resolution.
+    pub display_name: Option<String>,
     /// Whether this agent is selected as a recipient.
     pub selected: bool,
     /// Recipient kind: To, Cc, or Bcc.
@@ -297,6 +299,7 @@ impl ComposeState {
         let mut state = Self::new();
         state.recipients.push(RecipientEntry {
             name: agent_name.to_string(),
+            display_name: None,
             selected: true,
             kind: RecipientKind::To,
         });
@@ -306,6 +309,15 @@ impl ComposeState {
 
     /// Populate the agent list from known agents (fetched from DB).
     pub fn set_available_agents(&mut self, agents: Vec<String>) {
+        self.set_available_agent_profiles(agents.into_iter().map(|name| (name, None)).collect());
+    }
+
+    /// Refresh labels while retaining selections by routing name within the compose project.
+    pub fn set_available_agent_profiles(&mut self, agents: Vec<(String, Option<String>)>) {
+        let cursor_name = self
+            .filtered_recipients()
+            .get(self.recipient_cursor)
+            .map(|&index| self.recipients[index].name.clone());
         // Preserve existing selections
         let selected: std::collections::HashSet<String> = self
             .recipients
@@ -322,16 +334,25 @@ impl ComposeState {
 
         self.recipients = agents
             .into_iter()
-            .map(|name| {
+            .map(|(name, display_name)| {
                 let was_selected = selected.contains(&name);
                 let kind = kinds.get(&name).copied().unwrap_or(RecipientKind::To);
                 RecipientEntry {
                     name,
+                    display_name,
                     selected: was_selected,
                     kind,
                 }
             })
             .collect();
+        let filtered = self.filtered_recipients();
+        self.recipient_cursor = cursor_name
+            .and_then(|name| {
+                filtered
+                    .iter()
+                    .position(|&index| self.recipients[index].name == name)
+            })
+            .unwrap_or_else(|| self.recipient_cursor.min(filtered.len().saturating_sub(1)));
     }
 
     /// Return the filtered list of recipient indices.
@@ -340,11 +361,16 @@ impl ComposeState {
         if self.recipient_filter.is_empty() {
             return (0..self.recipients.len()).collect();
         }
-        let filter_lower = self.recipient_filter.to_ascii_lowercase();
+        let filter_lower = self.recipient_filter.to_lowercase();
         self.recipients
             .iter()
             .enumerate()
-            .filter(|(_, r)| crate::tui_screens::contains_ci(&r.name, &filter_lower))
+            .filter(|(_, r)| {
+                r.name.to_lowercase().contains(&filter_lower)
+                    || r.display_name
+                        .as_deref()
+                        .is_some_and(|label| label.to_lowercase().contains(&filter_lower))
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -1044,7 +1070,14 @@ impl<'a> ComposePanel<'a> {
                 } else {
                     String::new()
                 };
-                let line = format!(" {checkbox} {}{kind_label}", r.name);
+                let label = crate::tui_events::agent_label_with_width(
+                    &r.name,
+                    r.display_name.as_deref(),
+                    inner.width.saturating_sub(
+                        5 + u16::try_from(display_width(&kind_label)).unwrap_or(u16::MAX),
+                    ),
+                );
+                let line = format!(" {checkbox} {label}{kind_label}");
 
                 let (fg, bg) = if is_active && vi == self.state.recipient_cursor {
                     (cp.value_fg, cp.selected_recipient_bg)
@@ -1490,6 +1523,48 @@ mod tests {
         let mut s = ComposeState::new();
         s.set_available_agents(names.iter().map(std::string::ToString::to_string).collect());
         s
+    }
+
+    #[test]
+    fn display_name_picker_keeps_duplicate_labels_and_renames_routing_by_address() {
+        let mut state = ComposeState::new();
+        state.set_available_agent_profiles(vec![
+            ("BlueLake".into(), Some("Reviewer".into())),
+            ("RedStone".into(), Some("Reviewer".into())),
+        ]);
+        state.recipient_filter = "reviewer".into();
+        assert_eq!(state.filtered_recipients(), vec![0, 1]);
+        state.toggle_recipient();
+        state.recipient_filter.clear();
+        state.subject = "Review".into();
+        state.body = "Please review".into();
+        assert_eq!(state.build_envelope().unwrap().to, vec!["BlueLake"]);
+        state.set_available_agent_profiles(vec![
+            ("RedStone".into(), Some("Reviewer".into())),
+            ("BlueLake".into(), Some("Officer Alpha".into())),
+        ]);
+        assert_eq!(state.recipient_cursor, 1);
+        assert_eq!(state.to_recipients(), vec!["BlueLake"]);
+        state.recipient_filter = "officer".into();
+        assert_eq!(state.filtered_recipients(), vec![1]);
+        state.set_available_agent_profiles(vec![
+            ("RedStone".into(), Some("Reviewer".into())),
+            ("BlueLake".into(), None),
+        ]);
+        assert!(state.filtered_recipients().is_empty());
+        assert_eq!(state.build_envelope().unwrap().to, vec!["BlueLake"]);
+        state.recipient_filter = "bluelake".into();
+        assert_eq!(state.filtered_recipients(), vec![1]);
+    }
+
+    #[test]
+    fn display_name_picker_searches_unicode_labels() {
+        let mut state = ComposeState::new();
+        state.set_available_agent_profiles(vec![("BlueLake".into(), Some("Réviseur 東京".into()))]);
+        state.recipient_filter = "RÉVISEUR".into();
+        assert_eq!(state.filtered_recipients(), vec![0]);
+        state.recipient_filter = "東京".into();
+        assert_eq!(state.filtered_recipients(), vec![0]);
     }
 
     #[test]

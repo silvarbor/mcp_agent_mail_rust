@@ -59,6 +59,10 @@
 
           <!-- Quick actions -->
           <div class="flex items-center gap-2">
+            <button type="button" @click="refreshLabels()"
+                    class="px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
+              Refresh labels
+            </button>
             <button type="button" @click="selectAll()"
                     class="px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors">
               Select All
@@ -70,8 +74,8 @@
           </div>
         </div>
 
-        <!-- Search bar for recipients (if many agents) -->
-        <div x-show="agents.length > 6" class="mt-4">
+        <!-- Search by label or routing address -->
+        <div class="mt-4">
           <div class="relative">
             <i data-lucide="search" class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-slate-400"></i>
             <input type="text" x-model="recipientSearch"
@@ -87,7 +91,8 @@
         {% if agents %}
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {% for agent in agents %}
-              <label x-show="!recipientSearch || '{{ agent.name|replace('\\', '\\\\')|replace("'", "\\'") }}'.toLowerCase().includes(recipientSearch.toLowerCase())"
+              <label data-agent-label="{{ agent.label }}"
+                     x-show="!recipientSearch || labelFor('{{ agent.name }}').toLowerCase().includes(recipientSearch.toLowerCase())"
                      class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-900/50 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 cursor-pointer transition-colors"
                      :class="selectedRecipients.includes('{{ agent.name|replace('\\', '\\\\')|replace("'", "\\'") }}') ? 'ring-2 ring-primary-500 bg-primary-50 dark:bg-primary-900/20' : ''">
                 <input type="checkbox"
@@ -95,7 +100,7 @@
                        x-model="selectedRecipients"
                        class="w-4 h-4 text-primary-600 bg-white dark:bg-slate-700 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500" />
                 <i data-lucide="bot" class="w-4 h-4 text-slate-600 dark:text-slate-400"></i>
-                <span class="text-sm font-medium text-slate-900 dark:text-white truncate flex-1">{{ agent.name }}</span>
+                <span x-text="labelFor('{{ agent.name }}')" class="text-sm font-medium text-slate-900 dark:text-white break-words min-w-0 flex-1">{{ agent.label }}</span>
               </label>
             {% endfor %}
           </div>
@@ -430,6 +435,7 @@ Please investigate the following:
 function overseerComposer() {
   return {
     agents: [{% for agent in agents %}{{ agent.name | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}],
+    agentLabels: {{ agents | tojson }},
     selectedRecipients: [],
     subject: '',
     reason: '',
@@ -468,7 +474,22 @@ function overseerComposer() {
     filteredRecipientsCount() {
       if (!this.recipientSearch) return this.agents.length;
       const search = this.recipientSearch.toLowerCase();
-      return this.agents.filter(name => name.toLowerCase().includes(search)).length;
+      return this.agentLabels.filter(agent => agent.label.toLowerCase().includes(search)).length;
+    },
+
+    labelFor(address) {
+      return this.agentLabels.find(agent => agent.name === address)?.label || address;
+    },
+
+    async refreshLabels() {
+      try {
+        const response = await fetch(window.agentMailAppendAuth('/mail/api/projects/{{ project.slug }}/agents'));
+        if (!response.ok) throw new Error('Could not refresh labels');
+        const data = await response.json();
+        if (Array.isArray(data.agent_profiles)) this.agentLabels = data.agent_profiles;
+      } catch (error) {
+        window.showToast?.(error.message, 'error');
+      }
     },
 
     canSend() {

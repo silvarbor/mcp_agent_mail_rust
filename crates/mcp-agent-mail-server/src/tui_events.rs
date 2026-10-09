@@ -310,10 +310,32 @@ impl VerbosityTier {
 pub struct AgentSummary {
     pub project: String,
     pub name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub last_active_ts: i64,
     pub health: Option<AgentHealthScorecard>,
+}
+
+/// Fit a label into terminal cells, keeping its routing address visible first.
+pub(crate) fn agent_label_with_width(name: &str, display_name: Option<&str>, width: u16) -> String {
+    let Some(label) = display_name else {
+        return crate::tui_widgets::truncate_width(name, width).into_owned();
+    };
+    let address = format!("<{name}>");
+    let address_width = u16::try_from(ftui::text::display_width(&address)).unwrap_or(u16::MAX);
+    if width <= address_width.saturating_add(2) {
+        return crate::tui_widgets::truncate_width(name, width).into_owned();
+    }
+    let label_width = width.saturating_sub(address_width.saturating_add(1));
+    if ftui::text::display_width(label) <= usize::from(label_width) {
+        return mcp_agent_mail_core::models::format_agent_label(name, Some(label));
+    }
+    format!(
+        "{}… {address}",
+        crate::tui_widgets::truncate_width(label, label_width.saturating_sub(1))
+    )
 }
 
 /// Per-project summary for the Projects screen.
@@ -2155,6 +2177,39 @@ impl RenderItem for ExplorerRow {
 mod tests {
     use super::*;
 
+    #[test]
+    fn display_name_old_summary_defaults_to_no_label() {
+        let summary = serde_json::from_str::<AgentSummary>(r#"{"project":"alpha","name":"BlueLake","program":"agent","model":"test","last_active_ts":100,"health":null}"#).unwrap();
+        assert_eq!(summary.display_name, None);
+        assert_eq!(
+            agent_label_with_width(&summary.name, summary.display_name.as_deref(), 30),
+            "BlueLake"
+        );
+    }
+
+    #[test]
+    fn display_name_width_preserves_address_and_counts_unicode_cells() {
+        assert_eq!(
+            agent_label_with_width("BlueLake", Some("Reviewer"), 30),
+            "Reviewer <BlueLake>"
+        );
+        assert_eq!(
+            agent_label_with_width("BlueLake", Some("東京東京東京"), 16),
+            "東京… <BlueLake>"
+        );
+        assert_eq!(
+            agent_label_with_width("BlueLake", Some("Reviewer"), 10),
+            "BlueLake"
+        );
+        assert!(
+            ftui::text::display_width(&agent_label_with_width(
+                "BlueLake",
+                Some("Réviseur 東京"),
+                18
+            )) <= 18
+        );
+    }
+
     fn sample_tool_start(name: &str) -> MailEvent {
         MailEvent::tool_call_start(name, Value::Null, None, None)
     }
@@ -2467,6 +2522,7 @@ mod tests {
                     contact_links: 5,
                     ack_pending: 6,
                     agents_list: vec![AgentSummary {
+                        display_name: None,
                         project: String::new(),
                         name: "TealMeadow".to_string(),
                         program: "codex-cli".to_string(),
@@ -2656,6 +2712,7 @@ mod tests {
             ack_pending: 2,
             agents_list: vec![
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "GoldFox".into(),
                     program: "claude-code".into(),
@@ -2664,6 +2721,7 @@ mod tests {
                     health: None,
                 },
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "SilverWolf".into(),
                     program: "codex-cli".into(),

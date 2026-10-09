@@ -266,6 +266,7 @@ struct ThreadSummary {
     participant_count: usize,
     last_subject: String,
     last_sender: String,
+    last_sender_label: Option<String>,
     last_timestamp_micros: i64,
     last_timestamp_iso: String,
     /// Project slug for cross-project display.
@@ -276,10 +277,25 @@ struct ThreadSummary {
     velocity_msg_per_hr: f64,
     /// Participant names (comma-separated).
     participant_names: String,
+    participant_labels: Option<String>,
     /// First message timestamp in ISO format (for time span display).
     first_timestamp_iso: String,
     /// Number of unread messages in this thread (if tracking is available).
     unread_count: usize,
+}
+
+impl ThreadSummary {
+    fn sender_label(&self) -> &str {
+        self.last_sender_label
+            .as_deref()
+            .unwrap_or(&self.last_sender)
+    }
+
+    fn participant_labels(&self) -> &str {
+        self.participant_labels
+            .as_deref()
+            .unwrap_or(&self.participant_names)
+    }
 }
 
 #[derive(Debug)]
@@ -387,6 +403,8 @@ struct ThreadMessage {
     reply_to_id: Option<i64>,
     from_agent: String,
     to_agents: String,
+    sender_label: Option<String>,
+    recipient_labels: Option<String>,
     subject: String,
     body_md: String,
     timestamp_iso: String,
@@ -396,6 +414,16 @@ struct ThreadMessage {
     importance: String,
     is_unread: bool,
     ack_required: bool,
+}
+
+impl ThreadMessage {
+    fn sender_label(&self) -> &str {
+        self.sender_label.as_deref().unwrap_or(&self.from_agent)
+    }
+
+    fn recipient_labels(&self) -> &str {
+        self.recipient_labels.as_deref().unwrap_or(&self.to_agents)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +449,7 @@ fn tree_cache_key_hash(messages: &[ThreadMessage], collapsed: &HashSet<i64>) -> 
     for m in messages {
         m.id.hash(&mut hasher);
         m.reply_to_id.hash(&mut hasher);
+        m.sender_label.hash(&mut hasher);
     }
     // Sort collapsed IDs for deterministic hashing.
     let mut sorted: Vec<_> = collapsed.iter().copied().collect();
@@ -883,6 +912,19 @@ impl ThreadExplorerScreen {
             && self.total_thread_messages == selected_message_count
             && loaded_last_timestamp == selected_last_timestamp
         {
+            if let Some(conn) = &self.db_conn {
+                let ids = self
+                    .detail_messages
+                    .iter()
+                    .map(|message| message.id)
+                    .collect::<Vec<_>>();
+                let mut labels = super::messages::message_labels_by_id(conn, &ids);
+                for message in &mut self.detail_messages {
+                    let label = labels.remove(&message.id).unwrap_or_default();
+                    message.sender_label = label.sender;
+                    message.recipient_labels = label.recipients;
+                }
+            }
             return;
         }
 
@@ -2392,8 +2434,11 @@ fn fetch_threads(
 
 fn sender_ids_by_name(conn: &DbConn, like_term: &str) -> Vec<i64> {
     conn.query_sync(
-        "SELECT id FROM agents WHERE name LIKE ? ESCAPE '\\'",
-        &[Value::Text(like_term.to_string())],
+        "SELECT id FROM agents WHERE name LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\'",
+        &[
+            Value::Text(like_term.to_string()),
+            Value::Text(like_term.to_string()),
+        ],
     )
     .ok()
     .map(|rows| {
@@ -2426,7 +2471,8 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
     let participant_names_map = participant_names_by_thread(conn, &thread_ids, &sender_name_map);
 
-    rows.into_iter()
+    let mut summaries: Vec<ThreadSummary> = rows
+        .into_iter()
         .map(|row| {
             let last_meta = latest_meta.get(&row.thread_id);
             let participant_names = participant_names_map
@@ -2468,6 +2514,7 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                             .map(|meta| unknown_agent_label(meta.sender_id))
                             .unwrap_or_default()
                     }),
+                last_sender_label: None,
                 last_timestamp_micros: row.last_timestamp_micros,
                 last_timestamp_iso: micros_to_iso(row.last_timestamp_micros),
                 project_slug: last_meta
@@ -2481,11 +2528,70 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 has_escalation: row.has_escalation,
                 velocity_msg_per_hr: velocity,
                 participant_names,
+                participant_labels: None,
                 first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
                 unread_count: 0,
             }
         })
-        .collect()
+        .collect();
+    hydrate_thread_summary_labels(conn, &mut summaries, &latest_meta);
+    summaries
+}
+
+fn hydrate_thread_summary_labels(
+    conn: &DbConn,
+    summaries: &mut [ThreadSummary],
+    latest_meta: &HashMap<String, LatestThreadMeta>,
+) {
+    if summaries.is_empty() {
+        return;
+    }
+    let placeholders = vec!["?"; summaries.len()].join(", ");
+    let params: Vec<Value> = summaries
+        .iter()
+        .map(|summary| Value::Text(summary.thread_id.clone()))
+        .collect();
+    let participant_sql = format!(
+        "SELECT DISTINCT m.thread_id, a.id, a.name, a.display_name \
+         FROM messages m JOIN agents a ON a.id = m.sender_id \
+         WHERE m.thread_id IN ({placeholders}) \
+         UNION SELECT DISTINCT m.thread_id, a.id, a.name, a.display_name \
+         FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
+         JOIN agents a ON a.id = mr.agent_id WHERE m.thread_id IN ({placeholders})"
+    );
+    let participant_params: Vec<Value> = params.iter().chain(&params).cloned().collect();
+    let mut participants: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut agent_labels = HashMap::new();
+    if let Ok(rows) = conn.query_sync(&participant_sql, &participant_params) {
+        for row in rows {
+            if let (Ok(thread_id), Ok(id), Ok(name)) = (
+                row.get_named::<String>("thread_id"),
+                row.get_named::<i64>("id"),
+                row.get_named::<String>("name"),
+            ) {
+                let display_name = row
+                    .get_named::<Option<String>>("display_name")
+                    .ok()
+                    .flatten();
+                let label =
+                    mcp_agent_mail_core::models::format_agent_label(&name, display_name.as_deref());
+                participants
+                    .entry(thread_id)
+                    .or_default()
+                    .insert(label.clone());
+                agent_labels.insert(id, label);
+            }
+        }
+    }
+    for summary in summaries {
+        summary.last_sender_label = latest_meta
+            .get(&summary.thread_id)
+            .and_then(|meta| agent_labels.get(&meta.sender_id))
+            .cloned();
+        summary.participant_labels = participants
+            .remove(&summary.thread_id)
+            .map(|labels| labels.into_iter().collect::<Vec<_>>().join(", "));
+    }
 }
 
 fn latest_thread_meta_by_thread(
@@ -2836,17 +2942,21 @@ fn fetch_thread_messages_paginated(
         .filter_map(|row| row.get_named::<i64>("id").ok())
         .collect();
     let recipient_map = thread_recipient_names_by_message(conn, &message_ids);
+    let mut label_map = super::messages::message_labels_by_id(conn, &message_ids);
 
     let mut messages: Vec<ThreadMessage> = rows
         .into_iter()
         .filter_map(|row| {
             let created_ts = row.get_named::<i64>("created_ts").ok()?;
             let message_id = row.get_named::<i64>("id").ok()?;
+            let labels = label_map.remove(&message_id).unwrap_or_default();
             Some(ThreadMessage {
                 id: message_id,
                 reply_to_id: None,
                 from_agent: read_thread_agent_label(&row, "sender_name", "raw_sender_id"),
                 to_agents: recipient_map.get(&message_id).cloned().unwrap_or_default(),
+                sender_label: labels.sender,
+                recipient_labels: labels.recipients,
                 subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
                 body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
                 timestamp_iso: micros_to_iso(created_ts),
@@ -3158,7 +3268,7 @@ fn render_thread_list(
                 thread.message_count, thread.participant_count, thread.velocity_msg_per_hr,
             ),
             ViewLens::Participants => {
-                truncate_display_width(&thread.participant_names, inner_w.saturating_sub(30))
+                truncate_display_width(thread.participant_labels(), inner_w.saturating_sub(30))
             }
             ViewLens::Escalation => {
                 let flag = if thread.has_escalation { "ESC" } else { "---" };
@@ -3267,9 +3377,13 @@ fn render_thread_list(
                     ),
                 ])
             } else {
-                let sender_prefix = truncate_display_width(
-                    &format!("{}: ", thread.last_sender),
-                    subj_space.min(24),
+                let sender_prefix = format!(
+                    "{}: ",
+                    super::messages::compact_sender_label(
+                        thread.sender_label(),
+                        &thread.last_sender,
+                        subj_space.min(24).saturating_sub(2)
+                    )
                 );
                 let remaining =
                     subj_space.saturating_sub(ftui::text::display_width(sender_prefix.as_str()));
@@ -3336,7 +3450,7 @@ fn render_thread_list(
             format!(
                 "participants: {}",
                 truncate_display_width(
-                    &selected.participant_names,
+                    selected.participant_labels(),
                     inner_w.saturating_sub(16).max(12)
                 )
             )
@@ -3508,7 +3622,7 @@ fn render_thread_detail(
                 Span::styled("Agents: ", crate::tui_theme::text_meta(&tp)),
                 Span::styled(
                     truncate_display_width(
-                        &t.participant_names,
+                        t.participant_labels(),
                         content_inner.width.saturating_sub(8) as usize,
                     ),
                     Style::default().fg(tp.text_secondary),
@@ -3819,7 +3933,7 @@ fn render_thread_detail(
     let mut preview_lines = Vec::new();
     let mut preview_header_spans = vec![
         Span::styled(
-            selected_message.from_agent.clone(),
+            selected_message.sender_label().to_string(),
             Style::default()
                 .fg(agent_color(&selected_message.from_agent))
                 .bold(),
@@ -3833,7 +3947,7 @@ fn render_thread_detail(
         preview_header_spans.push(Span::raw(format!(
             " -> {}",
             truncate_display_width(
-                &selected_message.to_agents,
+                selected_message.recipient_labels(),
                 preview_content.width.saturating_sub(24) as usize
             )
         )));
@@ -4101,7 +4215,7 @@ fn build_thread_tree_item_node(
     let message = *message_by_id.get(&message_id)?;
     let mut node = crate::tui_widgets::ThreadTreeItem::new(
         message.id,
-        message.from_agent.clone(),
+        message.sender_label().to_string(),
         truncate_display_width(&message.subject, 60),
         iso_compact_time(&message.timestamp_iso).to_string(),
         message.is_unread,
@@ -5771,8 +5885,10 @@ mod tests {
 
     fn make_thread_messages_db(thread_id: &str, count: usize) -> DbConn {
         let conn = DbConn::open_memory().expect("open memory sqlite");
-        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-            .expect("create agents table");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, display_name TEXT)",
+        )
+        .expect("create agents table");
         conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)")
             .expect("create projects table");
         conn.execute_raw(
@@ -5792,7 +5908,7 @@ mod tests {
         conn.execute_raw(
             "CREATE TABLE message_recipients (\
                message_id INTEGER NOT NULL, \
-               agent_id INTEGER NOT NULL\
+               agent_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'to'\
              )",
         )
         .expect("create recipients table");
@@ -5847,6 +5963,79 @@ mod tests {
     }
 
     #[test]
+    fn display_name_threads_show_duplicate_labels_and_filter_by_label_or_address() {
+        let conn = make_thread_messages_db("labeled-thread", 2);
+        conn.execute_raw("UPDATE agents SET display_name = 'Reviewer'")
+            .expect("set duplicate labels");
+        let threads = fetch_threads(&conn, "Reviewer", None, 10);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].sender_label(), "Reviewer <Sender>");
+        assert_eq!(threads[0].last_sender, "Sender");
+        assert_eq!(threads[0].participant_count, 2);
+        assert_eq!(
+            threads[0].participant_labels(),
+            "Reviewer <Receiver>, Reviewer <Sender>"
+        );
+        assert_eq!(fetch_threads(&conn, "Send", None, 10).len(), 1);
+        let (messages, _) = fetch_thread_messages_paginated(&conn, "labeled-thread", 10, 0);
+        assert_eq!(messages[0].sender_label(), "Reviewer <Sender>");
+        assert_eq!(messages[0].recipient_labels(), "Reviewer <Receiver>");
+        assert_eq!(messages[0].from_agent, "Sender");
+        assert_eq!(messages[0].to_agents, "Receiver");
+    }
+
+    #[test]
+    fn display_name_thread_detail_refreshes_labels_without_new_messages_or_selection_loss() {
+        let conn = make_thread_messages_db("label-refresh", 2);
+        conn.execute_raw("UPDATE agents SET display_name = 'Reviewer'")
+            .expect("set duplicate labels");
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = fetch_threads(&conn, "", None, 10);
+        screen.db_conn = Some(conn);
+        screen.refresh_detail_if_needed(None);
+        screen.detail_cursor = 1;
+        let before = screen.detail_tree_rows();
+        assert!(before[0].label.contains("Reviewer <Sender>"));
+
+        screen
+            .db_conn
+            .as_ref()
+            .expect("mailbox")
+            .execute_raw("UPDATE agents SET display_name = 'Officer Alpha' WHERE id = 1")
+            .expect("rename sender");
+        screen.refresh_detail_if_needed(None);
+        assert_eq!(
+            screen.detail_messages[0].sender_label(),
+            "Officer Alpha <Sender>"
+        );
+        assert_eq!(screen.detail_messages[0].from_agent, "Sender");
+        assert_eq!(screen.detail_messages[0].body_md, "Body 1");
+        assert_eq!(screen.detail_cursor, 1);
+        assert_eq!(screen.selected_message().expect("selected message").id, 2);
+        assert!(
+            screen.detail_tree_rows()[0]
+                .label
+                .contains("Officer Alpha <Sender>")
+        );
+        assert_eq!(
+            agent_color(&screen.detail_messages[0].from_agent),
+            agent_color("Sender")
+        );
+
+        screen
+            .db_conn
+            .as_ref()
+            .expect("mailbox")
+            .execute_raw("UPDATE agents SET display_name = NULL WHERE id = 1")
+            .expect("clear sender label");
+        screen.refresh_detail_if_needed(None);
+        assert_eq!(screen.detail_messages[0].sender_label(), "Sender");
+        assert_eq!(screen.detail_messages[0].from_agent, "Sender");
+        assert_eq!(screen.detail_cursor, 1);
+        assert_eq!(screen.detail_messages.len(), 2);
+    }
+
+    #[test]
     fn fetch_threads_preserves_unknown_sender_and_project_labels() {
         let conn = make_thread_messages_db("thread-unknown-labels", 2);
         conn.execute_raw("DELETE FROM agents")
@@ -5871,6 +6060,7 @@ mod tests {
             participant_count,
             last_subject: format!("Re: Discussion in {id}"),
             last_sender: "GoldFox".to_string(),
+            last_sender_label: None,
             last_timestamp_micros: 1_700_000_000_000_000,
             last_timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
             project_slug: "test-proj".to_string(),
@@ -5878,6 +6068,7 @@ mod tests {
             #[allow(clippy::cast_precision_loss)]
             velocity_msg_per_hr: msg_count as f64 / 2.0,
             participant_names: "GoldFox,SilverWolf".to_string(),
+            participant_labels: None,
             first_timestamp_iso: "2026-02-06T10:00:00Z".to_string(),
             unread_count: 0,
         }
@@ -6134,6 +6325,8 @@ mod tests {
             reply_to_id: None,
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf".to_string(),
+            sender_label: None,
+            recipient_labels: None,
             subject: format!("Message #{id}"),
             body_md: format!("Body of message {id}.\nSecond line."),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -6551,12 +6744,14 @@ mod tests {
             participant_count: 2,
             last_subject: "Hello".to_string(),
             last_sender: "GoldHawk".to_string(),
+            last_sender_label: None,
             last_timestamp_micros: 0,
             last_timestamp_iso: "2026-02-15T12:00:00".to_string(),
             first_timestamp_iso: "2026-02-15T11:00:00".to_string(),
             has_escalation: false,
             velocity_msg_per_hr: 1.0,
             participant_names: "GoldHawk, SilverFox".to_string(),
+            participant_labels: None,
             unread_count: 3,
             project_slug: String::new(),
         };
@@ -6771,12 +6966,14 @@ mod tests {
             participant_count: 1,
             last_subject: "subject".into(),
             last_sender: "agent".into(),
+            last_sender_label: None,
             last_timestamp_micros: 0,
             last_timestamp_iso: String::new(),
             project_slug: "proj".into(),
             has_escalation: false,
             velocity_msg_per_hr: 0.0,
             participant_names: String::new(),
+            participant_labels: None,
             first_timestamp_iso: String::new(),
             unread_count: 0,
         }

@@ -1322,6 +1322,7 @@ pub fn curated_public_demo() -> DemoPack {
             let cycle = index / agent_templates.len();
             AgentSummary {
                 project: project.to_string(),
+                display_name: None,
                 name: if cycle == 0 {
                     name.to_string()
                 } else {

@@ -7672,6 +7672,7 @@ pub struct ThreadMessageRow {
 /// Recipient details for a single message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecipientDetailRow {
+    pub agent_id: i64,
     pub name: String,
     pub kind: String,
 }
@@ -9894,6 +9895,7 @@ pub async fn list_message_recipients_by_message(
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
                 out.push(MessageRecipientDetailRow {
+                    agent_id,
                     name: resolved_agent_display(agent_id, name),
                     kind,
                 });

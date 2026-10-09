@@ -330,9 +330,15 @@
     </div>
 
     {% if agents %}
+      <div x-data="projectAgentDirectory()">
+        <input type="search" x-model="agentSearch" placeholder="Search labels or addresses"
+               aria-label="Search registered agents" class="w-full mb-5 px-4 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white" />
+        <button type="button" @click="refreshLabels()" class="mb-5 text-sm text-primary-700 dark:text-primary-300">Refresh labels</button>
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
         {% for a in agents %}
-          <div class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-success-400 dark:hover:border-success-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
+          <div data-agent-label="{{ a.label }}" data-agent-name="{{ a.name }}"
+               x-show="!agentSearch || labelFor($el.dataset.agentName).toLowerCase().includes(agentSearch.toLowerCase())"
+               class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-success-400 dark:hover:border-success-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
 
             <!-- Decorative gradient blob -->
@@ -344,7 +350,7 @@
                 <i data-lucide="bot" class="w-7 h-7 text-white"></i>
               </div>
               <div class="flex-1 min-w-0">
-                <h3 class="text-lg font-bold text-slate-900 dark:text-white truncate group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
+                <h3 x-text="labelFor('{{ a.name }}')" class="text-lg font-bold text-slate-900 dark:text-white break-words group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
                   {{ a.label }}
                 </h3>
                 <div class="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 mt-1">
@@ -372,6 +378,7 @@
             </div>
           </div>
         {% endfor %}
+      </div>
       </div>
 
     {% else %}
@@ -403,6 +410,25 @@
 </div>
 
 <script>
+function projectAgentDirectory() {
+  return {
+    agentSearch: '',
+    agentLabels: {{ agents | tojson }},
+    labelFor(address) {
+      return this.agentLabels.find(agent => agent.name === address)?.label || address;
+    },
+    async refreshLabels() {
+      try {
+        const response = await fetch(window.agentMailAppendAuth('/mail/api/projects/{{ project.slug }}/agents'));
+        if (!response.ok) throw new Error('Could not refresh labels');
+        const data = await response.json();
+        if (Array.isArray(data.agent_profiles)) this.agentLabels = data.agent_profiles;
+      } catch (error) {
+        window.showToast?.(error.message, 'error');
+      }
+    },
+  };
+}
   document.addEventListener('DOMContentLoaded', () => {
     // Update keyboard shortcut display based on platform (with modern API fallback)
     const shortcutKey = document.querySelector('.shortcut-key');
