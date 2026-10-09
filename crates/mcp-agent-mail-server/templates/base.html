@@ -2199,10 +2199,10 @@
     <!-- Navigation Header -->
     <nav class="glass sticky top-0 z-40 border-b border-slate-200/80 dark:border-slate-700/80">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="flex items-center justify-between h-16">
+        <div class="flex flex-wrap items-center justify-between min-h-16 gap-3 py-3">
           <!-- Logo and Brand -->
-          <div class="flex items-center gap-8">
-            <a href="/mail" class="flex items-center gap-3 group">
+          <div class="flex flex-wrap flex-1 basis-64 min-w-0 items-center gap-3 sm:gap-8">
+            <a href="/mail" class="flex shrink-0 items-center gap-3 group">
               <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-700 flex items-center justify-center shadow-medium group-hover:shadow-glow transition-all duration-300">
                 <i data-lucide="mail" class="w-5 h-5 text-white"></i>
               </div>
@@ -2212,11 +2212,13 @@
             </a>
 
             <!-- Breadcrumbs -->
-            {% block breadcrumbs %}{% endblock %}
+            <div class="flex-1 basis-full sm:basis-auto min-w-0 max-w-full">
+              {% block breadcrumbs %}{% endblock %}
+            </div>
           </div>
 
           <!-- Right side actions -->
-          <div class="flex items-center gap-3">
+          <div class="flex flex-wrap items-center gap-3 max-w-full">
             {% block header_actions %}{% endblock %}
 
             <!-- Help Button -->

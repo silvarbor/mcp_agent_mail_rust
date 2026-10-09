@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -278,6 +278,7 @@ struct ThreadSummary {
     /// Participant names (comma-separated).
     participant_names: String,
     participant_labels: Option<String>,
+    participant_identities: Vec<super::messages::IdentityLabel>,
     /// First message timestamp in ISO format (for time span display).
     first_timestamp_iso: String,
     /// Number of unread messages in this thread (if tracking is available).
@@ -405,6 +406,7 @@ struct ThreadMessage {
     to_agents: String,
     sender_label: Option<String>,
     recipient_labels: Option<String>,
+    recipient_identities: Vec<super::messages::IdentityLabel>,
     subject: String,
     body_md: String,
     timestamp_iso: String,
@@ -923,6 +925,7 @@ impl ThreadExplorerScreen {
                     let label = labels.remove(&message.id).unwrap_or_default();
                     message.sender_label = label.sender;
                     message.recipient_labels = label.recipients;
+                    message.recipient_identities = label.recipient_identities;
                 }
             }
             return;
@@ -2529,6 +2532,7 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 velocity_msg_per_hr: velocity,
                 participant_names,
                 participant_labels: None,
+                participant_identities: Vec::new(),
                 first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
                 unread_count: 0,
             }
@@ -2560,7 +2564,8 @@ fn hydrate_thread_summary_labels(
          JOIN agents a ON a.id = mr.agent_id WHERE m.thread_id IN ({placeholders})"
     );
     let participant_params: Vec<Value> = params.iter().chain(&params).cloned().collect();
-    let mut participants: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut participants: HashMap<String, BTreeMap<i64, super::messages::IdentityLabel>> =
+        HashMap::new();
     let mut agent_labels = HashMap::new();
     if let Ok(rows) = conn.query_sync(&participant_sql, &participant_params) {
         for row in rows {
@@ -2575,10 +2580,13 @@ fn hydrate_thread_summary_labels(
                     .flatten();
                 let label =
                     mcp_agent_mail_core::models::format_agent_label(&name, display_name.as_deref());
-                participants
-                    .entry(thread_id)
-                    .or_default()
-                    .insert(label.clone());
+                participants.entry(thread_id).or_default().insert(
+                    id,
+                    super::messages::IdentityLabel {
+                        address: name,
+                        label: label.clone(),
+                    },
+                );
                 agent_labels.insert(id, label);
             }
         }
@@ -2588,9 +2596,22 @@ fn hydrate_thread_summary_labels(
             .get(&summary.thread_id)
             .and_then(|meta| agent_labels.get(&meta.sender_id))
             .cloned();
-        summary.participant_labels = participants
+        summary.participant_identities = participants
             .remove(&summary.thread_id)
-            .map(|labels| labels.into_iter().collect::<Vec<_>>().join(", "));
+            .unwrap_or_default()
+            .into_values()
+            .collect();
+        summary
+            .participant_identities
+            .sort_by(|a, b| a.label.cmp(&b.label));
+        summary.participant_labels = (!summary.participant_identities.is_empty()).then(|| {
+            summary
+                .participant_identities
+                .iter()
+                .map(|identity| identity.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
     }
 }
 
@@ -2957,6 +2978,7 @@ fn fetch_thread_messages_paginated(
                 to_agents: recipient_map.get(&message_id).cloned().unwrap_or_default(),
                 sender_label: labels.sender,
                 recipient_labels: labels.recipients,
+                recipient_identities: labels.recipient_identities,
                 subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
                 body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
                 timestamp_iso: micros_to_iso(created_ts),
@@ -3267,9 +3289,11 @@ fn render_thread_list(
                 "{}m  {}a  {:.1}/hr",
                 thread.message_count, thread.participant_count, thread.velocity_msg_per_hr,
             ),
-            ViewLens::Participants => {
-                truncate_display_width(thread.participant_labels(), inner_w.saturating_sub(30))
-            }
+            ViewLens::Participants => super::messages::compact_identity_labels(
+                &thread.participant_identities,
+                thread.participant_labels(),
+                inner_w.saturating_sub(30),
+            ),
             ViewLens::Escalation => {
                 let flag = if thread.has_escalation { "ESC" } else { "---" };
                 format!("{flag}  {:.1}/hr", thread.velocity_msg_per_hr)
@@ -3449,9 +3473,10 @@ fn render_thread_list(
         } else {
             format!(
                 "participants: {}",
-                truncate_display_width(
+                super::messages::compact_identity_labels(
+                    &selected.participant_identities,
                     selected.participant_labels(),
-                    inner_w.saturating_sub(16).max(12)
+                    inner_w.saturating_sub(16)
                 )
             )
         };
@@ -3621,7 +3646,8 @@ fn render_thread_detail(
             header_lines.push(Line::from_spans([
                 Span::styled("Agents: ", crate::tui_theme::text_meta(&tp)),
                 Span::styled(
-                    truncate_display_width(
+                    super::messages::compact_identity_labels(
+                        &t.participant_identities,
                         t.participant_labels(),
                         content_inner.width.saturating_sub(8) as usize,
                     ),
@@ -3841,7 +3867,45 @@ fn render_thread_detail(
                     .saturating_sub(marker_len)
                     .saturating_sub(ftui::text::display_width(indent.as_str()))
                     .saturating_sub(1);
-                let label = truncate_display_width(&row.label, available);
+                let label = messages
+                    .iter()
+                    .find(|message| message.id == row.message_id)
+                    .map_or_else(
+                        || truncate_display_width(&row.label, available),
+                        |message| {
+                            let glyph = if row.has_children {
+                                if row.is_expanded { "▼" } else { "▶" }
+                            } else {
+                                "•"
+                            };
+                            let unread = if message.is_unread { "*" } else { "" };
+                            let ack = if message.ack_required { " [ACK]" } else { "" };
+                            let time = if available >= 48 {
+                                format!(" [{}]", iso_compact_time(&message.timestamp_iso))
+                            } else {
+                                String::new()
+                            };
+                            let suffix = format!("{time}{ack}");
+                            let sender = super::messages::compact_sender_label(
+                                message.sender_label(),
+                                &message.from_agent,
+                                available
+                                    .saturating_sub(
+                                        4 + unread.len() + ftui::text::display_width(&suffix),
+                                    )
+                                    .min(32),
+                            );
+                            let prefix = format!("{glyph} {unread}{sender}: ");
+                            let remaining = available.saturating_sub(
+                                ftui::text::display_width(&prefix)
+                                    + ftui::text::display_width(&suffix),
+                            );
+                            format!(
+                                "{prefix}{}{suffix}",
+                                truncate_display_width(&message.subject, remaining)
+                            )
+                        },
+                    );
                 let mut line = Line::from_spans([
                     Span::styled(marker.to_string(), crate::tui_theme::text_meta(&tp)),
                     Span::styled(indent, crate::tui_theme::text_meta(&tp)),
@@ -3931,39 +3995,58 @@ fn render_thread_detail(
     }
 
     let mut preview_lines = Vec::new();
+    let timestamp_label = format!(" @ {}", iso_compact_time(&selected_message.timestamp_iso));
+    let importance_marker = match selected_message.importance.as_str() {
+        "high" => " [HIGH]",
+        "urgent" => " [URGENT]",
+        _ => "",
+    };
+    let ack_marker = if selected_message.ack_required {
+        " @ACK"
+    } else {
+        ""
+    };
+    let suffix_width = ftui::text::display_width(&timestamp_label)
+        + ftui::text::display_width(importance_marker)
+        + ftui::text::display_width(ack_marker);
     let mut preview_header_spans = vec![
         Span::styled(
-            selected_message.sender_label().to_string(),
+            super::messages::compact_sender_label(
+                selected_message.sender_label(),
+                &selected_message.from_agent,
+                usize::from(preview_content.width).saturating_sub(suffix_width),
+            ),
             Style::default()
                 .fg(agent_color(&selected_message.from_agent))
                 .bold(),
         ),
-        Span::raw(format!(
-            " @ {}",
-            iso_compact_time(&selected_message.timestamp_iso)
-        )),
+        Span::raw(timestamp_label),
     ];
-    if !selected_message.to_agents.is_empty() {
-        preview_header_spans.push(Span::raw(format!(
-            " -> {}",
-            truncate_display_width(
-                selected_message.recipient_labels(),
-                preview_content.width.saturating_sub(24) as usize
-            )
-        )));
-    }
     if selected_message.importance == "high" {
-        preview_header_spans.push(Span::styled(" [HIGH]", crate::tui_theme::text_warning(&tp)));
+        preview_header_spans.push(Span::styled(
+            importance_marker,
+            crate::tui_theme::text_warning(&tp),
+        ));
     } else if selected_message.importance == "urgent" {
         preview_header_spans.push(Span::styled(
-            " [URGENT]",
+            importance_marker,
             crate::tui_theme::text_critical(&tp),
         ));
     }
     if selected_message.ack_required {
-        preview_header_spans.push(Span::styled(" @ACK", crate::tui_theme::text_accent(&tp)));
+        preview_header_spans.push(Span::styled(ack_marker, crate::tui_theme::text_accent(&tp)));
     }
     preview_lines.push(Line::from_spans(preview_header_spans));
+    if !selected_message.to_agents.is_empty() {
+        preview_lines.push(Line::raw(format!(
+            "To: {}",
+            super::messages::compact_identity_labels(
+                &selected_message.recipient_identities,
+                selected_message.recipient_labels(),
+                usize::from(preview_content.width).saturating_sub(4)
+            )
+        )));
+    }
     if !selected_message.subject.is_empty() {
         preview_lines.push(Line::from_spans([
             Span::styled("Subject: ", crate::tui_theme::text_meta(&tp)),
@@ -6036,6 +6119,63 @@ mod tests {
     }
 
     #[test]
+    fn display_name_long_unicode_thread_frame_keeps_participant_tree_and_preview_addresses() {
+        let conn = make_thread_messages_db("long-label-thread", 2);
+        conn.execute_sync(
+            "UPDATE agents SET display_name = ?",
+            &[Value::Text(format!(
+                "審査員 🦀, <b>{}</b>",
+                "評価担当".repeat(24)
+            ))],
+        )
+        .expect("set long Unicode labels");
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads = fetch_threads(&conn, "", None, 10);
+        screen.db_conn = Some(conn);
+        screen.refresh_detail_if_needed(None);
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 40), &state);
+        let rendered = ftui_harness::buffer_to_text_with_pool(&frame.buffer, Some(&*frame.pool));
+        assert!(
+            rendered.lines().any(|line| line.contains("Agents:")
+                && line.contains("<Sender>")
+                && line.contains("<Receiver>")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains(" @ ") && line.contains("<Sender>")),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("To:") && line.contains("<Receiver>")),
+            "{rendered}"
+        );
+        let mut wide_pool = ftui::GraphemePool::new();
+        let mut wide_frame = ftui::Frame::new(240, 50, &mut wide_pool);
+        screen.view(&mut wide_frame, Rect::new(0, 0, 240, 50), &state);
+        let wide_rendered =
+            ftui_harness::buffer_to_text_with_pool(&wide_frame.buffer, Some(&*wide_frame.pool));
+        assert!(
+            wide_rendered
+                .lines()
+                .any(|line| line.contains('•') && line.contains("<Sender>")),
+            "{wide_rendered}"
+        );
+        assert_eq!(screen.threads[0].participant_identities.len(), 2);
+        assert_eq!(
+            screen.detail_messages[0].recipient_identities[0].address,
+            "Receiver"
+        );
+        assert_eq!(screen.detail_messages[0].from_agent, "Sender");
+    }
+
+    #[test]
     fn fetch_threads_preserves_unknown_sender_and_project_labels() {
         let conn = make_thread_messages_db("thread-unknown-labels", 2);
         conn.execute_raw("DELETE FROM agents")
@@ -6069,6 +6209,7 @@ mod tests {
             velocity_msg_per_hr: msg_count as f64 / 2.0,
             participant_names: "GoldFox,SilverWolf".to_string(),
             participant_labels: None,
+            participant_identities: Vec::new(),
             first_timestamp_iso: "2026-02-06T10:00:00Z".to_string(),
             unread_count: 0,
         }
@@ -6327,6 +6468,7 @@ mod tests {
             to_agents: "SilverWolf".to_string(),
             sender_label: None,
             recipient_labels: None,
+            recipient_identities: Vec::new(),
             subject: format!("Message #{id}"),
             body_md: format!("Body of message {id}.\nSecond line."),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -6752,6 +6894,7 @@ mod tests {
             velocity_msg_per_hr: 1.0,
             participant_names: "GoldHawk, SilverFox".to_string(),
             participant_labels: None,
+            participant_identities: Vec::new(),
             unread_count: 3,
             project_slug: String::new(),
         };
@@ -6974,6 +7117,7 @@ mod tests {
             velocity_msg_per_hr: 0.0,
             participant_names: String::new(),
             participant_labels: None,
+            participant_identities: Vec::new(),
             first_timestamp_iso: String::new(),
             unread_count: 0,
         }

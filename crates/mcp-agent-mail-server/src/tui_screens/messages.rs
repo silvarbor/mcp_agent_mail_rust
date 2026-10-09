@@ -238,6 +238,13 @@ struct MessageEntry {
 pub(super) struct MessageLabels {
     pub(super) sender: Option<String>,
     pub(super) recipients: Option<String>,
+    pub(super) recipient_identities: Vec<IdentityLabel>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IdentityLabel {
+    pub(super) address: String,
+    pub(super) label: String,
 }
 
 impl MessageEntry {
@@ -2580,8 +2587,22 @@ impl MessageBrowserScreen {
 
             if let Some((rows, cursor)) = tree_snapshot {
                 let mut combined_lines: Vec<Line<'static>> = vec![
-                    Line::raw(format!("From:    {}", entry.sender_label())),
-                    Line::raw(format!("To:      {}", entry.recipient_labels())),
+                    Line::raw(format!(
+                        "From:    {}",
+                        compact_sender_label(
+                            entry.sender_label(),
+                            &entry.from_agent,
+                            content_width.saturating_sub(9)
+                        )
+                    )),
+                    Line::raw(format!(
+                        "To:      {}",
+                        compact_identity_labels(
+                            &entry.labels.recipient_identities,
+                            entry.recipient_labels(),
+                            content_width.saturating_sub(9)
+                        )
+                    )),
                     Line::raw(format!("Subject: {}", entry.subject)),
                 ];
                 if let Some(topic) = entry.topic.as_deref() {
@@ -4406,7 +4427,7 @@ pub(super) fn message_labels_by_id(
          LEFT JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id IN ({placeholders}) \
          ORDER BY mr.message_id, CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, mr.agent_id"
     );
-    let mut recipients: std::collections::HashMap<i64, Vec<(i64, String)>> =
+    let mut recipients: std::collections::HashMap<i64, Vec<(i64, IdentityLabel)>> =
         std::collections::HashMap::new();
     if let Ok(rows) = conn.query_sync(&recipient_sql, &params) {
         for row in rows {
@@ -4425,10 +4446,13 @@ pub(super) fn message_labels_by_id(
                 if !labels.iter().any(|(existing_id, _)| *existing_id == id) {
                     labels.push((
                         id,
-                        mcp_agent_mail_core::models::format_agent_label(
-                            &name,
-                            display_name.as_deref(),
-                        ),
+                        IdentityLabel {
+                            label: mcp_agent_mail_core::models::format_agent_label(
+                                &name,
+                                display_name.as_deref(),
+                            ),
+                            address: name,
+                        },
                     ));
                 }
             }
@@ -4438,17 +4462,24 @@ pub(super) fn message_labels_by_id(
         .iter()
         .copied()
         .map(|id| {
+            let recipient_identities = recipients
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, identity)| identity)
+                .collect::<Vec<_>>();
             (
                 id,
                 MessageLabels {
                     sender: senders.remove(&id),
-                    recipients: recipients.remove(&id).map(|labels| {
-                        labels
-                            .into_iter()
-                            .map(|(_, label)| label)
+                    recipients: (!recipient_identities.is_empty()).then(|| {
+                        recipient_identities
+                            .iter()
+                            .map(|identity| identity.label.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
                     }),
+                    recipient_identities,
                 },
             )
         })
@@ -4469,6 +4500,65 @@ pub(super) fn compact_sender_label(label: &str, address: &str, width: usize) -> 
         "{}{suffix}",
         truncate_str(display_name, width - suffix_width)
     )
+}
+
+/// Allocate label space only after reserving every routing address.
+pub(super) fn compact_identity_labels(
+    identities: &[IdentityLabel],
+    fallback: &str,
+    width: usize,
+) -> String {
+    if identities.is_empty() {
+        return truncate_str(fallback, width);
+    }
+    let separators = identities.len().saturating_sub(1) * 2;
+    let address_width: usize = identities
+        .iter()
+        .map(|identity| ftui::text::display_width(&identity.address))
+        .sum();
+    if address_width + separators > width {
+        let mut visible = Vec::new();
+        for (idx, identity) in identities.iter().enumerate() {
+            let remaining = identities.len() - idx - 1;
+            let suffix = if remaining == 0 {
+                String::new()
+            } else {
+                format!(" (+{remaining})")
+            };
+            let separator = if visible.is_empty() { "" } else { ", " };
+            let candidate = format!(
+                "{}{separator}{}{suffix}",
+                visible.join(", "),
+                identity.address
+            );
+            if ftui::text::display_width(&candidate) > width {
+                break;
+            }
+            visible.push(identity.address.as_str());
+        }
+        if visible.is_empty() {
+            return identities[0].address.clone();
+        }
+        let remaining = identities.len() - visible.len();
+        return if remaining == 0 {
+            visible.join(", ")
+        } else {
+            format!("{} (+{remaining})", visible.join(", "))
+        };
+    }
+    let extra = width.saturating_sub(address_width + separators);
+    let share = extra / identities.len();
+    identities
+        .iter()
+        .map(|identity| {
+            compact_sender_label(
+                &identity.label,
+                &identity.address,
+                ftui::text::display_width(&identity.address) + share,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> std::collections::HashMap<i64, String> {
@@ -5256,8 +5346,19 @@ fn render_detail_panel(
 
     // Build detail text
     let mut lines = Vec::new();
-    lines.push(format!("From:    {}", msg.sender_label()));
-    lines.push(format!("To:      {}", msg.recipient_labels()));
+    let identity_width = usize::from(content_inner.width).saturating_sub(9);
+    lines.push(format!(
+        "From:    {}",
+        compact_sender_label(msg.sender_label(), &msg.from_agent, identity_width)
+    ));
+    lines.push(format!(
+        "To:      {}",
+        compact_identity_labels(
+            &msg.labels.recipient_identities,
+            msg.recipient_labels(),
+            identity_width
+        )
+    ));
     lines.push(format!("Subject: {}", msg.subject));
     if let Some(topic) = msg.topic.as_deref() {
         lines.push(format!("Topic:   {topic}"));
@@ -5636,10 +5737,15 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
             .enumerate()
             .map(|(idx, item)| {
                 let label = form.agent_labels.get(item).unwrap_or(item);
+                let label = compact_sender_label(
+                    label,
+                    item,
+                    usize::from(inner.width).saturating_sub(17).min(32),
+                );
                 if idx == form.suggestion_cursor {
                     format!("[{label}]")
                 } else {
-                    label.clone()
+                    label
                 }
             })
             .collect();
@@ -5679,10 +5785,15 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
             .enumerate()
             .map(|(idx, item)| {
                 let label = form.agent_labels.get(item).unwrap_or(item);
+                let label = compact_sender_label(
+                    label,
+                    item,
+                    usize::from(inner.width).saturating_sub(17).min(32),
+                );
                 if idx == form.suggestion_cursor {
                     format!("[{label}]")
                 } else {
-                    label.clone()
+                    label
                 }
             })
             .collect();
@@ -5853,7 +5964,14 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
     let mut cursor_y = inner.y;
     let bottom = inner.y + inner.height;
 
-    let to_line = format!("To: {}", form.context.original_sender_label);
+    let to_line = format!(
+        "To: {}",
+        compact_sender_label(
+            &form.context.original_sender_label,
+            &form.context.to_agent,
+            usize::from(inner.width).saturating_sub(4)
+        )
+    );
     Paragraph::new(truncate_str(&to_line, inner.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
@@ -5926,7 +6044,12 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
     if cursor_y < bottom {
         let from_line = format!(
             "Original from {} at {}",
-            form.context.original_sender_label, form.context.original_timestamp_iso
+            compact_sender_label(
+                &form.context.original_sender_label,
+                &form.context.to_agent,
+                usize::from(inner.width).saturating_sub(40)
+            ),
+            form.context.original_timestamp_iso
         );
         Paragraph::new(truncate_str(&from_line, inner.width as usize))
             .style(crate::tui_theme::text_meta(&tp))
@@ -6570,21 +6693,70 @@ mod tests {
             None,
             0,
         );
-        let mut rendered = String::new();
-        for y in 0..frame.buffer.height() {
-            for x in 0..frame.buffer.width() {
-                if let Some(cell) = frame.buffer.get(x, y) {
-                    if let Some(ch) = cell.content.as_char() {
-                        rendered.push(ch);
-                    } else if !cell.is_continuation() {
-                        rendered.push(' ');
-                    }
-                }
-            }
-            rendered.push('\n');
-        }
-        assert!(rendered.contains("審査員 <b>Reviewer</b> <BlueLake>"));
+        let rendered = ftui_harness::buffer_to_text_with_pool(&frame.buffer, Some(&*frame.pool));
+        assert!(
+            rendered.contains("審査員 <b>Reviewer</b> <BlueLake>"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Reviewer <RedStone>, Remote Reviewer <BlueLake>"));
+        assert_eq!(
+            QuickReplyContext::from_entry(first)
+                .expect("reply")
+                .to_agent,
+            "BlueLake"
+        );
+    }
+
+    #[test]
+    fn display_name_long_unicode_message_headers_keep_sender_and_recipient_addresses() {
+        let conn = display_name_messages_db();
+        conn.execute_sync(
+            "UPDATE agents SET display_name = ?",
+            &[Value::Text(format!(
+                "審査員 🦀, <b>{}</b>",
+                "評価担当".repeat(24)
+            ))],
+        )
+        .expect("set long Unicode labels");
+        let (entries, _) = fetch_recent_messages(&conn, 10, None, true);
+        let first = entries.iter().find(|entry| entry.id == 1).expect("message");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 24, &mut pool);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(0, 0, 60, 24),
+            Some(first),
+            0,
+            true,
+            &RefCell::new(None),
+            DetailViewMode::Markdown,
+            None,
+            0,
+        );
+        let rendered = ftui_harness::buffer_to_text_with_pool(&frame.buffer, Some(&*frame.pool));
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("From:") && line.contains("<BlueLake>")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line.contains("To:")
+                && line.contains("<RedStone>")
+                && line.contains("<BlueLake>")),
+            "{rendered}"
+        );
+        assert_eq!(first.labels.recipient_identities.len(), 2);
+        assert_eq!(first.labels.recipient_identities[0].address, "RedStone");
+        assert!(first.labels.recipient_identities[0].label.contains(','));
+        assert_eq!(
+            compact_identity_labels(
+                &first.labels.recipient_identities,
+                first.recipient_labels(),
+                16
+            ),
+            "RedStone (+1)"
+        );
         assert_eq!(
             QuickReplyContext::from_entry(first)
                 .expect("reply")

@@ -1551,7 +1551,7 @@ mod tests {
             ("RedStone".into(), Some("Reviewer".into())),
             ("BlueLake".into(), None),
         ]);
-        assert!(state.filtered_recipients().is_empty());
+        assert_eq!(state.filtered_recipients(), [] as [usize; 0]);
         assert_eq!(state.build_envelope().unwrap().to, vec!["BlueLake"]);
         state.recipient_filter = "bluelake".into();
         assert_eq!(state.filtered_recipients(), vec![1]);

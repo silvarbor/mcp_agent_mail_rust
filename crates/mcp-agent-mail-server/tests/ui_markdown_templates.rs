@@ -196,6 +196,7 @@ struct ThreadMessage {
     body_md: String,
     body_html: String,
     sender: String,
+    sender_label: String,
     created: String,
     importance: String,
 }
@@ -218,6 +219,7 @@ fn templates_render_mail_thread() {
             body_md: "Hello **world**".to_string(),
             body_html: "<p>Hello <strong>world</strong></p>".to_string(),
             sender: "BlueBear".to_string(),
+            sender_label: "Reviewer <BlueBear>".to_string(),
             created: "2026-02-06T00:00:00Z".to_string(),
             importance: "normal".to_string(),
         }],
@@ -225,6 +227,10 @@ fn templates_render_mail_thread() {
     let out = templates::render_template("mail_thread.html", ctx).expect("render mail_thread.html");
     assert!(out.contains("br-123"), "should contain thread ID");
     assert!(out.contains("BlueBear"), "should contain sender name");
+    assert!(
+        out.contains("Reviewer &lt;BlueBear&gt;"),
+        "should contain escaped label and address"
+    );
 }
 
 #[derive(Serialize)]
@@ -836,6 +842,7 @@ fn templates_render_thread_many_messages() {
             body_md: format!("Content of message {i}"),
             body_html: format!("<p>Content of message {i}</p>"),
             sender: format!("Agent{i}"),
+            sender_label: format!("Agent{i}"),
             created: "2026-02-06T00:00:00Z".to_string(),
             importance: if i % 3 == 0 { "high" } else { "normal" }.to_string(),
         })
@@ -876,6 +883,7 @@ fn templates_render_thread_long_subject() {
             body_md: "short body".to_string(),
             body_html: "<p>short body</p>".to_string(),
             sender: "TestAgent".to_string(),
+            sender_label: "TestAgent".to_string(),
             created: "2026-02-06T00:00:00Z".to_string(),
             importance: "normal".to_string(),
         }],
@@ -902,6 +910,7 @@ fn templates_render_thread_unicode_content() {
             body_md: "Hello \u{1F600} \u{4E16}\u{754C} \u{0410}\u{043B}\u{0435}\u{043A}\u{0441}\u{0430}\u{043D}\u{0434}\u{0440}".to_string(),
             body_html: "<p>Hello \u{1F600} \u{4E16}\u{754C} \u{0410}\u{043B}\u{0435}\u{043A}\u{0441}\u{0430}\u{043D}\u{0434}\u{0440}</p>".to_string(),
             sender: "TestAgent".to_string(),
+            sender_label: "TestAgent".to_string(),
             created: "2026-02-06T00:00:00Z".to_string(),
             importance: "normal".to_string(),
         }],
@@ -1013,6 +1022,7 @@ fn truncate_filter_short_string_unchanged() {
             body_md: "Short".to_string(),
             body_html: "<p>Short</p>".to_string(),
             sender: "A".to_string(),
+            sender_label: "A".to_string(),
             created: "2026-02-06T00:00:00Z".to_string(),
             importance: "normal".to_string(),
         }],
