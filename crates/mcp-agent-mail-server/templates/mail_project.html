@@ -14,7 +14,7 @@
 {% endblock %}
 
 {% block header_actions %}
-<div class="flex items-center gap-3">
+<div class="flex flex-wrap items-center gap-3 min-w-0 max-w-full">
   {% if not static_export %}
   <!-- Human Overseer - Primary Action -->
   <a href="/mail/{{ project.slug }}/overseer/compose"
@@ -29,7 +29,7 @@
   {% endif %}
 
   <!-- Secondary Actions -->
-  <div class="flex items-center gap-2">
+  <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
     <!-- File Reservations -->
     <a href="/mail/{{ project.slug }}/file_reservations"
        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-md transition-all duration-200"
@@ -56,19 +56,19 @@
   <!-- Project Hero Header -->
   <div class="relative overflow-hidden bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
     <div class="flex items-start justify-between">
-      <div class="flex-1">
+      <div class="flex-1 min-w-0">
         <div class="flex items-center gap-4 mb-4">
-          <div class="w-16 h-16 bg-primary-600 rounded-xl flex items-center justify-center shadow-md">
+          <div class="w-16 h-16 shrink-0 bg-primary-600 rounded-xl flex items-center justify-center shadow-md">
             <i data-lucide="git-branch" class="w-8 h-8 text-white"></i>
           </div>
-          <div>
-            <h1 class="text-4xl font-bold text-slate-900 dark:text-white mb-2">
+          <div class="flex-1 min-w-0">
+            <h1 class="text-4xl font-bold text-slate-900 dark:text-white mb-2 break-all">
               {{ project.human_key }}
             </h1>
-            <div class="flex items-center gap-3 text-sm">
-              <div class="flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
-                <i data-lucide="hash" class="w-4 h-4"></i>
-                <span class="font-mono">{{ project.slug }}</span>
+            <div class="flex flex-wrap items-center gap-3 text-sm min-w-0">
+              <div class="flex items-center gap-1.5 text-slate-600 dark:text-slate-400 min-w-0 max-w-full">
+                <i data-lucide="hash" class="w-4 h-4 shrink-0"></i>
+                <span class="font-mono min-w-0 break-all">{{ project.slug }}</span>
               </div>
               <span class="text-slate-300 dark:text-slate-600">•</span>
               <div class="flex items-center gap-1.5 px-3 py-1 bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 rounded-full font-medium text-xs">
