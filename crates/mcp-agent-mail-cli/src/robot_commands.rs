@@ -24420,7 +24420,9 @@ mod tests {
         for label in [Some("Officer Alpha"), None] {
             conn.query_sync(
                 "UPDATE agents SET display_name = ? WHERE id = 4",
-                &[label.map_or(Value::Null, |label| Value::Text(label.to_string()))],
+                &[label.map_or(sqlmodel_core::Value::Null, |label| {
+                    sqlmodel_core::Value::Text(label.to_string())
+                })],
             )
             .expect("rename or clear source identity label");
             assert_eq!(
