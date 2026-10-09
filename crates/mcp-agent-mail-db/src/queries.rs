@@ -6468,6 +6468,25 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
+/// Read one project's current labels keyed by case-insensitive stable address.
+pub async fn list_agent_display_names(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<BTreeMap<String, Option<String>>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let db_conn: &crate::DbConn = &conn;
+    match crate::sync::agent_display_names_from_conn(db_conn, project_id) {
+        Ok(labels) => Outcome::Ok(labels),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 /// Read profiles in one statement for cross-project inbox views, including
 /// historical sender identities. Ordering matches `list_agents`' selection.
 pub async fn list_mail_ui_agent_profiles(
@@ -10126,6 +10145,7 @@ pub struct InboxRow {
     pub message: MessageRow,
     pub kind: String,
     pub sender_name: String,
+    pub sender_display_name: Option<String>,
     pub read_ts: Option<i64>,
     pub ack_ts: Option<i64>,
 }
@@ -10849,11 +10869,13 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
     let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
     let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
     let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
+    let sender_display_name: Option<String> = row.get_as(16).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
         message,
         kind,
         sender_name,
+        sender_display_name,
         read_ts,
         ack_ts,
     })
@@ -10941,7 +10963,8 @@ async fn fetch_inbox_for_product_agent_impl(
     let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
+                r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts, \
+                s.display_name AS sender_display_name \
          FROM product_project_links ppl \
          JOIN agents recipient ON recipient.project_id = ppl.project_id AND recipient.name = ? COLLATE NOCASE \
          JOIN message_recipients r ON r.agent_id = recipient.id \
@@ -32786,7 +32809,19 @@ mod tests {
                 )
                 .expect("stabilize message timestamp");
             }
+            conn.execute_sync(
+                "UPDATE agents SET display_name = 'Reviewer' WHERE id = ?",
+                &[Value::BigInt(sender_b.id.expect("sender b id"))],
+            )
+            .expect("set current product sender label");
             drop(conn);
+
+            let labels = list_agent_display_names(&cx, &pool, project_b_id)
+                .await
+                .into_result()
+                .expect("read product project labels");
+            assert_eq!(labels["greencastle"].as_deref(), Some("Reviewer"));
+            assert_eq!(labels["bluelake"], None);
 
             let tracker = Arc::new(crate::QueryTracker::new());
             tracker.enable(None);
@@ -32816,6 +32851,12 @@ mod tests {
             assert_eq!(metadata_rows.len(), 2);
             assert_eq!(metadata_rows[0].message.subject, "newer urgent");
             assert_eq!(metadata_rows[1].message.subject, "older normal");
+            assert_eq!(metadata_rows[0].sender_name, "GreenCastle");
+            assert_eq!(
+                metadata_rows[0].sender_display_name.as_deref(),
+                Some("Reviewer")
+            );
+            assert_eq!(metadata_rows[1].sender_display_name, None);
             assert!(
                 metadata_rows
                     .iter()
@@ -32867,6 +32908,10 @@ mod tests {
             assert_eq!(urgent_rows.len(), 1);
             assert_eq!(urgent_rows[0].message.subject, "newer urgent");
             assert_eq!(urgent_rows[0].message.body_md, "newer body hydrated");
+            assert_eq!(
+                urgent_rows[0].sender_display_name.as_deref(),
+                Some("Reviewer")
+            );
         });
     }
 
@@ -33663,6 +33708,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
             assert_eq!(rows[0].message.subject, "Inbox survives sender drift");
+            assert_eq!(rows[0].sender_display_name, None);
         });
     }
 

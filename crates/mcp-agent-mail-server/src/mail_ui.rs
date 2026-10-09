@@ -3720,6 +3720,7 @@ fn aggregate_unified_deliveries(
 ) -> Option<UnifiedMessageAggregate> {
     let sender = agents.get(&message.sender_id);
     let mut row = queries::InboxRow {
+        sender_display_name: sender.and_then(|agent| agent.display_name.clone()),
         sender_name: sender.map_or_else(
             || queries::UNKNOWN_SENDER_DISPLAY.to_string(),
             |agent| agent.name.clone(),

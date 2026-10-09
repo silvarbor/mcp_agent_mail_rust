@@ -8,6 +8,7 @@ use crate::error::DbError;
 use crate::models::MessageRow;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
+use std::collections::BTreeMap;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -23,6 +24,8 @@ pub struct InboxDeliveryEvent {
     pub delivered_ts: i64,
     pub subject: String,
     pub sender_name: String,
+    pub sender_display_name: Option<String>,
+    pub recipients_json: String,
     pub importance: String,
     pub ack_required: bool,
 }
@@ -405,6 +408,35 @@ pub fn fetch_inbox_filtered_rows_from_conn(
     fetch_inbox_rows_from_conn_impl(conn, project_id, agent_id, since_ts, limit, options)
 }
 
+/// Read current labels by stable address, retaining historical identities.
+///
+/// Like agent routing, the first registered ID owns each case-insensitive
+/// address. Labels are values only and never participate in resolution.
+pub fn agent_display_names_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+) -> Result<BTreeMap<String, Option<String>>, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT name, display_name FROM agents WHERE project_id = ? ORDER BY id ASC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let mut labels = BTreeMap::new();
+    for row in rows {
+        let name: String = row
+            .get_named("name")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let display_name: Option<String> = row
+            .get_named("display_name")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        labels
+            .entry(name.to_ascii_lowercase())
+            .or_insert(display_name);
+    }
+    Ok(labels)
+}
+
 fn fetch_inbox_rows_from_conn_impl(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
@@ -422,7 +454,8 @@ fn fetch_inbox_rows_from_conn_impl(
     let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
+                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts, \
+                s.display_name AS sender_display_name \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
          LEFT JOIN agents s ON s.id = m.sender_id \
@@ -505,6 +538,9 @@ fn fetch_inbox_rows_from_conn_impl(
         let sender_name: String = row
             .get_named("sender_name")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let sender_display_name: Option<String> = row
+            .get_named("sender_display_name")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let read_ts: Option<i64> = row
             .get_named("read_ts")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -529,6 +565,7 @@ fn fetch_inbox_rows_from_conn_impl(
             },
             kind,
             sender_name,
+            sender_display_name,
             read_ts,
             ack_ts,
         });
@@ -634,7 +671,8 @@ pub fn inbox_delivery_events_from_conn(
     let rows = conn
         .query_sync(
             "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
-                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required, \
+                    sender.display_name AS sender_display_name, m.recipients_json \
              FROM inbox_delivery_events AS e \
              JOIN messages AS m ON m.id = e.message_id \
              LEFT JOIN agents AS sender ON sender.id = m.sender_id \
@@ -669,6 +707,12 @@ pub fn inbox_delivery_events_from_conn(
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
             sender_name: row.get_named("sender_name").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            sender_display_name: row.get_named("sender_display_name").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            recipients_json: row.get_named("recipients_json").map_err(|error| {
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
             importance: row.get_named("importance").map_err(|error| {
@@ -1354,6 +1398,7 @@ mod tests {
             fetch_inbox_rows_from_conn(&conn, pid, recipient_id, false, false, false, None, 10)
                 .expect("full inbox fetch");
         assert_eq!(full_rows.len(), 1);
+        assert_eq!(full_rows[0].sender_display_name, None);
         assert!(
             full_rows[0]
                 .message
@@ -1379,6 +1424,85 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+
+        for label in [Some("Reviewer"), Some("Officer Alpha"), None] {
+            conn.execute_sync(
+                "UPDATE agents SET display_name = ? WHERE id = ?",
+                &[
+                    label.map_or(Value::Null, |label| Value::Text(label.to_string())),
+                    Value::BigInt(sender_id),
+                ],
+            )
+            .expect("change current sender label");
+            for rows in [
+                fetch_inbox_rows_from_conn(&conn, pid, recipient_id, false, false, false, None, 10)
+                    .expect("full labeled inbox"),
+                fetch_inbox_metadata_rows_from_conn(
+                    &conn,
+                    pid,
+                    recipient_id,
+                    false,
+                    false,
+                    false,
+                    None,
+                    10,
+                )
+                .expect("metadata labeled inbox"),
+            ] {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].message.id, Some(msg_id));
+                assert_eq!(rows[0].message.sender_id, sender_id);
+                assert_eq!(rows[0].sender_name, "Sender");
+                assert_eq!(rows[0].sender_display_name.as_deref(), label);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_display_names_keep_duplicate_labels_historical_profiles_and_canonical_addresses() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "BlueLake");
+        let recipient_id = insert_agent(&conn, project_id, "GreenLake");
+        conn.execute_raw("DROP INDEX idx_agents_project_name_nocase")
+            .expect("allow legacy case variants in isolated test store");
+        let alias_id = insert_agent(&conn, project_id, "bluelake");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Reviewer' WHERE id IN (?, ?)",
+            &[Value::BigInt(sender_id), Value::BigInt(recipient_id)],
+        )
+        .expect("set duplicate labels");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Alias' WHERE id = ?",
+            &[Value::BigInt(alias_id)],
+        )
+        .expect("set case-variant label");
+        conn.execute_sync(
+            "UPDATE agents SET retired_at = 2000000 WHERE id = ?",
+            &[Value::BigInt(recipient_id)],
+        )
+        .expect("retire historical profile");
+
+        let labels = agent_display_names_from_conn(&conn, project_id).expect("project labels");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels["bluelake"].as_deref(), Some("Reviewer"));
+        assert_eq!(labels["greenlake"].as_deref(), Some("Reviewer"));
+        assert!(!labels.contains_key("Reviewer"));
+        assert!(
+            agent_display_names_from_conn(&conn, project_id + 1)
+                .expect("unrelated project labels")
+                .is_empty()
+        );
+
+        conn.execute_sync(
+            "UPDATE agents SET display_name = NULL WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("clear canonical label");
+        let cleared = agent_display_names_from_conn(&conn, project_id).expect("cleared labels");
+        assert_eq!(cleared.len(), 2);
+        assert_eq!(cleared["bluelake"], None);
+        assert_eq!(cleared["greenlake"].as_deref(), Some("Reviewer"));
     }
 
     #[test]
@@ -1416,7 +1540,38 @@ mod tests {
         );
         assert_eq!(first.events[0].subject, "test subject");
         assert_eq!(first.events[0].sender_name, "Sender");
+        assert_eq!(first.events[0].sender_display_name, None);
         assert_eq!(first.events[0].kind, "to");
+
+        for label in [Some("Reviewer"), Some("Officer Alpha"), None] {
+            conn.execute_sync(
+                "UPDATE agents SET display_name = ? WHERE id = ?",
+                &[
+                    label.map_or(Value::Null, |label| Value::Text(label.to_string())),
+                    Value::BigInt(sender_id),
+                ],
+            )
+            .expect("change current event sender label");
+            let relabeled =
+                inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 2)
+                    .expect("reread unchanged delivery facts with current labels");
+            assert_eq!(relabeled.next_cursor, first.next_cursor);
+            assert_eq!(relabeled.tail_cursor, first.tail_cursor);
+            assert_eq!(
+                relabeled.oldest_available_cursor,
+                first.oldest_available_cursor
+            );
+            assert_eq!(relabeled.has_more, first.has_more);
+            for (current, original) in relabeled.events.iter().zip(&first.events) {
+                assert_eq!(current.seq, original.seq);
+                assert_eq!(current.message_id, original.message_id);
+                assert_eq!(current.kind, original.kind);
+                assert_eq!(current.delivered_ts, original.delivered_ts);
+                assert_eq!(current.sender_name, original.sender_name);
+                assert_eq!(current.recipients_json, original.recipients_json);
+                assert_eq!(current.sender_display_name.as_deref(), label);
+            }
+        }
 
         // Draining unread state changes the snapshot but never rewrites or
         // hides a delivery event that a restart-safe monitor still needs.
@@ -1459,6 +1614,56 @@ mod tests {
             expired,
             InboxDeliveryEventError::CursorExpired { .. }
         ));
+    }
+
+    #[test]
+    fn inbox_delivery_events_keep_retired_and_orphaned_sender_history() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "BlueLake");
+        let recipient_id = insert_agent(&conn, project_id, "GreenLake");
+        let message_id = insert_message(&conn, project_id, sender_id, "historical-label");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+            &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+        )
+        .expect("persist historical delivery");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Reviewer', retired_at = 2000000 WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("retire labeled sender");
+
+        let retired = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 10)
+            .expect("read retired sender delivery");
+        assert_eq!(retired.events.len(), 1);
+        assert_eq!(retired.events[0].message_id, message_id);
+        assert_eq!(retired.events[0].sender_name, "BlueLake");
+        assert_eq!(
+            retired.events[0].sender_display_name.as_deref(),
+            Some("Reviewer")
+        );
+
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("allow orphan drift in isolated test store");
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("simulate missing historical sender profile");
+        let orphaned = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 10)
+            .expect("read orphaned sender delivery");
+        assert_eq!(orphaned.events.len(), 1);
+        assert_eq!(orphaned.events[0].message_id, message_id);
+        assert_eq!(orphaned.events[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+        assert_eq!(orphaned.events[0].sender_display_name, None);
+        assert_eq!(orphaned.events[0].seq, retired.events[0].seq);
+        assert_eq!(
+            orphaned.events[0].delivered_ts,
+            retired.events[0].delivered_ts
+        );
+        assert_eq!(orphaned.next_cursor, retired.next_cursor);
+        assert_eq!(orphaned.tail_cursor, retired.tail_cursor);
     }
 
     #[test]

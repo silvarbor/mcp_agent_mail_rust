@@ -1455,6 +1455,8 @@ mod tests {
                 importance: "high".into(),
                 ack_required: true,
                 from: "Sender".into(),
+                sender_display_name: None,
+                to_display_names: std::collections::BTreeMap::new(),
                 to: Vec::new(),
                 cc: Vec::new(),
                 bcc: Vec::new(),

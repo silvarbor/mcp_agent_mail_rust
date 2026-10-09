@@ -1324,6 +1324,8 @@ pub struct InboxEntry {
     pub id: i64,
     pub priority: String,
     pub from: String,
+    pub sender_display_name: Option<String>,
+    pub to_display_names: BTreeMap<String, Option<String>>,
     pub subject: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
@@ -6109,6 +6111,15 @@ fn server_inbox_row_to_entry(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            sender_display_name: row
+                .get("sender_display_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            to_display_names: row
+                .get("to_display_names")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             subject: row
                 .get("subject")
                 .and_then(serde_json::Value::as_str)
@@ -6396,11 +6407,12 @@ fn build_inbox_with_phase(
     let sql = format!(
         "SELECT sub.id, sub.subject, sub.topic, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
-                sub.priority_bucket,
-                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
+                sub.priority_bucket, sub.recipients_json,
+                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
+                a_sender.display_name AS sender_display_name
          FROM (
              SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required,
-                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select},
+                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select}, m.recipients_json,
                     CASE
                         WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 2
@@ -6434,6 +6446,9 @@ fn build_inbox_with_phase(
 
     let mut entries = Vec::new();
     let mut overdue_ids = Vec::new();
+
+    let display_names = mcp_agent_mail_db::sync::agent_display_names_from_conn(conn, project_id)
+        .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
 
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
@@ -6486,6 +6501,12 @@ fn build_inbox_with_phase(
             id,
             priority: priority_label.to_string(),
             from: sender,
+            sender_display_name: row.get_named("sender_display_name").ok(),
+            to_display_names: crate::inbox_visible_to_display_names(
+                &row.get_named::<String>("recipients_json")
+                    .unwrap_or_default(),
+                &display_names,
+            ),
             subject,
             topic,
             thread: thread_ref,
@@ -6628,7 +6649,22 @@ fn build_inbox_with_snapshot_cache(
         && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
-        return Ok(entry.result.clone());
+        let mut result = entry.result.clone();
+        let display_names =
+            mcp_agent_mail_db::sync::agent_display_names_from_conn(conn, project_id)
+                .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
+        let sender_display_names =
+            inbox_sender_display_names_by_message(conn, project_id, &result.entries)?;
+        for row in &mut result.entries {
+            row.sender_display_name = sender_display_names.get(&row.id).cloned().flatten();
+            for (name, label) in &mut row.to_display_names {
+                *label = display_names
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .flatten();
+            }
+        }
+        return Ok(result);
     }
 
     mark_tail_latency_phase(&mut phase, "snapshot_cache_miss");
@@ -6658,6 +6694,44 @@ fn build_inbox_with_snapshot_cache(
         },
     );
     Ok(result)
+}
+
+fn inbox_sender_display_names_by_message(
+    conn: &DbConn,
+    project_id: i64,
+    entries: &[InboxEntry],
+) -> Result<BTreeMap<i64, Option<String>>, CliError> {
+    if entries.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = entries.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut params = Vec::with_capacity(entries.len() + 1);
+    params.push(Value::BigInt(project_id));
+    params.extend(entries.iter().map(|entry| Value::BigInt(entry.id)));
+    // Cross-project deliveries keep the source agent's global sender_id.
+    // Resolve the current label through that identity even when a recipient
+    // project has an agent with the same routing name.
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT m.id, a.display_name AS sender_display_name
+             FROM messages m LEFT JOIN agents a ON a.id = m.sender_id
+             WHERE m.project_id = ? AND m.id IN ({placeholders})"
+            ),
+            &params,
+        )
+        .map_err(|e| CliError::Other(format!("inbox sender display names query failed: {e}")))?;
+    rows.iter()
+        .map(|row| {
+            let id = row.get_named("id").map_err(|e| {
+                CliError::Other(format!("inbox sender message ID decode failed: {e}"))
+            })?;
+            let label = row.get_named("sender_display_name").map_err(|e| {
+                CliError::Other(format!("inbox sender display name decode failed: {e}"))
+            })?;
+            Ok((id, label))
+        })
+        .collect()
 }
 
 fn load_recipient_display_names(
@@ -6917,6 +6991,8 @@ fn build_outbox_entries(
             id,
             priority: "sent".to_string(),
             from: recipient_names,
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             subject,
             topic,
             thread: thread_ref,
@@ -18626,6 +18702,8 @@ mod tests {
             priority: "high".into(),
             from: "RedHarbor".into(),
             subject: "Test".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "br-123".into(),
             age: "5m".into(),
@@ -18769,6 +18847,8 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "RedFox".into(),
             subject: "Urgent review needed".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "AUTH-001".into(),
             age: "35m ago".into(),
@@ -18789,6 +18869,8 @@ mod tests {
             priority: "unread".into(),
             from: "BlueLake".into(),
             subject: "FYI".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "".into(),
             age: "1h ago".into(),
@@ -18819,6 +18901,8 @@ mod tests {
                     priority: "ack-overdue".into(),
                     from: "RedFox".into(),
                     subject: "Review auth".into(),
+                    sender_display_name: None,
+                    to_display_names: BTreeMap::new(),
                     topic: None,
                     thread: "AUTH-1".into(),
                     age: "35m ago".into(),
@@ -18831,6 +18915,8 @@ mod tests {
                     priority: "urgent".into(),
                     from: "BlueLake".into(),
                     subject: "Blocking issue".into(),
+                    sender_display_name: None,
+                    to_display_names: BTreeMap::new(),
                     topic: None,
                     thread: "FEAT-1".into(),
                     age: "10m ago".into(),
@@ -18946,6 +19032,8 @@ mod tests {
                 "id": 1,
                 "subject": "Urgent unread",
                 "from": "BlueLake",
+                "sender_display_name": "SPX Maintainer",
+                "to_display_names": {"BlueLake": null},
                 "importance": "urgent",
                 "ack_required": true,
                 "created_ts": old.clone(),
@@ -18977,6 +19065,14 @@ mod tests {
         };
 
         let result = build_inbox_from_server_payload(&payload, &request).expect("server inbox");
+        assert_eq!(
+            result.entries[0].sender_display_name.as_deref(),
+            Some("SPX Maintainer")
+        );
+        assert_eq!(
+            result.entries[0].to_display_names.get("BlueLake"),
+            Some(&None)
+        );
         let ids = result
             .entries
             .iter()
@@ -21043,6 +21139,8 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "BlueLake".into(),
             subject: "[FEAT-1] Test".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: Some("feat.1".into()),
             thread: "FEAT-1".into(),
             age: "5m".into(),
@@ -21069,6 +21167,8 @@ mod tests {
                 priority: "ack-overdue".into(),
                 from: "Agent1".into(),
                 subject: "Urgent".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 topic: None,
                 thread: "".into(),
                 age: "45m".into(),
@@ -21081,6 +21181,8 @@ mod tests {
                 priority: "urgent".into(),
                 from: "Agent2".into(),
                 subject: "High".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 topic: None,
                 thread: "".into(),
                 age: "10m".into(),
@@ -24186,6 +24288,10 @@ mod tests {
 
     #[test]
     fn test_build_inbox_respects_include_bodies_flag() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         conn.query_sync(
             "INSERT INTO messages
@@ -24200,18 +24306,164 @@ mod tests {
             &[],
         )
         .expect("insert inbox recipient");
+        conn.query_sync(
+            "UPDATE agents SET display_name = 'Reviewer Ω' WHERE id IN (1, 2)",
+            &[],
+        )
+        .expect("assign duplicate labels");
+        conn.query_sync(
+            "UPDATE messages SET recipients_json = '{\"to\":[\"Bob\"],\"cc\":[\"Alice\"],\"bcc\":[\"Carol\"]}' WHERE id = 123",
+            &[],
+        )
+        .expect("set recipient metadata");
 
-        let metadata = build_inbox(
-            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        let metadata = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
         )
         .expect("build metadata inbox");
         assert_eq!(metadata.entries[0].body_md, None);
+        assert_eq!(metadata.entries[0].from, "Alice");
+        assert_eq!(
+            metadata.entries[0].sender_display_name.as_deref(),
+            Some("Reviewer Ω")
+        );
+        assert_eq!(
+            serde_json::to_value(&metadata.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": "Reviewer Ω"})
+        );
 
         let full = build_inbox(
             &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, true,
         )
         .expect("build full inbox");
         assert_eq!(full.entries[0].body_md.as_deref(), Some("inbox body"));
+        assert_eq!(
+            full.entries[0].sender_display_name.as_deref(),
+            Some("Reviewer Ω")
+        );
+        let generation = robot_status_snapshot_generation(&conn, 1).expect("snapshot generation");
+        conn.query_sync(
+            "UPDATE agents SET display_name = 'Officer Alpha' WHERE id = 1",
+            &[],
+        )
+        .expect("rename sender label without activity change");
+        conn.query_sync("UPDATE agents SET display_name = NULL WHERE id = 2", &[])
+            .expect("clear recipient label without activity change");
+        assert_eq!(
+            robot_status_snapshot_generation(&conn, 1).expect("unchanged snapshot generation"),
+            generation
+        );
+        let renamed = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("read current labels through cached inbox");
+        assert_eq!(renamed.entries[0].id, 123);
+        assert_eq!(renamed.entries[0].from, "Alice");
+        assert_eq!(
+            renamed.entries[0].sender_display_name.as_deref(),
+            Some("Officer Alpha")
+        );
+        assert_eq!(
+            serde_json::to_value(&renamed.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": null})
+        );
+    }
+
+    #[test]
+    fn robot_inbox_cross_project_sender_labels_follow_global_identity() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'source', '/tmp/source', 0)",
+        )
+        .expect("insert source project");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, display_name)
+             VALUES (4, 2, 'Alice', 'test', 'test', 0, 0, 'Methodology Director')",
+        )
+        .expect("insert source identity with colliding local name");
+        conn.execute_raw("UPDATE agents SET display_name = 'Local namesake' WHERE id = 1")
+            .expect("label local namesake");
+        conn.execute_raw("UPDATE agents SET display_name = 'Reviewer' WHERE id = 2")
+            .expect("label primary recipient");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md, attachments, recipients_json)
+             VALUES (124, 1, 4, 'Cross-project label', 'normal', 0, 10, 'body', '[]',
+                     '{\"to\":[\"Bob\"],\"cc\":[\"Alice\"],\"bcc\":[\"Carol\"]}')",
+        )
+        .expect("insert qualified cross-project delivery");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (124, 2, 'to'), (124, 1, 'cc'), (124, 3, 'bcc')",
+        )
+        .expect("insert recipients");
+        let fresh = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("fresh cross-project robot inbox");
+        assert_eq!(fresh.entries[0].id, 124);
+        assert_eq!(fresh.entries[0].from, "Alice");
+        assert_eq!(
+            fresh.entries[0].sender_display_name.as_deref(),
+            Some("Methodology Director")
+        );
+        assert_eq!(
+            serde_json::to_value(&fresh.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": "Reviewer"})
+        );
+        let generation = robot_status_snapshot_generation(&conn, 1).expect("recipient generation");
+        for label in [Some("Officer Alpha"), None] {
+            conn.query_sync(
+                "UPDATE agents SET display_name = ? WHERE id = 4",
+                &[label.map_or(Value::Null, |label| Value::Text(label.to_string()))],
+            )
+            .expect("rename or clear source identity label");
+            assert_eq!(
+                robot_status_snapshot_generation(&conn, 1).expect("unchanged recipient generation"),
+                generation
+            );
+            let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+            let cached = build_inbox_with_snapshot_cache(
+                &conn,
+                1,
+                "proj",
+                2,
+                "Bob",
+                false,
+                false,
+                true,
+                false,
+                20,
+                false,
+                Some(&mut phase),
+            )
+            .expect("current source label in cached cross-project inbox");
+            assert!(
+                phase
+                    .finish("ok")
+                    .phases
+                    .iter()
+                    .any(|phase| phase.name == "snapshot_cache_hit")
+            );
+            assert_eq!(cached.entries[0].id, 124);
+            assert_eq!(cached.entries[0].from, "Alice");
+            assert_eq!(cached.entries[0].sender_display_name.as_deref(), label);
+            assert_eq!(
+                serde_json::to_value(&cached.entries[0].to_display_names).unwrap(),
+                serde_json::json!({"Bob": "Reviewer"})
+            );
+            let full = build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, true,
+            )
+            .expect("current source label in full cross-project inbox");
+            assert_eq!(full.entries[0].sender_display_name.as_deref(), label);
+            assert_eq!(full.entries[0].body_md.as_deref(), Some("body"));
+        }
     }
 
     #[test]

@@ -9622,6 +9622,8 @@ fn handle_check_inbox(
                 "id": m.id,
                 "subject": m.subject,
                 "from": m.from,
+                "sender_display_name": m.sender_display_name,
+                "to_display_names": m.to_display_names,
                 "importance": m.importance,
                 "created_ts": m.created_ts,
             })
@@ -10130,11 +10132,15 @@ fn handle_inbox_events(
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or_default()
                     .to_string(),
-                event
-                    .get("from")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                mcp_agent_mail_core::models::format_agent_label(
+                    event
+                        .get("from")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    event
+                        .get("sender_display_name")
+                        .and_then(serde_json::Value::as_str),
+                ),
                 event
                     .get("subject")
                     .and_then(serde_json::Value::as_str)
@@ -37701,9 +37707,17 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     )
                     .await
                 })?;
+                let display_names = outcome_to_result(
+                    mcp_agent_mail_db::queries::list_agent_display_names(
+                        &cx,
+                        read_pool.pool(),
+                        pid,
+                    )
+                    .await,
+                )?;
                 Ok::<Vec<serde_json::Value>, CliError>(
                     rows.iter()
-                        .map(|row| inbox_row_to_json(row, include_bodies))
+                        .map(|row| inbox_row_to_json(row, include_bodies, &display_names))
                         .collect::<Vec<_>>(),
                 )
             };
@@ -40088,11 +40102,14 @@ fn ensure_message_in_project(
 fn inbox_row_to_json(
     r: &mcp_agent_mail_db::queries::InboxRow,
     include_body: bool,
+    display_names: &std::collections::BTreeMap<String, Option<String>>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
         "id": r.message.id.unwrap_or(0),
         "subject": r.message.subject,
         "from": r.sender_name,
+        "sender_display_name": r.sender_display_name,
+        "to_display_names": inbox_visible_to_display_names(&r.message.recipients_json, display_names),
         "importance": r.message.importance,
         "ack_required": r.message.ack_required != 0,
         "created_ts": mcp_agent_mail_db::micros_to_iso(r.message.created_ts),
@@ -40112,6 +40129,7 @@ fn inbox_row_to_json(
 fn product_inbox_row_to_json(
     r: &mcp_agent_mail_db::queries::InboxRow,
     include_body: bool,
+    display_names: &std::collections::BTreeMap<String, Option<String>>,
 ) -> serde_json::Value {
     let attachments = parse_product_inbox_attachments_json(&r.message.attachments);
     let mut v = serde_json::json!({
@@ -40125,6 +40143,8 @@ fn product_inbox_row_to_json(
         "ack_required": r.message.ack_required != 0,
         "created_ts": mcp_agent_mail_db::micros_to_iso(r.message.created_ts),
         "from": r.sender_name,
+        "sender_display_name": r.sender_display_name,
+        "to_display_names": inbox_visible_to_display_names(&r.message.recipients_json, display_names),
         "kind": r.kind,
         "attachments": attachments,
     });
@@ -40135,6 +40155,30 @@ fn product_inbox_row_to_json(
         );
     }
     v
+}
+
+pub(crate) fn inbox_visible_to_display_names(
+    recipients_json: &str,
+    display_names: &std::collections::BTreeMap<String, Option<String>>,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let recipients = serde_json::from_str::<serde_json::Value>(recipients_json)
+        .unwrap_or(serde_json::Value::Null);
+    recipients
+        .get("to")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|name| {
+            (
+                name.to_string(),
+                display_names
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .flatten(),
+            )
+        })
+        .collect()
 }
 
 fn parse_product_inbox_attachments_json(attachments_json: &str) -> Vec<serde_json::Value> {
@@ -40210,7 +40254,9 @@ fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serd
         "thread_id": delivery_payload.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
         "created_ts": delivery_payload.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
         "from": delivery_payload.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
+        "sender_display_name": delivery_payload.get("sender_display_name").cloned().unwrap_or(serde_json::Value::Null),
         "to": delivery_payload.get("to").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        "to_display_names": delivery_payload.get("to_display_names").cloned().unwrap_or_else(|| serde_json::json!({})),
     }))
 }
 
@@ -40249,6 +40295,8 @@ fn server_inbox_payload_to_cli_json(
                     "id": row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
                     "subject": row.get("subject").and_then(|v| v.as_str()).unwrap_or_default(),
                     "from": row.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "sender_display_name": row.get("sender_display_name").cloned().unwrap_or(serde_json::Value::Null),
+                    "to_display_names": row.get("to_display_names").cloned().unwrap_or_else(|| serde_json::json!({})),
                     "importance": row.get("importance").and_then(|v| v.as_str()).unwrap_or("normal"),
                     "ack_required": row.get("ack_required").and_then(|v| v.as_bool()).unwrap_or(false),
                     "created_ts": row.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
@@ -41734,11 +41782,24 @@ mod mail_server_cli_bridge_tests {
             },
             kind: "message".to_string(),
             sender_name: "BlueLake".to_string(),
+            sender_display_name: Some("SPX Maintainer".to_string()),
             read_ts: None,
             ack_ts: None,
         };
 
-        let json = product_inbox_row_to_json(&row, true);
+        let json = product_inbox_row_to_json(&row, true, &std::collections::BTreeMap::new());
+        assert_eq!(json["sender_display_name"], "SPX Maintainer");
+        let inbox = super::inbox_row_to_json(
+            &row,
+            false,
+            &std::collections::BTreeMap::from([("windygate".to_string(), None)]),
+        );
+        assert_eq!(inbox["sender_display_name"], "SPX Maintainer");
+        assert_eq!(
+            inbox["to_display_names"],
+            serde_json::json!({"WindyGate": null})
+        );
+        assert!(inbox.get("body_md").is_none());
 
         assert_eq!(json.get("id").and_then(serde_json::Value::as_i64), Some(42));
         assert_eq!(
@@ -41788,11 +41849,12 @@ mod mail_server_cli_bridge_tests {
             },
             kind: "message".to_string(),
             sender_name: "BlueLake".to_string(),
+            sender_display_name: None,
             read_ts: None,
             ack_ts: None,
         };
 
-        let json = product_inbox_row_to_json(&row, false);
+        let json = product_inbox_row_to_json(&row, false, &std::collections::BTreeMap::new());
         let attachments = json
             .get("attachments")
             .and_then(serde_json::Value::as_array)
@@ -41820,7 +41882,9 @@ mod mail_server_cli_bridge_tests {
                         "thread_id": "br-42",
                         "created_ts": "2026-03-11T21:30:00Z",
                         "from": "BlueLake",
-                        "to": ["GreenStone"]
+                        "sender_display_name": "SPX Maintainer",
+                        "to": ["GreenStone"],
+                        "to_display_names": {"GreenStone": "Methodology Director"}
                     }
                 }
             ],
@@ -41832,6 +41896,11 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             bridged.get("from").and_then(|v| v.as_str()),
             Some("BlueLake")
+        );
+        assert_eq!(bridged["sender_display_name"], "SPX Maintainer");
+        assert_eq!(
+            bridged["to_display_names"]["GreenStone"],
+            "Methodology Director"
         );
         assert_eq!(
             bridged.get("thread_id").and_then(|v| v.as_str()),
@@ -41853,6 +41922,7 @@ mod mail_server_cli_bridge_tests {
             "receipt_mode": "redacted", "project": "/tmp/project", "message_id": 42,
             "project_id": 1, "sender_id": 2, "thread_id": "br-42",
             "created_ts": "2026-09-11T04:00:00Z", "verified_sender": true,
+            "sender_display_name": "SPX Maintainer",
             "target_outcomes": [], "idempotent_replay": true,
             "subject": "must not echo", "body_md": "must not echo",
             "attachments": ["must not echo"], "deliveries": ["must not echo"]
@@ -41866,6 +41936,7 @@ mod mail_server_cli_bridge_tests {
             assert_eq!(bridged["id"], 42);
             assert_eq!(bridged["message_id"], 42);
             assert_eq!(bridged["verified_sender"], true);
+            assert_eq!(bridged["sender_display_name"], "SPX Maintainer");
             assert_eq!(bridged["idempotent_replay"], true);
             assert_eq!(bridged.get("reply_to").is_some(), reply);
             for forbidden in ["subject", "body_md", "attachments", "deliveries", "to"] {
@@ -41889,6 +41960,8 @@ mod mail_server_cli_bridge_tests {
                 "id": 7,
                 "subject": "Inbox",
                 "from": "SwiftCardinal",
+                "sender_display_name": "Reviewer Ω",
+                "to_display_names": {"BlueLake": null},
                 "importance": "urgent",
                 "ack_required": true,
                 "created_ts": "2026-03-11T21:31:00Z",
@@ -41902,8 +41975,14 @@ mod mail_server_cli_bridge_tests {
             server_inbox_payload_to_cli_json(&payload, false).expect("bridge without body");
         assert_eq!(without_body.len(), 1);
         assert!(without_body[0].get("body_md").is_none());
+        assert_eq!(without_body[0]["sender_display_name"], "Reviewer Ω");
+        assert_eq!(
+            without_body[0]["to_display_names"],
+            serde_json::json!({"BlueLake": null})
+        );
 
         let with_body = server_inbox_payload_to_cli_json(&payload, true).expect("bridge with body");
+        assert_eq!(with_body[0]["sender_display_name"], "Reviewer Ω");
         assert_eq!(
             with_body[0].get("body_md").and_then(|v| v.as_str()),
             Some("Visible body")
@@ -41931,6 +42010,9 @@ mod mail_server_cli_bridge_tests {
         let bridged =
             server_inbox_payload_to_cli_json(&payload, true).expect("bridge wrapped inbox");
         assert_eq!(bridged.len(), 1);
+        assert!(bridged[0].get("sender_display_name").is_some());
+        assert_eq!(bridged[0]["sender_display_name"], serde_json::Value::Null);
+        assert_eq!(bridged[0]["to_display_names"], serde_json::json!({}));
         assert_eq!(
             bridged[0].get("subject").and_then(|v| v.as_str()),
             Some("Wrapped inbox")
@@ -41939,6 +42021,161 @@ mod mail_server_cli_bridge_tests {
             bridged[0].get("body_md").and_then(|v| v.as_str()),
             Some("Wrapped body")
         );
+    }
+
+    #[test]
+    fn direct_mail_inbox_preserves_current_labels_and_primary_recipient_privacy() {
+        let temp = tempfile::tempdir().expect("isolated inbox store");
+        let database_path = temp.path().join("mailbox.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        super::handle_migrate_with_database_url(&database_url).expect("migrate isolated store");
+        let conn = mcp_agent_mail_db::DbConn::open_file(database_path.display().to_string())
+            .expect("open migrated store");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'label-test', '/tmp/label-test', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, display_name)
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 0, 0, 'Reviewer Ω'),
+                    (2, 1, 'GreenStone', 'test', 'test', 0, 0, 'Reviewer Ω'),
+                    (3, 1, 'ScarletGoose', 'test', 'test', 0, 0, 'Private label')",
+        )
+        .expect("insert identities");
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments)
+             VALUES (42, 1, 1, 'Label test', 'body', 'normal', 0, 10,
+                     '{\"to\":[\"GreenStone\"],\"bcc\":[\"ScarletGoose\"]}', '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (42, 2, 'to'), (42, 3, 'bcc')",
+        )
+        .expect("insert routing relationships");
+        let display_names = mcp_agent_mail_db::sync::agent_display_names_from_conn(&conn, 1)
+            .expect("current profile labels");
+        let event_page = super::inbox_events_page_from_direct(
+            mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(&conn, 1, 2, None, 20)
+                .expect("real durable delivery events"),
+            false,
+            &display_names,
+        );
+        assert_eq!(event_page.events[0]["message_id"], 42);
+        assert_eq!(event_page.events[0]["from"], "BlueLake");
+        assert_eq!(event_page.events[0]["sender_display_name"], "Reviewer Ω");
+        assert_eq!(
+            event_page.events[0]["to_display_names"],
+            serde_json::json!({"GreenStone": "Reviewer Ω"})
+        );
+        assert!(event_page.events[0].get("body_md").is_none());
+        let check = super::check_inbox_direct_with_database_url(
+            &super::CheckInboxDirectConfig {
+                project_key: "/tmp/label-test".to_string(),
+                agent_name: "GreenStone".to_string(),
+                limit: 20,
+            },
+            &database_url,
+        )
+        .expect("direct inbox reminder metadata");
+        assert_eq!(check.messages[0].from, "BlueLake");
+        assert_eq!(
+            check.messages[0].sender_display_name.as_deref(),
+            Some("Reviewer Ω")
+        );
+        assert_eq!(
+            check.messages[0].raw["to_display_names"],
+            serde_json::json!({"GreenStone": "Reviewer Ω"})
+        );
+        let rpc = super::parse_fetch_inbox_rows(serde_json::json!([check.messages[0].raw]))
+            .expect("normalized RPC inbox reminder metadata");
+        assert_eq!(
+            rpc.messages[0].sender_display_name,
+            check.messages[0].sender_display_name
+        );
+        assert_eq!(
+            rpc.messages[0].to_display_names,
+            check.messages[0].to_display_names
+        );
+        for include_bodies in [false, true] {
+            let inbox = super::fetch_mail_inbox_direct_with_database_url(
+                &database_url,
+                "/tmp/label-test",
+                "GreenStone",
+                false,
+                None,
+                20,
+                include_bodies,
+            )
+            .expect("direct native inbox");
+            assert_eq!(inbox[0]["id"], 42);
+            assert_eq!(inbox[0]["from"], "BlueLake");
+            assert_eq!(inbox[0]["sender_display_name"], "Reviewer Ω");
+            assert_eq!(
+                inbox[0]["to_display_names"],
+                serde_json::json!({"GreenStone": "Reviewer Ω"})
+            );
+            assert_eq!(inbox[0].get("body_md").is_some(), include_bodies);
+        }
+        conn.execute_raw("UPDATE agents SET display_name = NULL WHERE id = 1")
+            .expect("clear sender label");
+        let cleared = super::fetch_mail_inbox_direct_with_database_url(
+            &database_url,
+            "/tmp/label-test",
+            "GreenStone",
+            false,
+            None,
+            20,
+            false,
+        )
+        .expect("inbox after clearing label");
+        assert_eq!(cleared[0]["id"], 42);
+        assert_eq!(cleared[0]["from"], "BlueLake");
+        assert!(cleared[0].get("sender_display_name").is_some());
+        assert_eq!(cleared[0]["sender_display_name"], serde_json::Value::Null);
+        for label in [Some("Officer Alpha"), None] {
+            conn.query_sync(
+                "UPDATE agents SET display_name = ? WHERE id = 2",
+                &[
+                    label.map_or(mcp_agent_mail_db::sqlmodel_core::Value::Null, |label| {
+                        mcp_agent_mail_db::sqlmodel_core::Value::Text(label.to_string())
+                    }),
+                ],
+            )
+            .expect("rename or clear primary recipient label");
+            let inbox = super::fetch_mail_inbox_direct_with_database_url(
+                &database_url,
+                "/tmp/label-test",
+                "GreenStone",
+                false,
+                None,
+                20,
+                false,
+            )
+            .expect("existing inbox after recipient label change");
+            assert_eq!(inbox[0]["id"], 42);
+            assert_eq!(
+                inbox[0]["to_display_names"],
+                serde_json::json!({"GreenStone": label})
+            );
+            let events = super::inbox_events_page_from_direct(
+                mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(&conn, 1, 2, None, 20)
+                    .expect("existing delivery event after label change"),
+                false,
+                &mcp_agent_mail_db::sync::agent_display_names_from_conn(&conn, 1)
+                    .expect("current recipient profile labels"),
+            );
+            assert_eq!(events.events[0]["message_id"], 42);
+            assert_eq!(events.events[0]["cursor"], event_page.events[0]["cursor"]);
+            assert_eq!(
+                events.events[0]["sender_display_name"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                events.events[0]["to_display_names"],
+                serde_json::json!({"GreenStone": label})
+            );
+            assert_eq!(events.next_cursor, event_page.next_cursor);
+        }
     }
 
     #[test]
@@ -50851,6 +51088,8 @@ pub struct CheckInboxMessage {
     pub id: i64,
     pub subject: String,
     pub from: String,
+    pub sender_display_name: Option<String>,
+    pub to_display_names: std::collections::BTreeMap<String, Option<String>>,
     pub importance: String,
     pub created_ts: String,
     pub raw: serde_json::Value,
@@ -52118,6 +52357,15 @@ fn parse_fetch_inbox_rows(result_payload: serde_json::Value) -> CliResult<CheckI
                 .unwrap_or_default()
                 .to_string(),
             from,
+            sender_display_name: row
+                .get("sender_display_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            to_display_names: row
+                .get("to_display_names")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             importance,
             created_ts: row
                 .get("created_ts")
@@ -52408,6 +52656,7 @@ async fn fetch_inbox_events_via_jsonrpc_with_fallback(
 fn inbox_events_page_from_direct(
     page: mcp_agent_mail_db::sync::InboxDeliveryEventPage,
     position_now: bool,
+    display_names: &std::collections::BTreeMap<String, Option<String>>,
 ) -> InboxEventsPage {
     let events = if position_now {
         Vec::new()
@@ -52422,6 +52671,8 @@ fn inbox_events_page_from_direct(
                     "delivered_ts": format_micros_as_iso(event.delivered_ts),
                     "subject": event.subject,
                     "from": event.sender_name,
+                    "sender_display_name": event.sender_display_name,
+                    "to_display_names": inbox_visible_to_display_names(&event.recipients_json, display_names),
                     "importance": event.importance,
                     "ack_required": event.ack_required,
                 })
@@ -52463,7 +52714,18 @@ fn inbox_events_direct(
         config.limit,
     );
     match page {
-        Ok(page) => Ok(inbox_events_page_from_direct(page, config.position_now)),
+        Ok(page) => {
+            let display_names =
+                mcp_agent_mail_db::sync::agent_display_names_from_conn(read_db.conn(), project.id)
+                    .map_err(|error| {
+                        InboxEventsReadError::Other(CliError::Other(error.to_string()))
+                    })?;
+            Ok(inbox_events_page_from_direct(
+                page,
+                config.position_now,
+                &display_names,
+            ))
+        }
         Err(mcp_agent_mail_db::sync::InboxDeliveryEventError::CursorExpired {
             after,
             oldest_available,
@@ -52548,14 +52810,21 @@ fn validate_mail_inbox_limit(limit: i64) -> CliResult<usize> {
 /// This bypasses the HTTP/MCP server and queries the database directly,
 /// which is faster and works even when the server is not running.
 pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInboxRpcResult> {
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    check_inbox_direct_with_database_url(config, &database_url)
+}
+
+fn check_inbox_direct_with_database_url(
+    config: &CheckInboxDirectConfig,
+    database_url: &str,
+) -> CliResult<CheckInboxRpcResult> {
     if config.limit < 1 {
         return Err(CliError::InvalidArgument(
             "check-inbox limit must be at least 1".to_string(),
         ));
     }
 
-    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(database_url)?;
     let project_id = crate::context::resolve_project(read_db.conn(), &config.project_key)?.id;
     let agent_id =
         resolve_agent_id_for_inbox_check(read_db.conn(), project_id, &config.agent_name)?;
@@ -52572,6 +52841,9 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
     )
     .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
 
+    let display_names =
+        mcp_agent_mail_db::sync::agent_display_names_from_conn(read_db.conn(), project_id)
+            .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
     let mut messages = Vec::with_capacity(rows.len());
     let mut urgent_or_high_count = 0usize;
 
@@ -52592,6 +52864,8 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
             "id": id,
             "subject": &subject,
             "from": &from,
+            "sender_display_name": row.sender_display_name,
+            "to_display_names": inbox_visible_to_display_names(&row.message.recipients_json, &display_names),
             "importance": &importance,
             "created_ts": created_ts,
         });
@@ -52599,6 +52873,11 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
             id,
             subject,
             from,
+            sender_display_name: row.sender_display_name.clone(),
+            to_display_names: inbox_visible_to_display_names(
+                &row.message.recipients_json,
+                &display_names,
+            ),
             importance,
             created_ts: created_ts_str,
             raw,
@@ -52650,12 +52929,17 @@ fn fetch_mail_inbox_direct_with_database_url(
     }
     .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
 
+    let display_names =
+        mcp_agent_mail_db::sync::agent_display_names_from_conn(read_db.conn(), project.id)
+            .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
     let mut data = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut value = serde_json::json!({
             "id": row.message.id.unwrap_or(0),
             "subject": row.message.subject.clone(),
             "from": row.sender_name.clone(),
+            "sender_display_name": row.sender_display_name,
+            "to_display_names": inbox_visible_to_display_names(&row.message.recipients_json, &display_names),
             "importance": row.message.importance.clone(),
             "ack_required": row.message.ack_required != 0,
             "created_ts": mcp_agent_mail_db::micros_to_iso(
@@ -52689,10 +52973,10 @@ fn render_mail_inbox_output(
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0)
                     .to_string(),
-                row.get("from")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                mcp_agent_mail_core::models::format_agent_label(
+                    row.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
+                    row.get("sender_display_name").and_then(|v| v.as_str()),
+                ),
                 truncate_str(
                     row.get("subject")
                         .and_then(|v| v.as_str())
@@ -54104,10 +54388,14 @@ async fn handle_products_with(
                         asupersync::Outcome::Ok(v) => v,
                         _ => continue,
                     };
+                    let display_names = outcome_to_result(
+                        mcp_agent_mail_db::queries::list_agent_display_names(cx, pool, project_id)
+                            .await,
+                    )?;
                     for row in rows {
                         let id = row.message.id.unwrap_or(0);
                         let created_ts = row.message.created_ts;
-                        let obj = product_inbox_row_to_json(&row, include_bodies);
+                        let obj = product_inbox_row_to_json(&row, include_bodies, &display_names);
                         merged.push((created_ts, id, obj));
                     }
                 }
