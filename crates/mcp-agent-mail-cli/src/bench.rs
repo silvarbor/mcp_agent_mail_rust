@@ -1,4 +1,4 @@
-//! Benchmark domain models for the `am bench` foundation.
+//! Benchmark commands and domain models for `am bench`.
 //!
 //! This module provides typed contracts for benchmark configuration, execution
 //! results, summary aggregation, and deterministic fixture identity.
@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -16,6 +16,8 @@ use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::sqlmodel::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::{CliError, CliResult, open_db_sync_with_database_url, output};
 
 /// Current JSON schema version for benchmark summary artifacts.
 pub const BENCH_SCHEMA_VERSION: u32 = 1;
@@ -1348,6 +1350,328 @@ pub fn fixture_signature(
     hasher.update(material.as_bytes());
     let digest = hasher.finalize();
     hex::encode(digest)[..16].to_string()
+}
+
+const BENCH_DEFAULT_REGRESSION_THRESHOLD: f64 = 0.10;
+
+#[derive(Debug, Serialize)]
+struct BenchRunFailure {
+    name: String,
+    command: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchRunReport {
+    summary: BenchSummary,
+    profile: BenchProfile,
+    warmup: u32,
+    runs: u32,
+    filter: Option<String>,
+    baseline_path: Option<String>,
+    save_baseline_path: Option<String>,
+    seed_report: Option<BenchSeedReport>,
+    skipped: Vec<String>,
+    failures: Vec<BenchRunFailure>,
+    regression_count: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn handle_bench(
+    quick: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    baseline: Option<PathBuf>,
+    save_baseline: Option<PathBuf>,
+    filter: Option<String>,
+    list: bool,
+    warmup_override: Option<u32>,
+    runs_override: Option<u32>,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let profile = if quick {
+        BenchProfile::Quick
+    } else {
+        BenchProfile::Normal
+    };
+    let warmup = warmup_override.unwrap_or(profile.warmup());
+    let runs = runs_override.unwrap_or(profile.runs());
+    if warmup == 0 {
+        return Err(CliError::InvalidArgument(
+            "--warmup must be greater than zero".to_string(),
+        ));
+    }
+    if runs == 0 {
+        return Err(CliError::InvalidArgument(
+            "--runs must be greater than zero".to_string(),
+        ));
+    }
+
+    let filter_pattern = if let Some(raw) = filter.as_deref() {
+        Some(glob::Pattern::new(raw).map_err(|err| {
+            CliError::InvalidArgument(format!("invalid --filter pattern '{raw}': {err}"))
+        })?)
+    } else {
+        None
+    };
+
+    let mut configs: Vec<BenchConfig> = DEFAULT_BENCHMARKS
+        .iter()
+        .map(|definition| definition.to_config(profile))
+        .collect();
+    for cfg in &mut configs {
+        cfg.warmup = warmup;
+        cfg.runs = runs;
+    }
+    configs.retain(|cfg| {
+        filter_pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches(&cfg.name))
+    });
+    if configs.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "no benchmarks matched the current --filter".to_string(),
+        ));
+    }
+
+    if list {
+        let payload: Vec<serde_json::Value> = configs
+            .iter()
+            .map(|cfg| {
+                serde_json::json!({
+                    "name": cfg.name,
+                    "category": cfg.category,
+                    "command": cfg.command,
+                    "warmup": cfg.warmup,
+                    "runs": cfg.runs,
+                    "requires_seeded_db": cfg.requires_seeded_db,
+                    "conditional": cfg.conditional,
+                    "condition": cfg.condition,
+                    "env": cfg.env,
+                })
+            })
+            .collect();
+        output::emit_output(&payload, fmt, || {
+            ftui_runtime::ftui_println!(
+                "Benchmarks (profile={:?}, warmup={warmup}, runs={runs}):",
+                profile
+            );
+            for cfg in &configs {
+                ftui_runtime::ftui_println!(
+                    "- {:<16} {:<12} {}",
+                    cfg.name,
+                    format!("{:?}", cfg.category),
+                    cfg.command.join(" ")
+                );
+            }
+        });
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| CliError::Other(format!("failed to read current directory: {err}")))?;
+    let executable = std::env::current_exe()
+        .map_err(|err| CliError::Other(format!("failed to resolve current executable: {err}")))?;
+    let executable = executable.to_string_lossy().into_owned();
+    let hardware = HardwareInfo::detect();
+
+    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
+    let mut bench_env = std::collections::BTreeMap::new();
+    let mut seed_report = None;
+    let mut temp_workspace: Option<tempfile::TempDir> = None;
+    if needs_seeded_db {
+        let workspace_override = std::env::var_os("AM_BENCH_WORKSPACE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let workspace_path = if let Some(path) = workspace_override {
+            std::fs::create_dir_all(&path).map_err(|err| {
+                CliError::Other(format!("failed to create bench workspace: {err}"))
+            })?;
+            path
+        } else {
+            let workspace = tempfile::tempdir().map_err(|err| {
+                CliError::Other(format!("failed to create temp workspace: {err}"))
+            })?;
+            let path = workspace.path().to_path_buf();
+            temp_workspace = Some(workspace);
+            path
+        };
+        let db_path = workspace_path.join("bench.sqlite3");
+        let storage_root = workspace_path.join("archive");
+        std::fs::create_dir_all(&storage_root).map_err(|err| {
+            CliError::Other(format!("failed to create bench archive root: {err}"))
+        })?;
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let conn = open_db_sync_with_database_url(&database_url)?;
+        let report = seed_bench_database(&conn, false)
+            .map_err(|err| CliError::Other(format!("benchmark seed failed: {err}")))?;
+        bench_env.insert("DATABASE_URL".to_string(), database_url);
+        bench_env.insert(
+            "STORAGE_ROOT".to_string(),
+            storage_root.to_string_lossy().into_owned(),
+        );
+        seed_report = Some(report);
+    }
+
+    let condition_context = BenchConditionContext {
+        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
+        seeded_database_available: needs_seeded_db,
+    };
+    let mut summary = BenchSummary::new(hardware.clone());
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    for cfg in &configs {
+        cfg.validate().map_err(|err| {
+            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
+        })?;
+        if !cfg.enabled_for(condition_context) {
+            skipped.push(cfg.name.clone());
+            continue;
+        }
+        let mut command = vec![executable.clone()];
+        command.extend(cfg.command.iter().cloned());
+        let command_display = command.join(" ");
+        let params_json = serde_json::json!({
+            "warmup": cfg.warmup,
+            "runs": cfg.runs,
+            "requires_seeded_db": cfg.requires_seeded_db,
+            "conditional": cfg.conditional,
+            "env": cfg.env,
+        })
+        .to_string();
+        let signature = fixture_signature(&cfg.name, &command_display, &params_json, &hardware);
+        let mut benchmark_env = bench_env.clone();
+        benchmark_env.extend(cfg.env.clone());
+        match run_timed(&command, cfg.warmup, cfg.runs, &benchmark_env, Some(&cwd)) {
+            Ok(timing) => match BenchResult::from_samples(
+                cfg.name.clone(),
+                command_display,
+                &timing.samples_seconds,
+                signature,
+                None,
+            ) {
+                Ok(result) => summary.insert(result),
+                Err(err) => failures.push(BenchRunFailure {
+                    name: cfg.name.clone(),
+                    command: command.join(" "),
+                    error: err.to_string(),
+                }),
+            },
+            Err(err) => failures.push(BenchRunFailure {
+                name: cfg.name.clone(),
+                command: command.join(" "),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if summary.benchmarks.is_empty() {
+        return Err(CliError::Other(
+            "no benchmarks completed successfully; check failure diagnostics".to_string(),
+        ));
+    }
+
+    let baseline_data = if let Some(path) = baseline.as_ref() {
+        Some(
+            load_baseline(path)
+                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))?,
+        )
+    } else {
+        None
+    };
+    if let Some(data) = baseline_data.as_ref() {
+        apply_baseline_comparison(
+            &mut summary.benchmarks,
+            data,
+            BENCH_DEFAULT_REGRESSION_THRESHOLD,
+        );
+    }
+    if let Some(path) = save_baseline.as_ref() {
+        self::save_baseline(&summary.benchmarks, path)
+            .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
+    }
+
+    let regression_count = summary
+        .benchmarks
+        .values()
+        .filter(|result| result.baseline.regression)
+        .count();
+    let report = BenchRunReport {
+        summary,
+        profile,
+        warmup,
+        runs,
+        filter: filter.clone(),
+        baseline_path: baseline.map(|path| path.to_string_lossy().into_owned()),
+        save_baseline_path: save_baseline.map(|path| path.to_string_lossy().into_owned()),
+        seed_report,
+        skipped,
+        failures,
+        regression_count,
+    };
+
+    let results_dir = PathBuf::from("benches/results");
+    std::fs::create_dir_all(&results_dir)
+        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
+    let report_path = results_dir.join(format!("summary_{}.json", report.summary.timestamp));
+    let encoded = serde_json::to_string_pretty(&report)
+        .map_err(|err| CliError::Other(format!("failed to encode bench report: {err}")))?;
+    std::fs::write(&report_path, &encoded)
+        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+
+    output::emit_output(&report, fmt, || {
+        ftui_runtime::ftui_println!(
+            "[bench] profile={:?} warmup={} runs={}",
+            report.profile,
+            report.warmup,
+            report.runs
+        );
+        ftui_runtime::ftui_println!(
+            "{:<18} {:>9} {:>9} {:>9} {:>12}",
+            "Benchmark",
+            "Mean",
+            "P95",
+            "P99",
+            "Baseline Δ"
+        );
+        for result in report.summary.benchmarks.values() {
+            let delta = result
+                .baseline
+                .delta_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:+.2}ms"));
+            ftui_runtime::ftui_println!(
+                "{:<18} {:>7.2}ms {:>7.2}ms {:>7.2}ms {:>12}",
+                result.name,
+                result.mean_ms,
+                result.p95_ms,
+                result.p99_ms,
+                delta
+            );
+        }
+        if !report.skipped.is_empty() {
+            ftui_runtime::ftui_println!("skipped: {}", report.skipped.join(", "));
+        }
+        if !report.failures.is_empty() {
+            ftui_runtime::ftui_eprintln!("benchmark failures:");
+            for failure in &report.failures {
+                ftui_runtime::ftui_eprintln!(
+                    "- {} [{}]: {}",
+                    failure.name,
+                    failure.command,
+                    failure.error
+                );
+            }
+        }
+        ftui_runtime::ftui_println!("report: {}", report_path.display());
+    });
+
+    let _ = temp_workspace;
+    if !report.failures.is_empty() {
+        return Err(CliError::ExitCode(BenchExitCode::RuntimeError.code()));
+    }
+    if report.regression_count > 0 {
+        return Err(CliError::ExitCode(BenchExitCode::RegressionDetected.code()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
