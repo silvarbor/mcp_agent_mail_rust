@@ -164,13 +164,18 @@ fn try_generate_age_identity(dir: &Path) -> Option<(PathBuf, String)> {
     if !out.status.success() {
         return None;
     }
-    let combined =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    let recipient = combined
-        .lines()
-        .find(|line| line.contains("public key:"))
-        .and_then(|line| line.split_whitespace().last())
-        .map(|s| s.to_string())?;
+    let out = Command::new("age-keygen")
+        .arg("-y")
+        .arg(&identity_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let recipient = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if recipient.is_empty() {
+        return None;
+    }
     Some((identity_path, recipient))
 }
 
@@ -194,6 +199,9 @@ fn share_decrypt_roundtrip_identity_default_output() {
         }
     };
 
+    let original_input = dir.path().join("original-bundle.zip");
+    std::fs::rename(&input, &original_input).expect("preserve original before decryption");
+
     // Omit -o to exercise default output path behavior.
     let out = run_am(&[
         "share",
@@ -215,7 +223,7 @@ fn share_decrypt_roundtrip_identity_default_output() {
         "expected output at {}",
         output_path.display()
     );
-    let original = std::fs::read(&input).expect("read original");
+    let original = std::fs::read(&original_input).expect("read original");
     let decrypted = std::fs::read(&output_path).expect("read decrypted");
     assert_eq!(original, decrypted);
 }

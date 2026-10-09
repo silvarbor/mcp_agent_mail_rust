@@ -498,6 +498,10 @@ impl TestEnv {
             ),
             ("HOME".to_string(), self.home_dir.display().to_string()),
             (
+                "TMPDIR".to_string(),
+                std::env::temp_dir().display().to_string(),
+            ),
+            (
                 "XDG_CONFIG_HOME".to_string(),
                 self.home_dir.join(".config").display().to_string(),
             ),
@@ -979,6 +983,28 @@ fn assert_json_snapshot(env: &TestEnv, case: &str, cwd: Option<&Path>, args: &[&
 
     match read_fixture(&fixture_path) {
         Some(expected_raw) => {
+            // The fixture records Linux's warning for an absent listener.
+            // Other platforms explicitly skip the /proc-only descriptor
+            // probe, so expect its successful skip and one fewer warning.
+            #[cfg(not(target_os = "linux"))]
+            let expected_raw = if case == "doctor_check" {
+                let mut expected: Value =
+                    serde_json::from_str(&expected_raw).expect("doctor fixture JSON");
+                let descriptor = expected["checks"]
+                    .as_array_mut()
+                    .expect("doctor fixture checks")
+                    .iter_mut()
+                    .find(|check| check["check"] == "server_descriptors")
+                    .expect("doctor descriptor check");
+                descriptor["status"] = Value::String("ok".to_string());
+                expected["diagnostic_payload"]["finding_counts"]["total"] = 17.into();
+                expected["diagnostic_payload"]["finding_counts"]["warning"] = 17.into();
+                expected["summary"]["category_breakdown"]["live_incident_findings"] = 6.into();
+                expected["summary"]["secondary_warning_count"] = 16.into();
+                format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
+            } else {
+                expected_raw
+            };
             if expected_raw == actual {
                 return;
             }

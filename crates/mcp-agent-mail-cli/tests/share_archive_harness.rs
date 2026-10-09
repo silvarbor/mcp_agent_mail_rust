@@ -226,6 +226,8 @@ fn native_share_archive_transport_gate() {
     cmd.current_dir(&repo)
         .arg(suite_spec.adapter_script)
         .env("E2E_PROJECT_ROOT", &repo)
+        // The adapter selects an isolated port; offline CLI tests can inherit 1.
+        .env_remove("HTTP_PORT")
         .env(
             "E2E_SERVER_START_TIMEOUT_SECONDS",
             std::env::var("E2E_SERVER_START_TIMEOUT_SECONDS").unwrap_or_else(|_| "60".to_string()),

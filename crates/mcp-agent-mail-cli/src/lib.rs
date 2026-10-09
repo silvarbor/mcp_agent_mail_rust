@@ -19585,6 +19585,13 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
 fn run_file_reservations_mutation(
     action: &FileReservationsCommand,
 ) -> CliResult<serde_json::Value> {
+    if let FileReservationsCommand::Reserve { project, .. } = action
+        && parse_unknown_project_placeholder(project.trim()).is_some()
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "cannot reserve files for orphaned project {project}; restore its project identity first"
+        )));
+    }
     if let Some(payload) = try_proxy_file_reservations_mutation(action)? {
         return Ok(payload);
     }
@@ -52326,7 +52333,7 @@ http_headers = { Authorization = "Bearer secret" }
     #[cfg(target_os = "macos")]
     #[test]
     fn hardened_directory_walkers_accept_macos_system_temp_alias() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in("/var/tmp").expect("macOS system tempdir");
 
         assert!(
             dir.path().starts_with("/var") || dir.path().starts_with("/private/var"),
@@ -94420,7 +94427,7 @@ fn update_check_cache_ignores_symlinked_cache_file() {
     let home_text = home.to_string_lossy().to_string();
 
     mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-        &[("HOME", home_text.as_str())],
+        &[("HOME", home_text.as_str()), ("XDG_CACHE_HOME", "")],
         || {
             let cache_path = update_check_cache_path();
             let outside = temp.path().join("outside-update-cache.json");
@@ -95039,16 +95046,18 @@ fn try_generate_age_recipient(dir: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    combined
-        .lines()
-        .find(|line| line.contains("public key:"))
-        .and_then(|line| line.split_whitespace().last())
-        .map(str::to_string)
+    let output = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg(&identity_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|recipient| recipient.trim().to_string())
+        .filter(|recipient| !recipient.is_empty())
 }
 
 #[test]

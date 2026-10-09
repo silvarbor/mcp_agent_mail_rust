@@ -3337,7 +3337,6 @@ mod tests {
             assert!(error.to_string().contains("not valid UTF-8"));
         }
         let non_unicode_base = root.path().join(&raw);
-        fs::create_dir(&non_unicode_base).unwrap();
         let error = normalize_explicit_legacy_path(
             "DATABASE_URL",
             Path::new("relative.sqlite3"),
