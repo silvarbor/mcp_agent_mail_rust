@@ -2530,7 +2530,10 @@ mod tests {
                     assert_eq!(messages[0]["from"], "BlueLake");
                     assert!(messages[0].get("sender_display_name").is_some());
                     assert!(messages[0]["sender_display_name"].is_null());
-                    assert_eq!(messages[0]["to_display_names"], json!({"RedPeak": null}));
+                    assert_eq!(
+                        messages[0]["to_display_names"],
+                        serde_json::json!({"RedPeak": null})
+                    );
                     assert_eq!(
                         messages[0]["project_id"].as_i64(),
                         Some(healthy_project.id.unwrap_or(0))
@@ -2571,7 +2574,7 @@ mod tests {
                     assert_eq!(labeled[0]["sender_display_name"], "Reviewer");
                     assert_eq!(
                         labeled[0]["to_display_names"],
-                        json!({"RedPeak": "Reviewer"})
+                        serde_json::json!({"RedPeak": "Reviewer"})
                     );
                     assert!(labeled[0].get("body_md").is_none());
                 });
