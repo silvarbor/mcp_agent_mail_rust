@@ -16,7 +16,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="flex flex-col page-transition" x-data="unifiedInboxManager()" x-init="init()">
+<div class="flex flex-col page-transition" x-data="unifiedInboxManager()">
 
   <!-- Fullscreen Backdrop -->
   <div x-show="isFullscreen"
@@ -32,10 +32,10 @@
   </div>
 
   <!-- Gmail-style Search Header -->
-  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 flex items-center gap-4 sticky top-16 shadow-sm transition-all duration-300"
+  <div class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-4 sm:px-6 py-4 flex flex-wrap items-center gap-4 xl:sticky xl:top-16 shadow-sm transition-all duration-300"
        :class="isFullscreen ? 'z-50' : 'z-10'">
     <!-- Search Bar -->
-    <div class="flex-1 relative group">
+    <div class="flex-1 min-w-0 basis-full xl:basis-0 relative group">
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
         <i data-lucide="search" class="w-5 h-5 text-slate-400 group-focus-within:text-primary-500 transition-colors"></i>
       </div>
@@ -106,7 +106,7 @@
       <span>Static export snapshot</span>
     </div>
     {% else %}
-    <div class="flex items-center gap-3">
+    <div class="flex flex-wrap items-center gap-3 min-w-0 max-w-full">
       <button @click="fetchLatestMessages()"
               class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-2 transition-all duration-200 hover:border-primary-300 dark:hover:border-primary-700 hover:text-primary-700 dark:hover:text-primary-400"
               :aria-busy="isRefreshing"
@@ -116,7 +116,7 @@
            :class="isRefreshing ? 'animate-spin text-primary-500' : 'text-slate-500 dark:text-slate-400'"></i>
         <span class="hidden xl:inline">Refresh</span>
       </button>
-      <div class="flex flex-col">
+      <div class="flex flex-col min-w-0 break-words">
         <span class="text-xs font-medium text-slate-500 dark:text-slate-400" x-text="lastRefreshLabel"></span>
         <template x-if="refreshError">
           <span class="text-xs text-rose-500" x-text="refreshError"></span>
@@ -148,7 +148,7 @@
        x-transition:leave="transition ease-in duration-150"
        x-transition:leave-start="opacity-100 translate-y-0"
        x-transition:leave-end="opacity-0 -translate-y-2"
-       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 sticky top-40 transition-all duration-300"
+       class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 px-6 py-4 xl:sticky xl:top-40 transition-all duration-300"
        :class="isFullscreen ? 'z-50' : 'z-10'">
     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
       <!-- Project Filter -->
@@ -170,7 +170,7 @@
                 class="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent">
           <option value="">All Senders</option>
           <template x-for="sender in uniqueSenders" :key="sender">
-            <option :value="sender" x-text="sender"></option>
+            <option :value="sender" x-text="senderFilterLabel(sender)"></option>
           </template>
         </select>
       </div>
@@ -182,7 +182,7 @@
                 class="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent">
           <option value="">All Recipients</option>
           <template x-for="recip in uniqueRecipients" :key="recip">
-            <option :value="recip" x-text="recip"></option>
+            <option :value="recip" x-text="recipientFilterLabel(recip)"></option>
           </template>
         </select>
       </div>
@@ -308,7 +308,7 @@
       <div class="flex-1 overflow-y-auto">
         <template x-if="filteredMessages.length > 0">
           <div>
-            <template x-for="(msg, index) in filteredMessages" :key="msg.id">
+            <template x-for="(msg, index) in pagedMessages" :key="msg.id">
               <!-- Gmail-style Message Item -->
               <div @click="handleMessageClick(msg)"
                    @keydown.enter="handleMessageClick(msg)"
@@ -322,7 +322,7 @@
                    :style="`animation-delay: ${Math.min(index * 0.02, 0.5)}s;`"
                    tabindex="0"
                    role="button"
-                   :aria-label="'Message from ' + msg.sender + ': ' + msg.subject">
+                   :aria-label="'Message from ' + (msg.sender_label || msg.sender) + ': ' + msg.subject">
 
                 <div class="flex items-start gap-3">
                   <!-- Checkbox -->
@@ -336,10 +336,10 @@
                   <!-- Message Content -->
                   <div class="flex-1 min-w-0">
                     <!-- Sender → Recipients -->
-                    <div class="flex items-center gap-2 mb-1">
-                      <span class="text-sm font-semibold text-slate-900 dark:text-white truncate" x-text="msg.sender"></span>
+                    <div class="flex items-start gap-2 mb-1 min-w-0">
+                      <span class="flex-1 min-w-0 text-sm font-semibold text-slate-900 dark:text-white break-words" x-text="msg.sender_label || msg.sender"></span>
                       <i data-lucide="arrow-right" class="w-3 h-3 text-slate-400 flex-shrink-0"></i>
-                      <span class="text-sm text-slate-600 dark:text-slate-400 truncate" x-text="msg.recipients"></span>
+                      <span class="flex-1 min-w-0 text-sm text-slate-600 dark:text-slate-400 break-words" x-text="msg.recipients_label || msg.recipients"></span>
                     </div>
 
                     <!-- Badges Row -->
@@ -412,6 +412,11 @@
           </div>
         </template>
       </div>
+      <div x-show="filteredMessages.length > 0" class="flex items-center justify-between gap-2 px-4 py-3 border-t border-slate-200 dark:border-slate-700 text-sm">
+        <button @click="messagePage--" :disabled="messagePage === 0" class="px-3 py-2 rounded-lg border disabled:opacity-40">Previous</button>
+        <span x-text="`${messagePage * pageSize + 1}–${Math.min((messagePage + 1) * pageSize, filteredMessages.length)} of ${filteredMessages.length}`"></span>
+        <button @click="messagePage++" :disabled="(messagePage + 1) * pageSize >= filteredMessages.length" class="px-3 py-2 rounded-lg border disabled:opacity-40">Next</button>
+      </div>
     </aside>
 
     <!-- Right Pane: Message Detail (Split View Only) -->
@@ -443,36 +448,36 @@
               <!-- Metadata Grid -->
               <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-6 border-t border-slate-200 dark:border-slate-700">
                 <!-- From -->
-                <div class="flex items-center gap-3">
-                  <div class="w-10 h-10 bg-gradient-to-br from-success-500 to-success-700 rounded-xl flex items-center justify-center shadow-medium">
+                <div class="flex items-center gap-3 min-w-0">
+                  <div class="w-10 h-10 shrink-0 bg-gradient-to-br from-success-500 to-success-700 rounded-xl flex items-center justify-center shadow-medium">
                     <i data-lucide="user" class="w-5 h-5 text-white"></i>
                   </div>
-                  <div>
+                  <div class="flex-1 min-w-0">
                     <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">From</div>
-                    <div class="text-sm font-semibold text-slate-900 dark:text-white" x-text="selectedMessage.sender"></div>
+                    <div class="text-sm font-semibold text-slate-900 dark:text-white break-words" x-text="selectedMessage.sender_label || selectedMessage.sender"></div>
                   </div>
                 </div>
 
                 <!-- To -->
-                <div class="flex items-center gap-3">
-                  <div class="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium">
+                <div class="flex items-center gap-3 min-w-0">
+                  <div class="w-10 h-10 shrink-0 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium">
                     <i data-lucide="users" class="w-5 h-5 text-white"></i>
                   </div>
-                  <div>
+                  <div class="flex-1 min-w-0">
                     <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">To</div>
-                    <div class="text-sm font-semibold text-slate-900 dark:text-white" x-text="selectedMessage.recipients"></div>
+                    <div class="text-sm font-semibold text-slate-900 dark:text-white break-words" x-text="selectedMessage.recipients_label || selectedMessage.recipients"></div>
                   </div>
                 </div>
 
                 <!-- Project -->
-                <div class="flex items-center gap-3">
-                  <div class="w-10 h-10 bg-gradient-to-br from-purple-500 to-purple-700 rounded-xl flex items-center justify-center shadow-medium">
+                <div class="flex items-center gap-3 min-w-0">
+                  <div class="w-10 h-10 shrink-0 bg-gradient-to-br from-purple-500 to-purple-700 rounded-xl flex items-center justify-center shadow-medium">
                     <i data-lucide="folder" class="w-5 h-5 text-white"></i>
                   </div>
-                  <div>
+                  <div class="flex-1 min-w-0">
                     <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">Project</div>
                     <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}`)"
-                       class="text-sm font-semibold text-primary-600 dark:text-primary-400 hover:underline"
+                       class="text-sm font-semibold text-primary-600 dark:text-primary-400 hover:underline break-all"
                        x-text="selectedMessage.project_name"></a>
                   </div>
                 </div>
@@ -668,6 +673,8 @@ function unifiedInboxManager() {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
     filteredMessages: [],
+    messagePage: 0,
+    pageSize: 50,
     selectedMessage: null,
     selectedMessages: [],
     searchQuery: '',
@@ -681,6 +688,9 @@ function unifiedInboxManager() {
     isRefreshing: false,
     lastRefreshTime: null,
     refreshError: null,
+    refreshFailures: 0,
+    refreshController: null,
+    destroyed: false,
 
     // Filters
     filters: {
@@ -692,6 +702,10 @@ function unifiedInboxManager() {
     },
 
     // Computed
+    get pagedMessages() {
+      return this.filteredMessages.slice(this.messagePage * this.pageSize, (this.messagePage + 1) * this.pageSize);
+    },
+
     get uniqueProjects() {
       return [...new Set(
         this.allMessages
@@ -725,6 +739,18 @@ function unifiedInboxManager() {
         });
       });
       return [...recipients].sort((a, b) => a.localeCompare(b));
+    },
+
+    senderFilterLabel(address) {
+      return [...new Set(this.allMessages
+        .filter(message => message.sender === address)
+        .map(message => message.sender_label || address))].join(' / ') || address;
+    },
+
+    recipientFilterLabel(address) {
+      return [...new Set(this.allMessages
+        .filter(message => message.recipient_names?.includes(address))
+        .map(message => message.recipient_labels?.[address] || address))].join(' / ') || address;
     },
 
     get filtersActive() {
@@ -762,7 +788,6 @@ function unifiedInboxManager() {
     },
 
     init() {
-      this.filteredMessages = [...this.allMessages];
       this.filterMessages();
       if (!staticExport) {
         this.lastRefreshTime = new Date();
@@ -825,23 +850,15 @@ function unifiedInboxManager() {
         }
       }
 
-      // Auto-select first message if in split view
-      if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
-        this.selectMessage(this.filteredMessages[0]);
-      }
-
       this.scheduleAutoRefresh();
+    },
 
-      // Return cleanup function for Alpine.js v3
-      return () => {
-        if (this._keydownHandler) {
-          document.removeEventListener('keydown', this._keydownHandler);
-        }
-        if (this.autoRefreshHandle) {
-          clearInterval(this.autoRefreshHandle);
-          this.autoRefreshHandle = null;
-        }
-      };
+    destroy() {
+      this.destroyed = true;
+      document.removeEventListener('keydown', this._keydownHandler);
+      clearTimeout(this.autoRefreshHandle);
+      this.autoRefreshHandle = null;
+      this.refreshController?.abort();
     },
 
     // Filtering
@@ -888,8 +905,8 @@ function unifiedInboxManager() {
         const query = this.searchQuery.toLowerCase();
         filtered = filtered.filter(msg => {
           const subject = (msg.subject ?? '').toString().toLowerCase();
-          const sender = (msg.sender ?? '').toString().toLowerCase();
-          const recipients = (msg.recipients ?? '').toString().toLowerCase();
+          const sender = (msg.sender_label || msg.sender || '').toString().toLowerCase();
+          const recipients = (msg.recipients_label || msg.recipients || '').toString().toLowerCase();
           const excerpt = (msg.excerpt ?? '').toString().toLowerCase();
           const projectName = (msg.project_name ?? '').toString().toLowerCase();
           return (
@@ -985,6 +1002,8 @@ function unifiedInboxManager() {
       }
 
       this.filteredMessages = filtered;
+      const selectionIndex = filtered.findIndex(msg => msg.id === this.selectedMessage?.id);
+      this.messagePage = selectionIndex >= 0 ? Math.floor(selectionIndex / this.pageSize) : 0;
 
       const visibleIds = new Set(filtered.map((msg) => msg.id));
       if (this.selectedMessages.length > 0) {
@@ -1002,12 +1021,7 @@ function unifiedInboxManager() {
         this.selectMessage(filtered[0]);
       }
 
-      // Re-render icons
-      this.$nextTick(() => {
-        if (typeof lucide !== 'undefined') {
-          lucide.createIcons();
-        }
-      });
+      // The shared placeholder observer initializes icons added by Alpine.
     },
 
     // Refresh helpers
@@ -1017,15 +1031,17 @@ function unifiedInboxManager() {
         return;
       }
       if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
+        clearTimeout(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
-      if (!this.autoRefreshEnabled) {
+      if (!this.autoRefreshEnabled || this.destroyed) {
         return;
       }
-      this.autoRefreshHandle = setInterval(() => {
+      const delay = Math.min(this.autoRefreshSeconds * 1000 * (2 ** this.refreshFailures), 300000);
+      this.autoRefreshHandle = setTimeout(() => {
+        this.autoRefreshHandle = null;
         this.fetchLatestMessages({ silent: true });
-      }, this.autoRefreshSeconds * 1000);
+      }, delay);
     },
 
     handleAutoRefreshToggle() {
@@ -1036,7 +1052,7 @@ function unifiedInboxManager() {
       if (this.autoRefreshEnabled) {
         this.scheduleAutoRefresh();
       } else if (this.autoRefreshHandle) {
-        clearInterval(this.autoRefreshHandle);
+        clearTimeout(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
     },
@@ -1057,11 +1073,16 @@ function unifiedInboxManager() {
         }
         return;
       }
-      if (this.isRefreshing) {
+      if (this.isRefreshing || this.destroyed) {
         return;
       }
       this.isRefreshing = true;
       this.refreshError = null;
+      clearTimeout(this.autoRefreshHandle);
+      this.autoRefreshHandle = null;
+      const controller = new AbortController();
+      this.refreshController = controller;
+      const requestTimeout = setTimeout(() => controller.abort(), 30000);
 
       const previouslySelectedId = this.selectedMessage?.id ?? null;
       const previouslySelectedSet = new Set(this.selectedMessages || []);
@@ -1076,21 +1097,41 @@ function unifiedInboxManager() {
         }
         const response = await fetch(window.agentMailAppendAuth(`/mail/api/unified-inbox?${params.toString()}`), {
           headers: { Accept: 'application/json' },
-          cache: 'no-store'
+          cache: 'no-store',
+          signal: controller.signal
         });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const payload = await response.json();
+        if (this.destroyed) return;
         const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
-
-        this.allMessages = incomingMessages;
-        this.filterMessages();
+        const previousById = new Map(this.allMessages.map(message => [message.id, message]));
+        const stableContent = message => JSON.stringify(Object.fromEntries(
+          Object.keys(message).filter(key => key !== 'created_relative' && key !== 'body_length')
+            .sort().map(key => [key, message[key]])
+        ));
+        const nextMessages = incomingMessages.map(message => {
+          const previous = previousById.get(message.id);
+          if (previous && stableContent(previous) === stableContent(message)) {
+            if (previous.created_relative !== message.created_relative) {
+              previous.created_relative = message.created_relative;
+            }
+            return previous;
+          }
+          return message;
+        });
+        const changed = nextMessages.length !== this.allMessages.length ||
+          nextMessages.some((message, index) => message !== this.allMessages[index]);
+        if (changed) {
+          this.allMessages = nextMessages;
+          this.filterMessages();
+        }
 
         if (previouslySelectedId) {
           const nextSelection = this.filteredMessages.find((m) => m.id === previouslySelectedId);
           if (nextSelection) {
-            this.selectMessage(nextSelection);
+            if (this.selectedMessage !== nextSelection) this.selectMessage(nextSelection);
           } else if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
             this.selectMessage(this.filteredMessages[0]);
           } else {
@@ -1100,30 +1141,33 @@ function unifiedInboxManager() {
           this.selectMessage(this.filteredMessages[0]);
         }
 
-        if (previouslySelectedSet.size > 0) {
+        if (changed && previouslySelectedSet.size > 0) {
           this.selectedMessages = this.filteredMessages
             .filter((m) => previouslySelectedSet.has(m.id))
             .map((m) => m.id);
-        } else if (this.selectedMessages.length > 0) {
+        } else if (changed && this.selectedMessages.length > 0) {
           this.selectedMessages = [];
         }
 
         this.lastRefreshTime = new Date();
+        this.refreshFailures = 0;
 
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Inbox refreshed', 'success');
         }
       } catch (error) {
+        if (this.destroyed) return;
+        this.refreshFailures++;
         console.error('Unified inbox refresh failed:', error);
         this.refreshError = 'Refresh failed. Retrying soon.';
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Failed to refresh inbox', 'error');
         }
       } finally {
+        clearTimeout(requestTimeout);
+        this.refreshController = null;
         this.isRefreshing = false;
-        if (!silent) {
-          this.scheduleAutoRefresh();
-        }
+        this.scheduleAutoRefresh();
       }
     },
 
@@ -1173,6 +1217,8 @@ function unifiedInboxManager() {
       }
 
       this.selectedMessage = msg;
+      const index = this.filteredMessages.findIndex(message => message.id === msg.id);
+      if (index >= 0) this.messagePage = Math.floor(index / this.pageSize);
 
       // Scroll message into view in left pane (for keyboard navigation)
       this.$nextTick(() => {
@@ -1223,9 +1269,6 @@ function unifiedInboxManager() {
                 }
                 setTimeout(() => {
                   button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
-                  if (typeof lucide !== 'undefined') {
-                    lucide.createIcons();
-                  }
                 }, 2000);
               } else {
                 // Fallback for browsers without clipboard API
@@ -1244,9 +1287,6 @@ function unifiedInboxManager() {
           wrapper.appendChild(button);
         });
 
-        if (typeof lucide !== 'undefined') {
-          lucide.createIcons();
-        }
       });
     },
 

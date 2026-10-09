@@ -6468,6 +6468,31 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
+/// Read profiles in one statement for cross-project inbox views, including
+/// historical sender identities. Ordering matches `list_agents`' selection.
+pub async fn list_mail_ui_agent_profiles(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+               registration_token, retired_at, display_name FROM agents \
+               ORDER BY last_active_ts DESC, id DESC";
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.iter().map(decode_agent_row_indexed).collect()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 /// List canonical registered identities, including retired agents.
 ///
 /// Discovery must resolve case variants exactly like `get_agent`: the first
@@ -7672,6 +7697,7 @@ pub struct ThreadMessageRow {
 /// Recipient details for a single message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecipientDetailRow {
+    pub agent_id: i64,
     pub name: String,
     pub kind: String,
 }
@@ -9894,6 +9920,7 @@ pub async fn list_message_recipients_by_message(
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
                 out.push(MessageRecipientDetailRow {
+                    agent_id,
                     name: resolved_agent_display(agent_id, name),
                     kind,
                 });
@@ -10708,6 +10735,112 @@ fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, D
         recipients_json: row.get_as(10).map_err(|error| map_sql_error(&error))?,
         attachments: row.get_as(11).map_err(|error| map_sql_error(&error))?,
     })
+}
+
+/// A bounded, join-free message window for the unified inbox. Filter before
+/// limiting; the `(created_ts, id)` cursor also advances past undelivered rows.
+pub async fn list_mail_ui_message_window(
+    cx: &Cx,
+    pool: &DbPool,
+    before: Option<(i64, i64)>,
+    importance: Option<&str>,
+    limit: usize,
+) -> Outcome<Vec<MessageRow>, DbError> {
+    let Ok(limit) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let mut sql = String::from(
+        "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, \
+        importance, ack_required, created_ts, recipients_json, attachments FROM messages WHERE 1 = 1",
+    );
+    let mut params = Vec::new();
+    if let Some((created_ts, id)) = before {
+        sql.push_str(" AND (created_ts < ? OR (created_ts = ? AND id < ?))");
+        params.extend([
+            Value::BigInt(created_ts),
+            Value::BigInt(created_ts),
+            Value::BigInt(id),
+        ]);
+    }
+    if let Some(importance) = importance {
+        sql.push_str(" AND importance = ? COLLATE NOCASE");
+        params.push(Value::Text(importance.to_string()));
+    }
+    sql.push_str(" ORDER BY created_ts DESC, id DESC LIMIT ?");
+    params.push(Value::BigInt(limit));
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => match rows.iter().map(decode_message_row_indexed).collect() {
+            Ok(messages) => Outcome::Ok(messages),
+            Err(error) => Outcome::Err(error),
+        },
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Read receipt metadata without repeating message bodies for every delivery.
+#[derive(Debug)]
+pub struct MailUiReceiptRow {
+    pub message_id: i64,
+    pub agent_id: i64,
+    pub read_ts: Option<i64>,
+    pub ack_ts: Option<i64>,
+}
+
+pub async fn list_mail_ui_receipts(
+    cx: &Cx,
+    pool: &DbPool,
+    message_ids: &[i64],
+) -> Outcome<Vec<MailUiReceiptRow>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let mut receipts = Vec::new();
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT message_id, agent_id, read_ts, ack_ts FROM message_recipients \
+            WHERE message_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params = chunk.iter().copied().map(Value::BigInt).collect::<Vec<_>>();
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    let decoded = (|| -> std::result::Result<MailUiReceiptRow, DbError> {
+                        Ok(MailUiReceiptRow {
+                            message_id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
+                            agent_id: row.get_as(1).map_err(|error| map_sql_error(&error))?,
+                            read_ts: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+                            ack_ts: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+                        })
+                    })();
+                    match decoded {
+                        Ok(receipt) => receipts.push(receipt),
+                        Err(error) => return Outcome::Err(error),
+                    }
+                }
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    Outcome::Ok(receipts)
 }
 
 fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbError> {

@@ -3,18 +3,18 @@
 {% block title %}{{ project.human_key }} — Agent Mail{% endblock %}
 
 {% block breadcrumbs %}
-<nav class="flex items-center gap-2 text-sm">
+<nav class="flex flex-wrap items-center gap-2 text-sm min-w-0 max-w-full">
   <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors flex items-center gap-1">
     <i data-lucide="home" class="w-3.5 h-3.5"></i>
     Projects
   </a>
   <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <span class="text-slate-900 dark:text-white font-medium">{{ project.human_key }}</span>
+  <span class="text-slate-900 dark:text-white font-medium min-w-0 break-all">{{ project.human_key }}</span>
 </nav>
 {% endblock %}
 
 {% block header_actions %}
-<div class="flex items-center gap-3">
+<div class="flex flex-wrap items-center gap-3 min-w-0 max-w-full">
   {% if not static_export %}
   <!-- Human Overseer - Primary Action -->
   <a href="/mail/{{ project.slug }}/overseer/compose"
@@ -29,7 +29,7 @@
   {% endif %}
 
   <!-- Secondary Actions -->
-  <div class="flex items-center gap-2">
+  <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
     <!-- File Reservations -->
     <a href="/mail/{{ project.slug }}/file_reservations"
        class="inline-flex items-center gap-2 px-3 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm hover:shadow-md transition-all duration-200"
@@ -56,19 +56,19 @@
   <!-- Project Hero Header -->
   <div class="relative overflow-hidden bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
     <div class="flex items-start justify-between">
-      <div class="flex-1">
+      <div class="flex-1 min-w-0">
         <div class="flex items-center gap-4 mb-4">
-          <div class="w-16 h-16 bg-primary-600 rounded-xl flex items-center justify-center shadow-md">
+          <div class="w-16 h-16 shrink-0 bg-primary-600 rounded-xl flex items-center justify-center shadow-md">
             <i data-lucide="git-branch" class="w-8 h-8 text-white"></i>
           </div>
-          <div>
-            <h1 class="text-4xl font-bold text-slate-900 dark:text-white mb-2">
+          <div class="flex-1 min-w-0">
+            <h1 class="text-4xl font-bold text-slate-900 dark:text-white mb-2 break-all">
               {{ project.human_key }}
             </h1>
-            <div class="flex items-center gap-3 text-sm">
-              <div class="flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
-                <i data-lucide="hash" class="w-4 h-4"></i>
-                <span class="font-mono">{{ project.slug }}</span>
+            <div class="flex flex-wrap items-center gap-3 text-sm min-w-0">
+              <div class="flex items-center gap-1.5 text-slate-600 dark:text-slate-400 min-w-0 max-w-full">
+                <i data-lucide="hash" class="w-4 h-4 shrink-0"></i>
+                <span class="font-mono min-w-0 break-all">{{ project.slug }}</span>
               </div>
               <span class="text-slate-300 dark:text-slate-600">•</span>
               <div class="flex items-center gap-1.5 px-3 py-1 bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 rounded-full font-medium text-xs">
@@ -330,9 +330,15 @@
     </div>
 
     {% if agents %}
+      <div x-data="projectAgentDirectory()">
+        <input type="search" x-model="agentSearch" placeholder="Search labels or addresses"
+               aria-label="Search registered agents" class="w-full mb-5 px-4 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white" />
+        <button type="button" @click="refreshLabels()" class="mb-5 text-sm text-primary-700 dark:text-primary-300">Refresh labels</button>
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
         {% for a in agents %}
-          <div class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-success-400 dark:hover:border-success-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
+          <div data-agent-label="{{ a.label }}" data-agent-name="{{ a.name }}"
+               x-show="!agentSearch || labelFor($el.dataset.agentName).toLowerCase().includes(agentSearch.toLowerCase())"
+               class="group relative bg-white dark:bg-slate-800 rounded-2xl p-6 shadow-soft border-2 border-slate-200 dark:border-slate-700 hover:border-success-400 dark:hover:border-success-600 transition-all duration-300 card-hover overflow-hidden stagger-item"
                style="animation-delay: {{ [loop.index0 * 0.05, 1.0]|min }}s;">
 
             <!-- Decorative gradient blob -->
@@ -344,7 +350,7 @@
                 <i data-lucide="bot" class="w-7 h-7 text-white"></i>
               </div>
               <div class="flex-1 min-w-0">
-                <h3 class="text-lg font-bold text-slate-900 dark:text-white truncate group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
+                <h3 x-text="labelFor('{{ a.name }}')" class="text-lg font-bold text-slate-900 dark:text-white break-words group-hover:text-success-600 dark:group-hover:text-success-400 transition-colors">
                   {{ a.label }}
                 </h3>
                 <div class="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 mt-1">
@@ -372,6 +378,7 @@
             </div>
           </div>
         {% endfor %}
+      </div>
       </div>
 
     {% else %}
@@ -403,6 +410,25 @@
 </div>
 
 <script>
+function projectAgentDirectory() {
+  return {
+    agentSearch: '',
+    agentLabels: {{ agents | tojson }},
+    labelFor(address) {
+      return this.agentLabels.find(agent => agent.name === address)?.label || address;
+    },
+    async refreshLabels() {
+      try {
+        const response = await fetch(window.agentMailAppendAuth('/mail/api/projects/{{ project.slug }}/agents'));
+        if (!response.ok) throw new Error('Could not refresh labels');
+        const data = await response.json();
+        if (Array.isArray(data.agent_profiles)) this.agentLabels = data.agent_profiles;
+      } catch (error) {
+        window.showToast?.(error.message, 'error');
+      }
+    },
+  };
+}
   document.addEventListener('DOMContentLoaded', () => {
     // Update keyboard shortcut display based on platform (with modern API fallback)
     const shortcutKey = document.querySelector('.shortcut-key');

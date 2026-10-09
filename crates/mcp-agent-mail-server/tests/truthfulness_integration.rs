@@ -223,6 +223,7 @@ impl SeededEnv {
             agents_list: vec![
                 AgentSummary {
                     name: "RedFox".to_string(),
+                    display_name: None,
                     program: "claude-code".to_string(),
                     model: String::new(),
                     project: String::new(),
@@ -231,6 +232,7 @@ impl SeededEnv {
                 },
                 AgentSummary {
                     name: "BlueBear".to_string(),
+                    display_name: None,
                     program: "codex".to_string(),
                     model: String::new(),
                     project: String::new(),
@@ -239,6 +241,7 @@ impl SeededEnv {
                 },
                 AgentSummary {
                     name: "GreenOwl".to_string(),
+                    display_name: None,
                     program: "claude-code".to_string(),
                     model: String::new(),
                     project: String::new(),
@@ -247,6 +250,7 @@ impl SeededEnv {
                 },
                 AgentSummary {
                     name: "GoldEagle".to_string(),
+                    display_name: None,
                     program: "gemini".to_string(),
                     model: String::new(),
                     project: String::new(),
@@ -255,6 +259,7 @@ impl SeededEnv {
                 },
                 AgentSummary {
                     name: "SilverWolf".to_string(),
+                    display_name: None,
                     program: "claude-code".to_string(),
                     model: String::new(),
                     project: String::new(),
@@ -263,6 +268,7 @@ impl SeededEnv {
                 },
                 AgentSummary {
                     name: "CopperRobin".to_string(),
+                    display_name: None,
                     program: "codex".to_string(),
                     model: String::new(),
                     project: String::new(),

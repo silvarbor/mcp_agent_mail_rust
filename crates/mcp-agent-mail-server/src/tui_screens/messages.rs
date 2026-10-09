@@ -220,6 +220,8 @@ struct MessageEntry {
     topic: Option<String>,
     from_agent: String,
     to_agents: String,
+    /// Presentation only; routing and action keys use the addresses above.
+    labels: MessageLabels,
     project_slug: String,
     thread_id: String,
     timestamp_iso: String,
@@ -230,6 +232,29 @@ struct MessageEntry {
     ack_required: bool,
     /// Whether to display the project column (true in Global mode).
     show_project: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct MessageLabels {
+    pub(super) sender: Option<String>,
+    pub(super) recipients: Option<String>,
+    pub(super) recipient_identities: Vec<IdentityLabel>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IdentityLabel {
+    pub(super) address: String,
+    pub(super) label: String,
+}
+
+impl MessageEntry {
+    fn sender_label(&self) -> &str {
+        self.labels.sender.as_deref().unwrap_or(&self.from_agent)
+    }
+
+    fn recipient_labels(&self) -> &str {
+        self.labels.recipients.as_deref().unwrap_or(&self.to_agents)
+    }
 }
 
 #[derive(Debug)]
@@ -411,9 +436,8 @@ impl MessageEntry {
         };
         let time_style = crate::tui_theme::text_meta(&tp).bg(row_bg);
 
-        // Sender (truncated to 12 chars, Unicode-safe).
-        let sender_end = char_index_to_byte_offset(&self.from_agent, 12);
-        let sender = self.from_agent[..sender_end].to_string();
+        // Keep the routing address readable when the label needs shortening.
+        let sender = compact_sender_label(self.sender_label(), &self.from_agent, 24);
         let sender_style = Style::default().fg(tp.text_secondary).bg(row_bg);
 
         // Project badge (only in Global mode)
@@ -427,7 +451,7 @@ impl MessageEntry {
         let moving_badge = if keyboard_marked { " [MOVING]" } else { "" };
 
         // Calculate how much space remains for subject
-        // Format: marker + badge(2) + ack(1) + space + id(6) + space + time(8) + space + sender(<=12) + space + project + subject
+        // Format: marker + badge + ack + ID + time + sender + project + subject.
         let fixed_len = ftui::text::display_width(marker)
             + batch_marker.chars().count()
             + 1 // spacer
@@ -438,7 +462,7 @@ impl MessageEntry {
             + 1  // space
             + 8  // time
             + 1  // space
-            + sender.chars().count()
+            + ftui::text::display_width(&sender)
             + 1  // space
             + project_badge.chars().count()
             + moving_badge.chars().count();
@@ -779,7 +803,7 @@ struct QuickReplyContext {
     to_agent: String,
     thread_id: Option<String>,
     subject: String,
-    original_from_agent: String,
+    original_sender_label: String,
     original_timestamp_iso: String,
     original_body_md: String,
 }
@@ -802,7 +826,7 @@ impl QuickReplyContext {
             to_agent,
             thread_id,
             subject: prefixed_reply_subject(&entry.subject),
-            original_from_agent: entry.from_agent.clone(),
+            original_sender_label: entry.sender_label().to_string(),
             original_timestamp_iso: entry.timestamp_iso.clone(),
             original_body_md: entry.body_md.clone(),
         })
@@ -833,6 +857,7 @@ struct ComposeFormState {
     ack_required: bool,
     focus: ComposeField,
     available_agents: Vec<String>,
+    agent_labels: std::collections::HashMap<String, String>,
     suggestions: Vec<String>,
     suggestion_cursor: usize,
     errors: ComposeValidationErrors,
@@ -861,6 +886,7 @@ impl ComposeFormState {
             ack_required: false,
             focus: ComposeField::To,
             available_agents,
+            agent_labels: std::collections::HashMap::new(),
             suggestions: Vec::new(),
             suggestion_cursor: 0,
             errors: ComposeValidationErrors::default(),
@@ -940,7 +966,12 @@ impl ComposeFormState {
                         && name.is_char_boundary(prefix_lower.len())
                         && name[..prefix_lower.len()].eq_ignore_ascii_case(&prefix_lower)
                 };
-                starts_with_ci && !already.iter().any(|existing| existing == *name)
+                let label_matches = self
+                    .agent_labels
+                    .get(*name)
+                    .is_some_and(|label| label.to_lowercase().contains(&prefix.to_lowercase()));
+                (starts_with_ci || label_matches)
+                    && !already.iter().any(|existing| existing == *name)
             })
             .take(6)
             .cloned()
@@ -1352,6 +1383,36 @@ impl MessageBrowserScreen {
             })
     }
 
+    fn load_agent_labels_for_project(
+        &self,
+        project_slug: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let Some(conn) = &self.db_conn else {
+            return std::collections::HashMap::new();
+        };
+        let Some(project_id) = project_id_for_slug(conn, project_slug) else {
+            return std::collections::HashMap::new();
+        };
+        conn.query_sync(
+            "SELECT name, display_name FROM agents WHERE project_id = ?",
+            &[Value::BigInt(project_id)],
+        )
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let name = row.get_named::<String>("name").ok()?;
+            let display_name = row
+                .get_named::<Option<String>>("display_name")
+                .ok()
+                .flatten();
+            let label =
+                mcp_agent_mail_core::models::format_agent_label(&name, display_name.as_deref());
+            Some((name, label))
+        })
+        .collect()
+    }
+
     fn open_compose_error_form(
         &mut self,
         project_slug: String,
@@ -1409,7 +1470,10 @@ impl MessageBrowserScreen {
                 return;
             }
         };
+        let agent_labels = self.load_agent_labels_for_project(&project_slug);
         let mut form = ComposeFormState::new(project_slug, prefill_to, agents);
+        form.agent_labels = agent_labels;
+        form.refresh_suggestions();
         if form.available_agents.is_empty() {
             form.errors.general = Some(
                 "No registered agents found in this project. Register agents before composing."
@@ -2523,8 +2587,22 @@ impl MessageBrowserScreen {
 
             if let Some((rows, cursor)) = tree_snapshot {
                 let mut combined_lines: Vec<Line<'static>> = vec![
-                    Line::raw(format!("From:    {}", entry.from_agent)),
-                    Line::raw(format!("To:      {}", entry.to_agents)),
+                    Line::raw(format!(
+                        "From:    {}",
+                        compact_sender_label(
+                            entry.sender_label(),
+                            &entry.from_agent,
+                            content_width.saturating_sub(9)
+                        )
+                    )),
+                    Line::raw(format!(
+                        "To:      {}",
+                        compact_identity_labels(
+                            &entry.labels.recipient_identities,
+                            entry.recipient_labels(),
+                            content_width.saturating_sub(9)
+                        )
+                    )),
                     Line::raw(format!("Subject: {}", entry.subject)),
                 ];
                 if let Some(topic) = entry.topic.as_deref() {
@@ -3030,6 +3108,7 @@ impl MessageBrowserScreen {
                     topic: None,
                     from_agent: from.to_string(),
                     to_agents: to.join(", "),
+                    labels: MessageLabels::default(),
                     project_slug: project.to_string(),
                     thread_id: thread_id.to_string(),
                     timestamp_iso: micros_to_iso(e.timestamp_micros()),
@@ -3393,9 +3472,8 @@ impl MailScreen for MessageBrowserScreen {
             }
         }
 
-        // Periodic refresh for empty-query mode (every 5 seconds),
-        // but only when underlying data has actually changed.
-        if self.search_input.value().is_empty() {
+        // Profile changes also refresh labels on old and filtered messages.
+        if self.search_method != SearchMethod::Live {
             let should_refresh = self.last_refresh.is_none_or(|t| t.elapsed().as_secs() >= 5);
             if should_refresh {
                 let current_gen = state.data_generation();
@@ -4034,6 +4112,7 @@ fn search_messages_unified(
             topic: row.topic,
             from_agent: row.from_agent.unwrap_or_default(),
             to_agents: recipient_map.get(&row.id).cloned().unwrap_or_default(),
+            labels: MessageLabels::default(),
             project_slug,
             thread_id: row.thread_id.unwrap_or_default(),
             timestamp_iso: micros_to_iso(created_ts),
@@ -4045,6 +4124,7 @@ fn search_messages_unified(
         });
     }
 
+    hydrate_message_labels(conn, &mut out);
     let total = out.len();
     (out, total, SearchMethod::Unified)
 }
@@ -4274,7 +4354,8 @@ fn message_entries_from_rows(
     let sender_name_map = agent_names_by_id(conn, &sender_ids);
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
 
-    rows.into_iter()
+    let mut entries: Vec<MessageEntry> = rows
+        .into_iter()
         .map(|row| MessageEntry {
             id: row.id,
             subject: row.subject,
@@ -4284,6 +4365,7 @@ fn message_entries_from_rows(
                 .cloned()
                 .unwrap_or_else(|| unknown_agent_label(row.sender_id)),
             to_agents: recipient_names_from_json(&row.recipients_json),
+            labels: MessageLabels::default(),
             project_slug: project_slug_map
                 .get(&row.project_id)
                 .cloned()
@@ -4296,7 +4378,187 @@ fn message_entries_from_rows(
             ack_required: row.ack_required,
             show_project,
         })
+        .collect();
+    hydrate_message_labels(conn, &mut entries);
+    entries
+}
+
+/// Load current labels by persisted agent IDs, including cross-project recipients.
+fn hydrate_message_labels(conn: &DbConn, entries: &mut [MessageEntry]) {
+    let message_ids = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+    let mut labels = message_labels_by_id(conn, &message_ids);
+    for entry in entries {
+        entry.labels = labels.remove(&entry.id).unwrap_or_default();
+    }
+}
+
+pub(super) fn message_labels_by_id(
+    conn: &DbConn,
+    message_ids: &[i64],
+) -> std::collections::HashMap<i64, MessageLabels> {
+    if message_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let placeholders = vec!["?"; message_ids.len()].join(", ");
+    let params: Vec<Value> = message_ids.iter().copied().map(Value::BigInt).collect();
+    let sender_sql = format!(
+        "SELECT m.id, a.name, a.display_name FROM messages m \
+         JOIN agents a ON a.id = m.sender_id WHERE m.id IN ({placeholders})"
+    );
+    let mut senders = std::collections::HashMap::new();
+    if let Ok(rows) = conn.query_sync(&sender_sql, &params) {
+        for row in rows {
+            if let (Ok(id), Ok(name)) =
+                (row.get_named::<i64>("id"), row.get_named::<String>("name"))
+            {
+                let display_name = row
+                    .get_named::<Option<String>>("display_name")
+                    .ok()
+                    .flatten();
+                senders.insert(
+                    id,
+                    mcp_agent_mail_core::models::format_agent_label(&name, display_name.as_deref()),
+                );
+            }
+        }
+    }
+    let recipient_sql = format!(
+        "SELECT mr.message_id, mr.agent_id AS id, a.name, a.display_name FROM message_recipients mr \
+         LEFT JOIN agents a ON a.id = mr.agent_id WHERE mr.message_id IN ({placeholders}) \
+         ORDER BY mr.message_id, CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, mr.agent_id"
+    );
+    let mut recipients: std::collections::HashMap<i64, Vec<(i64, IdentityLabel)>> =
+        std::collections::HashMap::new();
+    if let Ok(rows) = conn.query_sync(&recipient_sql, &params) {
+        for row in rows {
+            if let (Ok(message_id), Ok(id)) = (
+                row.get_named::<i64>("message_id"),
+                row.get_named::<i64>("id"),
+            ) {
+                let name = row
+                    .get_named::<String>("name")
+                    .unwrap_or_else(|_| unknown_agent_label(id));
+                let display_name = row
+                    .get_named::<Option<String>>("display_name")
+                    .ok()
+                    .flatten();
+                let labels = recipients.entry(message_id).or_default();
+                if !labels.iter().any(|(existing_id, _)| *existing_id == id) {
+                    labels.push((
+                        id,
+                        IdentityLabel {
+                            label: mcp_agent_mail_core::models::format_agent_label(
+                                &name,
+                                display_name.as_deref(),
+                            ),
+                            address: name,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    message_ids
+        .iter()
+        .copied()
+        .map(|id| {
+            let recipient_identities = recipients
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, identity)| identity)
+                .collect::<Vec<_>>();
+            (
+                id,
+                MessageLabels {
+                    sender: senders.remove(&id),
+                    recipients: (!recipient_identities.is_empty()).then(|| {
+                        recipient_identities
+                            .iter()
+                            .map(|identity| identity.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }),
+                    recipient_identities,
+                },
+            )
+        })
         .collect()
+}
+
+pub(super) fn compact_sender_label(label: &str, address: &str, width: usize) -> String {
+    if label == address {
+        return address.to_string();
+    }
+    let suffix = format!(" <{address}>");
+    let suffix_width = ftui::text::display_width(&suffix);
+    let display_name = label.strip_suffix(&suffix).unwrap_or(label);
+    if suffix_width >= width {
+        return address.to_string();
+    }
+    format!(
+        "{}{suffix}",
+        truncate_str(display_name, width - suffix_width)
+    )
+}
+
+/// Allocate label space only after reserving every routing address.
+pub(super) fn compact_identity_labels(
+    identities: &[IdentityLabel],
+    fallback: &str,
+    width: usize,
+) -> String {
+    if identities.is_empty() {
+        return truncate_str(fallback, width);
+    }
+    let separators = identities.len().saturating_sub(1) * 2;
+    let address_width: usize = identities
+        .iter()
+        .map(|identity| ftui::text::display_width(&identity.address))
+        .sum();
+    if address_width + separators > width {
+        let mut visible = Vec::new();
+        for (idx, identity) in identities.iter().enumerate() {
+            let remaining = identities.len() - idx - 1;
+            let suffix = if remaining == 0 {
+                String::new()
+            } else {
+                format!(" (+{remaining})")
+            };
+            let separator = if visible.is_empty() { "" } else { ", " };
+            let candidate = format!(
+                "{}{separator}{}{suffix}",
+                visible.join(", "),
+                identity.address
+            );
+            if ftui::text::display_width(&candidate) > width {
+                break;
+            }
+            visible.push(identity.address.as_str());
+        }
+        if visible.is_empty() {
+            return identities[0].address.clone();
+        }
+        let remaining = identities.len() - visible.len();
+        return if remaining == 0 {
+            visible.join(", ")
+        } else {
+            format!("{} (+{remaining})", visible.join(", "))
+        };
+    }
+    let extra = width.saturating_sub(address_width + separators);
+    let share = extra / identities.len();
+    identities
+        .iter()
+        .map(|identity| {
+            compact_sender_label(
+                &identity.label,
+                &identity.address,
+                ftui::text::display_width(&identity.address) + share,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn agent_names_by_id(conn: &DbConn, agent_ids: &[i64]) -> std::collections::HashMap<i64, String> {
@@ -5084,8 +5346,19 @@ fn render_detail_panel(
 
     // Build detail text
     let mut lines = Vec::new();
-    lines.push(format!("From:    {}", msg.from_agent));
-    lines.push(format!("To:      {}", msg.to_agents));
+    let identity_width = usize::from(content_inner.width).saturating_sub(9);
+    lines.push(format!(
+        "From:    {}",
+        compact_sender_label(msg.sender_label(), &msg.from_agent, identity_width)
+    ));
+    lines.push(format!(
+        "To:      {}",
+        compact_identity_labels(
+            &msg.labels.recipient_identities,
+            msg.recipient_labels(),
+            identity_width
+        )
+    ));
     lines.push(format!("Subject: {}", msg.subject));
     if let Some(topic) = msg.topic.as_deref() {
         lines.push(format!("Topic:   {topic}"));
@@ -5463,10 +5736,16 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
             .iter()
             .enumerate()
             .map(|(idx, item)| {
+                let label = form.agent_labels.get(item).unwrap_or(item);
+                let label = compact_sender_label(
+                    label,
+                    item,
+                    usize::from(inner.width).saturating_sub(17).min(32),
+                );
                 if idx == form.suggestion_cursor {
-                    format!("[{item}]")
+                    format!("[{label}]")
                 } else {
-                    item.clone()
+                    label
                 }
             })
             .collect();
@@ -5505,10 +5784,16 @@ fn render_compose_modal(frame: &mut Frame<'_>, area: Rect, form: &ComposeFormSta
             .iter()
             .enumerate()
             .map(|(idx, item)| {
+                let label = form.agent_labels.get(item).unwrap_or(item);
+                let label = compact_sender_label(
+                    label,
+                    item,
+                    usize::from(inner.width).saturating_sub(17).min(32),
+                );
                 if idx == form.suggestion_cursor {
-                    format!("[{item}]")
+                    format!("[{label}]")
                 } else {
-                    item.clone()
+                    label
                 }
             })
             .collect();
@@ -5679,7 +5964,14 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
     let mut cursor_y = inner.y;
     let bottom = inner.y + inner.height;
 
-    let to_line = format!("To: {}", form.context.to_agent);
+    let to_line = format!(
+        "To: {}",
+        compact_sender_label(
+            &form.context.original_sender_label,
+            &form.context.to_agent,
+            usize::from(inner.width).saturating_sub(4)
+        )
+    );
     Paragraph::new(truncate_str(&to_line, inner.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
         .render(Rect::new(inner.x, cursor_y, inner.width, 1), frame);
@@ -5752,7 +6044,12 @@ fn render_quick_reply_modal(frame: &mut Frame<'_>, area: Rect, form: &QuickReply
     if cursor_y < bottom {
         let from_line = format!(
             "Original from {} at {}",
-            form.context.original_from_agent, form.context.original_timestamp_iso
+            compact_sender_label(
+                &form.context.original_sender_label,
+                &form.context.to_agent,
+                usize::from(inner.width).saturating_sub(40)
+            ),
+            form.context.original_timestamp_iso
         );
         Paragraph::new(truncate_str(&from_line, inner.width as usize))
             .style(crate::tui_theme::text_meta(&tp))
@@ -6203,6 +6500,7 @@ mod tests {
             topic: None,
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: thread_id.to_string(),
             timestamp_iso: "2026-02-06T12:00:00".to_string(),
@@ -6212,6 +6510,259 @@ mod tests {
             ack_required: false,
             show_project: false,
         }
+    }
+
+    fn display_name_messages_db() -> DbConn {
+        let conn = DbConn::open_memory().expect("open isolated mailbox");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize real mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES
+                (1, 'labels', '/labels', 0), (2, 'other', '/other', 0);
+             INSERT INTO agents (id, project_id, name, display_name, program, model, inception_ts, last_active_ts) VALUES
+                (1, 1, 'BlueLake', 'Reviewer', 'test', 'test', 0, 0),
+                (2, 1, 'RedStone', 'Reviewer', 'test', 'test', 0, 0),
+                (3, 2, 'BlueLake', 'Remote Reviewer', 'test', 'test', 0, 0);
+             INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts, recipients_json) VALUES
+                (1, 1, 1, 'labels-thread', 'First', 'Original history', 100, '{\"to\":[\"RedStone\"]}'),
+                (2, 1, 2, 'labels-thread', 'Second', 'Reply history', 200, '{\"to\":[\"BlueLake\"]}'),
+                (3, 2, 3, 'other-thread', 'Remote', 'Remote history', 300, '{\"to\":[\"BlueLake\"]}');
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES
+                (1, 2, 'to'), (1, 3, 'cc'), (2, 1, 'to'), (3, 1, 'to')"
+        ).expect("seed labeled mail and cross-project recipient");
+        conn
+    }
+
+    #[test]
+    fn display_name_messages_keep_addresses_and_refresh_history_after_rename_and_clear() {
+        let conn = display_name_messages_db();
+        let (entries, total) = fetch_recent_messages(&conn, 10, None, true);
+        assert_eq!(total, 3);
+        let first = entries
+            .iter()
+            .find(|entry| entry.id == 1)
+            .expect("first message");
+        let second = entries
+            .iter()
+            .find(|entry| entry.id == 2)
+            .expect("second message");
+        assert_eq!(first.sender_label(), "Reviewer <BlueLake>");
+        assert_eq!(second.sender_label(), "Reviewer <RedStone>");
+        assert_eq!(first.from_agent, "BlueLake");
+        assert_eq!(first.to_agents, "RedStone");
+        assert_eq!(
+            first.recipient_labels(),
+            "Reviewer <RedStone>, Remote Reviewer <BlueLake>"
+        );
+        assert_eq!(
+            QuickReplyContext::from_entry(first)
+                .expect("reply")
+                .to_agent,
+            "BlueLake"
+        );
+        assert_eq!(
+            QuickReplyContext::from_entry(second)
+                .expect("reply")
+                .to_agent,
+            "RedStone"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == 3)
+                .expect("remote message")
+                .sender_label(),
+            "Remote Reviewer <BlueLake>"
+        );
+
+        conn.execute_sync(
+            "UPDATE agents SET display_name = ? WHERE id = ?",
+            &[Value::Text("Officer Alpha".to_string()), Value::BigInt(1)],
+        )
+        .expect("rename presentation label");
+        let (renamed, _) = fetch_recent_messages(&conn, 10, None, true);
+        let renamed_first = renamed
+            .iter()
+            .find(|entry| entry.id == 1)
+            .expect("retained message");
+        assert_eq!(renamed_first.sender_label(), "Officer Alpha <BlueLake>");
+        assert_eq!(renamed_first.id, first.id);
+        assert_eq!(renamed_first.body_md, first.body_md);
+        assert_eq!(
+            QuickReplyContext::from_entry(renamed_first)
+                .expect("reply after rename")
+                .to_agent,
+            "BlueLake"
+        );
+        assert_eq!(
+            renamed
+                .iter()
+                .find(|entry| entry.id == 3)
+                .expect("remote message")
+                .sender_label(),
+            "Remote Reviewer <BlueLake>"
+        );
+
+        conn.execute_raw("UPDATE agents SET display_name = NULL WHERE id = 1")
+            .expect("clear label");
+        let (cleared, _) = fetch_recent_messages(&conn, 10, None, true);
+        let cleared_first = cleared
+            .iter()
+            .find(|entry| entry.id == 1)
+            .expect("retained cleared message");
+        assert_eq!(cleared_first.sender_label(), "BlueLake");
+        assert_eq!(cleared_first.body_md, "Original history");
+        assert_eq!(
+            cleared
+                .iter()
+                .find(|entry| entry.id == 2)
+                .expect("reply")
+                .recipient_labels(),
+            "BlueLake"
+        );
+        assert_eq!(
+            QuickReplyContext::from_entry(cleared_first)
+                .expect("reply after clear")
+                .to_agent,
+            "BlueLake"
+        );
+    }
+
+    #[test]
+    fn display_name_message_compose_suggestions_search_labels_and_insert_addresses() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(display_name_messages_db());
+        let agents = screen
+            .load_agent_names_for_project("labels")
+            .expect("routing identities");
+        let mut form = ComposeFormState::new("labels".to_string(), None, agents);
+        form.agent_labels = screen.load_agent_labels_for_project("labels");
+        form.to_input.set_value("reviewer");
+        form.refresh_suggestions();
+        assert_eq!(form.suggestions, ["BlueLake", "RedStone"]);
+        assert_eq!(
+            form.agent_labels.get("BlueLake").map(String::as_str),
+            Some("Reviewer <BlueLake>")
+        );
+        assert_eq!(
+            form.agent_labels.get("RedStone").map(String::as_str),
+            Some("Reviewer <RedStone>")
+        );
+        assert!(form.apply_suggestion());
+        assert!(form.to_input.value().contains("BlueLake"));
+        assert!(!form.to_input.value().contains("Reviewer"));
+    }
+
+    #[test]
+    fn display_name_message_clipping_preserves_address_and_unicode() {
+        assert_eq!(
+            compact_sender_label("審査員 🚀 長い名前 <BlueLake>", "BlueLake", 19),
+            "審査... <BlueLake>"
+        );
+        assert_eq!(
+            compact_sender_label("Officer Alpha <BlueLake>", "BlueLake", 8),
+            "BlueLake"
+        );
+        assert_eq!(compact_sender_label("BlueLake", "BlueLake", 24), "BlueLake");
+    }
+
+    #[test]
+    fn display_name_message_detail_renders_current_labels_as_literal_text() {
+        let conn = display_name_messages_db();
+        conn.execute_sync(
+            "UPDATE agents SET display_name = ? WHERE id = 1",
+            &[Value::Text("審査員 <b>Reviewer</b>".to_string())],
+        )
+        .expect("set literal label");
+        let (entries, _) = fetch_recent_messages(&conn, 10, None, true);
+        let first = entries
+            .iter()
+            .find(|entry| entry.id == 1)
+            .expect("first message");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 24, &mut pool);
+        let cache = RefCell::new(None);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(0, 0, 120, 24),
+            Some(first),
+            0,
+            true,
+            &cache,
+            DetailViewMode::Markdown,
+            None,
+            0,
+        );
+        let rendered = ftui_harness::buffer_to_text_with_pool(&frame.buffer, Some(&*frame.pool));
+        assert!(
+            rendered.contains("審査員 <b>Reviewer</b> <BlueLake>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Reviewer <RedStone>, Remote Reviewer <BlueLake>"));
+        assert_eq!(
+            QuickReplyContext::from_entry(first)
+                .expect("reply")
+                .to_agent,
+            "BlueLake"
+        );
+    }
+
+    #[test]
+    fn display_name_long_unicode_message_headers_keep_sender_and_recipient_addresses() {
+        let conn = display_name_messages_db();
+        conn.execute_sync(
+            "UPDATE agents SET display_name = ?",
+            &[Value::Text(format!(
+                "審査員 🦀, <b>{}</b>",
+                "評価担当".repeat(24)
+            ))],
+        )
+        .expect("set long Unicode labels");
+        let (entries, _) = fetch_recent_messages(&conn, 10, None, true);
+        let first = entries.iter().find(|entry| entry.id == 1).expect("message");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(60, 24, &mut pool);
+        render_detail_panel(
+            &mut frame,
+            Rect::new(0, 0, 60, 24),
+            Some(first),
+            0,
+            true,
+            &RefCell::new(None),
+            DetailViewMode::Markdown,
+            None,
+            0,
+        );
+        let rendered = ftui_harness::buffer_to_text_with_pool(&frame.buffer, Some(&*frame.pool));
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("From:") && line.contains("<BlueLake>")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line.contains("To:")
+                && line.contains("<RedStone>")
+                && line.contains("<BlueLake>")),
+            "{rendered}"
+        );
+        assert_eq!(first.labels.recipient_identities.len(), 2);
+        assert_eq!(first.labels.recipient_identities[0].address, "RedStone");
+        assert!(first.labels.recipient_identities[0].label.contains(','));
+        assert_eq!(
+            compact_identity_labels(
+                &first.labels.recipient_identities,
+                first.recipient_labels(),
+                16
+            ),
+            "RedStone (+1)"
+        );
+        assert_eq!(
+            QuickReplyContext::from_entry(first)
+                .expect("reply")
+                .to_agent,
+            "BlueLake"
+        );
     }
 
     #[test]
@@ -6584,6 +7135,7 @@ first body
                 topic: None,
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
+                labels: MessageLabels::default(),
                 project_slug: "proj1".to_string(),
                 thread_id: String::new(),
                 timestamp_iso: "2026-02-06T12:00:00".to_string(),
@@ -6627,6 +7179,7 @@ first body
                 topic: None,
                 from_agent: String::new(),
                 to_agents: String::new(),
+                labels: MessageLabels::default(),
                 project_slug: String::new(),
                 thread_id: String::new(),
                 timestamp_iso: String::new(),
@@ -6665,6 +7218,7 @@ first body
             topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
+            labels: MessageLabels::default(),
             project_slug: String::new(),
             thread_id: String::new(),
             timestamp_iso: String::new(),
@@ -6699,6 +7253,7 @@ first body
             topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: "br-2bbt".to_string(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -6748,6 +7303,7 @@ first body
             topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: String::new(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -6776,6 +7332,7 @@ first body
             topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: "br-2bbt.7".to_string(),
             timestamp_iso: "2026-03-04T00:00:00Z".to_string(),
@@ -6813,6 +7370,7 @@ first body
             topic: None,
             from_agent: "BlueLake".to_string(),
             to_agents: "GreenCastle".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: String::new(),
             timestamp_iso: "2026-03-04T00:00:00Z".to_string(),
@@ -7414,6 +7972,7 @@ first body
             topic: None,
             from_agent: "A".to_string(),
             to_agents: "B".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "p".to_string(),
             thread_id: String::new(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7547,6 +8106,7 @@ first body
                 topic: Some("br-abc.1".to_string()),
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
+                labels: MessageLabels::default(),
                 project_slug: "proj1".to_string(),
                 thread_id: "thread-1".to_string(),
                 timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7562,6 +8122,7 @@ first body
                 topic: None,
                 from_agent: "BluePeak".to_string(),
                 to_agents: "RedLake".to_string(),
+                labels: MessageLabels::default(),
                 project_slug: "proj2".to_string(),
                 thread_id: String::new(),
                 timestamp_iso: "2026-02-06T13:00:00Z".to_string(),
@@ -7599,6 +8160,7 @@ first body
             topic: None,
             from_agent: "Ágent🚀Name—Wide".to_string(),
             to_agents: "Team".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj—超長slug".to_string(),
             thread_id: "thread-1".to_string(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7659,6 +8221,7 @@ first body
             topic: Some("release.v31".to_string()),
             from_agent: "GoldFox".to_string(),
             to_agents: "SilverWolf, BluePeak".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "my-project".to_string(),
             thread_id: "thread-123".to_string(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7698,6 +8261,7 @@ first body
             topic: None,
             from_agent: "Agent".to_string(),
             to_agents: String::new(),
+            labels: MessageLabels::default(),
             project_slug: String::new(),
             thread_id: String::new(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7734,6 +8298,7 @@ first body
             topic: None,
             from_agent: "Agent".to_string(),
             to_agents: "Peer".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: String::new(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7911,6 +8476,7 @@ first body
             topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
+            labels: MessageLabels::default(),
             project_slug: String::new(),
             thread_id: String::new(),
             timestamp_iso: "2026-02-06T12:00:00Z".to_string(),
@@ -7954,6 +8520,7 @@ first body
                 topic: None,
                 from_agent: String::new(),
                 to_agents: String::new(),
+                labels: MessageLabels::default(),
                 project_slug: String::new(),
                 thread_id: String::new(),
                 timestamp_iso: String::new(),
@@ -8197,6 +8764,7 @@ first body
             topic: None,
             from_agent: "RedFox".to_string(),
             to_agents: "BlueLake".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: String::new(),
             timestamp_iso: String::new(),
@@ -8787,6 +9355,7 @@ first body
             topic: None,
             from_agent: String::new(),
             to_agents: String::new(),
+            labels: MessageLabels::default(),
             project_slug: "inferred-project".to_string(),
             thread_id: String::new(),
             timestamp_iso: String::new(),
@@ -9031,6 +9600,7 @@ first body
                 topic: None,
                 from_agent: "GoldFox".to_string(),
                 to_agents: "SilverWolf".to_string(),
+                labels: MessageLabels::default(),
                 project_slug: "proj".to_string(),
                 thread_id: "thread".to_string(),
                 timestamp_iso: micros_to_iso(now - (i64::from(idx) * 10_000)),
@@ -9152,6 +9722,7 @@ first body
             topic: None,
             from_agent: "GoldHawk".to_string(),
             to_agents: "SilverFox".to_string(),
+            labels: MessageLabels::default(),
             project_slug: "proj".to_string(),
             thread_id: "t-1".to_string(),
             timestamp_iso: "2026-02-15T12:00:00".to_string(),

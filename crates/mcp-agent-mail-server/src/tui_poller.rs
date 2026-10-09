@@ -81,6 +81,7 @@ struct AgentListRow {
     id: i64,
     project: String,
     name: String,
+    display_name: Option<String>,
     program: String,
     model: String,
     last_active_ts: i64,
@@ -1183,6 +1184,7 @@ fn restore_missing_detail_lists_from_previous(
         return;
     };
 
+    let current_agent_labels = snapshot.agents_list.clone();
     maybe_reuse_previous_detail_list(
         "agents",
         snapshot.agents,
@@ -1191,6 +1193,11 @@ fn restore_missing_detail_lists_from_previous(
         &previous.agents_list,
         sqlite_path,
     );
+    for agent in &mut snapshot.agents_list {
+        if let Some(current) = unique_previous_agent_summary(&current_agent_labels, agent) {
+            agent.display_name.clone_from(&current.display_name);
+        }
+    }
     restore_missing_agent_fields_from_previous(
         &mut snapshot.agents_list,
         &previous.agents_list,
@@ -1235,7 +1242,13 @@ fn restore_missing_agent_fields_from_previous(
             .iter()
             .all(|agent| unique_previous_agent_summary(previous_agents, agent).is_some())
     {
-        current_agents.clone_from_slice(previous_agents);
+        for agent in current_agents.iter_mut() {
+            if let Some(previous) = unique_previous_agent_summary(previous_agents, agent) {
+                let display_name = agent.display_name.take();
+                agent.clone_from(previous);
+                agent.display_name = display_name;
+            }
+        }
         tracing::warn!(
             path = sqlite_path.unwrap_or("<unknown>"),
             rows = current_agents.len(),
@@ -1603,6 +1616,7 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
             AgentSummary {
                 project: row.project,
                 name: row.name,
+                display_name: row.display_name,
                 program: row.program,
                 model: row.model,
                 last_active_ts: row.last_active_ts,
@@ -1621,6 +1635,11 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
     let has_projects_slug =
         table_has_required_columns(conn, "projects", &["id", "slug"]).unwrap_or(false);
     let has_name = available_columns.contains("name");
+    let display_name_select = if available_columns.contains("display_name") {
+        "a.display_name"
+    } else {
+        "NULL AS display_name"
+    };
     let has_program = available_columns.contains("program");
     let has_model = available_columns.contains("model");
     let has_last_active = available_columns.contains("last_active_ts");
@@ -1686,7 +1705,8 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                 {name_select}, \
                 {program_select}, \
                 {model_select}, \
-                {last_active_select} \
+                {last_active_select}, \
+                {display_name_select} \
              FROM agents a \
              {project_join} \
              {lifecycle_where} \
@@ -1737,6 +1757,7 @@ fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
                     id: agent_id,
                     project,
                     name,
+                    display_name: row.get_named::<String>("display_name").ok(),
                     program,
                     model,
                     last_active_ts: parse_raw_ts(&row, "last_active_ts"),
@@ -3424,6 +3445,7 @@ mod tests {
     fn delta_detects_agents_list_change() {
         let a = DbStatSnapshot {
             agents_list: vec![AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "GoldFox".into(),
                 program: "claude-code".into(),
@@ -3488,6 +3510,7 @@ mod tests {
             contact_links: 1,
             ack_pending: 1,
             agents_list: vec![AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "X".into(),
                 program: "Y".into(),
@@ -4280,6 +4303,7 @@ first body
             contact_links: 7,
             ack_pending: 11,
             agents_list: vec![AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "BlueLake".to_string(),
                 program: "codex".to_string(),
@@ -4725,6 +4749,7 @@ first body
             agents: 2,
             agents_list: vec![
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex".to_string(),
@@ -4733,6 +4758,7 @@ first body
                     health: None,
                 },
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedStone".to_string(),
                     program: "claude".to_string(),
@@ -4843,6 +4869,7 @@ first body
         let previous = vec![
             AgentSummary {
                 project: "alpha".to_string(),
+                display_name: None,
                 name: "BlueLake".to_string(),
                 program: "claude-code".to_string(),
                 model: String::new(),
@@ -4851,6 +4878,7 @@ first body
             },
             AgentSummary {
                 project: "beta".to_string(),
+                display_name: None,
                 name: "BlueLake".to_string(),
                 program: "codex".to_string(),
                 model: String::new(),
@@ -4859,6 +4887,7 @@ first body
             },
         ];
         let mut current = vec![AgentSummary {
+            display_name: None,
             project: "beta".to_string(),
             name: "BlueLake".to_string(),
             program: String::new(),
@@ -5485,6 +5514,7 @@ first body
             contact_links: 2,
             ack_pending: 1,
             agents_list: vec![AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "GoldFox".into(),
                 program: "claude-code".into(),
@@ -6007,6 +6037,65 @@ first body
         assert_eq!(agents[0].name, "NewAgent");
         assert_eq!(agents[1].name, "MidAgent");
         assert_eq!(agents[2].name, "OldAgent");
+        assert!(agents.iter().all(|agent| agent.display_name.is_none()));
+    }
+
+    #[test]
+    fn display_name_poller_refreshes_duplicate_labels_rename_and_clear() {
+        let conn = DbConn::open_memory().unwrap();
+        conn.execute_sync("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT, display_name TEXT, program TEXT, last_active_ts INTEGER)", &[]).unwrap();
+        conn.execute_sync("INSERT INTO agents VALUES (1, 'BlueLake', 'Reviewer', 'agent', 200), (2, 'RedStone', 'Reviewer', 'agent', 100)", &[]).unwrap();
+        let first = fetch_agents_list(&conn);
+        assert_eq!(first[0].display_name.as_deref(), Some("Reviewer"));
+        assert_eq!(first[1].display_name.as_deref(), Some("Reviewer"));
+        assert_ne!(first[0].name, first[1].name);
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Officer Alpha' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+        let renamed = fetch_agents_list(&conn);
+        assert_eq!(renamed[0].name, "BlueLake");
+        assert_eq!(renamed[0].display_name.as_deref(), Some("Officer Alpha"));
+        assert!(
+            snapshot_delta(
+                &DbStatSnapshot {
+                    agents_list: first,
+                    ..Default::default()
+                },
+                &DbStatSnapshot {
+                    agents_list: renamed.clone(),
+                    ..Default::default()
+                }
+            )
+            .agents_list_changed
+        );
+        conn.execute_sync(
+            "UPDATE agents SET display_name = NULL, program = '' WHERE id = 1",
+            &[],
+        )
+        .unwrap();
+        let mut cleared = fetch_agents_list(&conn);
+        restore_missing_agent_fields_from_previous(&mut cleared, &renamed, None);
+        assert_eq!(cleared[0].name, "BlueLake");
+        assert_eq!(cleared[0].display_name, None);
+        assert_eq!(cleared[0].program, "agent");
+        let mut partial = DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![cleared[0].clone()],
+            ..Default::default()
+        };
+        restore_missing_detail_lists_from_previous(
+            Some(&DbStatSnapshot {
+                agents: 2,
+                agents_list: renamed,
+                ..Default::default()
+            }),
+            &mut partial,
+            None,
+        );
+        assert_eq!(partial.agents_list[0].display_name, None);
+        assert_eq!(partial.agents_list.len(), 2);
     }
 
     #[test]
@@ -6514,6 +6603,7 @@ first body
             agents: 5,
             agents_list: vec![
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "cc".to_string(),
@@ -6522,6 +6612,7 @@ first body
                     health: None,
                 },
                 AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "cc".to_string(),
@@ -6712,6 +6803,7 @@ first body
         let inputs = fetch_agent_health_inputs(
             &conn,
             &[AgentListRow {
+                display_name: None,
                 id: 7,
                 project: "proj".to_string(),
                 name: "BlueLake".to_string(),

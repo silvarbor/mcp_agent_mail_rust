@@ -47,7 +47,8 @@ if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "mail_ui" \
     e2e_summary
     exit 1
 fi
-trap 'e2e_stop_server || true' EXIT
+MAIL_UI_BROWSER_SESSION=""
+trap 'if [ -n "${MAIL_UI_BROWSER_SESSION}" ]; then mail_ui_browser close >/dev/null 2>&1 || true; fi; e2e_stop_server || true' EXIT
 
 API_URL="${E2E_SERVER_URL%/mcp/}/api/"
 NETWORK_TRACE_FILE="${E2E_ARTIFACT_DIR}/network_trace.jsonl"
@@ -452,4 +453,207 @@ e2e_assert_contains "policy trace includes no-auth check" "${POLICY_TRACE_BODY}"
 e2e_assert_contains "policy trace includes invalid-token check" "${POLICY_TRACE_BODY}" "\"case_id\": \"mail_invalid_token\""
 e2e_assert_contains "policy trace passed=true" "${POLICY_TRACE_BODY}" "\"passed\": true"
 
+# Exercise Alpine, DOM rendering and Lucide in an owned Chromium session.
+# Synthetic messages stay in this browser model; the mailbox seed stays small.
+mail_ui_browser() {
+    env -u AGENT_BROWSER_AUTO_CONNECT -u AGENT_BROWSER_CDP \
+        -u AGENT_BROWSER_PROFILE -u AGENT_BROWSER_STATE -u AGENT_BROWSER_RESTORE \
+        -u AGENT_BROWSER_SESSION_NAME -u AGENT_BROWSER_PROVIDER \
+        -u AGENT_BROWSER_ARGS -u AGENT_BROWSER_HEADED \
+        agent-browser --engine chrome --session "${MAIL_UI_BROWSER_SESSION}" "$@"
+}
+
+test_unified_inbox_browser() {
+    if ! command -v agent-browser >/dev/null 2>&1; then
+        e2e_skip "unified inbox browser regression: agent-browser required"
+        return
+    fi
+    e2e_case_banner "Unified inbox browser regression (1000 messages)"
+    MAIL_UI_BROWSER_SESSION="mail-ui-e2e-$$-${RANDOM}"
+    local browser_log="${E2E_ARTIFACT_DIR}/unified_browser.log"
+    local browser_result="${E2E_ARTIFACT_DIR}/unified_browser_result.json"
+    if ! mail_ui_browser open "${BASE_URL}/mail/unified-inbox?limit=1000&token=${TOKEN}" >"${browser_log}" 2>&1 ||
+        ! mail_ui_browser wait --fn "window.Alpine && window.lucide && document.querySelector('[x-data=\"unifiedInboxManager()\"]')?._x_dataStack?.[0]?.allMessages?.length > 0" >>"${browser_log}" 2>&1; then
+        e2e_fail "unified inbox browser could not initialize; see unified_browser.log"
+        return
+    fi
+    if ! mail_ui_browser --json eval --stdin >"${browser_result}" 2>>"${browser_log}" <<'JS'
+(async () => {
+  const root = document.querySelector('[x-data="unifiedInboxManager()"]');
+  const inbox = Alpine.$data(root);
+  const checks = [];
+  const check = (name, passed) => checks.push({ name, passed: !!passed });
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const settle = async () => { await Alpine.nextTick(); await sleep(250); };
+  const realFetch = window.fetch;
+  const realTimeout = window.setTimeout;
+  const realIcons = lucide.createIcons;
+  const delays = new Map();
+  let mode = 'unchanged', payload, release, active = 0, maxActive = 0, requests = 0, aborted = false;
+  let iconCalls = 0, iconMutations = 0, probe;
+  const observer = new MutationObserver(records => {
+    iconMutations += records.flatMap(record => [...record.addedNodes])
+      .filter(node => node instanceof Element && (node.matches('[data-lucide]') || node.querySelector('[data-lucide]'))).length;
+  });
+  try {
+    inbox.autoRefreshEnabled = false;
+    inbox.handleAutoRefreshToggle();
+    const seed = inbox.allMessages[0];
+    inbox.allMessages = Array.from({ length: 1000 }, (_, index) => ({
+      ...seed, id: 100000 + index, subject: `Browser regression message ${index}`,
+      created: new Date(Date.UTC(2026, 0, 1) + index * 1000).toISOString()
+    }));
+    inbox.selectedMessage = null;
+    inbox.filterMessages();
+    await settle();
+    check('all 1000 messages remain searchable', inbox.filteredMessages.length === 1000);
+    check('at most 50 message rows render', root.querySelectorAll('[data-message-id]').length === 50);
+    inbox.searchQuery = 'Browser regression message 999';
+    inbox.filterMessages();
+    await settle();
+    check('search finds a message outside the initial page', inbox.filteredMessages.length === 1 && inbox.filteredMessages[0].id === 100999);
+    inbox.searchQuery = '';
+    inbox.filterMessages();
+    inbox.selectMessage(inbox.filteredMessages[49]);
+    await settle();
+    document.activeElement?.blur();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', bubbles: true }));
+    await settle();
+    check('keyboard navigation crosses page boundary', inbox.messagePage === 1 && inbox.selectedMessage.id === inbox.filteredMessages[50].id);
+    check('second page renders selected message within 50 rows', root.querySelectorAll('[data-message-id]').length === 50 && !!root.querySelector(`[data-message-id="${inbox.selectedMessage.id}"]`));
+
+    payload = JSON.parse(JSON.stringify(inbox.allMessages));
+    window.fetch = (input, options = {}) => {
+      const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+      if (url.pathname !== '/mail/api/unified-inbox') return realFetch(input, options);
+      requests++; active++; maxActive = Math.max(maxActive, active);
+      return new Promise((resolve, reject) => {
+        const finish = () => {
+          active--;
+          resolve(new Response(JSON.stringify({ messages: payload }), {
+            status: mode === '503' ? 503 : mode === '500' ? 500 : 200,
+            headers: { 'Content-Type': 'application/json' }
+          }));
+        };
+        if (mode === 'deferred') {
+          release = finish;
+          options.signal.addEventListener('abort', () => {
+            aborted = true; active--; reject(new DOMException('Aborted', 'AbortError'));
+          }, { once: true });
+        } else finish();
+      });
+    };
+    const allBefore = inbox.allMessages, filteredBefore = inbox.filteredMessages;
+    const selectedBefore = inbox.selectedMessage;
+    const bodyBefore = document.getElementById(`message-body-${selectedBefore.id}`);
+    const contentBefore = bodyBefore?.firstChild;
+    inbox.selectedMessages = [selectedBefore.id];
+    const selectionBefore = inbox.selectedMessages;
+    await inbox.fetchLatestMessages({ silent: true });
+    await settle();
+    check('unchanged refresh preserves array and filter identity', inbox.allMessages === allBefore && inbox.filteredMessages === filteredBefore);
+    check('unchanged refresh preserves selection and body DOM identity', inbox.selectedMessage === selectedBefore && inbox.selectedMessages === selectionBefore && document.getElementById(`message-body-${selectedBefore.id}`) === bodyBefore && bodyBefore?.firstChild === contentBefore && !!contentBefore);
+    payload = payload.map(message => message.id === selectedBefore.id ? { ...message, sender_label: `Officer Alpha <${message.sender}>` } : message);
+    payload.unshift({ ...payload[0], id: 101001, subject: 'New browser message', created: '2027-01-01T00:00:00Z' });
+    await inbox.fetchLatestMessages({ silent: true });
+    await settle();
+    check('changed label and new message appear', inbox.allMessages.length === 1001 && inbox.selectedMessage.sender_label === `Officer Alpha <${selectedBefore.sender}>` && root.textContent.includes('Officer Alpha'));
+    check('changed refresh retains selected address and message', inbox.selectedMessage.id === selectedBefore.id && inbox.selectedMessage.sender === selectedBefore.sender && inbox.selectedMessages.includes(selectedBefore.id));
+
+    mode = 'deferred';
+    const requestsBefore = requests;
+    const inFlight = inbox.fetchLatestMessages({ silent: true });
+    await inbox.fetchLatestMessages();
+    inbox.autoRefreshSeconds = 0.01;
+    inbox.autoRefreshEnabled = true;
+    inbox.scheduleAutoRefresh();
+    await sleep(50);
+    check('manual and automatic overlap allow only one request', requests === requestsBefore + 1 && maxActive === 1 && active === 1);
+    inbox.autoRefreshEnabled = false;
+    mode = 'unchanged';
+    release();
+    await inFlight;
+
+    window.setTimeout = (callback, delay, ...args) => {
+      const handle = realTimeout(callback, delay, ...args);
+      delays.set(handle, delay);
+      return handle;
+    };
+    inbox.autoRefreshSeconds = 45;
+    inbox.autoRefreshEnabled = true;
+    const usableMessages = inbox.allMessages;
+    for (const status of ['503', '500']) {
+      mode = status;
+      const failuresBefore = inbox.refreshFailures;
+      const failedSelection = inbox.selectedMessage;
+      await inbox.fetchLatestMessages({ silent: true });
+      check(`HTTP ${status} preserves data and selection`, inbox.allMessages === usableMessages && inbox.selectedMessage === failedSelection && !!inbox.refreshError);
+      check(`HTTP ${status} backs off automatic refresh`, inbox.refreshFailures === failuresBefore + 1 && delays.get(inbox.autoRefreshHandle) === 45000 * 2 ** inbox.refreshFailures);
+      inbox.selectNextMessage();
+      await settle();
+      check(`HTTP ${status} leaves navigation usable`, inbox.selectedMessage && inbox.selectedMessage.id !== failedSelection.id);
+    }
+    inbox.autoRefreshEnabled = false;
+    inbox.handleAutoRefreshToggle();
+    await settle();
+    lucide.createIcons = (...args) => { iconCalls++; return realIcons.apply(lucide, args); };
+    observer.observe(document.body, { childList: true, subtree: true });
+    await sleep(300);
+    check('idle page does not repeat icon work', iconCalls === 0 && iconMutations === 0);
+    probe = document.createElement('div');
+    probe.innerHTML = '<i data-lucide="inbox"></i>';
+    document.body.appendChild(probe);
+    await sleep(250);
+    check('new icon placeholder becomes SVG', !!probe.querySelector('svg') && !probe.querySelector('i') && iconCalls > 0);
+    const callsAfterIcon = iconCalls, mutationsAfterIcon = iconMutations;
+    await sleep(300);
+    check('icon replacement settles without a mutation loop', iconCalls === callsAfterIcon && iconMutations === mutationsAfterIcon);
+
+    mode = 'deferred';
+    inbox.autoRefreshEnabled = true;
+    const pending = inbox.fetchLatestMessages({ silent: true });
+    const pendingController = inbox.refreshController;
+    inbox.destroy();
+    await pending;
+    check('destroy aborts request and removes refresh handle', aborted && pendingController.signal.aborted && active === 0 && inbox.refreshController === null && inbox.autoRefreshHandle === null && inbox.destroyed);
+  } catch (error) {
+    check(`browser exception: ${error.stack || error}`, false);
+  } finally {
+    inbox.destroy();
+    observer.disconnect();
+    probe?.remove();
+    window.fetch = realFetch;
+    window.setTimeout = realTimeout;
+    lucide.createIcons = realIcons;
+  }
+  return { passed: checks.length > 0 && checks.every(item => item.passed), checks, maxActive, iconCalls, iconMutations };
+})()
+JS
+    then
+        e2e_fail "unified inbox browser evaluation failed; see unified_browser_result.json"
+        return
+    fi
+    if python3 - "${browser_result}" <<'PY'
+import json
+import sys
+
+response = json.load(open(sys.argv[1], encoding="utf-8"))
+result = (response.get("data") or {}).get("result")
+if isinstance(result, str):
+    result = json.loads(result)
+if not response.get("success") or not isinstance(result, dict) or not result.get("passed"):
+    print(json.dumps(result or response, indent=2))
+    sys.exit(1)
+print(f"{len(result['checks'])} browser checks passed; maximum concurrent refreshes={result['maxActive']}")
+PY
+    then
+        e2e_pass "unified inbox browser pagination, refresh stability, failure backoff and icon settling"
+    else
+        e2e_fail "unified inbox browser regression failed; see unified_browser_result.json"
+    fi
+    mail_ui_browser close >>"${browser_log}" 2>&1 || true
+    MAIL_UI_BROWSER_SESSION=""
+}
+
+test_unified_inbox_browser
 e2e_summary

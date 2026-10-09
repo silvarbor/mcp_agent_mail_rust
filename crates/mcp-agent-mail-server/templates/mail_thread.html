@@ -3,13 +3,13 @@
 {% block title %}{{ thread_subject }} — Thread{% endblock %}
 
 {% block breadcrumbs %}
-<nav class="flex items-center gap-2 text-sm">
+<nav class="flex flex-wrap items-center gap-2 text-sm min-w-0 max-w-full">
   <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors flex items-center gap-1">
     <i data-lucide="home" class="w-3.5 h-3.5"></i>
     Projects
   </a>
   <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
-  <a href="/mail/{{ project.slug }}" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+  <a href="/mail/{{ project.slug }}" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors min-w-0 break-all">
     {{ project.human_key }}
   </a>
   <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
@@ -30,10 +30,10 @@
             {{ thread_subject }}
           </h1>
         </div>
-        <div class="flex items-center gap-4 text-sm text-slate-600 dark:text-slate-400">
-          <div class="flex items-center gap-1.5">
+        <div class="flex flex-wrap items-center gap-4 text-sm text-slate-600 dark:text-slate-400 min-w-0">
+          <div class="flex items-center gap-1.5 min-w-0 max-w-full">
             <i data-lucide="hash" class="w-4 h-4"></i>
-            <span class="font-mono">{{ thread_id }}</span>
+            <span class="font-mono min-w-0 break-all">{{ thread_id }}</span>
           </div>
           <div class="flex items-center gap-1.5">
             <i data-lucide="layers" class="w-4 h-4"></i>
@@ -72,8 +72,8 @@
 
               <!-- Sender Info -->
               <div class="flex-1 min-w-0">
-                <div class="flex items-baseline gap-2 mb-1">
-                  <span class="font-semibold text-slate-900 dark:text-white">{{ msg.sender }}</span>
+                <div class="flex flex-wrap items-baseline gap-2 mb-1">
+                  <span class="font-semibold text-slate-900 dark:text-white break-words min-w-0">{{ msg.sender_label }}</span>
                   <span class="text-sm text-slate-500 dark:text-slate-400">{{ msg.created }}</span>
                 </div>
 

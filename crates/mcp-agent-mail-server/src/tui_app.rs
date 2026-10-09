@@ -1565,6 +1565,7 @@ pub struct MailAppModel {
     quit_confirm_source: Option<QuitConfirmSource>,
     /// Compose message overlay state (`Ctrl+N` to open, `Esc` to close).
     compose_state: Option<ComposeState>,
+    compose_db_stats_gen: u64,
     /// Global widget-tree inspector state (debug-only; gated by `AM_TUI_DEBUG`).
     inspector: InspectorState,
     /// Flattened inspector tree size from the most recent frame.
@@ -1699,6 +1700,7 @@ impl MailAppModel {
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
             compose_state: None,
+            compose_db_stats_gen: u64::MAX,
             contrast_guard_cache: RefCell::new(ContrastGuardCache::default()),
             contrast_guard_pending: Cell::new(true),
             contrast_guard_last_tick: Cell::new(u64::MAX),
@@ -3591,23 +3593,10 @@ impl MailAppModel {
             return; // Already open.
         }
         let mut cs = ComposeState::new();
-        // Populate agent list from a bounded recent event window so opening
-        // compose cannot trigger full-ring scans under large histories.
-        let agents: Vec<String> = self
-            .state
-            .recent_events(PALETTE_DYNAMIC_EVENT_SCAN)
-            .iter()
-            .filter_map(|e| {
-                if let crate::tui_events::MailEvent::AgentRegistered { name, .. } = e {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        cs.set_available_agents(agents);
+        if let Some(agents) = compose_agent_profiles(&self.state) {
+            cs.set_available_agent_profiles(agents);
+        }
+        self.compose_db_stats_gen = self.state.data_generation().db_stats_gen;
         self.compose_state = Some(cs);
     }
 
@@ -4251,6 +4240,15 @@ impl MailAppModel {
 
     #[allow(clippy::too_many_lines)]
     fn run_housekeeping_tick(&mut self, elapsed_tick: Duration) -> Cmd<MailMsg> {
+        let db_stats_gen = self.state.data_generation().db_stats_gen;
+        if self.compose_state.is_some() && self.compose_db_stats_gen != db_stats_gen {
+            if let Some(agents) = compose_agent_profiles(&self.state)
+                && let Some(compose) = &mut self.compose_state
+            {
+                compose.set_available_agent_profiles(agents);
+                self.compose_db_stats_gen = db_stats_gen;
+            }
+        }
         if let Some(mut transition) = self.screen_transition {
             transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
             self.screen_transition = if transition.ticks_remaining == 0 {
@@ -5945,6 +5943,56 @@ struct AmbientEventSignalSummary {
 type PaletteAgentDisplayMap = HashMap<String, (String, String)>;
 type PaletteDbData = (PaletteAgentDisplayMap, Vec<PaletteMessageSummary>);
 
+/// Compose dispatch uses the first project; load exactly that project's roster.
+fn compose_agent_profiles(state: &TuiSharedState) -> Option<Vec<(String, Option<String>)>> {
+    let snapshot = state.config_snapshot();
+    let db = crate::open_observability_sync_db_connection(
+        &snapshot.raw_database_url,
+        std::path::Path::new(&snapshot.storage_root),
+        "compose recipient profiles",
+    )
+    .ok()??;
+    compose_agent_profiles_from_db(db.conn())
+}
+
+fn compose_agent_profiles_from_db(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> Option<Vec<(String, Option<String>)>> {
+    let columns = conn.query_sync("PRAGMA table_info(agents)", &[]).ok()?;
+    let has_column = |name: &str| {
+        columns.iter().any(|row| {
+            row.get_named::<String>("name")
+                .is_ok_and(|column| column == name)
+        })
+    };
+    let display_name = if has_column("display_name") {
+        "a.display_name"
+    } else {
+        "NULL AS display_name"
+    };
+    let lifecycle = if has_column("retired_at") {
+        "AND a.retired_at IS NULL"
+    } else {
+        ""
+    };
+    let has_ledger = conn
+        .query_sync(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_deregistrations'",
+            &[],
+        )
+        .is_ok_and(|rows| !rows.is_empty());
+    let ledger = if has_ledger {
+        "AND NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id)"
+    } else {
+        ""
+    };
+    conn.query_sync(&format!(
+        "SELECT a.name, {display_name} FROM agents a WHERE a.project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) {lifecycle} {ledger} ORDER BY a.name LIMIT {PALETTE_DYNAMIC_AGENT_CAP}"
+    ), &[]).ok().map(|rows| rows.into_iter().filter_map(|row| {
+        Some((row.get_named::<String>("name").ok()?, row.get_named::<String>("display_name").ok()))
+    }).collect())
+}
+
 fn query_palette_db_data(
     state: &TuiSharedState,
     agent_limit: usize,
@@ -7615,6 +7663,30 @@ mod tests {
         let config = Config::default();
         let state = TuiSharedState::new(&config);
         MailAppModel::new(state)
+    }
+
+    #[test]
+    fn display_name_compose_profiles_match_dispatch_project() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().unwrap();
+        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        conn.execute_sync("CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, display_name TEXT)", &[]).unwrap();
+        conn.execute_sync("INSERT INTO projects VALUES (1), (2)", &[])
+            .unwrap();
+        conn.execute_sync("INSERT INTO agents VALUES (1, 1, 'BlueLake', 'Reviewer'), (2, 1, 'RedStone', 'Reviewer'), (3, 2, 'BlueLake', 'Other project reviewer')", &[]).unwrap();
+        assert_eq!(
+            compose_agent_profiles_from_db(&conn).unwrap(),
+            vec![
+                ("BlueLake".into(), Some("Reviewer".into())),
+                ("RedStone".into(), Some("Reviewer".into())),
+            ]
+        );
+        conn.execute_sync("UPDATE agents SET display_name = NULL WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(
+            compose_agent_profiles_from_db(&conn).unwrap()[0],
+            ("BlueLake".into(), None)
+        );
     }
 
     fn test_model_with_debug(debug: bool) -> MailAppModel {
