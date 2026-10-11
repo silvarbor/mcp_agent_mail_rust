@@ -201,7 +201,54 @@ Conditional gates: operator review if the adapter ADR changes, and
 [Change #468](https://github.com/outcomeeng/changes/issues/468) if an assertion
 audit is required. That report describes `auditClass: assertion` rejected by
 the current SPX contract; no local reproduction or workaround is claimed.
-Preserve required evidence and wait for the concrete Frame before validation.
+The concrete Frame is confirmed. The operator ordered execution of the six-step
+acceptance plan; continue through implementation and normal-workflow evidence.
+
+## Active execution — 2026-10-11
+
+The Plugins Maintainer separated the existing four-node work in
+[Change #461](https://github.com/outcomeeng/changes/issues/461) from Director
+resume/monitor in [Change #471](https://github.com/outcomeeng/changes/issues/471).
+The latter retains prerequisites #342 and #461. Native source dependencies for
+the adapter, lifecycle instructions and notifications already exist; those
+mutations need no #342 source. Monitor acceptance remains part of `br-0egjn`.
+The Director approved #461's manual execution route in **13173**, preserving
+its tests, audits and lifecycle records; it need not wait for the broad
+final-format execution-skill upgrade #470. #342 has a live Plugins Contributor
+recovering its branch and continuing the monitor prerequisite.
+
+SPX Maintainer **13127** confirms the existing published 0.9.0 contract permits
+class/kind `spec/spec` for the node-spec subject, retaining assertion identity
+in unit IDs and findings. The assertion producer's `assertion` class is outside
+that closed set. The Director and Plugins Maintainer agreed on a Plugins-side
+repair in #468, executed by Contributor 2, with a floor-version contract test
+and a real sealed assertion-audit run. No SPX release or weaker audit is needed.
+The #461 Frame amends no ADR/PDR, so its earlier conditional operator text-review
+gate does not apply.
+
+The obsolete native #342 dependency link on #461 still needs its narrow guard
+approval. Exact rejected command from the Plugins owner, mail **13144**:
+`gh api repos/outcomeeng/changes/issues/461/dependencies/blocked_by/5694106798 --method DELETE --silent`.
+DCG rejected it under `platform.github:gh-api-delete-generic`; its one-time
+permission is `dcg allow-once 776086`. The operator question is pending in this
+conversation; no retry or bypass occurred. It removes one dependency link and
+deletes neither issue. #471 preserves the monitor's true prerequisites.
+
+Fresh native/adapter baseline is retained under
+`/Users/shz/.local/state/mcp-agent-mail/stabilization/20261011-label-workflow/`:
+`baseline.json`, `label-routing-negative.json`, and `relationships.json`.
+The isolated server runs on 8877 through the existing demo helper, whose
+executable mode was corrected. Own fixture GreenLake ID 22 shares Reviewer with
+retained RedStone; original message 24 stays addressed by stable name through
+rename, omission and clear in both body modes. Immediate subsequent sends,
+Unicode/unlabeled/delimiter pointer parsing, control rejection and the 128/129
+Unicode-scalar boundary passed. Sending to Reviewer failed without delivery.
+The focused real DB relationship test passed 1/1, preserving contacts,
+reservations, token/contact policy and message identity. Source is unchanged.
+This baseline proves neither automatic lifecycle triggers nor the future monitor.
+Keep the task active, obtain each implementation's exact head, and validate the
+normal workflow before closing it.
+
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
 `record.sender`, `restart_pane.py` supplies no label registration step, and
