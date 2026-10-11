@@ -13,6 +13,10 @@ this note records how to resume it and where its evidence lives.
 3. Read `br-vas72`, then `br-0egjn`. Finish the remaining label acceptance before
    starting the stabilization implementation, unless new evidence establishes
    an immediate runtime risk.
+   The #461 Executor is active in Plugins `worktrees/executor-461` on
+   `work/change-461`; collect its implementation head and real resume probe.
+   #471 retains the actual monitor follow-up. The dependency guard approval
+   and #468 producer repair are complete; do not request them again.
 4. Select at most two local implementation items. The bounded assessment
    `br-vas72.1` completed on 2026-10-11; all three original P0 reports remain
    open. Migration mitigations passed; drain/crash runtime probes need Linux.
@@ -226,13 +230,17 @@ and a real sealed assertion-audit run. No SPX release or weaker audit is needed.
 The #461 Frame amends no ADR/PDR, so its earlier conditional operator text-review
 gate does not apply.
 
-The obsolete native #342 dependency link on #461 still needs its narrow guard
-approval. Exact rejected command from the Plugins owner, mail **13144**:
+The obsolete native #342 dependency link on #461 was removed at **18:30 UTC**
+on 2026-10-11. The operator replied "Continue delivering fucking value" to the
+exact scoped removal question. The authorized command, originally rejected
+and reported by the Plugins owner in **13144**, was:
 `gh api repos/outcomeeng/changes/issues/461/dependencies/blocked_by/5694106798 --method DELETE --silent`.
-DCG rejected it under `platform.github:gh-api-delete-generic`; its one-time
-permission is `dcg allow-once 776086`. The operator question is pending in this
-conversation; no retry or bypass occurred. It removes one dependency link and
-deletes neither issue. #471 preserves the monitor's true prerequisites.
+DCG's old grant 776086 was scoped to the owner's scratchpad and did not admit
+the current caller. Fresh single-use grant 905609 admitted the exact command;
+it exited zero. The unused old grant was revoked with
+`dcg allow-once revoke 776086 --yes`. Fresh GETs verify #461 has no native
+blockers and #471 still has #342 and #461. Neither issue was deleted. The
+earlier pending-approval snapshots below are historical, not current blockers.
 
 Fresh native/adapter baseline is retained under
 `/Users/shz/.local/state/mcp-agent-mail/stabilization/20261011-label-workflow/`:
@@ -311,6 +319,107 @@ The required one-time guard decision remains pending. On an explicit approval,
 relay the exact scope to the Plugins Maintainer, let its owner perform the
 approved action, and read back both #461 and #471 dependencies. Continue the
 real owner-session and final monitor checks before closing checklist 1, 7 or 9.
+
+Execution snapshot at **15:36 UTC**, superseding the earlier snapshots above:
+#468 merged as Plugins PR #649 at
+`437b9b57b5c2ec8d3101815d06d954f1f0d7bd15`, and spec-tree 0.105.3 is released.
+Maintainer **13563** reports the actual installed assertion-auditor run
+`2026-10-11_15-15-34-437-c04fa6cff606` sealed approved with zero findings and
+an audited `spec/spec` unit. Its target is
+`spx/15-validation.enabler/32-plugin-manifest.enabler/plugin-manifest.md`;
+the floor-version checks accepted the payload on SPX 0.8.0. That producer
+prerequisite is complete; no SPX release is required.
+
+Director **13576** set #461 to **Normal (Capability, Shield)**, independently
+read back at 15:26 UTC. This supersedes its earlier Deferred rank. Execution
+still requires removal of the obsolete #342 edge, an available slot, and no
+higher-ranked unblocked Executable Plugins Change waiting. The manual route
+**13173** remains valid; #470 is a capacity competitor, not a source dependency.
+#461 still has no implementation head. Its exact dependency-removal approval
+question remains unanswered; neither elapsed time nor another owner's
+readiness authorizes that rejected command.
+
+#342 has a new handoff **6110595337** at 15:28:13 UTC, branch
+`work/change-342-direct-positions-3`, head
+`30cb2a60a23cc6882154e181e21a13923d7f1bd1`. It waits on decision review #473
+and the full-gate setup repair #472; its tests have no passing verification on
+that head. #472's implementation and audits are approved at
+`af33d47d06b4a512b4d3ab139d9f75f95ce72735`, with its terminal full gate pending.
+Maintainer **13505** confirms #472 is no product dependency of #461: an
+existing owner can supply the real resume pilot. Do not mistake a handed-off
+branch for verified delivery or copy its scripts into this checkout.
+
+Maintainer **13651** confirms #342 released its slot. Both execution slots were
+then assigned to Urgent Changes #425 and #454. #461 remains queued at Normal;
+the dependency approval and execution assignment are both outstanding.
+Requests **13666** and **13667** ask the Plugins Maintainer and Methodology
+Director to use the already-supported own-label registration before their next
+mail, without registering another owner. This can improve current correspondence
+while the general trigger is implemented. Neither request establishes a
+completed registration or the required startup/resume acceptance.
+
+Execution snapshot at **19:11 UTC**, superseding the earlier scheduling notes:
+The record rewrite is complete. Handoff **6112602015** releases #461 as
+Executable with no blockers; its audit approved twice, including the absent
+or stale stored-label precondition. Maintainer **14108** confirms the herdr
+Executor is running: session `3eadb25c-ac31-4cf4-88eb-09e5c9c2cfd0`, worktree
+`/Users/shz/Code/outcomeeng/plugins/worktrees/executor-461`, pane `w51:p1`,
+branch `work/change-461`, initial head
+`8733b1b26b889e5d5fcb681cf1d684688a4454a6`. Claim **6112632075** matches this
+session and worktree. No implementation commit or passing owner-resume probe
+is claimed at this initial head. Collect the new source head and attested run.
+The separate disposable-home repair #472 is merged as Plugins PR #650 in
+this initial head. #471 remains open and still needs #342 and #461 delivery.
+
+Mail **14083** supplied the pilot precondition: the resumed owner itself
+prepares an absent or stale label in the isolated store, then the shipped
+resume restores its assigned label before its first mail. Starting with the
+already-correct label cannot establish that the trigger ran. Its send command
+exceeded the adapter deadline after persistence; exact search found 14083,
+and recipient answer **14108** explicitly confirms receipt and incorporation.
+No resend was made. Cheap health and reservation checks passed. The retained
+three-second `live-mail-timeout-sample.txt` establishes no root cause; record
+this bounded send-latency observation in installed acceptance `br-vas72.2`.
+No service restart, mailbox repair or timeout relaxation was performed.
+
+Historical execution snapshot at **18:47 UTC**:
+Maintainer **14042** reports the operator's new execution rule: Contributors
+take a Change to Executable, and a herdr Executor implements it. The old hand
+route is superseded. The installed execute skill expects the earlier record
+form with a Nodes section. In response to **14054**, Maintainer **14063**
+assigned BrightWillow to rewrite #461 immediately in that supported form,
+preserving the confirmed four-node scope, settled answers and real owner-session
+probe; it need not wait for #470. The fresh claim is **6112425324**,
+session `16cd39b2-7ee0-426d-9d89-e96018a24a3f`, worktree
+`/Users/shz/Code/outcomeeng/plugins/worktrees/ff030327`, intended branch
+`work/change-461`. The Maintainer will start its herdr Executor as soon as this
+record is released and provide the worktree, pane and head. This is an active
+record rewrite, not implementation or a passing workflow probe.
+
+Director **14035** retained Normal priority and declined further rank requests.
+The obsolete dependency is resolved. Do not ask the operator for that same
+permission again or treat #470/#472 as product prerequisites of #461. Collect
+the actual Executor head and run the agreed acceptance. #471 still needs #342
+delivery and #461 before its own monitor integration can finish.
+
+Both requested owner registrations now have direct live evidence: checked
+inbox **14042** reports `Plugins Maintainer` for ScarletGoose and **14035**
+reports `Methodology Director` for CobaltSpire. Native inbox metadata reflects
+the current label on older messages as well. Each owner registered itself;
+no operator-maintained label roster or registration of another identity was used.
+This improves current correspondence and does not establish the general
+startup/resume trigger.
+
+Real browser acceptance is retained in `web-label-refresh.json` and
+`web-label-refresh.png` under the 20261011-label-workflow evidence directory.
+The isolated page had 28 messages. Unchanged refresh preserved its array,
+message object and DOM row. Natural automatic refresh showed rename to
+`Officer Alpha Ω <GreenLake>` and clear to `GreenLake`, preserving message 28,
+its original body, selection, routing address and all message IDs. An HTML-shaped
+label remained literal text, inserted no image and executed no handler. Own
+fixture GreenLake remained ID 22 and was restored to Reviewer; the owned
+headless browser was closed. This is functional UI evidence, not a new
+1,000-message CPU/memory benchmark or automatic owner-lifecycle proof.
 
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
