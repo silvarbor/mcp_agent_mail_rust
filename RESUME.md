@@ -249,6 +249,36 @@ This baseline proves neither automatic lifecycle triggers nor the future monitor
 Keep the task active, obtain each implementation's exact head, and validate the
 normal workflow before closing it.
 
+Execution snapshot at **14:28 UTC**: #461 is Available/Executable; no source
+branch exists yet. Maintainer **13264** will assign its Executor when #468's
+merge frees a slot. #468 is Plugins PR #649, release head
+`7288a255692cfed121ccd4cf2e0d8d23ed3cfb48`; its current-head CI review passed,
+while Quality Gate is still running. A skill audit was reported approved;
+the floor-payload acceptance, sealed unit/finding/finish run and actual launched
+assertion-auditor evidence remains uncollected. Question **13293** requests
+those exact paths/results. Count only real sealed audit results for #461's gate.
+
+#342 recovered its branch and has implementation at
+`6128717882028ade069b3f7ac215723df79dbe22`. Its real-agent tests wait on Plugins
+#472, the separate disposable Codex-home configuration repair. #471 remains
+blocked by #342 and #461. Read-only inspection of the candidate monitor confirms
+`position_mail.py` discards labels and `monitor.py` prints the stable sender.
+The actual live Plugins reply **13264** carries `sender_display_name: null`.
+The same three acceptance items remain open; no normal workflow passed yet.
+
+Maintainer **13207** explicitly accepted a real resumed owner through shipped
+orchestration/recovery, its assigned context supplying the label before first
+mail. Retain the session, own registration, sent message, recipient inbox in
+both body modes and exact source-generated pointer. An API driver performing
+registration alone is insufficient. #471 must retain a real labeled monitor
+line plus passing signal-edge, deadline and lock checks. The Director receives
+mail only. Coordinate the actual pane recipient before submission; isolated
+fixture message IDs must never be sent into the shared live mail project.
+Facts **13257** made the native baseline available to Plugins; both that mail
+and question **13293** were delivered mail-only to ScarletGoose. The dependency
+guard question above is still unanswered. Preserve that pause and the existing
+operator authority for two build jobs and tracking-only checkpoints.
+
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
 `record.sender`, `restart_pane.py` supplies no label registration step, and
