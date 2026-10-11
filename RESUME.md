@@ -279,6 +279,39 @@ and question **13293** were delivered mail-only to ScarletGoose. The dependency
 guard question above is still unanswered. Preserve that pause and the existing
 operator authority for two build jobs and tracking-only checkpoints.
 
+Later evidence, **14:50 UTC**: #468 now has head
+`19795b314159a747cd71818460f264995690cb80` in PR #649. Tests added in
+`d297ccce9bc57abef0e1463e04289f1ca98a1650` are
+`test_audit_assertions_payload.conformance.l3.py` and
+`test_audit_assertions_sealed_run.scenario.l3.py` under the audit-assertions
+node. The real CLI checks exposed a second producer defect, absent
+`producerProvenance`, now repaired. The PR reports both focused tests passing
+against SPX floor 0.8.0 and failing when the original class defect is restored.
+Current-head CI review passed; Quality Gate remains running. These are
+owner-reported test results; the actual launched-auditor seal after installation
+is still required. Mail **13379** names the evidence files; its earlier
+unpushed-state report is superseded by the current PR head.
+
+The real candidate monitor gap was reproduced at source
+`ac15a0817a7d109767e027d2d1e9c9447be96bf6`. Evidence is retained in
+`/Users/shz/.local/state/mcp-agent-mail/stabilization/20261011-label-workflow/monitor-baseline.json`.
+A fresh private state withheld existing mail through 27; own GreenLake
+sent isolated message 28 with label Reviewer, and both send and actual inbox
+returned that label. Actual monitor output was `MAIL 28: from GreenLake`;
+the notification formatter produced `[Reviewer <GreenLake>] mail 28`.
+The next poll emitted nothing and retained cursor 28. The three source-script
+hashes remained unchanged, and the watch had no sessions/groups or pane reads.
+This proves the consumer defect and its baseline mail edge, not final label,
+deadline or lock acceptance. No fixture pointer entered a live pane. Mail
+**13384** supplied this evidence to Plugins. Compare the repaired monitor with
+a fresh private state and a new message; preserve the original baseline.
+
+#461 still has no implementation head and its obsolete #342 link still exists.
+The required one-time guard decision remains pending. On an explicit approval,
+relay the exact scope to the Plugins Maintainer, let its owner perform the
+approved action, and read back both #461 and #471 dependencies. Continue the
+real owner-session and final monitor checks before closing checklist 1, 7 or 9.
+
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
 `record.sender`, `restart_pane.py` supplies no label registration step, and
