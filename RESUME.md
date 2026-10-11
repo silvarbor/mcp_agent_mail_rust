@@ -362,11 +362,14 @@ Execution snapshot at **19:11 UTC**, superseding the earlier scheduling notes:
 The record rewrite is complete. Handoff **6112602015** releases #461 as
 Executable with no blockers; its audit approved twice, including the absent
 or stale stored-label precondition. Maintainer **14108** confirms the herdr
-Executor is running: session `3eadb25c-ac31-4cf4-88eb-09e5c9c2cfd0`, worktree
+Executor `change-461` is running under the Maintainer's controlling claim,
+whose session is `3eadb25c-ac31-4cf4-88eb-09e5c9c2cfd0`, in worktree
 `/Users/shz/Code/outcomeeng/plugins/worktrees/executor-461`, pane `w51:p1`,
 branch `work/change-461`, initial head
 `8733b1b26b889e5d5fcb681cf1d684688a4454a6`. Claim **6112632075** matches this
-session and worktree. No implementation commit or passing owner-resume probe
+claim session and worktree. The public herdr inventory does not expose an
+Executor session UUID; do not equate it with the controlling claim. No
+implementation commit or passing owner-resume probe
 is claimed at this initial head. Collect the new source head and attested run.
 The separate disposable-home repair #472 is merged as Plugins PR #650 in
 this initial head. #471 remains open and still needs #342 and #461 delivery.
@@ -420,6 +423,72 @@ label remained literal text, inserted no image and executed no handler. Own
 fixture GreenLake remained ID 22 and was restored to Reviewer; the owned
 headless browser was closed. This is functional UI evidence, not a new
 1,000-message CPU/memory benchmark or automatic owner-lifecycle proof.
+
+Acceptance snapshot at **20:00 UTC**: native source remains `1f309419` and
+Plugins #461 is on `work/change-461`, committed head
+`cae5ddf9cc89378bf56af99a61ecb4f300825a6d`, after rebasing its initial two
+commits onto `3af98c36daa2524f919c1205782075ca266ffcf8`. Only the agent-mail
+spec and startup/resume register instructions are committed; the adapter
+implementation is still an uncommitted round. Rows 2–4 have no delivery
+claim. Its adapter file SHA-256 is
+`ef46e3d4a56aaa901a8355b154d94f9d7b96eed90e17b026339e7b1f54cd8541`.
+
+Root ran the candidate's actual source-owned CLI against the retained isolated
+8877 store. Four reads covered 42 records in both body modes: `senderDisplays`
+paired each ID with its expected display while all immutable records stayed
+byte-identical to the installed adapter's results. Three own-fixture stages
+(rename to Officer Alpha Ω, clear, restore Reviewer) covered 96 more record
+reads. GreenLake stayed ID 22; earlier messages changed their displayed label
+without changing their IDs, bodies, sender or recipient. The source hash stayed
+unchanged. Evidence: `inbox-projection-before.json`,
+`inbox-projection-candidate.json`, and
+`inbox-projection-rename-clear-candidate.json` in the evidence directory.
+These are provisional uncommitted-candidate integration results, not formal
+gate, automatic-resume, pane or monitor acceptance. The fixture is restored.
+
+One precise formatter edge remains: `sender_display("BlueLake", "   ")`
+returned whitespace plus `<BlueLake>` rather than the blank-label fallback.
+Native registration already clears blank labels, so the real-store reads pass.
+Maintainer **14193** records the correction from **14187** in #461 comment
+**6112939996**, queued to its Executor: require nonblank eligibility with
+`label.strip()` while preserving full eligible label text, and test spaces.
+No source file belonging to that owner was edited here.
+
+Public herdr observation at 19:29 UTC showed the implementer at the host-load
+waiter for 15m22s. Maintainer **14175** declined transferring this session's
+operator-approved sequential/two-job exception into Plugins Executors; it
+requires direct operator authorization in his own session. He declined an
+extra mid-round checkpoint in **14193**. Question **14225** asks the Director
+for a concrete operating-model route. Root's authorized bounded checks above
+continued here. No waiter, hook, assertion or audit was weakened. A public
+recent-history read was refused while the Executor was working; no scrolling,
+keystroke, interruption or history capture followed.
+
+The remaining monitor route is concrete: Director **14130** presents #473's
+same-plugin-import decision, returns #342 for its decision/spec revision, and
+orders #471 refinement in parallel. Maintainer **14150** assigns BrightWillow;
+claim **6112775696** matches `ff030327`. Handoff **6112983956** releases its
+Proposed draft after the Advisor correction, retaining #342/#461 blockers,
+real fixture acceptance and existing monitor edge/deadline/lock behavior.
+It cites Director **14163** confirming operator approval of #473's import rule.
+Approval is not merged delivery; #473 remains open. #342 received Proposed
+confirmation **6113094450** at 19:56 UTC. Collect actual implementation heads.
+
+All three peer positions now have current native labels. SPX Maintainer's
+own registration response **14217**, following request **14214**, retains
+RusticOwl ID 238; its next send has `sender_display_name: "SPX Maintainer"`.
+Plugins Maintainer and Methodology Director proofs above remain valid. This
+improves live correspondence without operator configuration and establishes
+no general automatic-resume trigger or change to orchestration rank.
+
+The live inbox read in session 1825 exceeded its 30-second adapter deadline.
+Fresh native health reports green, passed integrity, aligned archive/database,
+empty queues, and archive-commit tails above the deadline (git p99 51,003ms;
+queue p99 53,389ms). Preserve `live-inbox-deadline-observation.json` for the
+already-planned installed acceptance `br-vas72.2`. The diagnostics identify
+the reported slow stage; they establish no exact cause for this inbox failure.
+No crash, corruption, permanent stall, descriptor proof, restart, repair or
+timeout relaxation is claimed. A later new bounded inbox read succeeded.
 
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
