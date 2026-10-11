@@ -1,6 +1,6 @@
 # Resume — local Agent Mail fork
 
-Updated 2026-10-10. This is an operational handoff. Beads owns the work plan;
+Updated 2026-10-11. This is an operational handoff. Beads owns the work plan;
 this note records how to resume it and where its evidence lives.
 
 ## Start here
@@ -13,9 +13,10 @@ this note records how to resume it and where its evidence lives.
 3. Read `br-vas72`, then `br-0egjn`. Finish the remaining label acceptance before
    starting the stabilization implementation, unless new evidence establishes
    an immediate runtime risk.
-4. Select at most two local implementation items. The first stabilization task
-   is `br-vas72.1`: bounded isolated triage of three serious historical reports.
-   The selected baseline repairs can follow; avoid a repository-wide rewrite.
+4. Select at most two local implementation items. The bounded assessment
+   `br-vas72.1` completed on 2026-10-11; all three original P0 reports remain
+   open. Migration mitigations passed; drain/crash runtime probes need Linux.
+   Finish label consumer integration with its named owner, then select a baseline repair.
 5. Before mailbox work, use the repository's cheap doctor health check. Discover
    current service ownership before any maintenance; PID values from old notes
    are stale. This planning checkpoint authorizes no restart or mailbox repair.
@@ -124,6 +125,20 @@ authoritative portable rule source without weakening the rules.
 
 ## Label delivery state
 
+The 2026-10-11 triage evidence is
+`/Users/shz/.local/state/mcp-agent-mail/stabilization/20261011-triage/triage.json`.
+Three focused real-store regressions passed: v31 physical materialization,
+older-schema robot refusal, and WAL-only initialized-family detection. The
+installed binary refused `robot projects` against a new isolated synthetic
+older-schema database with expected exit 1 and byte-identical SHA-256 before
+and after. These results support the fork mitigations. They do not resolve
+the upstream decoder defect or the original incident's live remediation.
+Current drain/crash code was reviewed; the retained release-smoke harness and
+original mapping/core capture need Linux `/proc`, unavailable on this Darwin
+arm64 host. No runtime soak, crash qualification or shell-skip PASS is claimed.
+`br-vas72.1` is closed as an assessment with documented blockers, as its
+checklist permits; the original P0s retain status/severity and next actions.
+
 Stable names and IDs remain routing/authorization identities. Duplicate labels
 are legal. Arbitrary labels never resolve recipients. Unicode/spaces, trimming,
 blank clearing, omission-preserves, control rejection and the 128-scalar limit
@@ -133,9 +148,12 @@ CC/BCC privacy remains intact.
 
 Native changes are installed locally at source `1f309419`. The earlier UI/CPU
 work is in merged fork PR #2. Coding-agents **0.12.0** now contains Plugins Change
-#414, merged at Plugins commit `5acfed14`. Director mail **10918** reports his
-self-registration as Methodology Director on CobaltSpire (ID 180), resume
-registration steps, and label-aware monitor/inbox consumers complete.
+#414, merged at Plugins commit `5acfed14`. Director mail **12674** supersedes
+the consumer completion report in **10918**: the monitor still prints stable
+mail names, and the startup/resume scripts supply no label registration step.
+Read-only inspection of the named scripts confirmed this. Native and Plugins
+delivery is retained; consumer/startup integration remains open. The Director
+identifies Plugins as its owner in 12682.
 
 Holder mail **10639** cites the attested probe at Plugins commit
 `f5cded5150ad486f02c637a77c1790ff1f6ab0c1`. The retained probe, inspected at
@@ -143,8 +161,36 @@ Holder mail **10639** cites the attested probe at Plugins commit
 rename, both inbox body modes, and labeled/unlabeled/delimiter-fallback formatting.
 It explicitly did not test the adapter event stream, doorbell parsing, or actual
 pane delivery. Native event regression coverage is separate. Collect the
-Director's consumer commit/evidence paths and the final real-pane/parser
-acceptance before closing `br-0egjn`; its whole-workflow checklist remains open.
+Director's consumer change/evidence paths and normal startup/monitor acceptance
+before closing `br-0egjn`; its whole-workflow checklist remains open. On
+2026-10-11 own registration preserved GreenLake ID 267; the next authenticated
+send returned its label. Pointer `[Agent Mail Maintainer <GreenLake>] mail 12672`
+was submitted once with checked trailing Enter, parsed to GreenLake/12672, and
+the Director confirmed receiving it verbatim. Copy 12673 reached the Plugins
+Maintainer. This proves the real labeled pane/parser path, while monitor,
+unlabeled/delimiter consumer and owner-resume acceptance remain open.
+
+Correction request **12680** went mail-only to CobaltSpire; copy **12681**
+reached ScarletGoose with checked pane submission. Director answer **12682**
+declines consumer changes in his temporary scripts and identifies Plugins as
+the startup/mail-tooling owner. His proposed Deferred rank has not been
+accepted by the operator. The label task remains active. A follow-up to the
+Plugins Maintainer (**12691**) requests a bounded normal startup/inbox/monitor integration
+path and owner, with any actual controller dependency stated explicitly.
+Plugins Maintainer answer **12698** confirms Plugins ownership and that no
+existing Change delivers these paths; #429 and #342 do not supply them.
+He will file one Proposed Change; entrypoint and controller dependencies are
+still unframed. Owner/scope agreement exists; implementation remains absent.
+On 2026-10-11 the operator instructed: "prioritize that bounded integration,
+and permit the tracking-only commit". This overrides the Director's proposed
+Deferred rank for this follow-up. Ask the Plugins Maintainer to frame and
+execute the bounded startup/resume and inbox/monitor integration now. Keep
+`br-0egjn` active until normal-workflow acceptance evidence is recorded.
+Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
+`position_mail.py` discards raw response label metadata, `monitor.py` prints
+`record.sender`, `restart_pane.py` supplies no label registration step, and
+`mail_send.py` constructs a custom legacy doorbell. Preserve stable identities,
+associate labels by store ID, and use source-generated pointers.
 
 Plugin labels live in the capability `response` beside immutable records;
 `data.records` retains stable identities without label fields. The plugin carries
@@ -156,7 +202,7 @@ their own assigned label; the operator maintains no secondary mapping.
 ## Mail coordination
 
 Use the current installed coding-agents skills before mail/Prowl operations.
-Version 0.12.0's adapter requires Python with `StrEnum`; this shell's default
+The installed 0.12.2 adapter requires Python with `StrEnum`; this shell's default
 Xcode `python3` is 3.9. `/opt/homebrew/bin/python3.13` successfully read the inbox
 on 2026-10-10. Use that interpreter for the adapter rather than changing system
 Python or falling back to raw mail commands.
@@ -168,11 +214,20 @@ or print tokens. Peers: Methodology Director <CobaltSpire>, Plugins Maintainer
 <ScarletGoose>, Plugins Contributor 2 <SilverHeron>. The Director authorized
 direct holder coordination with ScarletGoose copied on each mail.
 
+**Send no doorbells to the Methodology Director's pane.** Director mail 12674
+states that it is the operator's conversation and pane input can answer an
+operator question. Mail to CobaltSpire is mail-only. Use another authorized
+recipient for pane acceptance.
+
 Peer worktrees are `/Users/shz/Code/outcomeeng/methodology/worktrees/director/`,
 `/Users/shz/Code/outcomeeng/plugins/worktrees/maintainer/`, and
 `/Users/shz/Code/outcomeeng/plugins/worktrees/contributor-2/`. Resolve fresh public
 identities with the skill; do not infer panes from titles or read transcripts.
-This session lacked a Prowl caller identity. The operator-authorized bounded
+This session previously lacked a Prowl caller identity. On 2026-10-11 the
+inherited selector resolved an advisor pane. Scope resolver calls with
+`env -u PROWL_PANE_ID PROWL_WORKTREE_PATH=/Users/shz/Code/silvarbor/agent-mail/agent-mail/`
+so the public inventory resolves the actual Agent Mail worktree. The corrected
+caller matched the branch and repository. The operator-authorized bounded
 coordination exception was recorded in `br-0egjn`: uniquely matched public
 worktrees, exact one-line source-generated doorbells, checked trailing Enter,
 no fabricated caller or focus mutation. Preserve that scope; do not broaden it.
@@ -209,7 +264,9 @@ All required Cargo checks, production graph check, Clippy with warnings denied,
 and formatting passed at native source `1f309419`. Focused label suites passed;
 nine adjacent filters passed 106 test executions. This is not a full-workspace
 test pass. The server's seven retained failures are the baseline repair queue.
-No compiler or implementation tests were rerun for this documentation checkpoint.
+No native implementation edits or full compiler/workspace reruns occurred in
+this tracking checkpoint. The three targeted triage regressions above passed
+on 2026-10-11 with the pinned toolchain and two build jobs.
 
 Use pinned nightly executables from
 `/Users/shz/.rustup/toolchains/nightly-2026-08-31-aarch64-apple-darwin/bin`;
@@ -224,6 +281,13 @@ production `--lib --bins`, Clippy `-D warnings`, and formatting. Prefer the same
 focused package set during tests to avoid accidental feature-graph rebuilds.
 No full-suite passing claim, scanner waiver, or formal spec-node audit approval
 is implied by the native evidence.
+
+The operator's 2026-10-11 approval permits this tracking-only checkpoint despite
+UBS exit 3: Markdown and JSONL are unsupported, so nothing was scanned. The
+exception covers `RESUME.md`, `.beads/issues.jsonl`, and its generated sync
+baseline `.beads/beads.base.jsonl`. JSONL integrity, graph cycles, and whitespace
+checks passed. This exception provides no scanner approval for implementation
+or publication; normal pre-commit hooks remain enabled.
 
 The operator requested local work. Publish no upstream PR, deployment or public
 release as part of this plan. No file deletion or destructive Git operation is
