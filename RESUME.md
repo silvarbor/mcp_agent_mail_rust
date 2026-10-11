@@ -186,6 +186,22 @@ and permit the tracking-only commit". This overrides the Director's proposed
 Deferred rank for this follow-up. Ask the Plugins Maintainer to frame and
 execute the bounded startup/resume and inbox/monitor integration now. Keep
 `br-0egjn` active until normal-workflow acceptance evidence is recorded.
+The tracking checkpoint is `f0c6de2922376b511ee5e94a166934c3f1903ffc`.
+Priority request **13003** reached the Plugins Maintainer with checked pane
+submission; copy **13006** went mail-only to the Director. Maintainer answer
+**13010** acknowledges the operator priority, moves Proposed
+[Change #461](https://github.com/outcomeeng/changes/issues/461) ahead of Normal
+Plugins work, and assigns its framing to Contributor 4. The Plugins Maintainer
+owns execution through its Executor and confirms refinements. Concrete
+startup/resume and inbox/monitor/doorbell entrypoints arrive with the confirmed
+Frame. The accepted test list includes normal startup and resume, rename/clear
+with stable ID/history, immediate authenticated send, body/no-body inbox,
+Unicode labels, and absent/delimiter-safe fallback. Implementation remains open.
+Conditional gates: operator review if the adapter ADR changes, and
+[Change #468](https://github.com/outcomeeng/changes/issues/468) if an assertion
+audit is required. That report describes `auditClass: assertion` rejected by
+the current SPX contract; no local reproduction or workaround is claimed.
+Preserve required evidence and wait for the concrete Frame before validation.
 Read-only findings under `methodology/.spx/director/direct-positions/scripts/`:
 `position_mail.py` discards raw response label metadata, `monitor.py` prints
 `record.sender`, `restart_pane.py` supplies no label registration step, and
