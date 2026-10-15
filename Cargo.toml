@@ -182,7 +182,8 @@ module_name_repetitions = "allow"
 
 [profile.dev]
 opt-level = 1            # Slight optimization for faster test execution
-debug = 2                # Full debug info for development
+debug = 0                # Keep development and test artifacts small
+incremental = false      # Rebuild instead of retaining compiler caches
 
 [profile.release]
 lto = "thin"             # Cross-crate optimization (80% of full LTO, much faster compile)
@@ -275,6 +276,3 @@ fsqlite-wal-0410 = { package = "fsqlite-wal", git = "https://github.com/Dicklesw
 # instead of flooding trj. Revert = delete this block.
 [profile.release.package."mcp-agent-mail-server"]
 codegen-units = 16
-
-[profile.dev.package."mcp-agent-mail-server"]
-debug = 1

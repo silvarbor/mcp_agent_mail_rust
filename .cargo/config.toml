@@ -34,6 +34,8 @@ linker = "aarch64-linux-gnu-gcc"
 # ──────────────────────────────────────────────────────────────────────────────
 
 [build]
+# Prefer bounded disk use over faster repeated builds.
+incremental = false
 # The experimental parallel front-end (-Z threads=4, enabled 5d8bd0a6) reliably
 # DEADLOCKS rustc nightly-2026-08-25 while compiling the mcp-agent-mail binary
 # crate (multiple independent builds observed futex-wedged for hours on the
