@@ -11095,9 +11095,14 @@ fn parse_wal_checkpoint_rows(
     let checkpointed = wal_checkpoint_row_i64(row, "checkpointed").unwrap_or(0);
 
     if require_full_checkpoint && (busy > 0 || checkpointed < log) {
-        return Err(DbError::Sqlite(format!(
+        let detail = format!(
             "{context}: incomplete wal_checkpoint(TRUNCATE) result (busy={busy}, log={log}, checkpointed={checkpointed})"
-        )));
+        );
+        return Err(if busy > 0 {
+            DbError::ResourceBusy(detail)
+        } else {
+            DbError::Sqlite(detail)
+        });
     }
 
     Ok(u64::try_from(checkpointed.max(0)).unwrap_or(0))
@@ -21588,11 +21593,26 @@ mod tests {
             .expect("query");
         let err = parse_wal_checkpoint_rows(&rows, "checkpoint", true)
             .expect_err("busy truncate checkpoint should fail closed");
+        assert_eq!(
+            err.classification().class,
+            crate::DbErrorClass::BusyRetryable
+        );
         let err_text = err.to_string();
         assert!(
             err_text.contains("incomplete wal_checkpoint(TRUNCATE) result"),
             "unexpected error: {err_text}"
         );
+    }
+
+    #[test]
+    fn parse_wal_checkpoint_rows_rejects_incomplete_nonbusy_truncate_result() {
+        let conn = DbConn::open_file(":memory:".to_string()).expect("open");
+        let rows = conn
+            .query_sync("SELECT 0 AS busy, 5 AS log, 4 AS checkpointed", &[])
+            .expect("query");
+        let err = parse_wal_checkpoint_rows(&rows, "checkpoint", true)
+            .expect_err("incomplete nonbusy checkpoint must fail closed");
+        assert!(matches!(err, DbError::Sqlite(_)));
     }
 
     #[test]
