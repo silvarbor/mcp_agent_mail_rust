@@ -1623,6 +1623,18 @@ impl MailScreen for ToolMetricsScreen {
                 key: "J/K",
                 action: "Scroll detail",
             },
+            HelpEntry {
+                key: "Enter / Esc",
+                action: "Drill into evidence (deeper) / step back out",
+            },
+            HelpEntry {
+                key: "l/L",
+                action: "Disclosure level deeper/shallower",
+            },
+            HelpEntry {
+                key: "1-4",
+                action: "Disclosure level (inside the drill-down)",
+            },
         ]
     }
 
@@ -1638,6 +1650,13 @@ impl MailScreen for ToolMetricsScreen {
             return true;
         }
         false
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // Inside the evidence drill-down Esc steps up a level and finally
+        // leaves it, and 1-4 pick the disclosure level; outside it they stay
+        // the global quit confirmation and screen jumps.
+        self.drilldown_active && matches!(key.code, KeyCode::Escape | KeyCode::Char('1'..='4'))
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -2874,6 +2893,50 @@ mod tests {
             DisclosureLevel::Summary,
             "2 -> Summary"
         );
+    }
+
+    #[test]
+    fn esc_is_claimed_only_inside_the_evidence_drilldown() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        screen.evidence_entries = vec![EvidenceLedgerEntry::new(
+            "drill-esc",
+            "tui.diff_strategy",
+            "incremental",
+            0.85,
+            serde_json::json!({}),
+        )];
+
+        // Outside the drill-down Esc stays global, so it still arms quit
+        // confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        // Digits jump screens outside the drill-down ...
+        let four = ftui::KeyEvent::new(KeyCode::Char('4'));
+        assert!(!screen.claims_key(&four));
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        screen.update(&enter, &state);
+        assert!(screen.drilldown_active);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail);
+
+        // ... and pick the disclosure level inside it (5+ still jump).
+        assert!(screen.claims_key(&four));
+        assert!(!screen.claims_key(&ftui::KeyEvent::new(KeyCode::Char('5'))));
+        screen.update(&Event::Key(four), &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::DeepDive);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('3'))), &state);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail);
+
+        // Detail -> Summary -> Badge -> leave: every step is claimed.
+        for _ in 0..3 {
+            assert!(screen.claims_key(&esc));
+            screen.update(&Event::Key(esc), &state);
+        }
+        assert!(!screen.drilldown_active);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge);
+        assert!(!screen.claims_key(&esc));
     }
 
     // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────

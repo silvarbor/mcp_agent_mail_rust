@@ -79,6 +79,7 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
@@ -1030,9 +1031,12 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     stop_atc_operator_runtime();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    retention::shutdown();
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
+    // A sync interrupted by exit would leave `.git/index.lock` behind.
+    mcp_agent_mail_storage::stop_archive_index_sync(Duration::from_secs(10));
     cleanup_shutdown_sqlite_sidecars(config);
 }
 
@@ -2568,6 +2572,7 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     // The standalone headless process owns its signal policy. Embedders using
     // run_http_with_control retain their caller-supplied shutdown authority.
@@ -2589,7 +2594,8 @@ fn run_http_headless_supervisor(
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    let result_rx =
+        spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None, on_ready)?;
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
@@ -2604,7 +2610,69 @@ fn run_http_headless_supervisor(
     result
 }
 
-fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+type HttpReadyCallback = Box<dyn FnOnce(&mcp_agent_mail_core::Config) + Send>;
+
+/// A successful HTTP preflight bound to one immutable configuration snapshot.
+/// Serving consumes this value; callers cannot substitute another config or
+/// reuse a preflight after the first server exits.
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// startup.run()?;
+/// startup.run()?; // the preparation was already consumed
+/// # Ok(()) }
+/// ```
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// let other = mcp_agent_mail_core::Config::default();
+/// startup.run(&other)?; // serving accepts no replacement configuration
+/// # Ok(()) }
+/// ```
+#[must_use]
+pub struct PreparedHttpStartup {
+    config: mcp_agent_mail_core::Config,
+    on_ready: Option<HttpReadyCallback>,
+}
+
+impl PreparedHttpStartup {
+    /// Run once after the first listener passes its readiness self-probe.
+    /// The callback receives the actual bound address (including an assigned
+    /// ephemeral port). It is never run for a failed startup or a restart.
+    pub fn with_ready_callback(
+        mut self,
+        callback: impl FnOnce(&mcp_agent_mail_core::Config) + Send + 'static,
+    ) -> Self {
+        self.on_ready = Some(Box::new(callback));
+        self
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        run_http_supervised(self, None)
+    }
+
+    pub fn run_with_control(
+        self,
+        control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    ) -> std::io::Result<()> {
+        run_http_supervised(self, Some(control_rx))
+    }
+
+    pub fn run_with_tui(self) -> std::io::Result<()> {
+        run_http_with_tui_prepared(self)
+    }
+}
+
+/// Run the complete HTTP startup checks once, before any client setup writes.
+/// Direct server entrypoints also use this constructor; possession of a
+/// successful report alone cannot bypass the checks.
+pub fn prepare_http_startup(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<PreparedHttpStartup> {
+    config.validate_user_env_authority()?;
+    install_crash_marker_panic_hook(config.storage_root.clone());
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
@@ -2615,7 +2683,10 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    Ok(())
+    Ok(PreparedHttpStartup {
+        config: config.clone(),
+        on_ready: None,
+    })
 }
 
 fn boot_check_mode_from_config(
@@ -3257,6 +3328,11 @@ fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Op
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    // Startup moves staging here when $TMPDIR cannot hold a probe copy
+    // (br-txx8u); every snapshot must follow it.
+    if let Some(fallback) = mcp_agent_mail_db::pool::snapshot_temp_root_fallback() {
+        return validate_snapshot_temp_dir(&fallback, "staging fallback");
+    }
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
             continue;
@@ -3924,7 +4000,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup failed; binding the HTTP listener in DB-degraded mode. \
                  /healthz stays live and /health reports unavailable until the DB recovers. \
-                 Run `am doctor --json` to diagnose/repair."
+                 Run `am doctor check --json` to diagnose/repair."
             );
         }
         Err(_timeout) => {
@@ -3934,7 +4010,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
-                 background. If this persists, stop the service and run `am doctor --json`."
+                 background. If this persists, stop the service and run `am doctor check --json`."
             );
             // Detach: let the warmup finish in the background; never join here.
         }
@@ -4068,7 +4144,7 @@ fn append_crash_marker(path: &Path, record: &serde_json::Value) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    run_http_supervised(config, None)
+    prepare_http_startup(config)?.run()
 }
 
 /// Run the headless HTTP server exactly like [`run_http`], but stoppable by
@@ -4087,13 +4163,15 @@ pub fn run_http_with_control(
     config: &mcp_agent_mail_core::Config,
     control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
 ) -> std::io::Result<()> {
-    run_http_supervised(config, Some(control_rx))
+    prepare_http_startup(config)?.run_with_control(control_rx)
 }
 
 fn run_http_supervised(
-    config: &mcp_agent_mail_core::Config,
+    startup: PreparedHttpStartup,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -4101,15 +4179,8 @@ fn run_http_supervised(
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: startup probes (inside `prepare_http_runtime_startup`) must
-    // run BEFORE acquiring runtime activity locks.  The probes take an
-    // exclusive flock on the activity lockfile to verify no other process
-    // is running; if we already hold a shared flock from
-    // `acquire_runtime_mailbox_activity_locks`, the exclusive attempt
-    // deadlocks (EAGAIN) against our own process.
-    prepare_http_runtime_startup(config)?;
-
-    // Safe to acquire now -- probes have confirmed we are the sole owner.
+    // Preparation ran the exclusive integrity probe before runtime locks.
+    // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
@@ -4146,7 +4217,7 @@ fn run_http_supervised(
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone(), control_rx);
+    let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
     retention::shutdown();
@@ -4172,11 +4243,16 @@ fn run_http_supervised(
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    prepare_http_startup(config)?.run_with_tui()
+}
+
+fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<()> {
+    let config = &startup.config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
 
     // Guard against degenerate PTY geometry (e.g. `stty size` => `0 0`) which can
@@ -4186,30 +4262,19 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             "[warn] Detected invalid terminal size ({cols}x{rows}); \
              disabling TUI to avoid runaway CPU (headless HTTP mode)"
         );
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
+
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
 
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: probes must run BEFORE acquiring runtime activity locks.
-    // `probe_integrity` takes an exclusive flock on the activity lockfile;
-    // if we already hold a shared flock the exclusive attempt deadlocks
-    // (EAGAIN) against our own process.
-    let probe_report = startup_checks::run_startup_probes(config);
-    if !probe_report.is_ok() {
-        return Err(std::io::Error::other(probe_report.format_errors()));
-    }
-    ensure_boot_archive_preflight_pass(config)?;
-
-    // Now that probes have confirmed we are the sole owner, acquire the
-    // runtime shared lock for the lifetime of the process.
+    // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
@@ -4247,6 +4312,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         Some(Arc::clone(&tui_state)),
         Some(server_ctl_rx),
         Some(Arc::clone(&supervisor_fail_fast_active)),
+        on_ready,
     ) {
         Ok(result_rx) => result_rx,
         Err(err) => {
@@ -4928,6 +4994,7 @@ fn spawn_http_supervisor_task(
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
     fail_fast_active: Option<Arc<AtomicBool>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_handle = runtime_handle;
@@ -4944,6 +5011,7 @@ fn spawn_http_supervisor_task(
                     config,
                     supervisor_state,
                     control_rx,
+                    on_ready,
                 ),
             )
             .await;
@@ -5239,6 +5307,7 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
@@ -5283,6 +5352,10 @@ async fn run_http_server_supervisor(
     // ready so `systemctl is-active` only reports `active` once clients can
     // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
     sd_notify_ready();
+
+    if let Some(on_ready) = on_ready {
+        on_ready(&config);
+    }
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -6044,20 +6117,25 @@ fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
+    let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
          client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
+         archive_fence_wait_ms={}; archive_fence_holder={fence_holder}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
          blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
-         (archive stages are off the request path since ack-fast: archive \
-         lag cannot cause a tool timeout; archive_commit_queue is \
-         enqueue-to-durable queue latency, not pure git work.)",
+         (the archive write-behind queue and commit queue are off the request \
+         path since ack-fast, and archive_commit_queue is enqueue-to-durable \
+         queue latency, not pure git work; reservation artifacts are written \
+         on the request path and wait for the archive publication fence, \
+         whose oldest live wait is archive_fence_wait_ms.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6067,6 +6145,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
         micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_fence_wait_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.zombies_expired,
@@ -6078,9 +6157,15 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
+    let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder();
     McpError::new(
         McpErrorCode::InternalError,
-        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
+        dispatch_timeout_error_text(
+            method,
+            dispatch_timeout_secs,
+            &diagnostics,
+            fence_holder.as_ref(),
+        ),
     )
 }
 
@@ -9276,6 +9361,12 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
+    stable_tui_diff_config_with(full_redraw_max_interval_from_env())
+}
+
+fn stable_tui_diff_config_with(
+    full_redraw_max_interval: Option<Duration>,
+) -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
     // Explicitly tune the runtime diff path so sparse TUI updates remain
     // incremental and strategy switches do not thrash at overlay boundaries.
     let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
@@ -9303,34 +9394,39 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_dirty_span_config(dirty_spans)
         .with_tile_diff_config(tiles)
         // The TUI runs for days inside mux panes. If the visible terminal buffer
-        // is cleared or desynchronized outside the process, sparse diffs cannot
-        // reconstruct it, so force a bounded physical repaint.
+        // is cleared or desynchronized outside the process (a tmux/zellij pane
+        // swap, a detach/reattach), sparse diffs cannot reconstruct it, so a
+        // wall-clock bound forces a physical repaint whether the UI is idle or
+        // busy.
         //
-        // Two complementary bounds:
-        //  - frame-count: resync every N *rendered* frames. Cheap, but advances
-        //    only while the UI is actively rendering.
-        //  - wall-clock: resync at least every `full_redraw_max_secs` of elapsed
-        //    time, *regardless* of render cadence. This is what bounds visible
-        //    terminal-state desync (incremental-diff corruption, a tmux/zellij
-        //    pane swap, or a detach/reattach) when the TUI is idle or rendering
-        //    sparsely — exactly the case where the frame counter stalls and the
-        //    garbage would otherwise persist on screen. Tunable via
-        //    `AM_TUI_FULL_REDRAW_MAX_SECS` (default 1.0; <= 0 disables).
-        .with_full_redraw_interval_frames(20)
-        .with_full_redraw_max_interval(full_redraw_max_interval_from_env())
+        // That repaint re-emits every cell. A 1 s bound plus a 20-frame bound
+        // made an idle TUI resend the whole screen about once a second
+        // (~65 KB/s on an 86x382 pane; GH#338). The wall-clock bound alone
+        // limits how long a desync stays visible, so the frame-count bound is
+        // off and the default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`;
+        // operators can shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
+        .with_full_redraw_interval_frames(0)
+        .with_full_redraw_max_interval(full_redraw_max_interval)
 }
 
+/// Default wall-clock bound, in seconds, between forced full TUI redraws.
+const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
+
 /// Wall-clock bound between forced physical full redraws (see
-/// [`stable_tui_diff_config`]). Reads `AM_TUI_FULL_REDRAW_MAX_SECS`
-/// (floating-point seconds); defaults to 1.0s. A value <= 0 (or unparseable)
-/// disables the time-based resync, leaving only the frame-count bound.
+/// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    let secs = std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS")
-        .ok()
+    full_redraw_max_interval_from(std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS").ok().as_deref())
+}
+
+/// Parse floating-point seconds. Unset or unparseable falls back to
+/// [`DEFAULT_FULL_REDRAW_MAX_SECS`]; a value <= 0, non-finite, or too large
+/// for a `Duration` disables the wall-clock resync.
+fn full_redraw_max_interval_from(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
         .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
-    if secs.is_finite() && secs > 0.0 {
-        Some(Duration::from_secs_f64(secs))
+        .unwrap_or(DEFAULT_FULL_REDRAW_MAX_SECS);
+    if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).ok()
     } else {
         None
     }
@@ -11270,6 +11366,10 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    /// Aggregates the failed-request WARN for repeated 401/404 probes.
+    probe_rejection_log: HttpProbeRejectionLog,
+    /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
+    http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11463,6 +11563,8 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            probe_rejection_log: HttpProbeRejectionLog::default(),
+            http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11568,15 +11670,33 @@ impl HttpState {
         // requests even when the optional high-volume request log is disabled;
         // never include body or authorization data.
         if resp.status >= 400 {
-            tracing::warn!(
-                event = "http_request_error",
-                method = %method_name,
-                path = %path_for_diag,
-                status = resp.status,
-                duration_ms = dur_ms,
-                client_ip = %client_ip.as_deref().unwrap_or("-"),
-                "HTTP request failed"
-            );
+            let client = client_ip.as_deref().unwrap_or("-");
+            match self
+                .probe_rejection_log
+                .admit(client, resp.status, Instant::now())
+            {
+                HttpRejectionLogDecision::Log => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    "HTTP request failed"
+                ),
+                HttpRejectionLogDecision::LogWindowStart { suppressed_before } => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    suppressed_before,
+                    window_secs = HTTP_PROBE_REJECTION_LOG_WINDOW.as_secs(),
+                    "HTTP request failed; further responses with this status to this client within window_secs are counted, not logged"
+                ),
+                HttpRejectionLogDecision::Suppress => {}
+            }
         }
 
         if !needs_request_log {
@@ -11667,6 +11787,25 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
+        if self.config.messaging_session_identity && matches!(req.method, Http1Method::Delete) {
+            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+            let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
+                .is_some_and(|id| self.http_sessions.terminate(id, principal));
+            if !ended {
+                return self.error_response(&req, 404, "Not Found");
+            }
+            let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+            apply_cors_headers(
+                &mut resp,
+                self.cors_origin(&req),
+                self.config.http_cors_allow_credentials,
+                &self.config.http_cors_allow_methods,
+                &self.config.http_cors_allow_headers,
+            );
+            return resp;
+        }
+
         if !matches!(req.method, Http1Method::Post) {
             return self.error_response(&req, 405, "Method Not Allowed");
         }
@@ -11711,18 +11850,56 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
-            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-            |resp| HttpResponse::ok().with_json(&resp),
-        );
+        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
+        let response = self
+            .dispatch_with_session(json_rpc, session_state)
+            .await
+            .map_or_else(
+                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+                |resp| HttpResponse::ok().with_json(&resp),
+            );
 
-        to_http1_response(
+        let mut out = to_http1_response(
             response,
             self.cors_origin(&req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        )
+        );
+        if let Some(id) = new_session_id {
+            out.headers
+                .push((http_sessions::MCP_SESSION_ID_HEADER.to_string(), id));
+            out.headers.push((
+                "access-control-expose-headers".to_string(),
+                http_sessions::MCP_SESSION_ID_HEADER.to_string(),
+            ));
+        }
+        out
+    }
+
+    /// The MCP session a request belongs to (GH#279, opt-in). `initialize`
+    /// starts a session whose id is returned to the client; any other request
+    /// joins the live session named by its `Mcp-Session-Id` header, provided
+    /// it carries the same authorization the session was created under.
+    /// Otherwise the request is stateless, exactly as with the feature off.
+    fn resolve_mcp_session(
+        &self,
+        req: &Http1Request,
+        request: &JsonRpcRequest,
+    ) -> (Option<SessionState>, Option<String>) {
+        if !self.config.messaging_session_identity {
+            return (None, None);
+        }
+        let principal = http_sessions::principal_digest(header_value(req, "authorization"));
+        if request.method == "initialize" {
+            return self
+                .http_sessions
+                .create(principal)
+                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+        }
+        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
+            .and_then(|id| self.http_sessions.lookup(id, principal));
+        (state, None)
     }
 
     fn emit_http_request_log(
@@ -12882,7 +13059,20 @@ to skip auth for local requests.</p>
         None
     }
 
+    /// Stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.dispatch_with_session(request, None).await
+    }
+
+    /// Dispatch one JSON-RPC request. `session` is the persistent state of the
+    /// caller's MCP session (GH#279) when it has one; otherwise each request
+    /// gets fresh, request-local state.
+    async fn dispatch_with_session(
+        &self,
+        request: JsonRpcRequest,
+        session: Option<SessionState>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
@@ -12895,7 +13085,11 @@ to skip auth for local requests.</p>
             let id = request.id.clone();
             let outcome = std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.dispatch_inner(request))
+                    .spawn(|| {
+                        let cx = self.request_cx();
+                        let cancel = DispatchCancel::new();
+                        self.dispatch_inner_with_cx(request, session, &cx, &cancel)
+                    })
                     .join()
                     .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             });
@@ -12942,7 +13136,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| arc_self.dispatch_inner_with_cx(request, session, &worker_cx, &cancel),
         )
         .await;
 
@@ -12954,17 +13148,19 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Synchronous stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx(request, None, &cx, &cancel)
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner_with_cx(
         &self,
         request: JsonRpcRequest,
+        session_state: Option<SessionState>,
         cx: &Cx,
         cancel: &DispatchCancel,
     ) -> Result<serde_json::Value, McpError> {
@@ -12975,8 +13171,19 @@ to skip auth for local requests.</p>
         // fastmcp's router handlers now take a request-scoped `McpContext`
         // instead of a bare `Cx`; the budget travels inside the context
         // (handlers enforce it via `budget_error`) rather than as an
-        // explicit argument.
-        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        // explicit argument. The router derives tool/resource/prompt contexts
+        // from this context, so attach the same session bag used for catalog
+        // filtering; the separate router argument does not install it. Keep
+        // stateless contexts without a bag so macros cannot bind identities
+        // to a session that does not exist.
+        let request_ctx = session_state
+            .as_ref()
+            .map_or_else(
+                || McpContext::new(cx.clone(), request_id),
+                |state| McpContext::with_state(cx.clone(), request_id, state.clone()),
+            )
+            .with_budget_ceiling(budget);
+        let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {
             "initialize" => {
@@ -12994,7 +13201,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_tools_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -13006,7 +13213,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)
@@ -13099,7 +13310,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ));
@@ -13241,7 +13452,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resources_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13251,7 +13462,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resource_templates_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13263,7 +13474,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13283,7 +13494,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_prompts_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -13291,7 +13502,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -17843,6 +18054,66 @@ fn http_request_log_fallback_line(
     format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
 }
 
+/// Window in which repeated 401/404 rejections from one client are counted
+/// instead of logged (br-5804q).
+const HTTP_PROBE_REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Tracked `(client, status)` pairs; beyond this, rejections are logged.
+const HTTP_PROBE_REJECTION_LOG_MAX_KEYS: usize = 1024;
+
+/// Whether to emit the failed-request WARN for one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRejectionLogDecision {
+    /// Not a probe status: always logged.
+    Log,
+    /// First probe rejection of a window, with the count suppressed in the
+    /// previous window for this client and status.
+    LogWindowStart { suppressed_before: u64 },
+    /// A repeat inside the window: counted, not logged.
+    Suppress,
+}
+
+/// Aggregates the failed-request WARN for repeated 401/404 responses per
+/// client (br-5804q, GH#337). An unauthenticated client probing `/mcp`
+/// draws a 401 on every request and then 404s on OAuth `.well-known`
+/// probes, several a minute, which buried real warnings. The first rejection
+/// of each window is logged and says that repeats are counted; the next
+/// logged line carries the count. Other 4xx and every 5xx are always logged.
+#[derive(Default)]
+struct HttpProbeRejectionLog {
+    windows: Mutex<HashMap<(String, u16), (Instant, u64)>>,
+}
+
+impl HttpProbeRejectionLog {
+    fn admit(&self, client_ip: &str, status: u16, now: Instant) -> HttpRejectionLogDecision {
+        if !matches!(status, 401 | 404) {
+            return HttpRejectionLogDecision::Log;
+        }
+        let mut windows = lock_mutex(&self.windows);
+        let key = (client_ip.to_string(), status);
+        if let Some((started, suppressed)) = windows.get_mut(&key) {
+            if now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW {
+                *suppressed += 1;
+                return HttpRejectionLogDecision::Suppress;
+            }
+            let suppressed_before = std::mem::take(suppressed);
+            *started = now;
+            return HttpRejectionLogDecision::LogWindowStart { suppressed_before };
+        }
+        if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            windows.retain(|_, (started, _)| {
+                now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW
+            });
+            if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+                return HttpRejectionLogDecision::Log;
+            }
+        }
+        windows.insert(key, (now, 0));
+        HttpRejectionLogDecision::LogWindowStart {
+            suppressed_before: 0,
+        }
+    }
+}
+
 // render_http_request_panel moved to console.rs (br-1m6a.13)
 
 // ---------------------------------------------------------------------------
@@ -18529,6 +18800,24 @@ mod tests {
         }
     }
 
+    struct SessionStateProbeTool;
+
+    impl fastmcp::ToolHandler for SessionStateProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "session_state_probe".to_string(),
+                description: Some("test-only session-state presence probe".to_string()),
+                ..fastmcp::ToolHandler::definition(&NoopTool)
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"has_session_state": ctx.has_session_state()}).to_string(),
+            }])
+        }
+    }
+
     /// Test tool that always fails with a legacy-coded tool error (br-315wc).
     struct FailingTool {
         code: &'static str,
@@ -18635,16 +18924,106 @@ mod tests {
         (entry.calls, entry.errors, entry.rejections)
     }
 
+    /// `Write` sink whose bytes the test can read while a `TerminalWriter`
+    /// still owns the writer.
+    #[derive(Clone, Default)]
+    struct SharedTerminalSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedTerminalSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Present a full 200x50 screen, then `frames` frames that each change one
+    /// eight-cell "clock" run. Returns, per frame, the bytes it emitted and
+    /// whether the writer forced a full redraw.
+    fn present_clock_ticks(
+        config: ftui_runtime::terminal_writer::RuntimeDiffConfig,
+        frames: usize,
+    ) -> Vec<(usize, bool)> {
+        use ftui_render::cell::Cell;
+        use ftui_render::diff_strategy::DiffStrategy;
+
+        let sink = SharedTerminalSink::default();
+        let mut writer = ftui_runtime::terminal_writer::TerminalWriter::with_diff_config(
+            sink.clone(),
+            ftui::ScreenMode::AltScreen,
+            ftui::UiAnchor::Bottom,
+            ftui::TerminalCapabilities::basic(),
+            config,
+        );
+        writer.set_size(200, 50);
+        let mut buffer = ftui_render::buffer::Buffer::new(200, 50);
+        for y in 0..50_u16 {
+            for x in 0..200_u16 {
+                let letter = char::from(b'a' + u8::try_from((x + y) % 26).unwrap_or(0));
+                buffer.set_raw(x, y, Cell::from_char(letter));
+            }
+        }
+        writer.present_ui(&buffer, None, false).unwrap();
+        assert_eq!(writer.last_diff_strategy(), Some(DiffStrategy::FullRedraw));
+
+        let mut emitted = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let digit = char::from(b'0' + u8::try_from(frame % 10).unwrap_or(0));
+            for x in 190..198_u16 {
+                buffer.set_raw(x, 49, Cell::from_char(digit));
+            }
+            let before = sink.0.borrow().len();
+            writer.present_ui(&buffer, None, false).unwrap();
+            let bytes = sink.0.borrow().len() - before;
+            emitted.push((
+                bytes,
+                writer.last_diff_strategy() == Some(DiffStrategy::FullRedraw),
+            ));
+        }
+        emitted
+    }
+
     #[test]
-    fn stable_tui_diff_config_forces_periodic_terminal_resync() {
-        let config = stable_tui_diff_config();
-        assert_eq!(config.full_redraw_interval_frames, 20);
-        // The wall-clock resync is enabled by default (env unset => 1s), so an
-        // idle / sparsely-rendering TUI still resynchronizes the physical
-        // terminal on a time cadence — not only on rendered-frame count.
+    fn stable_tui_diff_config_emits_only_changed_cells_between_resyncs() {
+        // GH#338: with the default 30 s wall-clock bound, a TUI whose only
+        // change is its status-line clock must not repaint the screen.
+        let config = stable_tui_diff_config_with(full_redraw_max_interval_from(None));
+        assert_eq!(config.full_redraw_interval_frames, 0);
+        assert_eq!(
+            config.full_redraw_max_interval,
+            Some(Duration::from_secs(30))
+        );
+        for (frame, (bytes, full_redraw)) in present_clock_ticks(config, 60).into_iter().enumerate()
+        {
+            assert!(!full_redraw, "frame {frame} was a forced full redraw");
+            assert!(bytes < 512, "frame {frame} emitted {bytes} bytes");
+        }
+
+        // Negative control: the previous 20-frame bound repaints all 10,000
+        // cells after 20 incremental frames.
+        let previous = stable_tui_diff_config_with(None).with_full_redraw_interval_frames(20);
+        let ticks = present_clock_ticks(previous, 25);
+        let first_full = ticks
+            .iter()
+            .position(|(_, full_redraw)| *full_redraw)
+            .expect("the 20-frame bound must force a full redraw within 25 frames");
+        assert_eq!(first_full, 20);
         assert!(
-            config.full_redraw_max_interval.is_some(),
-            "wall-clock terminal resync must be enabled by default"
+            ticks[first_full].0 >= 10_000,
+            "full redraw emitted only {} bytes",
+            ticks[first_full].0
+        );
+
+        // The wall-clock bound is still wired: a zero interval forces every
+        // frame to be a full redraw.
+        let always_due = stable_tui_diff_config_with(Some(Duration::ZERO));
+        assert!(
+            present_clock_ticks(always_due, 2)
+                .iter()
+                .all(|(_, full_redraw)| *full_redraw)
         );
     }
 
@@ -18665,15 +19044,83 @@ mod tests {
     }
 
     #[test]
-    fn full_redraw_max_interval_env_parsing() {
-        // Default (env unset path is covered by the config test above); here we
-        // exercise the pure parsing branches via Duration::from_secs_f64 so the
-        // disable/clamp semantics are pinned without mutating process env.
-        assert_eq!(Duration::from_secs_f64(1.0), Duration::from_millis(1000));
-        // Non-positive / non-finite seconds must disable the bound.
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
-            let enabled = bad.is_finite() && bad > 0.0;
-            assert!(!enabled, "{bad} must disable the wall-clock resync");
+    fn probe_rejection_log_counts_repeats_per_client_and_status() {
+        use HttpRejectionLogDecision::{Log, LogWindowStart, Suppress};
+        // br-5804q (GH#337): one client's stream of 401s and .well-known
+        // 404s logs once per status per window and reports the count later.
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let first = LogWindowStart {
+            suppressed_before: 0,
+        };
+        assert_eq!(log.admit("10.0.0.1", 401, at(0)), first);
+        assert_eq!(log.admit("10.0.0.1", 401, at(1)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 401, at(30)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 404, at(2)), first);
+        assert_eq!(log.admit("10.0.0.2", 401, at(3)), first);
+        assert_eq!(
+            log.admit("10.0.0.1", 401, at(61)),
+            LogWindowStart {
+                suppressed_before: 2
+            }
+        );
+        assert_eq!(log.admit("10.0.0.1", 401, at(62)), Suppress);
+
+        // Negative controls: other statuses are never aggregated.
+        for status in [400, 403, 405, 429, 500, 503] {
+            for _ in 0..3 {
+                assert_eq!(log.admit("10.0.0.1", status, at(5)), Log, "{status}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rejection_log_stays_bounded_and_logs_when_full() {
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        for client in 0..HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            log.admit(&format!("client-{client}"), 401, t0);
+        }
+        // A new client while every window is live is logged, not tracked.
+        assert_eq!(
+            log.admit("late-client", 401, t0),
+            HttpRejectionLogDecision::Log
+        );
+        assert_eq!(
+            lock_mutex(&log.windows).len(),
+            HTTP_PROBE_REJECTION_LOG_MAX_KEYS
+        );
+        // Once windows expire, the map is pruned and tracking resumes.
+        let later = t0 + HTTP_PROBE_REJECTION_LOG_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            log.admit("late-client", 401, later),
+            HttpRejectionLogDecision::LogWindowStart {
+                suppressed_before: 0
+            }
+        );
+        assert_eq!(lock_mutex(&log.windows).len(), 1);
+    }
+
+    #[test]
+    fn full_redraw_max_interval_parsing() {
+        let default = Some(Duration::from_secs(30));
+        assert_eq!(full_redraw_max_interval_from(None), default);
+        assert_eq!(full_redraw_max_interval_from(Some("not-a-number")), default);
+        assert_eq!(
+            full_redraw_max_interval_from(Some(" 0.25 ")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            full_redraw_max_interval_from(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        for disabled in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert_eq!(
+                full_redraw_max_interval_from(Some(disabled)),
+                None,
+                "{disabled} must disable the wall-clock resync"
+            );
         }
     }
 
@@ -18820,6 +19267,7 @@ mod tests {
             archive_wbq_p99_us: 2_000,
             archive_commit_queue_p99_us: 16_778_000,
             git_commit_p99_us: 450_000,
+            archive_fence_wait_us: 0,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -18829,16 +19277,64 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("archive_fence_wait_ms=0; archive_fence_holder=none;"));
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
+    }
+
+    /// br-9bwnb: a reservation that timed out behind the archive publication
+    /// fence names the fence, its live wait and its holder, and the text no
+    /// longer claims that archive work cannot cause a tool timeout.
+    #[test]
+    fn dispatch_timeout_text_names_a_live_archive_fence_wait_and_its_holder() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::ArchiveFence,
+            stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
+            pool_acquire_p99_us: 3_000,
+            database_write_p99_us: 6_000,
+            archive_wbq_p99_us: 0,
+            archive_commit_queue_p99_us: 1_650_000,
+            git_commit_p99_us: 630_000,
+            archive_fence_wait_us: 29_400_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
+                timeouts_total: 13,
+            },
+        };
+        let holder = mcp_agent_mail_storage::ArchiveFenceHolder {
+            thread: "wbq-drain (ThreadId(7))".to_string(),
+            site: "crates/mcp-agent-mail-storage/src/lib.rs:9316:20".to_string(),
+            held_for: Duration::from_millis(29_500),
+        };
+
+        let text =
+            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        assert!(text.contains("stage=archive_publication_fence"), "{text}");
+        assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
+        assert!(
+            text.contains(
+                "archive_fence_holder=wbq-drain (ThreadId(7)) at \
+                 crates/mcp-agent-mail-storage/src/lib.rs:9316:20 for 29500 ms;"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("archive lag cannot cause a tool timeout"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -19528,6 +20024,192 @@ mod tests {
             assert!(error.to_string().contains("newer"), "{error}");
         });
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
+    }
+
+    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Runtime workers can rehydrate Config from the environment. Keep
+        // their whole lifetime in a private process, even under cargo test.
+        let dir = tempfile::tempdir().expect("private worker environment");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env(
+                "DATABASE_URL",
+                mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &dir.path().join("mailbox.sqlite3"),
+                ),
+            )
+            .env("STORAGE_ROOT", dir.path().join("archive"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "0")
+            .env("AM_ATC_ENABLED", "false")
+            .env("ATC_LEARNING_DISABLED", "1")
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(dir.path())
+            .output()
+            .expect("execute isolated runtime test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        // Only the isolated child that run_prepared_http_test_in_child spawns
+        // calls this; its private DATABASE_URL and STORAGE_ROOT reach Config
+        // through the ordinary env parsing rather than a raw re-read (GH#340).
+        // Outside that child the env is not private: refuse instead of
+        // resolving the operator's default mailbox.
+        assert!(
+            std::env::var_os("AM_PREPARED_HTTP_STARTUP_TEST_CHILD").is_some(),
+            "prepared_http_test_config runs only inside the isolated child"
+        );
+        let isolated = mcp_agent_mail_core::Config::from_env();
+        let config = mcp_agent_mail_core::Config {
+            database_url: isolated.database_url,
+            storage_root: isolated.storage_root,
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_bearer_token: None,
+            tui_enabled: false,
+            atc_enabled: false,
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            initialize_stdio_database(&cx, &config)
+                .await
+                .expect("seed real mailbox schema");
+        });
+        config
+    }
+
+    #[test]
+    fn prepared_http_startup_runs_probes_once_and_callback_after_readiness() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let expected_storage = config.storage_root.clone();
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        startup_checks::take_startup_work_counts();
+        let startup = prepare_http_startup(&config)
+            .expect("real full preflight")
+            .with_ready_callback(move |bound| {
+                // A real connection must be possible before a setup writer runs.
+                let connected =
+                    std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
+                        .is_ok();
+                *callback_observed.lock().expect("callback result") =
+                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
+            });
+        assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
+        // Mutation of the caller's config cannot retarget an existing token.
+        config.storage_root = dir.path().join("different-archive");
+        config.http_host = "invalid.invalid".to_string();
+        startup
+            .run_with_control(control_rx)
+            .expect("serve and drain");
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+        let observation = observed.lock().expect("callback result");
+        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        assert_eq!(storage, &expected_storage);
+        assert_ne!(*port, 0, "callback must receive actual bound port");
+        assert!(*connected, "callback must follow listener bind");
+        assert!(
+            !config.storage_root.exists(),
+            "caller mutation must not retarget startup"
+        );
+    }
+
+    #[test]
+    fn prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(false);
+    }
+
+    #[test]
+    fn prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(true);
+    }
+
+    fn assert_prepared_http_bind_failure(use_tui_entrypoint: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let available = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        config.http_port = available.local_addr().expect("address").port();
+        drop(available);
+        let setup_path = dir.path().join("client-config.json");
+        std::fs::write(&setup_path, b"original client setup").expect("seed setup");
+        let callback_path = setup_path.clone();
+        let startup = prepare_http_startup(&config)
+            .expect("preflight on available port")
+            .with_ready_callback(move |_| {
+                std::fs::write(callback_path, b"rewritten setup").expect("write setup");
+            });
+        startup_checks::take_startup_work_counts();
+        // Deterministically lose the port after preflight, before actual bind.
+        let _occupied = std::net::TcpListener::bind(("127.0.0.1", config.http_port))
+            .expect("occupy prepared port");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let result = if use_tui_entrypoint {
+            startup.run_with_tui()
+        } else {
+            startup.run_with_control(control_rx)
+        };
+        let error = result.expect_err("bind must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+        assert_eq!(
+            std::fs::read(setup_path).expect("setup after failure"),
+            b"original client setup"
+        );
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+    }
+
+    #[test]
+    fn prepared_http_startup_direct_entrypoints_keep_preflight_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: dir.path().join("archive"),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_path: "invalid-without-leading-slash".to_string(),
+            ..Default::default()
+        };
+        assert!(prepare_http_startup(&config).is_err());
+        assert!(run_http(&config).is_err());
+        assert!(run_http_with_tui(&config).is_err());
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(run_http_with_control(&config, rx).is_err());
     }
 
     fn config_for_boot_check_storage(
@@ -21162,7 +21844,7 @@ first body
         }
     }
 
-    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    fn with_serialized_tool_dispatch_env<F, T>(overrides: &[(&str, &str)], f: F) -> T
     where
         F: FnOnce(String) -> T,
     {
@@ -21186,13 +21868,14 @@ first body
             .expect("tool dispatch project root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            || f(project_key),
-        )
+        let mut env_overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env_overrides.extend_from_slice(overrides);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
+            f(project_key)
+        })
     }
 
     fn with_serialized_dispatch_permits<F, T>(f: F) -> T
@@ -23979,7 +24662,7 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(|project_key| {
+        with_serialized_tool_dispatch_env(&[], |project_key| {
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -24082,6 +24765,161 @@ first body
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "expected tools list result"
+        );
+    }
+
+    /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
+    /// `Mcp-Session-Id`; requests that send it back share the session's agent
+    /// identity (verified without a token, even fail-closed), cannot change
+    /// another agent's contact policy, and keep the policy intact on refusal.
+    /// Stateless requests do not share bindings, and `DELETE` ends the session.
+    #[test]
+    fn opt_in_http_sessions_carry_identity_across_requests() {
+        with_serialized_tool_dispatch_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+            ],
+            |project_key| {
+                let mut state = build_state(mcp_agent_mail_core::Config::from_env());
+                Arc::get_mut(&mut state.router)
+                    .expect("test owns the router")
+                    .add_tool(SessionStateProbeTool)
+                    .expect("admit the state probe");
+                let post =
+                    |method: &str, params: serde_json::Value, id: i64, session: Option<&str>| {
+                        let headers: Vec<(&str, &str)> = session
+                            .map(|session| vec![("Mcp-Session-Id", session)])
+                            .unwrap_or_default();
+                        let mut req = make_request(Http1Method::Post, "/api", &headers);
+                        req.body =
+                            serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
+                                .expect("serialize json-rpc");
+                        block_on(state.handle(req))
+                    };
+                let tool =
+                    |name: &str, arguments: serde_json::Value, id: i64, session: Option<&str>| {
+                        let resp = post(
+                            "tools/call",
+                            serde_json::json!({"name": name, "arguments": arguments}),
+                            id,
+                            session,
+                        );
+                        assert_eq!(resp.status, 200, "{name}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json-rpc body");
+                        let result = body["result"].clone();
+                        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+                        (
+                            body.get("error").is_some()
+                                || result["isError"].as_bool().unwrap_or(false),
+                            serde_json::from_str::<serde_json::Value>(text)
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    };
+
+                let init = post(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "session-test", "version": "1"},
+                    }),
+                    1,
+                    None,
+                );
+                assert_eq!(init.status, 200);
+                let session = response_header(&init, "mcp-session-id")
+                    .expect("initialize mints a session id")
+                    .to_string();
+
+                for (header, expected) in [
+                    (Some(session.as_str()), true),
+                    (None, false),
+                    (Some("unknown-session"), false),
+                ] {
+                    let (failed, presence) =
+                        tool("session_state_probe", serde_json::json!({}), 10, header);
+                    assert!(!failed, "{presence}");
+                    assert_eq!(presence["has_session_state"], expected);
+                }
+
+                let (failed, _) = tool(
+                    "ensure_project",
+                    serde_json::json!({"human_key": project_key}),
+                    2,
+                    Some(&session),
+                );
+                assert!(!failed);
+                let identity = serde_json::json!({
+                    "project_key": project_key,
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "return_registration_token": false,
+                });
+                let (failed, alice) =
+                    tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                assert!(!failed, "{alice}");
+                let alice = alice["name"].as_str().expect("alice").to_string();
+                let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                assert!(!failed, "{bob}");
+                let bob = bob["name"].as_str().expect("bob").to_string();
+                let (failed, _) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                    5,
+                    None,
+                );
+                assert!(!failed);
+
+                let (failed, refusal) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "block_all"}),
+                    6,
+                    Some(&session),
+                );
+                assert!(
+                    failed,
+                    "a bound session cannot change another agent's policy"
+                );
+                assert_eq!(refusal["error"]["type"], "SESSION_IDENTITY_MISMATCH");
+
+                let send_args = serde_json::json!({
+                    "project_key": project_key,
+                    "sender_name": alice,
+                    "to": [bob],
+                    "subject": "hello",
+                    "body_md": "sent from a session",
+                });
+                let (failed, receipt) = tool("send_message", send_args.clone(), 7, Some(&session));
+                assert!(
+                    !failed,
+                    "refused block_all must leave Bob reachable: {receipt}"
+                );
+                assert_eq!(receipt["verified_sender"], true);
+                assert_eq!(receipt["sender_verification"], "session");
+
+                let (failed, _) = tool("send_message", send_args.clone(), 8, None);
+                assert!(failed, "a stateless request has no session identity");
+
+                let mut end = make_request(
+                    Http1Method::Delete,
+                    "/api",
+                    &[("Mcp-Session-Id", session.as_str())],
+                );
+                end.body = Vec::new();
+                assert_eq!(block_on(state.handle(end)).status, 204);
+                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
+                assert!(failed, "an ended session has no identity");
+                let (failed, presence) = tool(
+                    "session_state_probe",
+                    serde_json::json!({}),
+                    11,
+                    Some(&session),
+                );
+                assert!(!failed, "{presence}");
+                assert_eq!(presence["has_session_state"], false);
+            },
         );
     }
 

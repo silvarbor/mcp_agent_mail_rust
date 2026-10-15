@@ -347,6 +347,8 @@ fn verify_remaining(
                 name.as_str(),
                 "messages"
                     | "message_recipients"
+                    | "project_mailbox_deliveries"
+                    | "project_mailbox_receipts"
                     | "inbox_delivery_events"
                     | "message_delivery_signal_receipts"
                     | "inbox_stats"
@@ -376,6 +378,8 @@ fn verify_remaining(
     }
     for (table, order) in [
         ("message_recipients", "message_id, agent_id"),
+        ("project_mailbox_deliveries", "message_id"),
+        ("project_mailbox_receipts", "message_id, agent_id"),
         ("inbox_delivery_events", "seq"),
         (
             "message_delivery_signal_receipts",
@@ -410,6 +414,8 @@ fn expire_rows(conn: &DbConn, plan: &Plan) -> CliResult<()> {
             plan.project_id, plan.before_micros
         );
         for table in [
+            "project_mailbox_receipts",
+            "project_mailbox_deliveries",
             "message_delivery_signal_receipts",
             "inbox_delivery_events",
             "message_recipients",
@@ -900,6 +906,13 @@ mod tests {
             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES
             (100,2,'to',NULL,NULL),(101,2,'to',7,NULL),(102,2,'to',NULL,8),(103,2,'to',7,8),(2,2,'to',7,8),(3,1,'to',NULL,NULL),(4,3,'to',NULL,NULL);
             INSERT INTO message_delivery_signal_receipts(message_id,agent_id,delivery_route,signal_path_digest,observed_ts) VALUES (100,2,'signal','old',9),(2,2,'signal','keep',10);").unwrap();
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES
+             (100,1,'to',999999),(2,1,'to',1000000),(4,2,'to',0);
+             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES
+             (100,2,7,8),(2,2,7,8),(4,3,NULL,NULL);",
+        )
+        .unwrap();
         drop(conn);
         let project_dir = root.join("projects/shared");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -1084,6 +1097,22 @@ mod tests {
             serde_json::from_slice(&std::fs::read(run_dir.join("result.json")).unwrap()).unwrap();
         let after =
             inspect_snapshot(Path::new(proof["checked_snapshot"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            rows(
+                &after,
+                "SELECT message_id FROM project_mailbox_deliveries ORDER BY message_id"
+            )
+            .unwrap(),
+            vec![vec![Value::Int(2)], vec![Value::Int(4)]]
+        );
+        assert_eq!(
+            rows(&after, "SELECT message_id,agent_id,read_ts,ack_ts FROM project_mailbox_receipts ORDER BY message_id")
+                .unwrap(),
+            vec![
+                vec![Value::Int(2), Value::Int(2), Value::Int(7), Value::Int(8)],
+                vec![Value::Int(4), Value::Int(3), Value::Null, Value::Null],
+            ]
+        );
         assert_eq!(
             rows(&after, "SELECT id FROM messages ORDER BY id").unwrap(),
             vec![

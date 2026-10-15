@@ -13,8 +13,8 @@ use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
     Direction, DocKind, Importance, PlanMethod, PlanParam, RankingMode, RecoverySuggestion,
-    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, ZeroResultGuidance,
-    plan_search,
+    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, TextFieldScope,
+    ZeroResultGuidance, plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -239,8 +239,43 @@ pub struct SearchOptions {
     pub redaction_policy: Option<RedactionPolicy>,
     /// Whether to emit telemetry events for this query.
     pub track_telemetry: bool,
-    /// Search engine override. `None` = use global config default.
+    /// Search engine override. `None` = the surface's configured engine.
+    /// The rollout kill switches apply either way.
     pub search_engine: Option<SearchEngine>,
+    /// Tool issuing the query (e.g. `"search_messages"`), which selects an
+    /// `AM_SEARCH_ENGINE_FOR_<TOOL>` override. `None` = the global engine.
+    pub surface: Option<&'static str>,
+}
+
+/// Whether this build compiled the semantic tier (`feature = "hybrid"`).
+/// Without it a hybrid or auto query runs lexical and a semantic one fails.
+pub const SEMANTIC_TIER_COMPILED: bool = cfg!(feature = "hybrid");
+
+fn resolve_search_engine(options: &SearchOptions) -> SearchEngine {
+    engine_for(options, &mcp_agent_mail_core::Config::get().search_rollout)
+}
+
+/// Semantic retrieval embeds whole messages, so it cannot keep a query to
+/// the subject or the body; such a query runs on the lexical tier, whose
+/// parser and SQL plan both scope every term.
+fn engine_for_text_fields(engine: SearchEngine, query: &SearchQuery) -> SearchEngine {
+    if query.text_fields == TextFieldScope::SubjectAndBody {
+        engine
+    } else {
+        SearchEngine::Lexical
+    }
+}
+
+/// The engine a query runs on: the explicit request, else the surface's
+/// override, else the global engine, with the rollout kill switches applied.
+fn engine_for(
+    options: &SearchOptions,
+    rollout: &mcp_agent_mail_core::config::SearchRolloutConfig,
+) -> SearchEngine {
+    options.search_engine.map_or_else(
+        || rollout.effective_engine(options.surface.unwrap_or_default()),
+        |requested| rollout.allowed_engine(requested),
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -284,6 +319,75 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
     } else {
         Some(assistance)
     }
+}
+
+/// Apply the `field:value` hints `parse_query_assistance` recognises as the
+/// filters they name, with the hints taken out of the text: `from:` (sender),
+/// `thread:`, `importance:`, `after:`, `before:`, and `project:` (by slug, on
+/// an unscoped search only). An explicit facet wins over a hint. Only hints
+/// that took effect are reported in the assistance payload.
+///
+/// Returns the hinted query (`None` when the text has no hints) and the
+/// assistance payload.
+async fn apply_query_hints(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+) -> (Option<SearchQuery>, Option<QueryAssistance>) {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
+        return (None, query_assistance_payload(query));
+    }
+    let mut assistance = parse_query_assistance(&query.text);
+    if assistance.applied_filter_hints.is_empty() {
+        let payload = (!assistance.did_you_mean.is_empty()).then_some(assistance);
+        return (None, payload);
+    }
+    let hint_micros = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|dt| dt.timestamp_micros())
+    };
+    let mut hinted = query.clone();
+    hinted.text.clone_from(&assistance.query_text);
+    for hint in std::mem::take(&mut assistance.applied_filter_hints) {
+        let applied = match hint.field.as_str() {
+            "from" if hinted.agent_name.is_none() && hinted.direction.is_none() => {
+                hinted.agent_name = Some(hint.value.clone());
+                hinted.direction = Some(Direction::Outbox);
+                true
+            }
+            "thread" if hinted.thread_id.is_none() => {
+                hinted.thread_id = Some(hint.value.clone());
+                true
+            }
+            "importance" if hinted.importance.is_empty() => Importance::parse(&hint.value)
+                .map(|importance| hinted.importance = vec![importance])
+                .is_some(),
+            "after" if hinted.time_range.min_ts.is_none() => hint_micros(&hint.value)
+                .map(|ts| hinted.time_range.min_ts = Some(ts))
+                .is_some(),
+            "before" if hinted.time_range.max_ts.is_none() => hint_micros(&hint.value)
+                .map(|ts| hinted.time_range.max_ts = Some(ts))
+                .is_some(),
+            "project" if hinted.project_id.is_none() && hinted.product_id.is_none() => {
+                match crate::queries::get_project_by_slug(cx, pool, &hint.value).await {
+                    Outcome::Ok(project) => {
+                        hinted.project_id = project.id;
+                        project.id.is_some()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if applied {
+            assistance.applied_filter_hints.push(hint);
+        }
+    }
+    let payload = (!assistance.applied_filter_hints.is_empty()
+        || !assistance.did_you_mean.is_empty())
+    .then_some(assistance);
+    (Some(hinted), payload)
 }
 
 /// Generate zero-result recovery guidance based on query facets and result count.
@@ -466,12 +570,18 @@ fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
     }
 
     message_query_uses_sql_plan(query)
-        || query.ranking == RankingMode::Recency
+        || query.ranking != RankingMode::Relevance
         || query.product_id.is_some()
         || query.ack_required.is_some()
         || query_needs_recipient_filter(query)
         || importance_filter_requires_sql_plan(query)
         || scoped_project_set_requires_sql_plan(query)
+        // A numeric thread id includes its root message, which the index's
+        // thread_id field does not carry.
+        || query
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread| thread.parse::<i64>().is_ok())
 }
 
 fn lexical_candidate_limit(query: &SearchQuery) -> usize {
@@ -510,13 +620,16 @@ fn cursor_sort_score(result: &SearchResult, ranking: RankingMode) -> f64 {
             || result.score.unwrap_or(0.0),
             |created_ts| -micros_to_f64_for_cursor(created_ts),
         ),
+        RankingMode::Oldest => result
+            .created_ts
+            .map_or_else(|| result.score.unwrap_or(0.0), micros_to_f64_for_cursor),
         RankingMode::Relevance => result.score.unwrap_or(0.0),
     }
 }
 
 fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> Vec<SearchResult> {
     match query.ranking {
-        RankingMode::Recency => {
+        RankingMode::Recency | RankingMode::Oldest => {
             results.sort_by(|a, b| {
                 let a_score = cursor_sort_score(a, query.ranking);
                 let b_score = cursor_sort_score(b, query.ranking);
@@ -554,7 +667,7 @@ fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> V
     results.retain(|result| {
         let score = cursor_sort_score(result, query.ranking);
         match query.ranking {
-            RankingMode::Recency => {
+            RankingMode::Recency | RankingMode::Oldest => {
                 score > cursor.score
                     || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
             }
@@ -1449,8 +1562,11 @@ fn lexical_backfill_database_url(pool: &DbPool) -> String {
 /// Process-wide memo of each pool generation's mailbox generation token.
 ///
 /// Lets the per-search health probe avoid re-opening the database: keyed by
-/// `pool.sqlite_identity_key()` (`path@pool-generation`), which a recovery
-/// that replaces the file also replaces.
+/// `pool.engine_identity_key()` (`path@pool-generation`), which a recovery
+/// that replaces the file also replaces. Not `sqlite_identity_key()`: live
+/// read-lane wrappers carry a fresh read-cache generation per call, and a
+/// per-call key would open a fresh connection on the live file for every
+/// search (GH#333).
 fn lexical_generation_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1465,7 +1581,7 @@ fn cached_db_generation_for_pool(pool: &DbPool) -> Option<String> {
     if pool.sqlite_path() == ":memory:" {
         return None;
     }
-    let cache_key = pool.sqlite_identity_key();
+    let cache_key = pool.engine_identity_key();
     if let Some(generation) = lexical_generation_cache()
         .lock()
         .ok()
@@ -4196,6 +4312,7 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     query.product_id.hash(&mut hasher);
     query.project_id.hash(&mut hasher);
     query.doc_kind.hash(&mut hasher);
+    query.text_fields.hash(&mut hasher);
     query.ack_required.hash(&mut hasher);
 
     match query.direction {
@@ -4207,6 +4324,7 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     match query.ranking {
         RankingMode::Relevance => "relevance".hash(&mut hasher),
         RankingMode::Recency => "recency".hash(&mut hasher),
+        RankingMode::Oldest => "oldest".hash(&mut hasher),
     }
 
     query.explain.hash(&mut hasher);
@@ -4335,9 +4453,7 @@ fn build_search_cache_key(
     use std::hash::{Hash, Hasher};
 
     let filter = query.to_search_filter();
-    let engine_mode = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let engine_mode = engine_for_text_fields(resolve_search_engine(options), query);
     let mode = engine_to_search_mode(engine_mode);
     let mut discriminator_hasher = DefaultHasher::new();
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
@@ -4412,11 +4528,12 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    // Hints become filters before routing, caching and planning see the query.
+    let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
+    let query = hinted.as_ref().unwrap_or(query);
     let product_sql_budget = product_sql_budget_state(cx, query);
     let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
-    let engine = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let engine = engine_for_text_fields(resolve_search_engine(options), query);
     let needs_lexical_freshness = matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
@@ -4444,11 +4561,28 @@ pub async fn execute_search(
         return Outcome::Ok(cached);
     }
 
-    let assistance = query_assistance_payload(query);
-
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
         || message_query_requires_sql_plan(query)
     {
+        // A filter-only search (no text) has nothing to rank, and every SQL
+        // row scores 0.0, so Relevance there listed ascending ids: the oldest
+        // matches first. It runs newest first instead; the next page's cursor
+        // routes the same way, so paging stays consistent. Text searches on
+        // this path keep id order, which the Python reference fixtures pin
+        // (search_messages_product "Hello" → [2, 5]).
+        let newest_first;
+        let query = if query.ranking == RankingMode::Relevance
+            && matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
+            && message_query_uses_sql_plan(query)
+        {
+            newest_first = SearchQuery {
+                ranking: RankingMode::Recency,
+                ..query.clone()
+            };
+            &newest_first
+        } else {
+            query
+        };
         return execute_sql_plan_search(
             cx,
             pool,
@@ -5045,6 +5179,41 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The SQL plan selects no recipients; fill to/cc/bcc for message results as
+/// the index path's canonicalization does, so a result does not lose its
+/// recipients just because the search was ordered by time or filtered.
+async fn hydrate_plan_recipients(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    mut results: Vec<SearchResult>,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) || results.is_empty() {
+        return Outcome::Ok(results);
+    }
+    let ids: Vec<i64> = results.iter().map(|r| r.id).collect();
+    let details =
+        match crate::queries::get_messages_details_by_ids(cx, pool, &ids, query.project_id).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    let recipients_by_id: HashMap<i64, String> = details
+        .into_iter()
+        .map(|row| (row.id, row.recipients))
+        .collect();
+    for result in &mut results {
+        if let Some(raw) = recipients_by_id.get(&result.id) {
+            let recipients = parse_search_result_recipients(raw);
+            result.to = Some(recipients.to);
+            result.cc = Some(recipients.cc);
+            result.bcc = Some(recipients.bcc);
+        }
+    }
+    Outcome::Ok(results)
+}
+
 async fn execute_sql_plan_search(
     cx: &Cx,
     pool: &DbPool,
@@ -5081,6 +5250,12 @@ async fn execute_sql_plan_search(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
         map_planned_rows(rows, query.doc_kind)
+    };
+    let raw_results = match hydrate_plan_recipients(cx, pool, query, raw_results).await {
+        Outcome::Ok(results) => results,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
     let explain = if query.explain {
@@ -5168,6 +5343,7 @@ pub async fn execute_search_simple(
         redaction_policy: None,
         track_telemetry: true,
         search_engine: None,
+        surface: None,
     };
 
     match execute_search(cx, pool, query, &options).await {
@@ -5235,6 +5411,69 @@ mod tests {
     use std::time::Duration;
 
     static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// `AM_SEARCH_ENGINE_FOR_<TOOL>` and `AM_SEARCH_SEMANTIC_ENABLED` were
+    /// parsed but never consulted: every query ran the global engine.
+    #[test]
+    fn engine_routing_honors_surface_overrides_and_the_semantic_kill_switch() {
+        use mcp_agent_mail_core::config::SearchRolloutConfig;
+        let opts = |search_engine, surface| SearchOptions {
+            search_engine,
+            surface,
+            ..SearchOptions::default()
+        };
+        let mut enabled = SearchRolloutConfig {
+            engine: SearchEngine::Lexical,
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        enabled
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Hybrid);
+        assert_eq!(
+            engine_for(&opts(None, Some("search_messages")), &enabled),
+            SearchEngine::Hybrid
+        );
+        assert_eq!(
+            engine_for(&opts(None, Some("search_messages_product")), &enabled),
+            SearchEngine::Lexical
+        );
+        assert_eq!(
+            engine_for(&opts(None, None), &enabled),
+            SearchEngine::Lexical
+        );
+        // An explicit request outranks the surface override.
+        assert_eq!(
+            engine_for(
+                &opts(Some(SearchEngine::Semantic), Some("search_messages")),
+                &enabled
+            ),
+            SearchEngine::Semantic
+        );
+
+        // With the kill switch thrown, no route reaches a semantic engine —
+        // not the global engine, not an override, not an explicit request.
+        let mut killed = SearchRolloutConfig {
+            engine: SearchEngine::Hybrid,
+            semantic_enabled: false,
+            ..SearchRolloutConfig::default()
+        };
+        killed
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Semantic);
+        for options in [
+            opts(None, None),
+            opts(None, Some("search_messages")),
+            opts(Some(SearchEngine::Hybrid), None),
+            opts(Some(SearchEngine::Auto), Some("search_messages")),
+        ] {
+            assert_eq!(
+                engine_for(&options, &killed),
+                SearchEngine::Lexical,
+                "{options:?}"
+            );
+        }
+    }
 
     /// GH#227: message ingestion must invalidate the process-wide search
     /// cache even when the lexical bridge is uninitialized or bound to a
@@ -6084,6 +6323,7 @@ mod tests {
                 redaction_policy: None,
                 track_telemetry: false,
                 search_engine: Some(SearchEngine::Lexical),
+                surface: None,
             };
             let response = match execute_search(&cx, &pool, &query, &options).await {
                 Outcome::Ok(response) => response,

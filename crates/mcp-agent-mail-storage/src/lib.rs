@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 // (lines ~1290); removed the bare `use` after bead C5 deleted the
 // read-tree shell-out.
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -555,6 +555,55 @@ fn fence_contention_report(
     })
 }
 
+/// Contended fence waits in progress: wait sequence number to the wait's start
+/// in µs since the epoch. The oldest start is published as
+/// `storage.archive_fence_wait_since_us`, so a timeout that is still waiting
+/// behind the fence names it instead of reporting an unattributed stall
+/// (br-9bwnb).
+static FENCE_WAITS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+static FENCE_WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One contended fence wait, registered until it drops.
+struct FenceWait {
+    seq: u64,
+}
+
+impl FenceWait {
+    fn begin() -> Self {
+        let seq = FENCE_WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.insert(seq, now_micros_u64());
+        publish_oldest_fence_wait(&waits);
+        Self { seq }
+    }
+}
+
+impl Drop for FenceWait {
+    fn drop(&mut self) {
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.remove(&self.seq);
+        publish_oldest_fence_wait(&waits);
+    }
+}
+
+/// The earliest start among `waits`, or zero when none. Sequence order need
+/// not match start order: a wait may take its number, then lose the race for
+/// the map to a later one.
+fn oldest_fence_wait_start(waits: &BTreeMap<u64, u64>) -> u64 {
+    waits.values().copied().min().unwrap_or(0)
+}
+
+fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_fence_wait_since_us
+        .set(oldest_fence_wait_start(waits));
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -571,9 +620,11 @@ impl FenceLease {
             Err(std::sync::TryLockError::WouldBlock) => {
                 let blocker = archive_publication_fence_holder();
                 let started = Instant::now();
+                let wait = FenceWait::begin();
                 let guard = ARCHIVE_PUBLICATION_FENCE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(wait);
                 if let Some(report) =
                     fence_contention_report(started.elapsed(), site, blocker.as_ref())
                 {
@@ -1474,8 +1525,10 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-#[must_use]
-pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+fn write_op_sync_direct_with_cancel(
+    op: &WriteOp,
+    mut cancelled: impl FnMut() -> bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
@@ -1487,6 +1540,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             .add(1);
         return DirectArchiveWrite::SkippedDiskCritical;
     }
+
+    // GH#351: direct request-path publication must never enter the blocking
+    // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
+    // mutation guard used by recovery: try_lock first, preserve the existing
+    // fence -> epoch -> filesystem ordering, and refuse contention before any
+    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
+    // this thread and therefore reuse this already-held publication window.
+    let _publication =
+        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
+            Ok(guard) => guard,
+            Err(error) => return DirectArchiveWrite::Failed(error),
+        };
+
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
     metrics.storage.archive_direct_writes_total.add(1);
@@ -1502,6 +1568,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             DirectArchiveWrite::Failed(error)
         }
     }
+}
+
+/// Cancellation-aware direct writer for request paths with an asupersync
+/// context. Cancellation racing fence admission exits before any archive
+/// mutation bookkeeping or filesystem publication begins.
+#[must_use]
+pub fn write_op_sync_direct_cancellable(cx: &asupersync::Cx, op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || cx.checkpoint().is_err())
+}
+
+#[must_use]
+pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || false)
 }
 
 // ---------------------------------------------------------------------------
@@ -3093,7 +3172,7 @@ fn wbq_circuit_breaker_escalate(storage_root: &Path, project_slug: &str, consecu
             storage_root = %storage_root.display(),
             "[wbq-circuit-breaker] boot-check found no repairable git-shape issue; the failure \
              cause is elsewhere (disk full / permissions / DB corruption) — run \
-             `am robot health --include-host` then `am doctor --json`",
+             `am robot health --include-host` then `am doctor check --json`",
         );
     }
 }
@@ -3628,7 +3707,17 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     // documented (and debug-asserted) not to initiate archive writes. Keep it
     // that way: never acquire the fence from code already holding a
     // per-project archive lock.
-    let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
+    //
+    // A reservation op takes no outer window (br-9bwnb): it stages and syncs
+    // its artifacts outside the fence and holds it only to rename them into
+    // place, and it takes no per-project archive lock. Holding the fence
+    // across its fsyncs serialized every agent's reservation behind every
+    // other's, the swarm-scale p99 of ~25 s.
+    let _mutation = if matches!(op, WriteOp::FileReservation { .. }) {
+        None
+    } else {
+        Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+    };
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -7446,11 +7535,10 @@ where
     tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
     tx.commit()?;
     // The archive commit is durable even when an operator or an interrupted
-    // writer owns staged evidence. Index maintenance must never discard it or
-    // turn an already-committed operation into a retryable commit failure.
-    if let Err(error) = sync_clean_index_after_commit(repo, parent.as_ref(), &tree) {
-        tracing::warn!("failed to synchronize clean archive index: {error}");
-    }
+    // writer owns staged evidence. The shared index catches up later, off the
+    // commit path and outside the archive fence; it can never turn an
+    // already-committed operation into a retryable failure (br-0i0g4).
+    note_archive_commit_for_index_sync(repo.path());
     Ok(())
 }
 fn commit_paths_lockfree(
@@ -8094,8 +8182,16 @@ fn archive_storage_root(config: &Config) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const ARCHIVE_GITIGNORE_HEADER: &str = "# Agent Mail runtime artifacts";
-const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
-    &[".mailbox.activity.lock", "diagnostics/", "search_index/"];
+/// `.tmp-*` covers atomic-write temp files (`atomic_write_tmp_path`): staged
+/// reservation artifacts exist outside the publication fence (br-9bwnb), so a
+/// concurrent `commit_all` must never publish one. No archive name can match
+/// it: thread ids and project slugs never start with a dot.
+const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".mailbox.activity.lock",
+    "diagnostics/",
+    "search_index/",
+    ".tmp-*",
+];
 
 /// Ensure the global archive root directory exists and is a git repository.
 ///
@@ -8293,6 +8389,12 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    // A cached repo is no mutation: like `ensure_dir`, it must not wait for
+    // the global publication fence (br-9bwnb: every reservation write opens
+    // its archive here before staging outside the fence).
+    if repo_cache_contains(root) {
+        return Ok(false);
+    }
     let _mutation = ArchiveMutationGuard::begin_at(root);
     if repo_cache_contains(root) {
         return Ok(false);
@@ -8303,9 +8405,11 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         // Pre-existing archive: apply gc defaults once. `configure_archive_git_defaults`
         // is idempotent and respects operator-set values, so this is safe to run
         // every time a cold process first opens the archive.
-        if let Ok(existing) = Repository::open(root) {
-            configure_archive_git_defaults(&existing);
-        }
+        // A leftover .git directory is not proof that initialization succeeded.
+        // Propagate an invalid repository before changing its configuration or
+        // caching the path; otherwise subsequent writes silently trust it.
+        let existing = Repository::open(root)?;
+        configure_archive_git_defaults(&existing);
         if ensure_archive_gitignore(root)? {
             commit_paths_with_retry(
                 root,
@@ -8507,6 +8611,13 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
 }
 
 /// Write file reservation records to the archive and commit.
+///
+/// Every artifact is written and synced under a temp name before the archive
+/// publication fence is taken; the fence covers only the renames that publish
+/// them (br-9bwnb). The fence serializes every archive writer in the process,
+/// so syncing inside it queued each agent's reservation behind every other
+/// agent's. Durability on return is unchanged: the data is synced before the
+/// rename, exactly as `atomic_write_bytes` does it.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -8557,7 +8668,9 @@ pub fn write_file_reservation_records(
     let reservation_dir = project_root.join("file_reservations");
     ensure_dir(&reservation_dir)?;
 
+    let mut files = Vec::with_capacity(normalized_reservations.len() * 2);
     for (normalized, path_pattern, agent_name) in normalized_reservations {
+        let content = serde_json::to_string_pretty(&normalized)?.into_bytes();
         // Legacy path: sha1(path_pattern).json
         let digest = {
             let mut hasher = sha1::Sha1::new();
@@ -8565,8 +8678,8 @@ pub fn write_file_reservation_records(
             hex::encode(hasher.finalize())
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
-        write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
+        files.push((legacy_path, content.clone()));
 
         // Stable per-reservation artifact, keyed by (db_generation, id). The
         // generation token (br-n8qh6) makes the name unique across DB
@@ -8583,12 +8696,13 @@ pub fn write_file_reservation_records(
                     generation, id,
                 ),
             );
-            write_json(&id_path, &normalized, true)?;
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
+            files.push((id_path, content));
         }
 
         entries.push((agent_name, path_pattern));
     }
+    StagedArchiveWrites::stage(files)?.publish()?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -12454,19 +12568,381 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
     Ok(())
 }
 
-/// Update an unstaged index without consuming an interrupted writer's evidence.
+// ── Shared `.git/index` maintenance (br-0i0g4) ──────────────────────────────
+//
+// Commits build trees from private indexes and never read `.git/index`. It is
+// kept current so `git status` in the archive (and tooling that walks it) sees
+// a clean tree. Rewriting it is O(archive): about 0.5 s and 32 MB for a
+// 174k-file archive. Doing that after every commit, under the archive fence,
+// cost ~6 cpu-s and ~75 MB per message on a 352k-file archive (GH#337) and
+// stretched fence holds. Commits now only mark the repository pending; one
+// background thread brings the index up to HEAD outside the fence once commits
+// pause for `ARCHIVE_INDEX_SYNC_QUIET_PERIOD` (or the index has lagged for
+// `ARCHIVE_INDEX_SYNC_MAX_LAG` under unbroken traffic), and waits
+// `ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR` times as long as a rewrite took before
+// rewriting that index again. Rewriting between commits instead cost a
+// 350k-file archive 10-15% more CPU and 30-160% more bytes per message than
+// refusing the rewrite outright.
+
+/// Record, inside the archive's Git directory, of the tree the shared index
+/// was last synchronized to and the identity of the index file written then.
+const ARCHIVE_INDEX_SYNC_FILE_NAME: &str = "agent-mail-index-sync";
+const ARCHIVE_INDEX_SYNC_FORMAT_VERSION: &str = "1";
+/// Shortest interval between two rewrites of one archive's index.
+const ARCHIVE_INDEX_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// The next rewrite of an index waits this many times the previous rewrite,
+/// so rewriting stays near 3% of one core however large the index grows.
+const ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR: u32 = 30;
+/// Commits must pause this long before their index is rewritten.
+const ARCHIVE_INDEX_SYNC_QUIET_PERIOD: Duration = Duration::from_secs(2);
+/// An index behind HEAD this long is rewritten even if commits never pause.
+const ARCHIVE_INDEX_SYNC_MAX_LAG: Duration = Duration::from_secs(300);
+/// Without a matching record, an index equal to one of this many most recent
+/// first-parent commits is a sync that fell behind, not foreign state.
+const ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct ArchiveIndexSyncState {
+    /// Git directories with commits the shared index has not caught up with.
+    pending: BTreeMap<PathBuf, ArchiveIndexLag>,
+    /// Earliest next rewrite per Git directory.
+    next_due: HashMap<PathBuf, Instant>,
+    /// Git directories whose current run of failures was already logged.
+    warned: HashSet<PathBuf>,
+    worker_started: bool,
+    /// A sync is rewriting an index right now.
+    in_flight: bool,
+    /// Shutdown: start no further syncs.
+    stopping: bool,
+}
+
+/// When an index fell behind HEAD, and when its latest commit landed.
+#[derive(Debug, Clone, Copy)]
+struct ArchiveIndexLag {
+    since: Instant,
+    last_commit: Instant,
+}
+
+fn mark_archive_index_pending(state: &mut ArchiveIndexSyncState, git_dir: &Path, now: Instant) {
+    state
+        .pending
+        .entry(git_dir.to_path_buf())
+        .and_modify(|lag| lag.last_commit = now)
+        .or_insert(ArchiveIndexLag {
+            since: now,
+            last_commit: now,
+        });
+}
+
+static ARCHIVE_INDEX_SYNC: LazyLock<(Mutex<ArchiveIndexSyncState>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(ArchiveIndexSyncState::default()), Condvar::new()));
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests get the shared index synchronized at commit time, so archive
+    /// fixtures always find a current `.git/index`. Tests of the background
+    /// contract switch this off for their thread.
+    static ARCHIVE_INDEX_SYNC_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Mark `git_dir`'s shared index as behind HEAD and wake the sync worker.
+fn note_archive_commit_for_index_sync(git_dir: &Path) {
+    #[cfg(test)]
+    if ARCHIVE_INDEX_SYNC_INLINE.with(std::cell::Cell::get) {
+        let _ = sync_archive_index_to_head(git_dir);
+        return;
+    }
+    let (state, wake) = &*ARCHIVE_INDEX_SYNC;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mark_archive_index_pending(&mut state, git_dir, Instant::now());
+    // Unit tests drive `sync_archive_index_to_head` themselves so their index
+    // assertions are deterministic.
+    if !state.worker_started && !cfg!(test) {
+        match std::thread::Builder::new()
+            .name("archive-index-sync".to_string())
+            .spawn(archive_index_sync_worker)
+        {
+            Ok(_) => state.worker_started = true,
+            Err(error) => {
+                tracing::warn!("could not start the archive index sync worker: {error}");
+            }
+        }
+    }
+    drop(state);
+    wake.notify_one();
+}
+
+/// Stop the index sync worker for shutdown: start no further syncs and wait up
+/// to `timeout` for one in progress, so the process does not exit holding
+/// `.git/index.lock`. A sync still owed is left to the next process's commits.
+pub fn stop_archive_index_sync(timeout: Duration) {
+    let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+    let mut state = state_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopping = true;
+    wake.notify_all();
+    let deadline = Instant::now() + timeout;
+    while state.in_flight {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            tracing::warn!("archive index sync still running at shutdown; not waiting longer");
+            break;
+        }
+        state = wake
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// The pending Git directory to synchronize at `now`, or how long until the
+/// earliest pending one is due (`None` when nothing is pending).
+fn next_archive_index_sync(
+    state: &ArchiveIndexSyncState,
+    now: Instant,
+) -> std::result::Result<PathBuf, Option<Duration>> {
+    let mut wait: Option<Duration> = None;
+    for (git_dir, lag) in &state.pending {
+        // Due once commits pause, or once the lag bound is reached, and never
+        // before the backoff from the previous rewrite ends.
+        let wanted = (lag.last_commit + ARCHIVE_INDEX_SYNC_QUIET_PERIOD)
+            .min(lag.since + ARCHIVE_INDEX_SYNC_MAX_LAG);
+        let due = state
+            .next_due
+            .get(git_dir)
+            .map_or(wanted, |backoff| (*backoff).max(wanted));
+        if due <= now {
+            return Ok(git_dir.clone());
+        }
+        let left = due - now;
+        wait = Some(wait.map_or(left, |wait| wait.min(left)));
+    }
+    Err(wait)
+}
+
+/// How long after a rewrite that took `elapsed` the same index may be
+/// rewritten again.
+fn archive_index_sync_backoff(elapsed: Duration) -> Duration {
+    elapsed
+        .saturating_mul(ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR)
+        .max(ARCHIVE_INDEX_SYNC_MIN_INTERVAL)
+}
+
+fn archive_index_sync_worker() {
+    let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+    loop {
+        let git_dir = {
+            let mut state = state_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if state.stopping {
+                    return;
+                }
+                match next_archive_index_sync(&state, Instant::now()) {
+                    Ok(git_dir) => {
+                        state.pending.remove(&git_dir);
+                        state.in_flight = true;
+                        break git_dir;
+                    }
+                    Err(Some(wait)) => {
+                        state = wake
+                            .wait_timeout(state, wait)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    Err(None) => {
+                        state = wake
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            }
+        };
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(|| sync_archive_index_to_head(&git_dir))
+            .unwrap_or_else(|_| {
+                Err(StorageError::Io(std::io::Error::other(
+                    "archive index synchronization panicked",
+                )))
+            });
+        let mut state = state_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = false;
+        wake.notify_all();
+        state.next_due.insert(
+            git_dir.clone(),
+            Instant::now() + archive_index_sync_backoff(started.elapsed()),
+        );
+        match result {
+            Ok(ArchiveIndexSync::Settled) => {
+                state.warned.remove(&git_dir);
+            }
+            // Someone else holds the lock: this commit's sync is still owed.
+            Ok(ArchiveIndexSync::Locked) => {
+                mark_archive_index_pending(&mut state, &git_dir, Instant::now());
+            }
+            Err(error) if state.warned.insert(git_dir.clone()) => tracing::warn!(
+                git_dir = %git_dir.display(),
+                "could not bring the archive's .git/index up to HEAD: {error}; repeats are logged at debug level until it succeeds"
+            ),
+            Err(error) => tracing::debug!(
+                git_dir = %git_dir.display(),
+                "could not bring the archive's .git/index up to HEAD: {error}"
+            ),
+        }
+    }
+}
+
+/// Device, inode, length and modification time of an index file.
+fn archive_index_file_identity(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        format!(
+            "{}:{}:{}:{modified}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{}:{modified}", metadata.len())
+    }
+}
+
+/// The tree recorded by the last sync, if the record describes `identity`.
+/// The tree the last sync wrote and the identity of the index file it wrote.
+fn read_archive_index_sync_record(git_dir: &Path) -> Option<(git2::Oid, String)> {
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME),
+        512,
+    )
+    .ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != ARCHIVE_INDEX_SYNC_FORMAT_VERSION {
+        return None;
+    }
+    let tree = git2::Oid::from_str(lines.next()?).ok()?;
+    let identity = lines.next()?.to_string();
+    lines.next().is_none().then_some((tree, identity))
+}
+
+fn write_archive_index_sync_record(
+    git_dir: &Path,
+    tree: git2::Oid,
+    identity: &str,
+) -> std::io::Result<()> {
+    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = git_dir.join(format!(
+        "{ARCHIVE_INDEX_SYNC_FILE_NAME}.tmp-{}-{seq}",
+        std::process::id()
+    ));
+    let content = format!("{ARCHIVE_INDEX_SYNC_FORMAT_VERSION}\n{tree}\n{identity}\n");
+    fs::write(&tmp, content)
+        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME)))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+}
+
+/// Whether `tree` is the tree of `head` or of one of its recent first-parent
+/// ancestors.
+fn tree_on_recent_first_parent_chain(head: &git2::Commit<'_>, tree: git2::Oid) -> bool {
+    let mut commit = head.clone();
+    for _ in 0..ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT {
+        if commit.tree_id() == tree {
+            return true;
+        }
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Whether `tree` is the tree of `head` or of a recent first-parent ancestor
+/// committed after the newest commit whose tree is `since`.
+fn tree_committed_since(head: &git2::Commit<'_>, tree: git2::Oid, since: git2::Oid) -> bool {
+    let mut commit = head.clone();
+    for _ in 0..ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT {
+        let current = commit.tree_id();
+        if current == since {
+            return false;
+        }
+        if current == tree {
+            return true;
+        }
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// What one synchronization attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveIndexSync {
+    /// The index is current, was rewritten, or is foreign and left alone.
+    Settled,
+    /// Another writer holds `index.lock`: try again later.
+    Locked,
+}
+
+/// Age after which an `index.lock` whose owner is gone may be reclaimed: the
+/// rule commits apply on their first retry.
+const ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS: f64 = 30.0;
+
+fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Removes this process's `index.lock.owner` record when dropped.
+struct IndexLockOwner<'a>(Option<&'a Path>);
+
+impl Drop for IndexLockOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(repo_root) = self.0 {
+            remove_lock_owner(repo_root);
+        }
+    }
+}
+
+/// Bring the shared `.git/index` up to HEAD when it holds nothing but this
+/// maintenance's own earlier result.
 ///
-/// Hold Git's exclusive index lock from observation through atomic replacement.
-/// Dirty, conflicted, corrupt, oversized or locked indexes remain untouched.
-/// This maintenance is best-effort: the caller has already committed its tree.
-fn sync_clean_index_after_commit(
-    repo: &Repository,
-    parent: Option<&git2::Commit<'_>>,
-    committed: &git2::Tree<'_>,
-) -> Result<()> {
-    const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
-    let index_path = repo.path().join("index");
-    let lock_path = repo.path().join("index.lock");
+/// The index is ours when it is the exact file the last sync wrote (per
+/// [`ARCHIVE_INDEX_SYNC_FILE_NAME`]); when it was rewritten since but holds
+/// HEAD's tree, the tree that sync wrote (a `git status` stat refresh), or the
+/// tree of a commit made after it (a reset); when it is missing; or, without
+/// any record, when it is empty or equals HEAD or one of its recent
+/// first-parent ancestors (a sync that fell behind before the record
+/// existed). Git's exclusive index lock is held from observation through
+/// atomic replacement, with an owner record so a lock left by a process that
+/// exited mid-sync can be reclaimed. Staged, conflicted, corrupt, oversized,
+/// locked or otherwise foreign indexes stay untouched: they may hold an
+/// interrupted writer's only evidence.
+fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
+    const MAX_INDEX_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_INDEX_ENTRIES: u32 = 500_000;
+    let index_path = git_dir.join("index");
+    let lock_path = git_dir.join("index.lock");
     if path_existing_prefix_has_symlink(&index_path)?
         || path_existing_prefix_has_symlink(&lock_path)?
     {
@@ -12474,13 +12950,24 @@ fn sync_clean_index_after_commit(
             "archive index synchronization refuses symlinked paths".to_string(),
         ));
     }
-    let lock_file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
+    let repo = Repository::open(git_dir)?;
+    let repo_root = repo.workdir().map(Path::to_path_buf);
+    let lock_file = match create_index_lock(&lock_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A process that exited mid-sync never releases its lock, which
+            // would block every later sync and every archive read stamp.
+            let reclaimed = repo_root.as_deref().is_some_and(|root| {
+                try_clean_stale_git_lock(root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS)
+            });
+            match reclaimed.then(|| create_index_lock(&lock_path)) {
+                Some(Ok(file)) => file,
+                Some(Err(error)) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return Err(error.into());
+                }
+                _ => return Ok(ArchiveIndexSync::Locked),
+            }
+        }
         Err(error) => return Err(error.into()),
     };
     // Adopt only the lock we just created; dropping it never touches another
@@ -12489,8 +12976,23 @@ fn sync_clean_index_after_commit(
         lock_file,
         tempfile::TempPath::try_from_path(lock_path)?,
     );
+    // Written only once the lock is ours and declared after it, so it is
+    // removed before the lock is released on every path: it can never erase
+    // the record of whoever takes the lock next.
+    if let Some(root) = repo_root.as_deref() {
+        write_lock_owner(root);
+    }
+    let owner = IndexLockOwner(repo_root.as_deref());
+    // HEAD is read under the lock, so a slow sync cannot publish a tree older
+    // than one another writer synced while this one waited.
+    let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
+        return Ok(ArchiveIndexSync::Settled);
+    };
+    let head = repo.find_commit(head_oid)?;
+    let head_tree = head.tree_id();
     let scratch = tempfile::tempdir()?;
     let scratch_path = scratch.path().join("index");
+    let mut identity = None;
     match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &index_path,
         MAX_INDEX_BYTES,
@@ -12507,29 +13009,70 @@ fn sync_clean_index_after_commit(
                 StorageError::InvalidPath("archive index header is incomplete".to_string())
             })?;
             if &header[..4] != b"DIRC"
-                || u32::from_be_bytes([header[8], header[9], header[10], header[11]]) > 100_000
+                || u32::from_be_bytes([header[8], header[9], header[10], header[11]])
+                    > MAX_INDEX_ENTRIES
             {
                 return Err(StorageError::InvalidPath(
                     "archive index format or entry budget is invalid".to_string(),
                 ));
             }
+            identity = Some(archive_index_file_identity(&metadata));
             fs::write(&scratch_path, bytes)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     let mut index = git2::Index::open_ext(&scratch_path, repo.object_format())?;
-    let parent_tree = parent.map(git2::Commit::tree).transpose()?;
-    if index.has_conflicts()
-        || repo
-            .diff_tree_to_index(parent_tree.as_ref(), Some(&index), None)?
-            .deltas()
-            .len()
-            != 0
-    {
-        return Ok(());
+    if index.has_conflicts() {
+        return Ok(ArchiveIndexSync::Settled);
     }
-    index.read_tree(committed)?;
+    // A missing index file is simply rebuilt.
+    if let Some(identity) = identity.as_deref() {
+        // Records it as current, so later syncs skip the tree comparison.
+        let record_current = || {
+            if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, identity) {
+                tracing::debug!("could not record the archive index sync: {error}");
+            }
+        };
+        match read_archive_index_sync_record(git_dir) {
+            Some((tree, recorded)) if recorded == identity => {
+                if tree == head_tree {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            Some((tree, _)) => {
+                // Rewritten since the last sync. Git rewrites the file to
+                // refresh stat data (`git status`), keeping the tree we wrote,
+                // and a reset leaves the tree of a commit made since; both
+                // stage nothing, so the index is still ours. Any older tree is
+                // someone's staged change (`git rm --cached` of a recent file,
+                // `git revert --no-commit`).
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if index_tree != tree && !tree_committed_since(&head, index_tree, tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            None if index.is_empty() => {}
+            None => {
+                // No record yet (first sync after an upgrade, or a lost
+                // record). Cheap when the index carries Git's tree cache, as
+                // every index this function writes does.
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if !tree_on_recent_first_parent_chain(&head, index_tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+        }
+    }
+    index.read_tree(&head.tree()?)?;
     index.write()?;
     let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &scratch_path,
@@ -12537,9 +13080,16 @@ fn sync_clean_index_after_commit(
     )?;
     lock.write_all(&bytes)?;
     lock.as_file().sync_all()?;
+    // A rename keeps inode, length and mtime, so this is the identity the
+    // published index will have.
+    let written = archive_index_file_identity(&lock.as_file().metadata()?);
+    drop(owner);
     lock.persist(&index_path)
         .map_err(|error| StorageError::Io(error.error))?;
-    Ok(())
+    if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, &written) {
+        tracing::debug!("could not record the archive index sync: {error}");
+    }
+    Ok(ArchiveIndexSync::Settled)
 }
 
 /// Add files to the git index and create a commit.
@@ -12880,9 +13430,73 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
-    use std::io::Write as _;
-
     let _mutation = ArchiveMutationGuard::begin_at(path);
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    let tmp_path = stage_atomic_write(path, data, sync)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Archive files written and synced under temp names beside their targets,
+/// then renamed into place together inside one archive mutation window
+/// (br-9bwnb). Staging needs no publication fence: readers only open named
+/// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
+/// Whatever is still staged when this drops is removed.
+struct StagedArchiveWrites {
+    /// `(temp path, target path)` pairs not yet renamed into place.
+    staged: Vec<(PathBuf, PathBuf)>,
+}
+
+impl StagedArchiveWrites {
+    /// Write and `fdatasync` each file under a temp name beside its target.
+    fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
+        let mut writes = Self {
+            staged: Vec::with_capacity(files.len()),
+        };
+        for (path, data) in files {
+            let tmp_path = stage_atomic_write(&path, &data, true)?;
+            writes.staged.push((tmp_path, path));
+        }
+        Ok(writes)
+    }
+
+    /// Rename every staged file into place inside one archive mutation window.
+    fn publish(mut self) -> Result<()> {
+        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        let mut pending = std::mem::take(&mut self.staged).into_iter();
+        while let Some((tmp_path, path)) = pending.next() {
+            if let Err(err) = fs::rename(&tmp_path, &path) {
+                let _ = fs::remove_file(&tmp_path);
+                self.staged.extend(pending);
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedArchiveWrites {
+    fn drop(&mut self) {
+        for (tmp_path, _) in &self.staged {
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+}
+
+/// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
+/// return the temp path for the caller to rename into place. `create_new`
+/// means a pre-existing file or symlink at a temp name is never clobbered.
+fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+    use std::io::Write as _;
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -12923,12 +13537,11 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
             if sync {
                 f.sync_data()?;
             }
-            fs::rename(&tmp_path, path)?;
             Ok(())
         })();
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(tmp_path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -13846,6 +14459,49 @@ mod tests {
     /// publication fence that a draining write-behind batch holds (observed:
     /// inbox reads waiting 25-30 s); a real archive mutation still waits.
     #[test]
+    fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
+        assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
+        // Wait 7 took its number first but registered after wait 8.
+        let waits = BTreeMap::from([(7, 2_000), (8, 1_000), (9, 3_000)]);
+        assert_eq!(oldest_fence_wait_start(&waits), 1_000);
+    }
+
+    /// br-9bwnb: a thread blocked on the held fence is visible to timeout
+    /// diagnostics while it waits. Without the registration the live wait age
+    /// stays zero and a timed-out reservation reads as unattributed.
+    #[test]
+    fn a_contended_fence_wait_is_visible_to_timeout_diagnostics() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let waiter = std::thread::spawn(|| drop(ArchiveMutationGuard::begin()));
+
+        let gauge = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gauge.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waiting = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(30_000_000);
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        waiter.join().expect("waiter thread");
+
+        assert!(
+            waiting.archive_fence_wait_us >= 20_000,
+            "a blocked fence wait must have a live age: {waiting:?}"
+        );
+    }
+
+    #[test]
     fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
         let cached_dir = tmp.path().join("cached");
@@ -14612,6 +15268,156 @@ mod tests {
                 "failed reservation batches must not leave partial archive artifacts"
             );
         }
+    }
+
+    fn staged_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(".tmp-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// br-9bwnb: a reservation write syncs its artifacts outside the archive
+    /// publication fence and takes the fence only to rename them into place.
+    /// While another writer holds the fence the artifacts are staged but not
+    /// visible; once it is released they publish and no temp file remains.
+    #[test]
+    fn reservation_writes_stage_outside_the_fence_and_publish_inside_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        // A cached archive and directory are no mutation; warm both first.
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 7,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let writer = std::thread::spawn(move || wbq_execute_op(&op, "br-9bwnb-test"));
+
+        // The legacy and id artifacts both stage while the fence is held.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        let id_artifact = reservation_dir.join("id-7.json");
+        let published_while_held = id_artifact.exists();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("reservation write");
+
+        assert_eq!(
+            staged.len(),
+            2,
+            "both artifacts must sync outside the held fence: {staged:?}"
+        );
+        assert!(
+            !published_while_held,
+            "publication must wait for the held fence"
+        );
+        let id_json = fs::read_to_string(&id_artifact).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&id_json).unwrap();
+        assert_eq!(written["path_pattern"], "src/**");
+        let legacy = reservation_dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(b"src/**"))
+        ));
+        assert_eq!(fs::read_to_string(legacy).unwrap(), id_json);
+        assert!(
+            staged_temp_files(&reservation_dir).is_empty(),
+            "publication leaves no temp file"
+        );
+    }
+
+    /// br-9bwnb: a staged temp file is no archive state. The overload
+    /// `commit_all` adds the whole worktree; it must never publish a temp file
+    /// another writer staged outside the fence, while the artifact beside it
+    /// is committed. Dropping an unpublished stage removes its temp file.
+    #[test]
+    fn commit_all_never_publishes_a_staged_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let staged =
+            StagedArchiveWrites::stage(vec![(reservation_dir.join("id-1.json"), b"{}".to_vec())])
+                .unwrap();
+        fs::write(reservation_dir.join("id-2.json"), "{}").unwrap();
+        assert_eq!(staged_temp_files(&reservation_dir).len(), 1);
+
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_all(&repo, &config, "overload snapshot").unwrap();
+
+        let committed = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new("projects/proj/file_reservations"))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.name().ok().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(committed, ["id-2.json"]);
+        drop(staged);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    /// A failed publication stops at the failing rename and removes every
+    /// temp file it still owns.
+    #[test]
+    fn staged_archive_writes_clean_up_after_a_failed_publication() {
+        let tmp = TempDir::new().unwrap();
+        // A file cannot be renamed over a non-empty directory.
+        let blocked = tmp.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "keep").unwrap();
+        let later = tmp.path().join("later.json");
+        let staged = StagedArchiveWrites::stage(vec![
+            (blocked.clone(), b"{}".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(staged_temp_files(tmp.path()).len(), 2);
+
+        staged
+            .publish()
+            .expect_err("a rename over a non-empty directory fails");
+
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        assert_eq!(fs::read_to_string(blocked.join("keep")).unwrap(), "keep");
+        assert!(!later.exists(), "publication stops at the failed rename");
     }
 
     #[test]
@@ -15544,6 +16350,10 @@ mod tests {
         let outside = outside_tmp.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
 
+        // Production order: the fence before the test lock. Holding only the
+        // test lock here while `write_text` waits on the fence would deadlock
+        // against a concurrent atomic write that holds the fence.
+        let _mutation = ArchiveMutationGuard::begin();
         let _guard = atomic_write_test_guard();
         ATOMIC_WRITE_TMP_COUNTER.store(0, Ordering::Relaxed);
         for seq in 0..8 {
@@ -22197,6 +23007,7 @@ mod tests {
 
     #[test]
     fn archive_commit_strategies_preserve_staged_locked_and_corrupt_indexes() {
+        let _background = BackgroundIndexSync::enter();
         for strategy in 0..3 {
             for state in ["clean", "staged", "locked", "corrupt"] {
                 let tmp = TempDir::new().unwrap();
@@ -22246,6 +23057,11 @@ mod tests {
                 )
                 .unwrap();
                 assert!(tree.get_path(Path::new(&staged_relative)).is_err());
+                // What the background worker would do next (br-0i0g4). Only
+                // the corrupt index is an error; the others succeed, with a
+                // staged or locked index left untouched.
+                let synced = sync_archive_index_to_head(repo.path());
+                assert_eq!(synced.is_err(), state == "corrupt", "{synced:?}");
                 if state == "clean" {
                     let reopened = Repository::open(&archive.repo_root).unwrap();
                     assert_eq!(
@@ -22280,6 +23096,236 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The tree the shared `.git/index` currently describes.
+    fn shared_index_tree(repo: &Repository) -> git2::Oid {
+        let mut index =
+            git2::Index::open_ext(&repo.path().join("index"), repo.object_format()).unwrap();
+        index.write_tree_to(repo).unwrap()
+    }
+
+    /// For the rest of a test, commits leave `.git/index` to the background
+    /// sync, as in production, instead of the inline sync unit tests get.
+    struct BackgroundIndexSync;
+
+    impl BackgroundIndexSync {
+        fn enter() -> Self {
+            ARCHIVE_INDEX_SYNC_INLINE.with(|inline| inline.set(false));
+            Self
+        }
+    }
+
+    impl Drop for BackgroundIndexSync {
+        fn drop(&mut self) {
+            ARCHIVE_INDEX_SYNC_INLINE.with(|inline| inline.set(true));
+        }
+    }
+
+    #[test]
+    fn archive_index_sync_catches_up_but_never_overwrites_foreign_state() {
+        // br-0i0g4: commits no longer rewrite .git/index; a later sync brings
+        // it up to HEAD however many commits it is behind, across restarts,
+        // and leaves an index holding someone else's staged state alone.
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-sync").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let commit = |name: &str| {
+            let path = archive.root.join(name);
+            fs::write(&path, name).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            commit_paths_lockfree(&repo, &config, name, &[rel.as_str()]).unwrap();
+        };
+        let head_tree = || repo.head().unwrap().peel_to_tree().unwrap().id();
+        let record = git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME);
+
+        commit("a.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+        assert!(record.exists(), "a sync records what it wrote");
+
+        // Three commits behind: the record identifies the index as ours.
+        let behind = shared_index_tree(&repo);
+        for name in ["b.txt", "c.txt", "d.txt"] {
+            commit(name);
+        }
+        assert_eq!(
+            shared_index_tree(&repo),
+            behind,
+            "commits leave .git/index alone"
+        );
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Without the record (an upgrade or a lost record) an index equal to
+        // a recent ancestor of HEAD is still a sync that fell behind.
+        let moved = tmp.path().join("moved-record");
+        fs::rename(&record, &moved).unwrap();
+        commit("e.txt");
+        commit("f.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Negative control: a staged foreign entry makes the index someone
+        // else's evidence, with or without a record.
+        let mut index = repo.index().unwrap();
+        let staged = archive.root.join("staged-only.txt");
+        fs::write(&staged, "irreplaceable staged evidence").unwrap();
+        let staged_rel = rel_path_cached(&archive.canonical_repo_root, &staged).unwrap();
+        index.add_path(Path::new(&staged_rel)).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let before = fs::read(git_dir.join("index")).unwrap();
+        commit("g.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), before);
+        assert!(!git_dir.join("index.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_reclaims_dead_locks_and_keeps_staged_changes() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-sync-locks").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let rel = |name: &str| {
+            let path = archive.root.join(name);
+            rel_path_cached(&archive.canonical_repo_root, &path).unwrap()
+        };
+        let commit = |name: &str| {
+            fs::write(archive.root.join(name), name).unwrap();
+            commit_paths_lockfree(&repo, &config, name, &[rel(name).as_str()]).unwrap();
+        };
+        let head_tree = || repo.head().unwrap().peel_to_tree().unwrap().id();
+        let index_bytes = || fs::read(git_dir.join("index")).unwrap();
+        let lock = git_dir.join("index.lock");
+        let owner = git_dir.join("index.lock.owner");
+        let sync = || sync_archive_index_to_head(&git_dir).unwrap();
+
+        // A lock whose recorded owner is alive belongs to that writer: wait,
+        // and keep the sync owed.
+        commit("a.txt");
+        fs::write(&lock, "live writer").unwrap();
+        let me = std::process::id();
+        let ticks = process_start_ticks(me).unwrap_or(0);
+        fs::write(&owner, format!("{me}\n0\n{ticks}\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Locked);
+        assert_eq!(fs::read(&lock).unwrap(), b"live writer");
+
+        // A lock left by a process that exited mid-sync is reclaimed, so the
+        // index is not stuck behind HEAD (and reads are not stuck) forever.
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        fs::write(&owner, format!("{dead}\n0\n0\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+        assert!(!lock.exists() && !owner.exists());
+
+        // A staged change whose tree equals an ancestor (`git rm --cached` of
+        // the file the last commit added) is someone's, not a lagging sync.
+        // Git reloads the index file before changing it; so do these steps.
+        let shared_index = || {
+            let mut index = repo.index().unwrap();
+            index.read(true).unwrap();
+            index
+        };
+        let tree_a = head_tree();
+        commit("b.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        let mut index = shared_index();
+        index.remove_path(Path::new(&rel("b.txt"))).unwrap();
+        index.write().unwrap();
+        drop(index);
+        assert_eq!(shared_index_tree(&repo), tree_a);
+        let staged = index_bytes();
+        commit("c.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(index_bytes(), staged);
+
+        // An index reset to HEAD stages nothing: it is adopted and followed
+        // after the next commit.
+        let mut index = shared_index();
+        index
+            .read_tree(&repo.head().unwrap().peel_to_tree().unwrap())
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit("d.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Git rewriting the file without changing its tree (a `git status`
+        // stat refresh) leaves it ours.
+        let mut index = shared_index();
+        index.write().unwrap();
+        drop(index);
+        commit("e.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+    }
+
+    #[test]
+    fn archive_index_sync_waits_for_a_pause_bounds_the_lag_and_backs_off() {
+        let quiet = ARCHIVE_INDEX_SYNC_QUIET_PERIOD;
+        let now = Instant::now();
+        let mut state = ArchiveIndexSyncState::default();
+        assert_eq!(next_archive_index_sync(&state, now), Err(None));
+
+        // A commit makes the index due once commits pause for the quiet period.
+        let repo = PathBuf::from("/archives/busy/.git");
+        mark_archive_index_pending(&mut state, &repo, now);
+        assert_eq!(next_archive_index_sync(&state, now), Err(Some(quiet)));
+        assert_eq!(
+            next_archive_index_sync(&state, now + quiet),
+            Ok(repo.clone())
+        );
+
+        // Each further commit pushes the rewrite out (no rewrite between two
+        // commits of a busy archive)...
+        let mut at = now;
+        for _ in 0..10 {
+            at += quiet / 2;
+            mark_archive_index_pending(&mut state, &repo, at);
+            assert_eq!(next_archive_index_sync(&state, at), Err(Some(quiet)));
+        }
+        // ...but unbroken traffic cannot hold the index behind HEAD for longer
+        // than the lag bound.
+        while at < now + ARCHIVE_INDEX_SYNC_MAX_LAG {
+            at += quiet / 2;
+            mark_archive_index_pending(&mut state, &repo, at);
+        }
+        assert_eq!(next_archive_index_sync(&state, at), Ok(repo.clone()));
+
+        // The backoff after a slow rewrite holds even a quiet repository.
+        state.pending.clear();
+        mark_archive_index_pending(&mut state, &repo, now);
+        state
+            .next_due
+            .insert(repo.clone(), now + Duration::from_secs(40));
+        assert_eq!(
+            next_archive_index_sync(&state, now + quiet),
+            Err(Some(Duration::from_secs(40) - quiet))
+        );
+        assert_eq!(
+            next_archive_index_sync(&state, now + Duration::from_secs(40)),
+            Ok(repo)
+        );
+
+        assert_eq!(
+            archive_index_sync_backoff(Duration::from_millis(10)),
+            ARCHIVE_INDEX_SYNC_MIN_INTERVAL
+        );
+        assert_eq!(
+            archive_index_sync_backoff(Duration::from_millis(500)),
+            Duration::from_millis(15_000)
+        );
     }
 
     #[test]
@@ -24731,5 +25777,60 @@ Test body.
             Some("256"),
             "pre-existing archive must have gc.auto=256 migrated in"
         );
+    }
+
+    #[test]
+    fn ensure_repo_rejects_missing_head_without_caching_or_rewriting_history() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let config = test_config(root);
+        let repo = Repository::init(root).expect("init real archive");
+        let sig = git2::Signature::now("archive-test", "archive@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let original_tip = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "preserve this history",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let head_path = root.join(".git/HEAD");
+        let saved_head = root.join("saved-HEAD");
+        let head_bytes = fs::read(&head_path).unwrap();
+        let config_bytes = fs::read(root.join(".git/config")).unwrap();
+        drop(tree);
+        drop(repo);
+        // Preserve the real HEAD, rather than deleting it to plant the fault.
+        fs::rename(&head_path, &saved_head).unwrap();
+        // Already-correct .gitignore reproduces the old silent Ok/cache path.
+        ensure_archive_gitignore(root).unwrap();
+        let ignore_bytes = fs::read(root.join(".gitignore")).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                ensure_repo(root, &config),
+                Err(StorageError::Git(_))
+            ));
+            assert!(
+                !repo_cache_contains(root),
+                "invalid root must not be cached"
+            );
+            assert!(!head_path.exists(), "must not guess a replacement HEAD");
+            assert_eq!(fs::read(&saved_head).unwrap(), head_bytes);
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), config_bytes);
+            assert_eq!(fs::read(root.join(".gitignore")).unwrap(), ignore_bytes);
+        }
+
+        // An operator can restore the known HEAD; the failed opens must not
+        // poison later archive initialization or replace the existing history.
+        fs::rename(&saved_head, &head_path).unwrap();
+        assert!(!ensure_repo(root, &config).expect("open restored archive"));
+        let restored = Repository::open(root).unwrap();
+        assert_eq!(restored.head().unwrap().target(), Some(original_tip));
+        assert!(restored.find_commit(original_tip).is_ok());
     }
 }

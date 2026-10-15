@@ -57,7 +57,15 @@ pub mod mail_retention;
 pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
+pub mod never_written_pages;
+#[path = "pool_registry.rs"]
 pub mod pool;
+#[path = "pool.rs"]
+// The public pool facade glob-reexports this module. Crate-only visibility
+// keeps recovery helpers out of that public API.
+#[allow(clippy::redundant_pub_crate)]
+mod pool_impl;
+pub mod project_mailbox;
 pub mod queries;
 pub mod query_assistance;
 pub mod query_plan_diagnostics;
@@ -301,6 +309,7 @@ pub use pool::{
     ensure_sqlite_file_healthy_with_archive,
     evaluate_write_route,
     get_cached_pool,
+    get_or_create_live_query_only_pool,
     get_or_create_pool,
     inspect_mailbox_db_inventory,
     inspect_mailbox_recovery_lock,

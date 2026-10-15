@@ -15,6 +15,7 @@ use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{AgentHealthGrade, AgentHealthScorecard};
 use mcp_agent_mail_db::DbConn;
 
+use crate::tui_action_menu::{ActionEntry, agents_actions};
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -994,8 +995,11 @@ impl MailScreen for AgentsScreen {
                     self.table_state.selected = Some(0);
                 }
                 KeyCode::Char('/') => {
+                    // A fresh filter starts from the full list, not the
+                    // one the previous filter left behind.
                     self.filter_active = true;
                     self.filter.clear();
+                    self.rebuild_from_state(state);
                 }
                 KeyCode::Char('s') => {
                     self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
@@ -1179,10 +1183,29 @@ impl MailScreen for AgentsScreen {
         self.filter_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search. Esc
+        // clears a committed filter; with no filter it stays the global quit
+        // confirmation.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Escape => !self.filter_active && !self.filter.is_empty(),
+            _ => false,
+        }
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let idx = self.table_state.selected?;
         let agent = self.agents.get(idx)?;
         Some(agent.name.clone())
+    }
+
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let idx = self.table_state.selected?;
+        let agent = self.agents.get(idx)?;
+        // Anchor row is the selected row + header offset, as in Contacts.
+        let anchor_row = u16::try_from(idx).unwrap_or(u16::MAX).saturating_add(2);
+        Some((agents_actions(&agent.name), anchor_row, agent.name.clone()))
     }
 
     fn title(&self) -> &'static str {
@@ -2065,6 +2088,83 @@ mod tests {
     }
 
     #[test]
+    fn esc_is_claimed_only_while_a_committed_filter_can_be_cleared() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    project: String::new(),
+                    name: "RedFox".to_string(),
+                    display_name: None,
+                    program: "claude-code".to_string(),
+                    model: String::new(),
+                    last_active_ts: 100,
+                    health: None,
+                },
+                crate::tui_events::AgentSummary {
+                    project: String::new(),
+                    name: "BlueLake".to_string(),
+                    display_name: None,
+                    program: "codex-cli".to_string(),
+                    model: String::new(),
+                    last_active_ts: 200,
+                    health: None,
+                },
+            ],
+            ..Default::default()
+        });
+        let mut screen = AgentsScreen::new();
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.agents.len(), 2);
+
+        // With no filter Esc stays global, so it still arms quit confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('r'),
+            KeyCode::Char('e'),
+            KeyCode::Char('d'),
+            KeyCode::Enter,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert!(!screen.consumes_text_input());
+        assert_eq!(screen.agents.len(), 1);
+        assert!(screen.claims_key(&esc));
+
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.filter, "");
+        assert_eq!(
+            screen.agents.len(),
+            2,
+            "clearing the filter rebuilds the list"
+        );
+        assert!(!screen.claims_key(&esc));
+
+        // Starting a new filter with `/` also clears the old one, so the list
+        // must not stay filtered behind an empty filter (where Esc, with
+        // nothing to clear, would arm quit instead).
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('r'),
+            KeyCode::Char('e'),
+            KeyCode::Char('d'),
+            KeyCode::Enter,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert_eq!(screen.agents.len(), 1);
+        for code in [KeyCode::Char('/'), KeyCode::Enter] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert_eq!(screen.filter, "");
+        assert_eq!(screen.agents.len(), 2);
+    }
+
+    #[test]
     fn s_cycles_sort_column() {
         let state = test_state();
         let mut screen = AgentsScreen::new();
@@ -2084,6 +2184,41 @@ mod tests {
         let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('S')));
         screen.update(&s, &state);
         assert_ne!(screen.sort_asc, initial);
+    }
+
+    #[test]
+    fn action_menu_offers_the_selected_agents_links() {
+        use crate::tui_action_menu::ActionKind;
+        let mut screen = AgentsScreen::new();
+        assert!(screen.contextual_actions().is_none(), "no row, no menu");
+        for name in ["RedFox", "BlueLake"] {
+            screen
+                .agents
+                .push(test_agent_row(name, "", "claude-code", "opus-4.6", 100, 5));
+        }
+        screen.table_state.selected = Some(1);
+
+        let (actions, _, context) = screen.contextual_actions().expect("menu for a row");
+        assert_eq!(context, "BlueLake");
+        let action = |label: &str| {
+            actions
+                .iter()
+                .find(|a| a.label == label)
+                .map(|a| a.action.clone())
+                .unwrap_or_else(|| panic!("missing {label}"))
+        };
+        assert!(matches!(
+            action("View reservations"),
+            ActionKind::DeepLink(DeepLinkTarget::ReservationByAgent(name)) if name == "BlueLake"
+        ));
+        assert!(matches!(
+            action("View inbox"),
+            ActionKind::DeepLink(DeepLinkTarget::ExplorerForAgent(name)) if name == "BlueLake"
+        ));
+        assert!(matches!(
+            action("Send message"),
+            ActionKind::Execute(op) if op == "compose_to:BlueLake"
+        ));
     }
 
     #[test]

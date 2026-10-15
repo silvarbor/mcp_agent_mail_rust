@@ -633,7 +633,7 @@ enum TimelineViewMode {
     Events,
     Commits,
     Combined,
-    #[allow(dead_code)] // Will be constructed via keybinding in a future bead.
+    /// The event stream as a scrolling log (same rows and cursor as Events).
     LogViewer,
 }
 
@@ -664,7 +664,8 @@ impl TimelineViewMode {
         match self {
             Self::Events => Self::Commits,
             Self::Commits => Self::Combined,
-            Self::Combined | Self::LogViewer => Self::Events,
+            Self::Combined => Self::LogViewer,
+            Self::LogViewer => Self::Events,
         }
     }
 }
@@ -702,6 +703,9 @@ pub struct TimelineScreen {
     last_visible_at: Cell<Option<Instant>>,
     /// Log viewer pane used when `view_mode == LogViewer`.
     log_viewer: RefCell<crate::console::LogPane>,
+    /// Fingerprint of the filtered entries `log_viewer` holds, so a frame
+    /// re-formats the lines only when they changed.
+    log_viewer_lines: Cell<Option<u64>>,
     /// Debounced preference persister (auto-saves dock layout to envfile).
     persister: Option<PreferencePersister>,
     /// On-disk path for persisted screen filter presets.
@@ -755,6 +759,7 @@ impl TimelineScreen {
             commit_refresh_rx: None,
             last_visible_at: Cell::new(None),
             log_viewer: RefCell::new(crate::console::LogPane::new()),
+            log_viewer_lines: Cell::new(None),
             persister,
             filter_presets_path,
             filter_presets,
@@ -846,6 +851,13 @@ impl TimelineScreen {
             .pane
             .cursor
             .min(self.active_row_count().saturating_sub(1));
+    }
+
+    /// Re-derive the visible rows after a filter change from the action menu.
+    fn refilter_after_action(&mut self) {
+        self.invalidate_combined_cache();
+        self.clamp_cursor_for_mode();
+        self.prune_selection_to_visible();
     }
 
     fn visible_action_rows(&self) -> Vec<TimelineActionRow> {
@@ -1125,6 +1137,24 @@ impl TimelineScreen {
         match rows.get(self.pane.cursor) {
             Some(CombinedTimelineRow::Event(entry)) => Some(entry.raw.clone()),
             _ => None,
+        }
+    }
+
+    /// Where digit `c` leads from the visible inspector dock: the selected
+    /// event's correlation link at that index, if it has one.
+    fn correlation_link(&self, c: char) -> Option<DeepLinkTarget> {
+        if !self.dock.visible {
+            return None;
+        }
+        let index = usize::try_from(c.to_digit(10)?).ok()?;
+        match self.view_mode {
+            TimelineViewMode::Events | TimelineViewMode::LogViewer => {
+                super::inspector::resolve_link(self.pane.selected_event()?, index)
+            }
+            TimelineViewMode::Combined => {
+                super::inspector::resolve_link(&self.selected_combined_event()?, index)
+            }
+            TimelineViewMode::Commits => None,
         }
     }
 
@@ -1416,7 +1446,7 @@ impl MailScreen for TimelineScreen {
                         }
                     }
 
-                    // Capital-V cycles timeline views (Events -> Commits -> Combined).
+                    // Capital-V cycles timeline views (Events -> Commits -> Combined -> Log).
                     KeyCode::Char('V') => {
                         self.view_mode = self.view_mode.next_primary();
                         if matches!(
@@ -1505,28 +1535,13 @@ impl MailScreen for TimelineScreen {
                     }
 
                     // Correlation link navigation (1-9 when dock is visible)
-                    KeyCode::Char(c @ '1'..='9') if self.dock.visible => {
-                        if self.view_mode == TimelineViewMode::Events {
-                            if let Some(event) = self.pane.selected_event() {
-                                let idx = (c as u8 - b'0') as usize;
-                                if let Some(target) = super::inspector::resolve_link(event, idx) {
-                                    // Auto-save if needed before navigating away.
-                                    if self.dock != dock_before {
-                                        self.dock_changed();
-                                    }
-                                    return Cmd::Msg(MailScreenMsg::DeepLink(target));
-                                }
+                    KeyCode::Char(c @ '1'..='9') => {
+                        if let Some(target) = self.correlation_link(c) {
+                            // Auto-save if needed before navigating away.
+                            if self.dock != dock_before {
+                                self.dock_changed();
                             }
-                        } else if self.view_mode == TimelineViewMode::Combined {
-                            let idx = (c as u8 - b'0') as usize;
-                            if let Some(event) = self.selected_combined_event()
-                                && let Some(target) = super::inspector::resolve_link(&event, idx)
-                            {
-                                if self.dock != dock_before {
-                                    self.dock_changed();
-                                }
-                                return Cmd::Msg(MailScreenMsg::DeepLink(target));
-                            }
+                            return Cmd::Msg(MailScreenMsg::DeepLink(target));
                         }
                     }
 
@@ -1654,6 +1669,61 @@ impl MailScreen for TimelineScreen {
             }
             _ => false,
         }
+    }
+
+    /// The `.` menu's event actions act on this screen. Their context names
+    /// the event by sequence number (`event:{seq}`); it is not a timestamp,
+    /// and the menu's labels are display text, not search terms.
+    fn handle_action(&mut self, operation: &str, context: &str) -> Cmd<MailScreenMsg> {
+        // A commit row's details live in the archive browser, as with Enter.
+        if context.starts_with("commit:") && operation == "view_details" {
+            return Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser));
+        }
+        let Some(seq) = context
+            .strip_prefix("event:")
+            .and_then(|seq| seq.parse::<u64>().ok())
+        else {
+            return Cmd::None;
+        };
+        let Some((kind, source)) = self
+            .pane
+            .entries
+            .iter()
+            .find(|entry| entry.seq == seq)
+            .map(|entry| (entry.display.kind, entry.source))
+        else {
+            return Cmd::None;
+        };
+        match operation
+            .split_once(':')
+            .map_or(operation, |(name, _)| name)
+        {
+            "view_details" => {
+                let key = TimelineSelectionKey::Event { seq };
+                if let Some(row) = self
+                    .visible_action_rows()
+                    .iter()
+                    .position(|row| row.key == key)
+                {
+                    self.pane.cursor = row;
+                    self.pane.follow = false;
+                }
+                if !self.dock.visible {
+                    self.dock.visible = true;
+                    self.dock_changed();
+                }
+            }
+            "filter_kind" => {
+                self.pane.kind_filter = HashSet::from([kind]);
+                self.refilter_after_action();
+            }
+            "filter_source" => {
+                self.pane.source_filter = HashSet::from([source]);
+                self.refilter_after_action();
+            }
+            _ => return Cmd::None,
+        }
+        Cmd::msg(MailScreenMsg::Noop)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1785,11 +1855,21 @@ impl MailScreen for TimelineScreen {
             }
             TimelineViewMode::LogViewer => {
                 let mut viewer = self.log_viewer.borrow_mut();
-                render_timeline_log_viewer(frame, primary_area, &self.pane, self.dock, &mut viewer);
+                render_timeline_log_viewer(
+                    frame,
+                    primary_area,
+                    &self.pane,
+                    self.dock,
+                    &mut viewer,
+                    &self.log_viewer_lines,
+                );
             }
         }
         if let Some(dock_area) = detail_area {
-            let event_ref = if self.view_mode == TimelineViewMode::Events {
+            let event_ref = if matches!(
+                self.view_mode,
+                TimelineViewMode::Events | TimelineViewMode::LogViewer
+            ) {
                 self.pane.selected_event()
             } else {
                 combined_selected_event.as_ref()
@@ -1840,7 +1920,7 @@ impl MailScreen for TimelineScreen {
             },
             HelpEntry {
                 key: "V",
-                action: "Cycle Events/Commits/Combined",
+                action: "Cycle Events/Commits/Combined/Log",
             },
             HelpEntry {
                 key: "Z",
@@ -1925,6 +2005,13 @@ impl MailScreen for TimelineScreen {
                 entry.keybinding = Some("y".to_string());
             }
         }
+        // Commits have no event type or source to filter on.
+        if matches!(current.key, TimelineSelectionKey::Commit { .. }) {
+            actions.retain(|entry| {
+                !matches!(&entry.action, ActionKind::Execute(op)
+                    if op.starts_with("filter_kind:") || op.starts_with("filter_source:"))
+            });
+        }
         let context_id = match &current.key {
             TimelineSelectionKey::Event { seq } => format!("event:{seq}"),
             TimelineSelectionKey::Commit {
@@ -1949,6 +2036,25 @@ impl MailScreen for TimelineScreen {
             );
         }
         rows.get(self.pane.cursor).map(|row| row.copy_text.clone())
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        // The preset dialogs are modal: typing a preset name must not fire
+        // single-key global shortcuts (`q` would quit).
+        self.preset_dialog_mode != PresetDialogMode::None
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // A digit follows the inspector's correlation link when the selected
+        // event has one at that index; otherwise it still jumps screens.
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                self.preset_dialog_mode == PresetDialogMode::None
+                    && key.modifiers.is_empty()
+                    && self.correlation_link(c).is_some()
+            }
+            _ => false,
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -2651,12 +2757,13 @@ fn render_timeline_log_viewer(
     pane: &TimelinePane,
     dock: DockLayout,
     viewer: &mut crate::console::LogPane,
+    viewer_lines: &Cell<Option<u64>>,
 ) {
     if area.width < 20 || area.height < 3 {
         return;
     }
 
-    let filtered: Vec<TimelineEntry> = pane.filtered_entries().into_iter().cloned().collect();
+    let filtered = pane.filtered_entries();
     let total = filtered.len();
     let cursor = pane.cursor.min(total.saturating_sub(1));
     let pos = if total == 0 {
@@ -2686,18 +2793,26 @@ fn render_timeline_log_viewer(
         return;
     }
 
-    viewer.clear();
-    viewer.push_many(filtered.iter().map(|entry| {
-        format!(
-            "{:>6} {} {:<3} [{:<4}] {:<10} {}",
-            entry.seq,
-            entry.display.timestamp,
-            entry.severity.badge(),
-            source_badge(entry.source),
-            entry.display.kind.compact_label(),
-            entry.display.summary
-        )
-    }));
+    // Entries never change after ingest, so their sequence numbers identify
+    // the lines; re-format only when the filtered set changed.
+    let seed = u64::try_from(total).unwrap_or(u64::MAX);
+    let fingerprint = filtered.iter().fold(seed, |acc, entry| {
+        (acc ^ entry.seq).wrapping_mul(0x0100_0000_01b3)
+    });
+    if viewer_lines.replace(Some(fingerprint)) != Some(fingerprint) {
+        viewer.clear();
+        viewer.push_many(filtered.iter().map(|entry| {
+            format!(
+                "{:>6} {} {:<3} [{:<4}] {:<10} {}",
+                entry.seq,
+                entry.display.timestamp,
+                entry.severity.badge(),
+                source_badge(entry.source),
+                entry.display.kind.compact_label(),
+                entry.display.summary
+            )
+        }));
+    }
 
     viewer.scroll_to_bottom();
     if !pane.follow && total > 0 {
@@ -3588,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_v_cycles_events_commits_combined_views() {
+    fn capital_v_cycles_events_commits_combined_log_views() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         assert_eq!(screen.view_mode, TimelineViewMode::Events);
@@ -3600,8 +3715,80 @@ mod tests {
         screen.update(&key, &state);
         assert_eq!(screen.view_mode, TimelineViewMode::Combined);
 
+        // The log viewer used to be unreachable: the cycle skipped it.
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
+
         screen.update(&key, &state);
         assert_eq!(screen.view_mode, TimelineViewMode::Events);
+    }
+
+    #[test]
+    fn digits_follow_correlation_links_only_where_the_selected_event_has_one() {
+        let mut screen = TimelineScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::tool_call_start(
+                "send_message",
+                serde_json::json!({}),
+                Some("proj".to_string()),
+                Some("RedFox".to_string()),
+            ),
+        );
+        screen.dock.visible = true;
+        let digit = |c| ftui::KeyEvent::new(KeyCode::Char(c));
+
+        // Link 1 exists, so the screen takes `1` from the screen-jump keys.
+        assert!(screen.claims_key(&digit('1')));
+        assert!(matches!(
+            screen.update(&Event::Key(digit('1')), &state),
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::ProjectBySlug(_)))
+        ));
+        // No link 9, or a hidden dock: digits keep jumping screens.
+        assert!(!screen.claims_key(&digit('9')));
+        screen.dock.visible = false;
+        assert!(!screen.claims_key(&digit('1')));
+    }
+
+    #[test]
+    fn log_viewer_lines_follow_new_entries_and_filter_changes() {
+        let mut pane = test_pane();
+        push_event_entry(&mut pane, 1, make_event(1));
+        push_event_entry(&mut pane, 2, MailEvent::server_shutdown());
+        let mut viewer = crate::console::LogPane::new();
+        let lines = Cell::new(None);
+        let render = |pane: &TimelinePane, viewer: &mut crate::console::LogPane| {
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(100, 20, &mut pool);
+            let area = Rect::new(0, 0, 100, 20);
+            render_timeline_log_viewer(
+                &mut frame,
+                area,
+                pane,
+                DockLayout::default(),
+                viewer,
+                &lines,
+            );
+        };
+
+        render(&pane, &mut viewer);
+        assert_eq!(viewer.len(), 2);
+        let first = lines.get();
+        // An unchanged frame keeps the cached lines.
+        render(&pane, &mut viewer);
+        assert_eq!((viewer.len(), lines.get()), (2, first));
+
+        // A new entry and a filter change both reach the viewer.
+        push_event_entry(&mut pane, 3, make_event(3));
+        render(&pane, &mut viewer);
+        assert_eq!(viewer.len(), 3);
+        pane.toggle_kind_filter(MailEventKind::HttpRequest);
+        render(&pane, &mut viewer);
+        assert_eq!(viewer.len(), 2);
+        assert_ne!(lines.get(), first);
     }
 
     #[test]
@@ -3702,6 +3889,65 @@ mod tests {
                 .contains(&MailEventKind::HttpRequest)
         );
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
+    }
+
+    #[test]
+    fn action_menu_filters_and_details_act_on_the_timeline_itself() {
+        let mut screen = TimelineScreen::new();
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::message_sent(2, "A", vec!["B".to_string()], "s", "t", "p", ""),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            3,
+            MailEvent::http_request("GET", "/three", 200, 1, "127.0.0.1"),
+        );
+        let handled = |cmd: &Cmd<MailScreenMsg>| matches!(cmd, Cmd::Msg(MailScreenMsg::Noop));
+
+        // Handled here, so the app never turns the label into a text search.
+        let cmd = screen.handle_action("filter_kind:msgsent", "event:2");
+        assert!(handled(&cmd));
+        assert_eq!(
+            screen.pane.kind_filter,
+            HashSet::from([MailEventKind::MessageSent])
+        );
+        assert_eq!(screen.pane.filtered_len(), 1);
+
+        screen.pane.kind_filter.clear();
+        let cmd = screen.handle_action("filter_source:http", "event:3");
+        assert!(handled(&cmd));
+        assert_eq!(
+            screen.pane.source_filter,
+            HashSet::from([EventSource::Http])
+        );
+        assert_eq!(screen.pane.filtered_len(), 2);
+
+        // The context is a sequence number, not a timestamp: details select
+        // event 3 (second visible row), not the oldest row, and open the dock.
+        screen.pane.cursor = 0;
+        screen.dock.visible = false;
+        let cmd = screen.handle_action("view_details", "event:3");
+        assert!(handled(&cmd));
+        assert_eq!(screen.pane.cursor, 1);
+        assert!(screen.dock.visible);
+
+        // Unknown events and other operations fall through to the app.
+        assert!(matches!(
+            screen.handle_action("filter_kind:x", "event:99"),
+            Cmd::None
+        ));
+        assert!(matches!(
+            screen.handle_action("acknowledge", "event:1"),
+            Cmd::None
+        ));
     }
 
     #[test]
