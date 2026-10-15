@@ -1,5 +1,149 @@
 # Resume — local Agent Mail fork
 
+Local integration merge committed as3adb733859aa5d41e2e3b519cac08cc658ca3379.
+No hook was installed; no bypass was used. A dynamic staging command was
+blocked by the command guard; explicit literal paths succeeded instead.
+Cached diff-check reports two space-only context lines in the imported
+docs/evidence/release_smoke/2026-10-12_qbhs0-skip-per-commit-publication.patch.
+Inspection confirms these are required unified-diff context markers in a
+preserved evidence artifact,not source whitespace to rewrite. Beads graph has
+zero dependency cycles. Only FIFO tracking and this resume remain for the
+separate tracking commit,then the exact committed integration is reviewable.
+
+CURRENT 2026-10-15: operator agreed to separate FIFO tracking and continue.
+Created br-1tzh0 (P2,verified-important,verified-local,operator-deferred) in
+the JSONL authority using the pinned br executable with --no-db. Its evidence,
+revisit condition,and unchanged failing regression are recorded. No full stdio
+pass is claimed. Proceed with integration checkpoint,final review,fork PR and
+supervised upgrade under the already-approved eight-step plan. Historical
+"pending FIFO decision" entries below are superseded by this approval.
+The source diff still exactly matches the qualified patch except this resume;
+no qualified implementation section drifted before the tracking update.
+
+FINAL QUALIFICATION CHECKPOINT 2026-10-15 14:35Z. All test/build processes
+completed; no active qualification sessions remain. Final combined build
+session6565 passed5.96s,then stdio suite exited1 with17pass/1fail. Its sole
+failure is immediate named-FIFO EOF on macOS,also17pass/1fail on installed
+baseline. Malformed JSON now passes the original5s deadline. Scope choice
+for separate tracking versus repair was asked asynchronously and remains
+unanswered. Do not claim full stdio pass or silently waive publication gates.
+Final binaries preserved as independent APFS clones in qualification/final-binaries:
+am SHA25602f3cc7257c05c4cf4d0b722d8a269d36a2b1c36e37c145e631fc702f292f8ae
+mcp-agent-mail SHA256685977cb1ce24eed18f43f69fa984c395e80fd5058504c358b73d47d22010892.
+Tracked+staged source snapshot qualified-working-tree.patch SHA256
+0a345577f056fa475d17e6fe25f1801546cc2450a07f2a7c012e2e9cf64b78e0;
+git ls-files --others --exclude-standard returned empty. Ignored resume is separate.
+Live release symlink and both installed hashes rechecked unchanged. No publication,
+upgrade,or live mailbox repair occurred. Remaining: FIFO scope decision,final
+integration review,commit/fork PR/merge,supervised upgrade,24-hour observation,
+and generated-build cleanup after review needs end. The two-file narrow audit
+could not run through the installed whole-changeset audit workflow; no approval
+verdict is claimed. This does not replace the required final integration review.
+
+14:31Z: HOUR WORKLOAD PASSED(session8651 exit0). 3600.020active seconds,
+540sends,540read/acks,660doorbell+42monitor reads,two restarts/three clean exits.
+All three cold full-integrity/FK checks PASS,exact message and receipt IDs
+180/360/540,one reservation and durable checkpoint retained. Final evidence
+qualification/workload-candidate-hour/result.json. The old qualified server
+image ran all three phases; corrected server has separate HTTP/browser/stdio
+passes documented below. Final combined executable build then isolated stdio
+suite now running: build-qualification-final.log and stdio-corrected.log.
+No live mailbox mutation,publication,or installation during qualification.
+
+14:20Z: corrected server HTTP repeat PASSED102 assertions(session29047 exit0,
+http-corrected.log). Corrected browser repeat PASSED38,zero skipped/failed
+(session4933 exit0,browser-corrected.log). Browser harness reports SIGKILL on
+cleanup; this suite proves its assertions,not graceful shutdown. The hour
+workload's two supervised clean exits and cold checks supply that evidence.
+Soak remains active nearing50minutes. No am rebuild yet.
+
+14:17Z: server-only rebuild session73576 PASSED2m32s. Corrected server SHA256
+685977cb1ce24eed18f43f69fa984c395e80fd5058504c358b73d47d22010892.
+am hash remains da57fb90...,so soak adapter executable is unchanged.
+New server ordinary-pipe controls PASSED3(session34006): EOF0/3.45s,
+malformed parse-error exit1/4.26s,reused EOF0/3.25s. Evidence:
+qualification/stdio-corrected-pipe-2/result.json. Initial probe passed the CLI
+serve-stdio verb in MCP mode and correctly exited2; corrected invocation uses
+the server's no-argument stdio entrypoint. Failed probe retained.
+HTTP core repeat against rebuilt server ACTIVE session29047,
+qualification/http-corrected.log. Rebuild actual am binary after soak ends,
+then rerun the isolated stdio suite without loosening its deadlines. FIFO scope
+question remains unanswered; do not infer permission to waive its failure.
+
+14:11Z: SECOND checkpoint PASSED360 exact sends/read/acks,full integrity/FKs,
+reservation/checkpoint continuity. Final phase already started at1792073425,
+PID49057,using original qualified server image. Changed earlier build timing:
+server-only rebuild now runs after final restart,so no subsequent soak server
+launch can select the new image. am remains unchanged for adapter subprocesses.
+Build log build-qualification-server.log; collect active session returned by
+the tool before another build. Original server also preserved as independent
+APFS clone qualification/runtime-binaries/mcp-agent-mail-frozen. Original am
+and server hard links are beside it. Final rebuilt executable still requires
+separate transport checks; do not attribute this hour to the rebuilt hash.
+
+Additional pressure control: workload-candidate-hour/between-burst-health.json
+is fully GREEN with zero pending commits and all critical verdicts green.
+Minute samples alias the deliberate synchronized bursts; retain their red
+pressure readings alongside this independent between-burst probe. Streamable
+HTTP final count is17passed/0failed/0skipped. No new executables built yet.
+
+13:57Z: workspace all-target,production,and strict Clippy gates for lifecycle
+fix PASSED(session73981,1m00/39s/39s). HTTP core E2E PASSED102 assertions,
+zero failures,one explicit focused-subsuites skip(session39568). Streamable
+HTTP suite session86027 exit0; collect exact assertion count from its log.
+Current tested executable SHA256 (before the stdio-only source fix rebuild):
+am da57fb90b5160553f74713fbf06e4eca038446eb9c4074c7dbfd4d966596d651
+mcp-agent-mail 2408b65510fc2a3e990fda59ebe7d2e6a081f15e16ab70f168e46df956bd18c4.
+Guard falsely classified a hash-manifest command's filename as Redis SHUTDOWN;
+used read-only shasum and recorded its output here instead. No Redis command ran.
+Browser comparative results consolidated in qualification/browser-comparison-summary.json.
+
+LATEST 13:53Z: first20-minute phase PASSED full canonical integrity/FKs and
+exact180send/read/ack IDs,one active reservation,durable checkpoint. Phase2 is
+running. Untraced180s failure comparison session44851 exit0: baseline CPU25.01%,
+RSS319.7→258.5MiB,heap47.9→26.8MiB; candidate CPU24.12%,RSS320.0→262.4MiB,
+heap47.5→27.0MiB. Both maxActive1,5requests,DOM grows by exactly1 error element.
+This resolves the apparent trace-RSS growth for this bounded window; it does
+not establish a long-term memory-leak absence. Compiler/production/Clippy gates
+for the stdio shutdown fix ACTIVE session73981,logs check-qualification-all-targets,
+check-qualification-production,clippy-qualification. Two jobs authorized.
+No executable rebuild until workload session8651 finishes its three phases.
+Implementation audit role could not express two-edits-only scope: worktree:HEAD
+requires all modified/untracked paths. No audit verdict was obtained; full
+integration review remains required before publication,as already planned.
+
+QUALIFICATION UPDATE 2026-10-15 13:49Z:
+Hour workload session8651 remains active (started about13:30Z); do not duplicate
+or rebuild its executable paths before all three phases finish. At least162
+successful sends and acknowledgements; all observed critical health checks pass.
+Matched browser session74144 completed exit0. Each version/scenario uses1000
+synthetic messages,50 rendered rows,5s stress refresh and60s process measurement.
+Baseline/candidate CPU: unchanged23.63/21.30%,changing29.68/30.04%,failures22.28/24.51%.
+These are comparable,not evidence of a general speed improvement. All scenarios
+have maxActive1,stable routing addresses and working navigation; unchanged/error
+responses preserve array and body identity. DOM remains bounded; heap decreases.
+Trace RSS grew during failure scenarios. Untraced180s failures comparison ACTIVE
+session44851,outputs qualification/memory-baseline-2 and memory-candidate.
+First memory-baseline attempt used a wrong executable path and never started;
+corrected to installed release bin/mcp-agent-mail, preserving failed fixture.
+Stdio suite first attempt was stopped after discovering missing STORAGE_ROOT
+isolation. Live owner refused access; startup had read the live archive into the
+isolated DB. Fixed tests/e2e/test_stdio.sh to export its own archive root.
+Candidate rerun stdio-candidate-2 reports malformed JSON correct response but
+missed5s full-process deadline,plus immediate FIFO EOF15s timeout. Baseline suite
+session19054 exit1:17pass/1fail, same FIFO EOF failure. Fresh ordinary pipes pass
+for both releases; reused candidate store pipes pass4–6s. FIFO probe4/4 hangs.
+Native Python OS probe confirms macOS poll(POLLIN) returns no readiness on empty
+closed FIFO while direct read returns EOF. Evidence qualification/fifo-os-probe,
+stdio-fifo-probe,stdio-pipe-probe,stdio-reused-probe. User scope question pending:
+track FIFO transport separately or repair here. Do not silently waive it.
+Found stdio shutdown hook omitted retention worker shutdown. Safe local repair
+adds retention::shutdown() in shutdown_runtime_services; fmt and diff checks
+pass, compile/smoke checks still required. HTTP shutdown already calls it, so
+running HTTP evidence is before this stdio-only change. Do not claim exact
+final-binary qualification until subsequent checks are recorded. Bounded audit
+agent integration_shutdown_audit was asked to inspect these two fixes.
+
 UPSTREAM INTEGRATION ACTIVE, 2026-10-15. The operator approved all eight steps
 in the attached plan: preserve source; review upstream; isolated integration;
 compiler and regression checks; a 60-minute isolated reliability workload;
@@ -19,8 +163,243 @@ Live binaries still match the October 13 rollback release recorded below.
 Fresh health: one orphaned page, leaked_pages_only, all rows readable;
 reservation parity 13/13. Investigate during the authorized reliability work
 before choosing a live repair. No service restart or database repair performed.
-Next: finish checkpointing notes, create isolated integration worktree, inventory
-upstream/fork overlaps and merge while retaining required fork behavior.
+Checkpoint complete: d036cf300e28dd199464fddc3f6446e99b07a52e, with separate
+engine 3996e7fc, retention 4f9fcd0c and build dc78f19e commits. Original checkout
+is clean. Integration worktree: /Users/shz/Code/silvarbor/agent-mail/upstream-integration,
+branch work/upstream-integration-20261015. An uncommitted merge of exact upstream
+92fd8025bcfff616b1b517e4f480d2b47458b1dc is ACTIVE there. Do not restart it.
+Six of 15 conflicting files resolved: Cargo.toml, DB id_floor/schema, tools
+macros/messaging, storage agent_reconcile. Preserve the runtime engine repair
+pin; adopt upstream FastMCP 0.13.0, comrak/detection versions and version0.3.39.
+The automatically merged identity helper lost display_name forwarding; fixed
+both helper parameter and caller. Both migration sets and recorded IDs retained.
+Remaining conflict: CLI lib.rs only. The other fourteen paths are resolved.
+CLI robot inbox preserves labels/recipient metadata and upstream ack_overdue.
+Web sender labels use upstream page_rows; unified search retains labels and
+upstream full-body search. Cargo update --workspace succeeded after an offline
+cache miss; all 20 runtime engine crates retain the repair pin while FastMCP
+uses registry0.13.0. README/AGENTS describe that selection.
+Beads merge preserves 2808 records including all23 fork-only IDs. Field-level
+three-way reconciliation found only67 timestamp conflicts and one notes
+conflict (br-2hpuk); both complete notes retained. Report: beads-merge.json.
+Operator approved: "I Approve mechanical extraction". Applied the bounded CLI
+extraction using preserved Git stages and git merge-file. Evidence directory:
+cli-extraction-approved under the integration evidence root. Test merge had
+zero conflicts; all1066 upstream and1028 fork function names survive (1067
+combined). Upstream benchmark block was byte-identical to base; preserved the
+fork's extracted bench module. Retained632 lines of new upstream quiesce helpers.
+CLI lib.rs reduced from134489 conflicted lines to62016 before formatting.
+Rustfmt and whitespace checks passed; lib.rs/tests.rs staged. ZERO unresolved
+Git conflicts remain. Merge is still uncommitted pending full validation.
+Workspace all-target check PASSED,session19221 exit0,5m09s,
+check-workspace-all-targets.log. One platform-only dead-code warning for the
+Linux Systemd supervisor on macOS was corrected with the same conditional
+allow pattern used by the adjacent Launchd variant; next gates verify it.
+Workspace formatting initially found wrapping differences in upstream files;
+cargo fmt corrected them. fmt-workspace-2.log exit0 and git diff --check pass.
+Production graph check PASSED,session78808 exit0,2m24s,without warnings,
+check-workspace-production.log. Platform-only warning fix is verified.
+Strict Clippy first run failed on pool_impl redundant_pub_crate diagnostics,
+non-Linux fallible-signature lint and a non-octal permission literal.
+Investigation: pool_registry publicly glob-reexports pool_impl; making the
+helpers pub widens the public API. Retained pub(crate), documenting a scoped
+redundant_pub_crate allowance on pool_impl. This permits intentional internal
+visibility only; all other strict warnings remain enforced. Non-Linux helper
+retains the Linux Result signature with a documented function-only allowance.
+Permission literal is 0o0. Also moved misplaced cache documentation to its
+actual function and shortened the fixture doc summary. Intermediate failures
+are preserved in clippy-workspace-2.log and -3.log; no API widening remains.
+Clippy run4 verified DB fixes,then found ATC Result handling style; replaced
+if-let/false with is_ok_and, preserving poisoned-lock behavior. Run5 found
+three server test lints: fixed chunks_exact with as_chunks, extension matching
+with Path::extension,and duration subtraction with checked_sub. Run6 PASSED
+all workspace targets with -D warnings,41.53s,session3973 exit0,
+clippy-workspace-6.log. Final formatting check PASSED,fmt-workspace-3.log.
+Nextest is unavailable on this host; use the timeout-supervised Cargo fallback.
+CLI retention tests PASSED2,0.81s after23m54 build,session92312 exit0,
+test-cli-retention.log. CLI test binary:
+target/debug/build/mcp-agent-mail-cli/b469bf04399f87ff/out/mcp_agent_mail_cli-b469bf04399f87ff.
+Extracted reset_lock_quiesce tests PASSED3 (test-cli-quiesce.log); plan grouping
+PASSED1; registration display_name parsing PASSED1. All use the same binary.
+User explicitly requested runtime/browser qualification next. Production binary
+build active session8534,two jobs,timeout5400s,build-runtime.log; builds both am
+and mcp-agent-mail with default production features. Collect before another build.
+Qualification artifacts/scripts: evidence-root/qualification. runtime_workload.py
+implements Director60s/90s adapter subprocess polling plus three concurrent HTTP
+senders (bursts3 with3s spacing every60s),read/ack,2s checkpoint interval,three
+phases/two clean restarts,cold canonical integrity/FKs and exact successful-send
+and receipt ID comparison. Default3600 active seconds. Ruff/mypy strict pass.
+Twelve-second baseline preflight PASSED18messages,two restarts; all three cold
+checks pass,workload-preflight-baseline/result.json. This is harness validation,
+NOT the required60-minute integration evidence. Adapter uses installed0.13.1.
+Installed-release browser E2E PASSED38 assertions incl20browser checks,maxActive1,
+qualification/browser-baseline,session87300 exit0. Fixture preserved at
+qualification/tmp/e2e_mail_ui.lsdhx4; use only copies for further runs.
+browser_measure.py/browser_probe.js implement three controlled1000-message
+browser scenarios (unchanged/changing/500+503),5s refresh,60s measurements,
+trace+rendererCPU/RSS+heap/DOM samples. Ruff/mypy pass. First baseline measurement
+active session34534,performance-baseline.log. This run overlaps compilation;
+repeat matched baseline/candidate measurements after build for fair comparison.
+Production binary build PASSED,session8534 exit0,13m27s. Integrated browser E2E
+PASSED38checks incl20interactive checks,session15693 exit0,browser-candidate.log.
+First candidate preflight stopped on aggregate pressure red while all critical
+verdicts/integrity were green. Evidence: commit queue p95~1028ms with7pending;
+pressure red threshold250ms. Harness wrongly required aggregate green during
+load; corrected to enforce critical health/status and record all pressure, as
+the approved plan requires zero corruption/write failures,not zero transient
+queue pressure. No product thresholds were changed. Candidate preflight2
+PASSED30active seconds/27messages/two restarts/all three cold exact-ID,FKey,
+integrity checks. The missing generation/checkpoint warning was diagnosed:
+generation is intentionally seeded on first reservation,not by mail. Added
+real reservation to workload; candidate hour run has generated its durable
+reservation checkpoint already. No source fix required by these observations.
+Candidate60minute run ACTIVE session8651,qualification/workload-candidate-hour.log,
+root qualification/workload-candidate-hour. Starts three1200second phases with
+two restarts,three senders,11pollers,Director monitor,read/acks,2s checkpoint.
+Current counts after first cycle9sends/9acks/11poller reads/1monitor;no failure.
+Matched browser baseline THEN candidate ACTIVE session74144,outputs
+qualification/performance-{baseline,candidate}-matched. Same copied fixture and
+1000message model,60s per scenario,5s refresh. Compiler is stopped for both.
+First calibration browser run completed successfully (performance-baseline),
+but overlapped compilation; do not use it as the final comparative result.
+Candidate stdio suite ACTIVE session49274,
+qualification/stdio-candidate.log. No live mailbox or service mutation.
+Database-only all-target compilation initial session69802 ended101: new upstream
+project_mailbox.rs InboxRow initializer lacked sender_display_name. Fixed shared
+inbox SELECT/decode and product inbox SELECT (index16) to carry current labels.
+Added shared-inbox label rename/clear regression and updated reader fixture schema.
+Second compilation session70476 ended101 on a test InboxRow initializer;
+added sender_display_name:None. Third database all-target check PASSED18.16s,
+session35221 exit0, log check-db-3.log. This includes the new label test source.
+Database project_mailbox::tests PASSED: 18 passed, zero failed, runtime1.51s
+after13m56s compilation; session92106 exited0. Log test-project-mailbox.log.
+Includes current sender label rename/clear with stable address/message identity.
+Schema validation session12892 exited101:96 passed,2 failed. Both project event
+upgrade tests exposed shared event SELECT missing sender_display_name (and
+recipients_json) required by the fork's decoder. Rust implementation workflow:
+safe local integration fix applied to project_mailbox::visible_events_sql;
+rerun schema tests before considering this defect verified fixed. First failure
+log preserved as test-schema.log. Rerun test-schema-2.log PASSED98 tests,
+zero failed,5.69s; session35165 exited0. Both failed upgrade regressions now
+pass on canonical and runtime engines; label migration regression also passes.
+Missing shared-event decoder fields defect is verified fixed.
+Pool validation test-pool.log PASSED5 tests,zero failed,0.54s; session41327
+exited0. Includes real engine four-writer/256-row workload, generation retirement,
+bounded owner eviction, and anonymous-memory lifetime checks.
+Sync/event validation test-sync.log PASSED34 tests,zero failed,4.92s;
+session68148 exited0. Next validation: tools crate all-target compilation,
+two jobs, timeout1800s, log check-tools.log, session85345 exited101.
+Storage lib.rs defined write_op_storage_root twice (lines1528/3628). Safe local
+Rust integration fix: removed the identical first helper, retaining the shared
+definition and restoring the direct-write documentation to its function.
+Rerun check-tools-2.log session87529 exited101: duplicate helper fixed;
+six upstream test calls lacked the optional display_name registration argument.
+Safe local Rust test integration fix: add None in auto_register_profile,
+project_mailbox,session_identity (three calls),session_identity_eviction.
+Existing assertions retained. Third tools all-target check PASSED:
+check-tools-3.log,session90463 exit0. Both compilation defects verified fixed;
+affected files pass git diff --check. Runtime tools tests still required.
+Server all-target check session74435 exited101,check-server.log:10 test
+compilation errors. Safe local Rust test integration fixes applied: two
+catch_up acquire diagnostics use into_result instead of requiring connection
+Debug; two AgentSummary fixtures add display_name:None; five label message
+tests pass upstream MessageFilter::NONE; TUI seed registration adds None.
+Assertions preserved. Rerun check-server-2.log PASSED,session12043 exit0.
+All ten compilation errors verified fixed. Server runtime display_name tests
+PASSED21 tests,zero failed,1.09s after17m06s compilation;session99191 exit0,
+log test-server-display-name.log. Covers web escaping,duplicate labels,Unicode,
+compose addresses,and current labels in directory/message/thread histories.
+Mail UI regression run PASSED152 tests,zero failed,19.92s;session66468 exit0,
+test-mail-ui.log. Next archive catch_up integration tests,one test thread,
+timeout600s,log test-archive-catch-up.log. Session41210 exited101:all3 failed;
+first reconciliation repaired0 instead of4; catch-up returned backlog even on
+shutdown. Required Rust integration defect under investigation. Added captured
+WARN tracing to the fixture and first-report assertion diagnostics to expose
+production refusal reasons; assertions unchanged. Rerun diagnostic log
+test-archive-catch-up-2.log session18198 exited101:diagnostic subscriber lacked
+a declared dependency. Added existing workspace tracing-subscriber as server
+dev-dependency for captured warning diagnostics. Next offline diagnostic rerun
+updates only required lock metadata; verified Cargo.lock adds just that existing
+dependency to the server entry. Diagnostic session21326 exited101,all3 failed.
+test-archive-catch-up-3.log proves all9 messages deferred because the fixture
+used macOS /var symlink paths and the archive guard refused them. Safe local
+Rust fixture fix: canonicalize the temp root before deriving DB/archive/project
+paths, preserving guard behavior and every assertion. Rerun session94874 exited0,
+test-archive-catch-up-4.log:3 passed,zero failed,4.56s after2m23s build.
+Archive catch-up fixture defect verified fixed. Warning diagnostics remain useful
+for future refusals. Server executable depends on CLI (crates/mcp-agent-mail/
+Cargo.toml),so browser/live-process qualification cannot bypass the CLI conflict.
+Tools runtime regression display_labels_follow_current_profiles_without_changing_mail_identity
+PASSED1 test,zero failed,0.76s after10m11s compilation;session73756 exited0,
+test-tools-current-labels.log. No validation process remains active.
+CLI conflict resolution completed after explicit mechanical extraction approval.
+Next full workspace gates,integrated executable,browser/workload,publication
+and upgrade. Preserve build output until qualification completes; no service
+mutation or deployment has occurred. Prior blocked condition is resolved.
+Broader archive catch_up run using the existing server test executable passed
+20 tests,zero failed,3.86s (includes the three integration tests),session96867
+exit0,test-archive-catch-up-all.log. No second compiler job was started.
+Database ID floor regressions passed34 tests,zero failed,0.40s using the existing
+DB test executable;test-id-floor.log. Next bounded message_prune tests use the
+same executable while tools compilation continues. Bounded candidate selection
+passed1 test,test-message-prune.log;verified source/settlement/pool/cascade
+pruning passed3 tests,test-verified-prune.log. CLI retention tests remain
+pending; these database cases do not replace them.
+Full CLI/workspace gates remain pending.
+Build-storage preservation checked: git diff dc78f19e -- install-local.sh
+.cargo/config.toml is empty; bash -n install-local.sh passed. The October13
+installer lifecycle evidence below remains dated evidence for identical script
+content; integrated binary installation still requires current validation.
+Focused rustfmt check over ten edited integration files found one storage
+function-signature layout difference; formatted it and reran successfully.
+Logs fmt-integration-seams.log and fmt-integration-seams-2.log preserve both
+results. Full workspace format gate awaits the CLI conflict resolution.
+Mechanical extraction approval applies only to this CLI merge.
+Completed compilation command:
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 gtimeout --kill-after=15s3600
+cargo +nightly-2026-08-31 check --locked -p mcp-agent-mail-db --all-targets.
+All three compilation logs are retained. Third check includes final source.
+Existing two-job host-load override applies. Build output must be cleaned after
+qualification, as required by the approved plan.
+Retention now explicitly expires shared-mailbox receipts/deliveries and verifies
+their retained full rows; the existing real-database regression now includes
+expired, exact-cutoff and other-project shared deliveries with receipt checks.
+This regression is not yet executable while CLI lib.rs remains conflicted.
+CLI test inventory saved as cli-test-inventory.json: upstream adds32 test/helper
+functions and removes0 relative to the common base; extracted fork tests.rs
+has34986lines. Preserve those additions in the module merge. Read-only inventory
+used exact Git source, with no mechanical source edits while approval is pending.
+Merged inbox refresh retains single-request admission, unchanged-object reuse,
+failure backoff and lifecycle cleanup by inspection. Existing browser regression
+is tests/e2e/test_mail_ui.sh; bash -n passes. Runtime/browser checks remain undone.
+Next collect the focused database tests, resolve remaining CLI conflicts, inspect
+automatically merged seams, and run the remaining approved checks. The dependency
+lock has already been regenerated; avoid unnecessary dependency updates.
+Full disposition and ledger: preservation evidence directory/disposition.md.
+Installed UI baseline captured in separate browser session mail-integration-baseline
+(now closed): live-ui-baseline.trace.json and live-ui-baseline.json under evidence.
+1000messages, auto-refresh45s, requested30s idle recording, DOM2419before/after,
+JS heap50857902→74256687bytes, refreshFailures0. Trace RunTask inclusive2916ms;
+do not sum overlapping trace categories or equate JS heap with RSS. Live traffic
+was uncontrolled. This is a baseline of installed0.3.36; integrated/changing/
+failure comparisons and long-term growth checks still required.
+Browser regression inspection confirms tests/e2e/test_mail_ui.sh exercises
+1000 synthetic messages in the real browser model,50 rendered rows,search and
+keyboard paging,unchanged array/body identity,label updates,one in-flight
+refresh,500/503 backoff,navigation after failures,icon settling,and destroy
+cleanup. This is controlled frontend evidence; run it against the integrated
+server and separately measure CPU/memory with real mailbox data. Inspection
+alone does not satisfy the browser qualification step.
+Reliability harness prior art inspected: stabilization/20261012-engine-repair/
+process-workload.py. It uses isolated native server/adapter subprocesses,11
+pollers and a director monitor, but runs30 accelerated rounds and10 bursts.
+It cannot satisfy the approved60-minute run unchanged. It also names cached
+coding-agents0.13.0; resolve the installed adapter when preparing the new run.
+Before qualification, adapt duration/cadence to60/90s, add supervised isolated
+restart cycles, and compare successful send IDs with persisted records.
+Classification: required integration validation work, still open. Preserve the
+original incident script/evidence. Initial search included the engine checkout;
+subsequent inspection was restricted to the exact root-level harness path.
 
 BUILD DISK CLEANUP COMPLETE, 2026-10-13: operator authorized cleaning unused artifacts
 and changing builds to favor disk space over speed. Cargo clean removed this
