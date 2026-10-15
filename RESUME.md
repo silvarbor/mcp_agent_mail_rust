@@ -13,8 +13,9 @@ this note records how to resume it and where its evidence lives.
 3. Read `br-vas72`, then `br-0egjn`. Finish the remaining label acceptance before
    starting the stabilization implementation, unless new evidence establishes
    an immediate runtime risk.
-   The #461 Executor is active in Plugins `worktrees/executor-461` on
-   `work/change-461`; collect its implementation head and real resume probe.
+   The #461 Executor is stopped at committed head `707a86da` in Plugins
+   `worktrees/executor-461`. The current state and operator's fork-only resume
+   choice are in `.spx/worktree/RESUME.md`; the Plugins team remains paused.
    #471 retains the actual monitor follow-up. The dependency guard approval
    and #468 producer repair are complete; do not request them again.
 4. Select at most two local implementation items. The bounded assessment
@@ -598,3 +599,34 @@ release as part of this plan. No file deletion or destructive Git operation is
 authorized. Shared-store repairs require explicit authority, supervised draining,
 backups and reversible hash-witnessed changes. Commit coherent local checkpoints
 with normal hooks and explicit paths; preserve unrelated work.
+
+Verified disk inventory on 2026-10-11 is tracked in **br-hxcv4**, labeled
+`verified-important` and `verified-local`. The configured Library log directory
+is 16 MiB; the actual large paths are the live store's `doctor/reclaimable`
+(662 files, 10.2 GiB) and retained upgrade state (approximately 21 GiB,
+including 8.9 GiB preflight rollback and 9.3 GiB cutover rollback). Rotation
+quarantines older backups on the same disk, so it preserves their space.
+The upgrade rollback copies retain additional recovery material. Detailed
+read-only evidence and cleanup acceptance are in
+`~/.local/state/mcp-agent-mail/stabilization/20261011-triage/disk-retention.md`.
+Keep the bounded label integration first. Prepare an exact cleanup inventory
+and verify a retained restore generation before requesting deletion. No files
+were deleted or moved during this inspection. `du` totals do not prove unique
+physical capacity across APFS clones or snapshots.
+
+Label execution update at 21:03 UTC on 2026-10-11: the public herdr read
+reports `change-461` done. Its retained checkout is clean and detached at
+`707a86da431e3b953c0a410b8c691c859f9d106b`. The formatter and blank-label
+repair are committed. The reported implementation and skill audits approved;
+the test-evidence audit rejected twice because its oracle compares only sender
+and id, and the assertion audit is blocked/unsealed after adding a second unit
+to a file-scoped run. These are reported gate results, not independently
+qualified audit verdicts. Rows 2–4 and the attested owner resume probe have not
+started; nothing is merged or installed from this execution.
+Question **14360** was delivered to Plugins Maintainer <ScarletGoose>, asking
+for the bounded full-record oracle repair and the exact assertion scope error
+artifacts/owner route. Delivery establishes neither acknowledgement nor an
+assigned repair. No gate waiver, peer source edit, or additional Executor
+launch occurred. Resume with the owner's concrete repair handoff, then verify
+real owner startup/resume, pane pointer and monitor acceptance before closing
+the label work.

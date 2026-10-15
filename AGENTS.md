@@ -103,7 +103,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.10.0`, immutable Git revision `03b52745`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
-| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `db458bfba780e79d099d9f8986da5a1f7b360901` for SQL binding, schema-prefix, NOCASE, INSERT SELECT UPSERT, and Linux descriptor-retention repairs. Embedded Beads still uses a separate patched 0.3.18 engine |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.10` is the runtime `DbConn`, pinned to `3659c270a42adac3ef1f980c36c731890d015306` for WAL-generation page-reclamation and macOS descriptor-retention repairs, retaining SQL binding, schema-prefix, NOCASE and INSERT SELECT UPSERT behavior. Embedded Beads still uses a separate patched 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
 | `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
@@ -586,7 +586,7 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-db` | `src/queries.rs` | All SQL queries (instrumented with query tracking) |
 | `mcp-agent-mail-db` | `src/cache.rs` | Write-behind read cache with dual indexing |
 | `mcp-agent-mail-db` | `src/pool.rs` | SQLite connection pool with WAL hardening |
-| `mcp-agent-mail-storage` | `src/archive.rs` | Git-backed message archive |
+| `mcp-agent-mail-storage` | `src/lib.rs` | Git-backed message archive |
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
