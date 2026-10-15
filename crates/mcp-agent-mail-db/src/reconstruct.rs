@@ -1480,6 +1480,7 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
+    crate::mail_retention::require_complete(storage_root)?;
     reconstruct_from_archive_impl(db_path, storage_root, false)
 }
 
@@ -1547,6 +1548,7 @@ fn reconstruct_from_archive_impl(
     storage_root: &Path,
     create_empty_target: bool,
 ) -> DbResult<ReconstructStats> {
+    crate::mail_retention::require_complete(storage_root)?;
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
@@ -1834,6 +1836,9 @@ fn reconstruct_from_archive_impl(
     }
     conn.execute_raw("COMMIT;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: commit transaction: {e}")))?;
+    if let Some(floor) = crate::mail_retention::require_complete(storage_root)? {
+        crate::id_floor::advance_messages_id_floor(&conn, Some(floor))?;
+    }
     drop(conn);
     crate::pool::wal_checkpoint_truncate_path(db_path)
         .map_err(|e| DbError::Sqlite(format!("reconstruct: checkpoint: {e}")))?;

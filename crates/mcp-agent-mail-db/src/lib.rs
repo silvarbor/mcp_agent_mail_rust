@@ -53,6 +53,7 @@ pub mod idempotency;
 pub mod integrity;
 pub mod invariants;
 pub mod mail_explorer;
+pub mod mail_retention;
 pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;

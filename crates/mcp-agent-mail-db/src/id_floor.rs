@@ -53,14 +53,12 @@ const MAX_FRONTMATTER_PREFIX_BYTES: u64 = 256 * 1024;
 /// JSON, or message-id failure encountered in the canonical archive layout.
 /// An incomplete scan is never safe to publish as an authoritative zero floor.
 pub fn max_message_id_in_archive(storage_root: &Path) -> DbResult<Option<i64>> {
+    let retained_floor = crate::mail_retention::require_complete(storage_root)?;
     #[cfg(unix)]
-    {
-        descriptor_scan::scan(storage_root, &mut |_, _| {})
-    }
+    let archive_floor = descriptor_scan::scan(storage_root, &mut |_, _| {})?;
     #[cfg(not(unix))]
-    {
-        scan_archive_by_path(storage_root)
-    }
+    let archive_floor = scan_archive_by_path(storage_root)?;
+    Ok(archive_floor.into_iter().chain(retained_floor).max())
 }
 
 /// Keep every open relative to a retained directory. Generation checks reject

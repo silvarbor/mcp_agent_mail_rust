@@ -1763,7 +1763,10 @@ pub fn acquire_mailbox_activity_lock(
     config: &mcp_agent_mail_core::Config,
     mode: MailboxActivityLockMode,
 ) -> std::io::Result<Option<MailboxActivityLockGuard>> {
-    acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)
+    let guard = acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)?;
+    mcp_agent_mail_db::mail_retention::require_complete(&config.storage_root)
+        .map_err(std::io::Error::other)?;
+    Ok(guard)
 }
 
 struct RuntimeMailboxActivityLocks {

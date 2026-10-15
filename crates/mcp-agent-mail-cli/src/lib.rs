@@ -27,6 +27,7 @@ pub mod legacy;
 pub mod output;
 mod release_signing;
 pub mod reliability_coverage;
+mod retention;
 pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -1754,6 +1755,21 @@ pub struct ShareStaticExportArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ArchiveCommand {
+    /// Preview or resume offline expiration of a project's old messages.
+    Prune {
+        /// Exact project slug or human key. Required when creating the plan.
+        #[arg(long)]
+        project: Option<String>,
+        /// Exclusive UTC cutoff (RFC3339). Defaults to 24 hours ago.
+        #[arg(long)]
+        before: Option<String>,
+        /// Fresh directory for the manifest, full snapshot and quarantined files.
+        #[arg(long)]
+        run_dir: PathBuf,
+        /// Apply the saved manifest; requires a supervised, drained mailbox.
+        #[arg(long)]
+        apply: bool,
+    },
     Save {
         #[arg(long = "project", short = 'p')]
         projects: Vec<String>,
@@ -47397,6 +47413,12 @@ fn archive_restore_state(
 
 fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
     match action {
+        ArchiveCommand::Prune {
+            project,
+            before,
+            run_dir,
+            apply,
+        } => retention::run(project.as_deref(), before.as_deref(), &run_dir, apply),
         ArchiveCommand::Save {
             projects,
             scrub_preset,

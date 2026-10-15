@@ -2106,6 +2106,33 @@ fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
     archive_storage_root(config).join(".archive_backlog")
 }
 
+/// Refuse offline retention while durable archive work could replay old messages.
+///
+/// # Errors
+/// Returns an error for pending journal records or an unreadable journal directory.
+pub fn require_drained_archive_backlog(config: &Config) -> Result<()> {
+    let directory = archive_backlog_journal_dir_for(config);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            return Err(StorageError::InvalidPath(format!(
+                "Archive work is pending at {}. Drain it through the service before pruning.",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
 const fn write_op_config(op: &WriteOp) -> &Config {
     match op {
