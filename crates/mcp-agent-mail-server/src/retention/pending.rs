@@ -878,6 +878,36 @@ mod tests {
     }
 
     #[test]
+    fn either_replay_lane_progresses_while_its_peer_is_blocked() {
+        for blocked in REPLAY_KINDS {
+            let progressing = match blocked {
+                journal_scan::Kind::Ack => journal_scan::Kind::Release,
+                journal_scan::Kind::Release => journal_scan::Kind::Ack,
+            };
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+            let blocked_worker = ReplayWorker::spawn_with(blocked, move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+            .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let progressing_worker = ReplayWorker::spawn_with(progressing, move |_| {
+                progress_tx.send(()).unwrap();
+            })
+            .unwrap();
+            let progress = progress_rx.recv_timeout(Duration::from_secs(5));
+            let peer_still_running = !blocked_worker.is_finished();
+            let _ = release_tx.send(());
+            drop(blocked_worker);
+            drop(progressing_worker);
+            assert!(progress.is_ok());
+            assert!(peer_still_running);
+        }
+    }
+
+    #[test]
     fn shutdown_signals_both_lanes_before_joining_either() {
         let (peer_stopped_tx, peer_stopped_rx) = std::sync::mpsc::channel();
         let (observed_tx, observed_rx) = std::sync::mpsc::channel();
@@ -940,15 +970,16 @@ mod tests {
         }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
             let config = Config {
-                storage_root: temp.path().join("archive"),
+                storage_root: root.join("archive"),
                 database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
-                    &temp.path().join("mail.sqlite3"),
+                    &root.join("mail.sqlite3"),
                 ),
                 ..Config::default()
             };
             std::fs::create_dir_all(&config.storage_root).unwrap();
-            let project_root = temp.path().join("project");
+            let project_root = root.join("project");
             std::fs::create_dir_all(&project_root).unwrap();
             let mut selected = pool_config(&config);
             selected.run_migrations = true;
