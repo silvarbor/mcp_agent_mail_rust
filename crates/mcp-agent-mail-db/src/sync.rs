@@ -299,6 +299,7 @@ pub fn fetch_inbox_rows_from_conn(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
 }
@@ -327,6 +328,7 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
 }
@@ -354,6 +356,7 @@ pub fn fetch_inbox_ack_overdue_rows_from_conn(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
 }
@@ -381,6 +384,7 @@ pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
 }
@@ -401,6 +405,9 @@ pub struct InboxFetchOptions<'a> {
     pub ack_overdue_before: Option<i64>,
     pub topic: Option<&'a str>,
     pub body_policy: InboxBodyPolicy,
+    /// Order by operator priority before limiting, using this overdue cutoff.
+    /// `None` retains the ordinary newest-first inbox order.
+    pub priority_before: Option<i64>,
 }
 
 /// Fetch inbox rows with the complete filter set used by the MCP tool.
@@ -494,7 +501,13 @@ fn fetch_inbox_rows_from_conn_impl(
 
     let limit_i64 =
         i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
-    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
+    if let Some(cutoff) = options.priority_before {
+        sql.push_str(&crate::project_mailbox::priority_order_sql("r"));
+        params.push(Value::BigInt(cutoff));
+    } else {
+        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC");
+    }
+    sql.push_str(" LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
     let rows = conn
@@ -579,11 +592,23 @@ fn fetch_inbox_rows_from_conn_impl(
     }
 
     // GH#282: the agent's view of its project's shared mailbox, under the same
-    // filters, merged into one newest-first window.
+    // filters, merged into one window using the requested ordering.
     let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
         conn, project_id, agent_id, since_ts, limit, options,
     )?;
-    Ok(crate::project_mailbox::merge_inbox_rows(out, shared, limit))
+    if let Some(cutoff) = options.priority_before {
+        out.extend(shared);
+        out.sort_by(|left, right| {
+            crate::project_mailbox::inbox_priority(left, cutoff)
+                .cmp(&crate::project_mailbox::inbox_priority(right, cutoff))
+                .then_with(|| right.message.created_ts.cmp(&left.message.created_ts))
+                .then_with(|| right.message.id.cmp(&left.message.id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    } else {
+        Ok(crate::project_mailbox::merge_inbox_rows(out, shared, limit))
+    }
 }
 
 /// Read an append-only, recipient-scoped inbox delivery page.
@@ -1720,6 +1745,75 @@ mod tests {
         );
         assert_eq!(orphaned.next_cursor, retired.next_cursor);
         assert_eq!(orphaned.tail_cursor, retired.tail_cursor);
+    }
+
+    #[test]
+    fn priority_inbox_keeps_old_urgent_mail_beyond_a_thousand_newer_rows() {
+        for shared in [false, true] {
+            let conn = test_conn();
+            let project_id = insert_project(&conn);
+            let sender_id = insert_agent(&conn, project_id, "Sender");
+            let viewer_id = insert_agent(&conn, project_id, "Viewer");
+            conn.execute_raw("UPDATE agents SET inception_ts = 0")
+                .unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            let urgent = insert_message(&conn, project_id, sender_id, "urgent");
+            let overdue_urgent = insert_message(&conn, project_id, sender_id, "overdue-urgent");
+            conn.execute_sync(
+                "UPDATE messages SET importance = 'urgent', created_ts = 999999 WHERE id = ?",
+                &[Value::BigInt(urgent)],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET importance = 'urgent', ack_required = 1, created_ts = 999998 WHERE id = ?",
+                &[Value::BigInt(overdue_urgent)],
+            ).unwrap();
+            let mut message_ids = vec![urgent, overdue_urgent];
+            for _ in 0..1000 {
+                message_ids.push(insert_message(&conn, project_id, sender_id, "newer-normal"));
+            }
+            conn.execute_raw("UPDATE messages SET ack_required = 1 WHERE importance = 'normal'")
+                .unwrap();
+            for id in message_ids {
+                if shared {
+                    conn.execute_sync(
+                        "INSERT INTO project_mailbox_deliveries (message_id, project_id, delivered_ts) VALUES (?, ?, 1000000)",
+                        &[Value::BigInt(id), Value::BigInt(project_id)],
+                    ).unwrap();
+                } else {
+                    conn.execute_sync(
+                        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+                        &[Value::BigInt(id), Value::BigInt(viewer_id)],
+                    ).unwrap();
+                }
+            }
+            conn.execute_raw("COMMIT").unwrap();
+            for (unread_only, ack_overdue_before, expected) in [
+                (true, None, urgent),
+                (false, None, urgent),
+                (false, Some(2_000_000), overdue_urgent),
+            ] {
+                let rows = fetch_inbox_filtered_rows_from_conn(
+                    &conn,
+                    project_id,
+                    viewer_id,
+                    None,
+                    1,
+                    InboxFetchOptions {
+                        urgent_only: false,
+                        unread_only,
+                        ack_required_only: false,
+                        ack_overdue_before,
+                        topic: None,
+                        body_policy: InboxBodyPolicy::MetadataOnly,
+                        priority_before: Some(2_000_000),
+                    },
+                )
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].message.id, Some(expected));
+            }
+        }
     }
 
     #[test]

@@ -121,6 +121,7 @@ async fn inbox(ctx: &McpContext, project: &str, agent: &str) -> Result<Vec<Value
         None,
         None,
         Some(false),
+        None,
     )
     .await
     .map(|json| serde_json::from_str(&json).expect("inbox JSON"))

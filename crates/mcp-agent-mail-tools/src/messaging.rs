@@ -5104,6 +5104,9 @@ effective_free_bytes={free}"
 /// - `mark_read`: Auto-mark returned messages read (default: true). Pass false
 ///   for a non-consuming peek — e.g. `am check-inbox` hooks (GH#207) — which
 ///   must never change read state.
+/// - `priority_order`: Rank unread urgent mail, overdue acknowledgements,
+///   unread acknowledgement requests, other unread mail, and read unacknowledged
+///   mail before applying `limit` (default: false, newest first).
 ///
 /// # Conformance
 /// Python-parity (`mark_read` is a Rust-native additive extension).
@@ -5113,7 +5116,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: exact case-insensitive topic filter\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, topic?, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: exact case-insensitive topic filter\n- `priority_order`: default false (newest first). When true, rank unread urgent/high mail, overdue acknowledgements, unread acknowledgement requests, other unread mail, read unacknowledged mail, then other read mail. Rank before applying limit; newest first within each priority.\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, topic?, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -5127,6 +5130,7 @@ pub async fn fetch_inbox(
     ack_overdue_only: Option<bool>,
     topic: Option<String>,
     mark_read: Option<bool>,
+    priority_order: Option<bool>,
 ) -> McpResult<String> {
     let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
     phase.mark("queue_wait");
@@ -5239,6 +5243,9 @@ pub async fn fetch_inbox(
             ack_overdue_before,
             topic.as_deref(),
             include_body,
+            priority_order
+                .unwrap_or(false)
+                .then(|| mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US),
         )
         .await,
     )?;
@@ -6593,6 +6600,7 @@ mod tests {
                                 None,
                                 None,
                                 Some(false),
+                                None,
                             )
                             .await
                             .expect("read label-aware inbox");
@@ -6766,6 +6774,7 @@ mod tests {
                         None,
                         None,
                         mark_read,
+                        None,
                     )
                     .await
                     .expect("fetch live inbox");

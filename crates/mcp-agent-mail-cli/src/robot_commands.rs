@@ -6026,49 +6026,27 @@ fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> 
 /// `fetch_inbox` caps `limit` at this many rows.
 const ROBOT_INBOX_SERVER_WINDOW: usize = 1000;
 
-/// The `fetch_inbox` calls whose union holds every row the robot view could
-/// show. The server returns the newest rows of each call, so a view ordered
-/// by priority asks for the whole window of each candidate class and trims to
-/// `--limit` only after sorting; otherwise an old urgent message would fall
-/// behind the newest `--limit` rows and never be ranked.
+/// Ask the server to rank before limiting so older high-priority messages
+/// remain eligible even when the mailbox exceeds the server's row cap.
 fn robot_inbox_server_windows(request: &RobotInboxServerRequest) -> Vec<serde_json::Value> {
-    let window = |urgent_only: bool, unread_only: bool, ack_overdue_only: bool, limit: usize| {
-        serde_json::json!({
-            "project_key": request.project_key,
-            "agent_name": request.agent_name,
-            "urgent_only": urgent_only,
-            "limit": i32::try_from(limit.max(1)).unwrap_or(i32::MAX),
-            "include_bodies": request.include_bodies,
-            "unread_only": unread_only,
-            "ack_overdue_only": ack_overdue_only,
-            // `am inbox` is a listing, not a consumption: without this the
-            // fetch_inbox tool auto-marks every returned row read, and the
-            // client-side bucket filter then hides those same rows from the very
-            // response that consumed them — messages nobody ever saw become
-            // permanently invisible to the default unread-only view (GH#229).
-            // Read-state changes are left to explicit `am mail read` / ack, the
-            // same non-consuming-peek contract check-inbox adopted in GH#207.
-            "mark_read": false,
-        })
-    };
-    if request.urgent {
-        // Every row is unread high/urgent, which the server already returns
-        // newest first: the same order the priority sort gives them.
-        return vec![window(true, true, false, request.limit)];
-    }
-    if request.ack_overdue {
-        return vec![window(false, false, true, ROBOT_INBOX_SERVER_WINDOW)];
-    }
-    let mut windows = vec![
-        window(false, true, false, ROBOT_INBOX_SERVER_WINDOW),
-        window(false, false, true, ROBOT_INBOX_SERVER_WINDOW),
-    ];
-    if request.all || !request.unread {
-        // Read rows rank after every unread or overdue one, newest first, so
-        // the newest `--limit` rows hold every read row the view can reach.
-        windows.push(window(false, false, false, request.limit));
-    }
-    windows
+    vec![serde_json::json!({
+        "project_key": request.project_key,
+        "agent_name": request.agent_name,
+        "urgent_only": request.urgent,
+        "limit": request.limit.clamp(1, ROBOT_INBOX_SERVER_WINDOW),
+        "include_bodies": request.include_bodies,
+        "unread_only": request.urgent,
+        "ack_overdue_only": !request.urgent && request.ack_overdue,
+        "priority_order": true,
+        // `am inbox` is a listing, not a consumption: without this the
+        // fetch_inbox tool auto-marks every returned row read, and the
+        // client-side bucket filter then hides those same rows from the very
+        // response that consumed them — messages nobody ever saw become
+        // permanently invisible to the default unread-only view (GH#229).
+        // Read-state changes are left to explicit `am mail read` / ack, the
+        // same non-consuming-peek contract check-inbox adopted in GH#207.
+        "mark_read": false,
+    })]
 }
 
 /// Merges the window payloads into one row list, keeping each message once.
@@ -19306,19 +19284,17 @@ mod tests {
             limit: 20,
             include_bodies: false,
         };
-        let window = i64::try_from(ROBOT_INBOX_SERVER_WINDOW).expect("window fits");
         let default_windows = robot_inbox_server_windows(&default_request);
-        // Unread plus overdue acknowledgements, each whole, so the priority
-        // sort runs over every candidate before `--limit` trims.
+        // The server ranks all priority classes before applying the limit.
         assert_eq!(
             default_windows.iter().map(window_flags).collect::<Vec<_>>(),
-            vec![(false, true, false, window), (false, false, true, window)]
+            vec![(false, false, false, 20)]
         );
         // Listing must never consume unread state (GH#229).
         assert!(
             default_windows
                 .iter()
-                .all(|args| args["mark_read"] == false)
+                .all(|args| args["mark_read"] == false && args["priority_order"] == true)
         );
 
         let urgent_request = RobotInboxServerRequest {
@@ -19346,7 +19322,7 @@ mod tests {
                 .iter()
                 .map(window_flags)
                 .collect::<Vec<_>>(),
-            vec![(false, false, true, window)]
+            vec![(false, false, true, 20)]
         );
 
         let all_request = RobotInboxServerRequest {
@@ -19358,12 +19334,8 @@ mod tests {
         let all_windows = robot_inbox_server_windows(&all_request);
         assert_eq!(
             all_windows.iter().map(window_flags).collect::<Vec<_>>(),
-            vec![
-                (false, true, false, window),
-                (false, false, true, window),
-                // The server refuses limit 0; the view trims to 0 afterwards.
-                (false, false, false, 1),
-            ]
+            // The server refuses limit 0; the view trims to 0 afterwards.
+            vec![(false, false, false, 1)]
         );
         assert!(all_windows.iter().all(|args| args["mark_read"] == false));
     }

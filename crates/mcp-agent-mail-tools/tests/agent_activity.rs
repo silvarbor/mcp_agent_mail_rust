@@ -216,6 +216,7 @@ fn sending_and_reading_mail_mark_the_acting_agent_active() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("fetch_inbox");

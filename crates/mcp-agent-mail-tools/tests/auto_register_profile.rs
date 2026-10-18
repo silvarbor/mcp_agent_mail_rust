@@ -453,6 +453,7 @@ async fn peek_inbox(ctx: &McpContext, project: &str, agent: &str) -> Vec<Value> 
         None,
         None,
         Some(false),
+        None,
     )
     .await
     .expect("peek inbox");

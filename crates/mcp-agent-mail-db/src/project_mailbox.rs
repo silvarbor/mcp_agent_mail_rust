@@ -77,6 +77,39 @@ pub(crate) use visible_to_viewer_sql;
 
 const VISIBLE_TO_VIEWER_SQL: &str = visible_to_viewer_sql!();
 
+/// Priority order shared by direct and project inbox SQL. The one parameter
+/// is the acknowledgement overdue cutoff. Aliases are internal SQL identifiers.
+pub(crate) fn priority_order_sql(receipt: &str) -> String {
+    format!(
+        " ORDER BY CASE \
+         WHEN m.importance IN ('urgent', 'high') AND {receipt}.read_ts IS NULL THEN 1 \
+         WHEN m.ack_required = 1 AND {receipt}.ack_ts IS NULL AND m.created_ts < ? THEN 2 \
+         WHEN m.ack_required = 1 AND {receipt}.ack_ts IS NULL AND {receipt}.read_ts IS NULL THEN 3 \
+         WHEN {receipt}.read_ts IS NULL THEN 4 \
+         WHEN m.ack_required = 1 AND {receipt}.ack_ts IS NULL THEN 5 \
+         ELSE 6 END, m.created_ts DESC, m.id DESC"
+    )
+}
+
+pub(crate) fn inbox_priority(row: &InboxRow, overdue_before: i64) -> u8 {
+    if matches!(row.message.importance.as_str(), "urgent" | "high") && row.read_ts.is_none() {
+        1
+    } else if row.message.ack_required != 0
+        && row.ack_ts.is_none()
+        && row.message.created_ts < overdue_before
+    {
+        2
+    } else if row.message.ack_required != 0 && row.ack_ts.is_none() && row.read_ts.is_none() {
+        3
+    } else if row.read_ts.is_none() {
+        4
+    } else if row.message.ack_required != 0 && row.ack_ts.is_none() {
+        5
+    } else {
+        6
+    }
+}
+
 /// Actual recipients for an operator receipt action, including eligible
 /// shared-mailbox viewers. Direct delivery takes precedence over shared mail.
 pub fn receipt_agent_ids_from_conn(
@@ -230,7 +263,13 @@ pub fn fetch_project_mailbox_rows_from_conn(
     }
     let limit_i64 =
         i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
-    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+    if let Some(cutoff) = options.priority_before {
+        sql.push_str(&priority_order_sql("pr"));
+        params.push(Value::BigInt(cutoff));
+    } else {
+        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC");
+    }
+    sql.push_str(" LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
     let rows = match conn.query_sync(&sql, &params) {
@@ -1343,6 +1382,7 @@ mod tests {
 
     fn options() -> InboxFetchOptions<'static> {
         InboxFetchOptions {
+            priority_before: None,
             urgent_only: false,
             unread_only: false,
             ack_required_only: false,

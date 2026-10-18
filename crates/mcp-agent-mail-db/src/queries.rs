@@ -10552,6 +10552,7 @@ pub async fn fetch_inbox(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
     .await
@@ -10580,6 +10581,7 @@ pub async fn fetch_inbox_metadata(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
     .await
@@ -10608,6 +10610,7 @@ pub async fn fetch_inbox_unread(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
     .await
@@ -10636,6 +10639,7 @@ pub async fn fetch_inbox_unread_metadata(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
     .await
@@ -10665,6 +10669,7 @@ pub async fn fetch_inbox_ack_overdue(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
     .await
@@ -10694,6 +10699,7 @@ pub async fn fetch_inbox_ack_overdue_metadata(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
     .await
@@ -10720,6 +10726,7 @@ pub async fn fetch_inbox_ack_required(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
     .await
@@ -10746,6 +10753,7 @@ pub async fn fetch_inbox_ack_required_metadata(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
     .await
@@ -10759,6 +10767,7 @@ enum InboxBodyPolicy {
 
 #[derive(Clone, Copy)]
 struct InboxQueryOptions<'a> {
+    priority_before: Option<i64>,
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
@@ -10781,6 +10790,7 @@ pub async fn fetch_inbox_filtered(
     ack_overdue_before: Option<i64>,
     topic: Option<&str>,
     include_bodies: bool,
+    priority_before: Option<i64>,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     fetch_inbox_impl(
         cx,
@@ -10793,6 +10803,7 @@ pub async fn fetch_inbox_filtered(
             urgent_only,
             unread_only,
             ack_required_only: false,
+            priority_before,
             ack_overdue_before,
             topic,
             body_policy: if include_bodies {
@@ -10909,6 +10920,7 @@ async fn fetch_inbox_impl(
             since_ts,
             limit,
             crate::sync::InboxFetchOptions {
+                priority_before: options.priority_before,
                 urgent_only: options.urgent_only,
                 unread_only: options.unread_only,
                 ack_required_only: options.ack_required_only,
@@ -34697,6 +34709,7 @@ mod tests {
                 None,
                 Some("br-abc.1"),
                 false,
+                None,
             )
             .await
             .into_result()
@@ -34721,6 +34734,7 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
             )
             .await
             .into_result()

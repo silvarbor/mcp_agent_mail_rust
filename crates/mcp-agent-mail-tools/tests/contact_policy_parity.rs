@@ -193,6 +193,7 @@ fn test_request_contact_uses_canonical_agent_names_in_intro() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("fetch GreenCastle inbox");
@@ -223,6 +224,7 @@ async fn fetch_inbox_with_bodies(ctx: &McpContext, project_key: &str, agent: &st
         None,
         Some(20),
         Some(true),
+        None,
         None,
         None,
         None,
@@ -505,6 +507,7 @@ fn test_contact_blocked_message() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("fetch_inbox");
@@ -674,6 +677,7 @@ fn test_mixed_recipients_partial_block() {
             None,
             Some(20),
             Some(true),
+            None,
             None,
             None,
             None,

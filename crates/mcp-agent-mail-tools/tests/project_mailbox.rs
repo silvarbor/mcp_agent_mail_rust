@@ -157,6 +157,7 @@ async fn inbox(
         None,
         None,
         Some(mark_read),
+        None,
     )
     .await
     .expect("fetch inbox");
@@ -218,6 +219,120 @@ async fn table_count(cx: &Cx, sql: &str) -> i64 {
     let conn = pool.acquire(cx).await.into_result().expect("DB checkout");
     let rows = conn.query_sync(sql, &[]).expect("count query");
     rows[0].get_as::<i64>(0).expect("count")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn priority_fetch_selects_old_urgent_mail_before_limiting_candidates() {
+    run_with_storage(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = format!("/tmp/priority-mailbox-{}", unique_suffix());
+        let slug = project_slug(&ctx, &project).await;
+        register(&ctx, &project, "GreenCastle", "open").await;
+        register(&ctx, &project, "BlueLake", "open").await;
+        let direct = send(
+            &ctx,
+            &project,
+            "GreenCastle",
+            &["BlueLake"],
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("direct urgent fixture");
+        let shared = send(
+            &ctx,
+            &project,
+            "GreenCastle",
+            &[&format!("project:{slug}")],
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("shared urgent fixture");
+        {
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+            let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("UPDATE agents SET inception_ts = 0")
+                .unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET importance = 'urgent', created_ts = 1000000 + id",
+            )
+            .unwrap();
+            for _ in 0..1001 {
+                conn.execute_raw(
+                    "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, created_ts) \
+                     SELECT project_id, sender_id, 'newer normal', '', 'normal', 1, 2000000 FROM messages ORDER BY id LIMIT 1"
+                ).unwrap();
+                conn.execute_raw(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind) \
+                     SELECT (SELECT MAX(id) FROM messages), id, 'to' FROM agents WHERE name = 'BlueLake'"
+                ).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+        }
+        for (unread_only, overdue_only) in [(true, false), (false, false), (false, true)] {
+            let rows: Vec<Value> = serde_json::from_str(
+                &fetch_inbox(
+                    &ctx,
+                    project.clone(),
+                    "BlueLake".to_string(),
+                    None,
+                    None,
+                    Some(2),
+                    Some(false),
+                    Some(unread_only),
+                    Some(overdue_only),
+                    None,
+                    Some(false),
+                    Some(true),
+                )
+                .await
+                .expect("priority inbox through the real tool"),
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["id"], shared["deliveries"][0]["payload"]["id"]);
+            assert_eq!(rows[1]["id"], direct["deliveries"][0]["payload"]["id"]);
+            assert!(rows.iter().all(|row| row["read_ts"].is_null()));
+        }
+        let ordinary: Vec<Value> = serde_json::from_str(
+            &fetch_inbox(
+                &ctx,
+                project,
+                "BlueLake".to_string(),
+                None,
+                None,
+                Some(2),
+                Some(false),
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+            )
+            .await
+            .expect("ordinary inbox preserves newest-first behavior"),
+        )
+        .unwrap();
+        assert_eq!(ordinary.len(), 2);
+        assert!(ordinary.iter().all(|row| row["subject"] == "newer normal"));
+        assert_eq!(
+            table_count(
+                &cx,
+                "SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            table_count(&cx, "SELECT COUNT(*) FROM project_mailbox_receipts").await,
+            0
+        );
+    });
 }
 
 #[test]

@@ -1813,6 +1813,7 @@ mod tests {
                             None,
                             None,
                             mark_read,
+                            None,
                         )
                         .await
                         .expect("archive inbox remains readable");
