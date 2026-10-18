@@ -23,6 +23,21 @@ use crate::tool_util::{
     resolve_existing_project, resolve_project,
 };
 
+#[cfg(test)]
+type RegistrationLookupHook = Box<
+    dyn FnOnce(
+        Outcome<mcp_agent_mail_db::AgentRow, mcp_agent_mail_db::DbError>,
+    ) -> Outcome<mcp_agent_mail_db::AgentRow, mcp_agent_mail_db::DbError>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    // One-shot fault/interleaving seam after the real lookup. It leaves all
+    // registration writes, token updates and session binding on the real path.
+    static REGISTRATION_LOOKUP_HOOK: std::cell::RefCell<Option<RegistrationLookupHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
 /// for `register_agent` (#98). Matches the same shape the lib.rs error mapper
 /// converts into a `RESOURCE_BUSY` MCP response — those are by definition
@@ -2790,9 +2805,19 @@ Check that all parameters have valid values."
     let existing_before = if crate::session_identity::enabled()
         && let Some(agent_name) = explicit_name.as_deref()
     {
-        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await {
+        let lookup =
+            mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await;
+        #[cfg(test)]
+        let lookup =
+            if let Some(hook) = REGISTRATION_LOOKUP_HOOK.with(|slot| slot.borrow_mut().take()) {
+                hook(lookup)
+            } else {
+                lookup
+            };
+        match lookup {
             asupersync::Outcome::Ok(existing) => Some(existing),
-            _ => None,
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            other => Some(db_outcome_to_mcp_result(other)?),
         }
     } else {
         None
@@ -2802,22 +2827,49 @@ Check that all parameters have valid values."
     }
 
     let mut row = if let Some(agent_name) = explicit_name {
+        // A missing lookup alone cannot establish ownership: another session
+        // may claim the name before this write. Only an atomic insert proves
+        // that this session created it. A competing insert fails before any
+        // existing profile or token can be changed.
+        let created = if crate::session_identity::enabled() && existing_before.is_none() {
+            Some(db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::create_agent(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    &agent_name,
+                    &program,
+                    &model,
+                    task_description.as_deref(),
+                    Some(&policy),
+                )
+                .await,
+            )?)
+        } else {
+            None
+        };
         // Explicit name: documented upsert/idempotent-re-registration
         // semantics (refresh program/model/task, bump last_active_ts).
-        db_outcome_to_mcp_result(
-            register_agent_db_with_retry(
-                ctx,
-                &pool,
-                project_id,
-                &agent_name,
-                &program,
-                &model,
-                task_description.as_deref(),
-                &policy,
-                reaper_exempt,
-            )
-            .await,
-        )?
+        if let Some(created) = created
+            && reaper_exempt.is_none()
+        {
+            created
+        } else {
+            db_outcome_to_mcp_result(
+                register_agent_db_with_retry(
+                    ctx,
+                    &pool,
+                    project_id,
+                    &agent_name,
+                    &program,
+                    &model,
+                    task_description.as_deref(),
+                    &policy,
+                    reaper_exempt,
+                )
+                .await,
+            )?
+        }
     } else {
         // No name given: draw a FRESH name. A random draw that collides with
         // an already-registered agent must redraw, never merge onto that
@@ -3944,6 +3996,219 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    fn with_registration_store<F, Fut>(f: F)
+    where
+        F: FnOnce(Cx, String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let temp = tempfile::tempdir().expect("registration store");
+        with_process_env_overrides_for_test(
+            &[
+                (
+                    "DATABASE_URL",
+                    &format!("sqlite:///{}", temp.path().join("mail.sqlite3").display()),
+                ),
+                (
+                    "STORAGE_ROOT",
+                    &temp.path().join("archive").display().to_string(),
+                ),
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        f(
+                            Cx::current().expect("runtime context"),
+                            temp.path().display().to_string(),
+                        )
+                        .await;
+                    });
+                REGISTRATION_LOOKUP_HOOK.with(|slot| slot.borrow_mut().take());
+                Config::reset_cached();
+            },
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn registration_stale_absence_cannot_claim_or_rewrite_the_winner() {
+        with_registration_store(|cx, project| async move {
+            let loser = McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+            ensure_project(&loser, project.clone(), None).await.unwrap();
+            let winner_row = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let recorded = winner_row.clone();
+            let competing_project = project.clone();
+            REGISTRATION_LOOKUP_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |lookup| {
+                    assert!(matches!(
+                        lookup,
+                        Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. })
+                    ));
+                    // The first request has already observed absence. Finish
+                    // another real registration before resuming its write.
+                    let row = std::thread::spawn(move || {
+                        RuntimeBuilder::current_thread()
+                            .build()
+                            .unwrap()
+                            .block_on(async {
+                                let cx = Cx::current().unwrap();
+                                let winner = McpContext::with_state(
+                                    cx.clone(),
+                                    2,
+                                    fastmcp_core::SessionState::new(),
+                                );
+                                let response = register_agent(
+                                    &winner,
+                                    competing_project,
+                                    "winner-program".into(),
+                                    "winner-model".into(),
+                                    Some("BlueLake".into()),
+                                    Some("winner task".into()),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some("Winner label".into()),
+                                )
+                                .await
+                                .expect("competing registration succeeds");
+                                let response: serde_json::Value =
+                                    serde_json::from_str(&response).unwrap();
+                                let id = response["id"].as_i64().unwrap();
+                                assert!(crate::session_identity::holds(&winner, Some(id)));
+                                mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                                    &cx,
+                                    &get_db_pool().unwrap(),
+                                    id,
+                                )
+                                .await
+                                .into_result()
+                                .unwrap()
+                            })
+                    })
+                    .join()
+                    .expect("winner thread");
+                    *recorded.lock().unwrap() = Some(row);
+                    lookup
+                }));
+            });
+            register_agent(
+                &loser,
+                project,
+                "loser-program".into(),
+                "loser-model".into(),
+                Some("BlueLake".into()),
+                Some("loser task".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Loser label".into()),
+            )
+            .await
+            .expect_err("stale absence cannot claim an existing identity");
+            let before = winner_row.lock().unwrap().take().unwrap();
+            let after = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                &cx,
+                &get_db_pool().unwrap(),
+                before.id.unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(
+                crate::session_identity::session_bindings(&loser),
+                Vec::<crate::session_identity::SessionBinding>::new()
+            );
+        });
+    }
+
+    #[test]
+    fn registration_lookup_failure_preserves_profile_token_and_binding() {
+        with_registration_store(|cx, project| async move {
+            let owner = McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+            let response = register_agent(
+                &owner,
+                project.clone(),
+                "owner-program".into(),
+                "owner-model".into(),
+                Some("BlueLake".into()),
+                Some("owner task".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Owner label".into()),
+            )
+            .await
+            .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let before = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                &cx,
+                &get_db_pool().unwrap(),
+                response["id"].as_i64().unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            REGISTRATION_LOOKUP_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|lookup| {
+                    assert!(matches!(lookup, Outcome::Ok(_)));
+                    Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(
+                        "injected lookup contention".into(),
+                    ))
+                }));
+            });
+            let outsider = McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+            let error = register_agent(
+                &outsider,
+                project,
+                "changed-program".into(),
+                "changed-model".into(),
+                Some("BlueLake".into()),
+                Some("changed task".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("Changed label".into()),
+            )
+            .await
+            .expect_err("lookup failure must propagate before any registration write");
+            assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+            let after = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                &cx,
+                &get_db_pool().unwrap(),
+                before.id.unwrap(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert!(crate::session_identity::holds(&owner, before.id));
+            assert_eq!(
+                crate::session_identity::session_bindings(&outsider),
+                Vec::<crate::session_identity::SessionBinding>::new()
+            );
+        });
+    }
 
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.
