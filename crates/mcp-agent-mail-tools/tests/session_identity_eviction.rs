@@ -21,6 +21,10 @@ struct ResetConfigCache;
 
 impl Drop for ResetConfigCache {
     fn drop(&mut self) {
+        // Finish writes while this fixture's archive and environment still
+        // exist, including when a test unwinds.
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
         Config::reset_cached();
     }
 }
@@ -38,6 +42,7 @@ where
         &[
             ("DATABASE_URL", database.as_str()),
             ("STORAGE_ROOT", archive.as_str()),
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ("WORKTREES_ENABLED", "0"),
             ("MESSAGING_SESSION_IDENTITY", "true"),
             // A token-profile refusal must not mask the eviction regression.

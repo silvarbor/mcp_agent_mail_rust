@@ -4002,22 +4002,16 @@ mod tests {
         F: FnOnce(Cx, String) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let temp = tempfile::tempdir().expect("registration store");
-        with_process_env_overrides_for_test(
+        static REGISTRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &REGISTRATION_TEST_LOCK,
+            "registration",
             &[
-                (
-                    "DATABASE_URL",
-                    &format!("sqlite:///{}", temp.path().join("mail.sqlite3").display()),
-                ),
-                (
-                    "STORAGE_ROOT",
-                    &temp.path().join("archive").display().to_string(),
-                ),
                 ("MESSAGING_SESSION_IDENTITY", "true"),
                 ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
                 ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ],
-            || {
+            |mailbox| {
                 Config::reset_cached();
                 RuntimeBuilder::current_thread()
                     .build()
@@ -4025,7 +4019,12 @@ mod tests {
                     .block_on(async {
                         f(
                             Cx::current().expect("runtime context"),
-                            temp.path().display().to_string(),
+                            mailbox
+                                .database_path
+                                .parent()
+                                .unwrap()
+                                .display()
+                                .to_string(),
                         )
                         .await;
                     });
