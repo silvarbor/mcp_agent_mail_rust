@@ -77,6 +77,38 @@ pub(crate) use visible_to_viewer_sql;
 
 const VISIBLE_TO_VIEWER_SQL: &str = visible_to_viewer_sql!();
 
+/// Actual recipients for an operator receipt action, including eligible
+/// shared-mailbox viewers. Direct delivery takes precedence over shared mail.
+pub fn receipt_agent_ids_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    message_id: i64,
+) -> Result<Vec<i64>, DbError> {
+    let direct = "SELECT agent_id AS id FROM message_recipients WHERE message_id = ?";
+    let sql = format!(
+        "{direct} UNION SELECT viewer.id AS id FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         JOIN agents viewer ON viewer.project_id = d.project_id \
+         WHERE d.message_id = ? AND {VISIBLE_TO_VIEWER_SQL} ORDER BY id"
+    );
+    let rows = match conn.query_sync(
+        &sql,
+        &[Value::BigInt(message_id), Value::BigInt(message_id)],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            allow_absent_shared_schema(conn, &error.to_string())?;
+            conn.query_sync(direct, &[Value::BigInt(message_id)])
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+        }
+    };
+    rows.into_iter()
+        .map(|row| {
+            row.get_named("id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))
+        })
+        .collect()
+}
+
 /// The project identifier named by a shared-mailbox address, or `None` when
 /// `raw` is not one.
 ///
@@ -117,7 +149,7 @@ fn missing_table_name(message: &str) -> Option<&str> {
 /// fallback. Run this catalog check on a missing-table error, not on healthy
 /// reads. An incomplete schema, failed inspection or broken view stays an
 /// error; callers must not mistake it for a successfully observed empty inbox.
-fn allow_absent_shared_schema(
+pub(crate) fn allow_absent_shared_schema(
     conn: &impl crate::pool::SyncQuery,
     error: &str,
 ) -> Result<(), DbError> {
@@ -816,6 +848,43 @@ mod tests {
     fn assert_receipt_writer_released(conn: &DbConn) {
         conn.execute_raw("BEGIN IMMEDIATE").unwrap();
         conn.execute_raw("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn operator_receipt_recipients_resolve_shared_viewers_and_direct_precedence() {
+        receipt_fixture(|conn| {
+            assert_eq!(
+                receipt_agent_ids_from_conn(conn, 100).unwrap(),
+                vec![20, 30]
+            );
+            conn.execute_raw("INSERT INTO message_recipients VALUES (100, 20)")
+                .unwrap();
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 30, 11, 22)")
+                .unwrap();
+            assert_eq!(
+                receipt_agent_ids_from_conn(conn, 100).unwrap(),
+                vec![20, 30]
+            );
+            conn.execute_raw("UPDATE agents SET contact_policy = 'block_all' WHERE id = 30")
+                .unwrap();
+            assert_eq!(receipt_agent_ids_from_conn(conn, 100).unwrap(), vec![20]);
+            assert_eq!(
+                conn.query_sync("SELECT read_ts, ack_ts FROM project_mailbox_receipts", &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| (
+                        row.get_named::<i64>("read_ts").unwrap(),
+                        row.get_named::<i64>("ack_ts").unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(11, 22)]
+            );
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            )
+            .unwrap();
+            assert!(receipt_agent_ids_from_conn(conn, 100).is_err());
+        });
     }
 
     #[test]

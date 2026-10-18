@@ -717,7 +717,26 @@ pub fn inbox_delivery_events_from_conn(
         Err(error)
             if crate::project_mailbox::is_missing_project_mailbox_table_error(
                 &error.to_string(),
-            ) => {}
+            ) =>
+        {
+            crate::project_mailbox::allow_absent_shared_schema(conn, &error.to_string())
+                .map_err(InboxDeliveryEventError::Database)?;
+            let retained_shared_events = conn
+                .query_sync(
+                    "SELECT seq FROM inbox_delivery_events WHERE project_id = ? \
+                         AND agent_id IS NULL AND kind = 'project' LIMIT 1",
+                    &[Value::BigInt(project_id)],
+                )
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            if !retained_shared_events.is_empty() {
+                return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                    "incomplete project mailbox schema; shared events retain delivery authority"
+                        .to_string(),
+                )));
+            }
+        }
         Err(error) => {
             return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
                 error.to_string(),
@@ -1701,6 +1720,51 @@ mod tests {
         );
         assert_eq!(orphaned.next_cursor, retired.next_cursor);
         assert_eq!(orphaned.tail_cursor, retired.tail_cursor);
+    }
+
+    #[test]
+    fn shared_event_cursor_rejects_missing_delivery_authority_until_restored() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let viewer_id = insert_agent(&conn, project_id, "Viewer");
+        let message_id = insert_message(&conn, project_id, sender_id, "shared-cursor");
+        conn.execute_sync(
+            "INSERT INTO project_mailbox_deliveries \
+             (message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', 1000000)",
+            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO inbox_delivery_events \
+             (project_id, agent_id, message_id, kind, delivered_ts) \
+             VALUES (?, NULL, ?, 'project', 1000000)",
+            &[Value::BigInt(project_id), Value::BigInt(message_id)],
+        )
+        .unwrap();
+        let before =
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).unwrap();
+        assert_eq!(before.events.len(), 1);
+        assert_eq!(before.events[0].message_id, message_id);
+
+        conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+            .unwrap();
+        assert!(
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).is_err()
+        );
+        conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+            .unwrap();
+        assert!(
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).is_err()
+        );
+        conn.execute_raw("ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries")
+            .unwrap();
+        conn.execute_raw("ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts")
+            .unwrap();
+        let restored =
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).unwrap();
+        assert_eq!(restored.events, before.events);
+        assert_eq!(restored.next_cursor, before.next_cursor);
     }
 
     #[test]

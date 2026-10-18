@@ -1843,7 +1843,14 @@ impl MessageBrowserScreen {
             return Err("no message selected".to_string());
         }
         let ctx = operator_tool_context();
-        let mut receipts = 0_usize;
+        let pool =
+            mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|error| error.to_string())?;
+        let conn = block_on(pool.acquire(ctx.cx()))
+            .into_result()
+            .map_err(|error| error.to_string())?;
+        // Resolve every action before writing any receipts. Displayed address
+        // strings may denote a project mailbox rather than an agent identity.
+        let mut actions = Vec::new();
         for &id in ids {
             let entry = self
                 .results
@@ -1851,17 +1858,35 @@ impl MessageBrowserScreen {
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| format!("message #{id} is no longer listed"))?;
             let project = entry.project_slug.clone();
-            let recipients: Vec<String> = entry
-                .to_agents
-                .split(", ")
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
+            let recipient_ids =
+                mcp_agent_mail_db::project_mailbox::receipt_agent_ids_from_conn(&*conn, id)
+                    .map_err(|error| format!("#{id}: {error}"))?;
+            let mut recipients = Vec::with_capacity(recipient_ids.len());
+            for recipient_id in recipient_ids {
+                let rows = conn
+                    .query_sync(
+                        "SELECT name FROM agents WHERE id = ?",
+                        &[Value::BigInt(recipient_id)],
+                    )
+                    .map_err(|error| format!("#{id}: {error}"))?;
+                let row = rows
+                    .first()
+                    .ok_or_else(|| format!("#{id}: recipient {recipient_id} is unavailable"))?;
+                recipients.push(
+                    row.get_named::<String>("name")
+                        .map_err(|error| error.to_string())?,
+                );
+            }
             if project.is_empty() || recipients.is_empty() {
                 return Err(format!(
                     "message #{id} has no recorded project or recipients"
                 ));
             }
+            actions.push((id, project, recipients));
+        }
+        drop(conn);
+        let mut receipts = 0_usize;
+        for (id, project, recipients) in actions {
             for agent in recipients {
                 let result = if acknowledge {
                     block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
@@ -10109,6 +10134,110 @@ first body
                 expect_operator_result(screen.handle_action("mark_read:999999", ""));
             assert_eq!(status, "error");
             assert!(text.contains("no longer listed"), "{text}");
+        });
+    }
+
+    #[test]
+    fn action_menu_receipts_support_shared_only_and_mixed_deliveries() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            for mixed in [false, true] {
+                let mut to = vec![mcp_agent_mail_db::project_mailbox::project_mailbox_address(
+                    &slug,
+                )];
+                if mixed {
+                    to.push("BlueLake".to_string());
+                }
+                let sent: serde_json::Value = serde_json::from_str(
+                    &block_on(mcp_agent_mail_tools::messaging::send_message(
+                        &operator_tool_context(),
+                        project_key.to_string(),
+                        "GreenCastle".to_string(),
+                        to,
+                        "operator shared receipt".to_string(),
+                        "body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(true),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                let id = sent["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+                let mut screen = MessageBrowserScreen::new();
+                screen.results.push(MessageEntry {
+                    to_agents: if mixed {
+                        format!("BlueLake, project:{slug}")
+                    } else {
+                        format!("project:{slug}")
+                    },
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "shared", "operator shared receipt")
+                });
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("mark_read:{id}"), ""));
+                assert_eq!(status, "ok", "{text}");
+                assert!(text.contains("2 recipient"), "{text}");
+                let shared_before = crate::tui_screens::with_operator_test_conn(|conn| {
+                    conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = ? ORDER BY agent_id",
+                        &[Value::BigInt(id)],
+                    ).unwrap().iter().map(|row| (
+                        row.get_named::<i64>("agent_id").unwrap(),
+                        row.get_named::<Option<i64>>("read_ts").unwrap(),
+                        row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    )).collect::<Vec<_>>()
+                });
+                assert_eq!(shared_before.len(), if mixed { 1 } else { 2 });
+                assert!(
+                    shared_before
+                        .iter()
+                        .all(|(_, read, ack)| read.is_some() && ack.is_none())
+                );
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                assert_eq!(status, "ok", "{text}");
+                let shared_after = crate::tui_screens::with_operator_test_conn(|conn| {
+                    conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = ? ORDER BY agent_id",
+                        &[Value::BigInt(id)],
+                    ).unwrap().iter().map(|row| (
+                        row.get_named::<i64>("agent_id").unwrap(),
+                        row.get_named::<Option<i64>>("read_ts").unwrap(),
+                        row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    )).collect::<Vec<_>>()
+                });
+                assert!(shared_after.iter().all(|(_, _, ack)| ack.is_some()));
+                assert_eq!(
+                    shared_after
+                        .iter()
+                        .map(|(agent, read, _)| (*agent, *read))
+                        .collect::<Vec<_>>(),
+                    shared_before
+                        .iter()
+                        .map(|(agent, read, _)| (*agent, *read))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    recipient_receipts(id),
+                    if mixed {
+                        vec![("BlueLake".to_string(), true, true)]
+                    } else {
+                        vec![]
+                    }
+                );
+            }
         });
     }
 

@@ -11322,6 +11322,12 @@ async fn fetch_inbox_for_product_agent_impl(
                 &error.to_string(),
             ) =>
         {
+            if let Err(error) = crate::project_mailbox::allow_absent_shared_schema(
+                tracked.inner,
+                &error.to_string(),
+            ) {
+                return Outcome::Err(error);
+            }
             let direct = format!("{sql} ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
             let mut direct_params = arm_params;
             direct_params.push(Value::BigInt(limit_i64));
@@ -12326,7 +12332,13 @@ async fn record_project_mailbox_receipt_in_tx(
                 &error.to_string(),
             ) =>
         {
-            return Outcome::Ok(None);
+            return match crate::project_mailbox::allow_absent_shared_schema(
+                tracked.inner,
+                &error.to_string(),
+            ) {
+                Ok(()) => Outcome::Ok(None),
+                Err(error) => Outcome::Err(error),
+            };
         }
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -12825,6 +12837,13 @@ pub async fn mark_messages_read_bulk(
                         &error.to_string(),
                     ) =>
                 {
+                    if let Err(error) = crate::project_mailbox::allow_absent_shared_schema(
+                        tracked.inner,
+                        &error.to_string(),
+                    ) {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(error);
+                    }
                     Vec::new()
                 }
                 Outcome::Err(error) => {
@@ -33420,6 +33439,60 @@ mod tests {
             );
             assert_eq!(lookup.name, format!("[unknown-product-{product_id}]"));
             assert!(lookup.created_at > 0);
+        });
+    }
+
+    #[test]
+    fn pooled_inbox_and_bulk_read_reject_retained_receipts_without_deliveries() {
+        let (_, pool, _dir) = setup_test_pool("partial_shared_schema.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = Cx::current().unwrap();
+            let project = ensure_project(&cx, &pool, "/tmp/partial-shared-schema")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let agent = create_agent(&cx, &pool, project_id, "BlueLake", "test", "test", None, None)
+                .await.into_result().unwrap();
+            let product = ensure_product(&cx, &pool, Some("partial-shared"), Some("partial-shared"))
+                .await.into_result().unwrap();
+            link_product_to_projects(&cx, &pool, product.id.unwrap(), &[project_id])
+                .await.into_result().unwrap();
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync(
+                "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, created_ts) \
+                 VALUES (?, ?, 'receipt rollback', '', 'normal', 0, 1)",
+                &[Value::BigInt(project_id), Value::BigInt(agent.id.unwrap())],
+            ).unwrap();
+            let message_id = conn.query_sync("SELECT id FROM messages", &[]).unwrap()[0]
+                .get_named::<i64>("id").unwrap();
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+                &[Value::BigInt(message_id), Value::BigInt(agent.id.unwrap())],
+            ).unwrap();
+            conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries").unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_inbox_for_product_agent(&cx, &pool, product.id.unwrap(), &agent.name, false, None, 10).await,
+                Outcome::Err(_)
+            ));
+            assert!(matches!(
+                mark_messages_read_bulk(&cx, &pool, project_id, agent.id.unwrap(), None, 10).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT read_ts FROM message_recipients", &[]).unwrap()[0]
+                    .get_named::<Option<i64>>("read_ts").unwrap(),
+                None
+            );
+            conn.execute_raw("ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries").unwrap();
+            drop(conn);
+            let restored = fetch_inbox_for_product_agent(&cx, &pool, product.id.unwrap(), &agent.name, false, None, 10)
+                .await.into_result().unwrap();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].message.id, Some(message_id));
         });
     }
 
