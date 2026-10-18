@@ -1,5 +1,243 @@
 # Resume — local Agent Mail fork
 
+READY FOR SECOND REVIEW (2026-10-18). All repair source is committed through
+84b7ff8a60b495c2e3955f6d81f89ded980e97de. Session 72503 completed exit 0:
+13 session-identity integration tests, two registration regressions, strict
+workspace Clippy (52.44s) and formatting pass. The final changes after the
+passing workspace compilation checks affect test fixtures only. CLI priority
+tests pass 3/3; shared-mailbox tool tests pass 3/3; compiled pending-worker
+tests pass 17/17. The targeted schema, cursor, TUI receipt and cap-boundary
+regressions also pass as recorded below. No active test/build process remains.
+
+Next: commit this evidence note, then use the mandatory changes reviewer on
+the clean exact range d036cf300e28dd199464fddc3f6446e99b07a52e..HEAD. This is the
+second review after sealed rejection 2026-10-15_14-51-32-479-e93a537399f9.
+The first review examined all 317 then-changed paths and found five blocking
+items plus the duplicate-file debt; all six are addressed. No gate waiver is
+claimed. Rebuild both runtime executables from the final committed revision,
+then rerun applicable runtime/browser qualification before fork publication
+and local upgrade. The approved 24-hour observation remains afterward.
+
+Latest validation: session 7010 ended exit 101. All three project-mailbox tool
+tests PASSED (2.65s), and 11 session-identity tests passed. Two eviction tests
+stopped at the temporary-project guard. Added the explicit ephemeral-project
+allowance inside their isolated fixture. Rerun 55826 passed 12/13; the second
+eviction test's initial send returned DURABILITY_DEGRADED. Inspection found
+its temporary archive could be dropped before queued writes completed.
+Safe local fixture repair: ResetConfigCache now drains write-back and async
+commits before the environment/tempdir can disappear, including unwinding.
+The new registration unit fixture had the same lifetime hazard, so it now
+uses the existing test_support::with_isolated_mailbox helper, which drains
+and checks its own writes. No production durability guard was changed.
+
+These last fixture changes are now committed and validated. All 13
+session tests now PASS (10.11s, test-review-session-identity-final-3.log),
+including both eviction cases with the archive drain in place. The same
+sequential command also passed two registration regressions,
+strict workspace Clippy, then formatting. Logs:
+test-review-session-identity-final-3.log,
+test-review-registration-admission-final.log, clippy-review-final-4.log,
+fmt-review-final-2.log. Session 72503 is complete. Preserve earlier failure logs.
+
+Local repair checkpoints created with ordinary hooks, no bypass:
+- 6f8a7d600da86b32acd813f479f124e05fca61b9: registration admission and regressions.
+- 895554caa61cd54b74a305c44da79f2d6e009350: shared delivery/schema authority and
+  real TUI receipts (four files, priority edits excluded through a manually
+  prepared index patch).
+- a4d993001868071adaacfea107e7c029991e815e: approved duplicate worker removal,
+  compiled independence coverage and canonical macOS fixture root.
+- 8f4337435966aea91ade1ecdd40d1084ebc4723f: priority ordering before the server
+  limit, optional MCP argument, robot request, native callers and regressions.
+- 84b7ff8a60b495c2e3955f6d81f89ded980e97de: drain isolated identity-fixture
+  archives and explicitly allow their ephemeral project paths. Current HEAD.
+  All implementation and test changes are committed.
+
+At the priority checkpoint only this evidence note remained unstaged; the
+index was empty. The two fixture changes above are now committed. Commit payloads
+and the manually edited shared-mail staging patch are preserved at
+/tmp/agent-mail-repair-commits.qIoP4Q. CLI compilation passed in 6m32s, but the
+initial filter used the filename rather than the extracted module name and
+ran zero tests. Corrected direct invocation of that compiled binary with
+robot::commands::tests::robot_inbox_server_ PASSED all three tests in 0.01s:
+test-review-robot-inbox-exact.log. The zero-test run supplies no test evidence.
+Session 7010 completed as recorded above. Do not dispatch the second review until
+this evidence note is committed and deterministic checks pass.
+No source files changed during this commit preparation; current compiler and
+Clippy results still cover the source. Runtime binaries must be rebuilt after
+the final checkpoint, before qualification or installation.
+
+Final repair gates ALL PASSED at session 31869 exit 0: strict Clippy (1m10s,
+clippy-review-final-3.log), workspace all-target compilation (1m17s,
+check-review-final-all-targets-2.log), production-only compilation (51.41s,
+check-review-final-production-2.log), and formatting (fmt-review-final.log).
+Two earlier Clippy logs preserve the repaired findings: numeric separators,
+original test annotations displaced by an insertion, and two empty-binding
+assertions changed to equality assertions with diagnostic output. No production
+behavior changed during lint repair.
+
+Remaining: final focused CLI/tool regression checks, checkpoint and sealed
+re-review, rebuild and applicable runtime/browser qualification, fork merge/
+local upgrade, 24-hour observation and build cleanup. The goal is active; no
+publication has occurred. A sequential test command now runs robot inbox CLI
+tests, then the real project-mailbox tool tests, then session identity tool
+tests; logs test-review-robot-inbox.log, test-review-project-mailbox-final.log,
+test-review-session-identity-final.log. Collect session 7010 before another
+heavy command; the later logs exist only if the earlier step succeeds.
+
+Latest checkpoint (2026-10-18): the priority ordering API and robot request
+are now wired end to end. `cargo check --workspace --all-targets` passed
+(check-priority-api.log, 1m22s). The real MCP tool regression passed with
+1,001 newer normal messages plus older direct/shared urgent messages: unread,
+all-mail and overdue filters preserve priority before limiting; omitted
+priority preserves newest-first; mark_read=false leaves both receipt stores
+untouched. Evidence: test-review-priority-tool-it.log, 1 test, 1.12s. The first
+test command targeted a nonexistent standalone project_mailbox target; the
+correct aggregate target is `--test it`. No code issue remained from that
+invocation error.
+
+DB priority regression PASSED (one test, 1.43s), test-review-priority-db.log.
+Both registration regressions PASSED (two tests, 0.86s),
+test-review-registration-admission-2.log. They use a one-shot, thread-local,
+test-only seam after the real lookup: deterministic competing registration
+after absence was observed, and a transient lookup error. All subsequent
+writes/token/session operations use the real production path. The initial
+run stopped at the temporary-project path guard; the isolated fixture now
+explicitly enables AM_ALLOW_EPHEMERAL_PROJECT_ROOTS. No production guard was
+changed. Test-only line-count annotations were added after compilation began;
+final checks must cover that exact source too.
+
+Server pending-worker tests completed: 16 passed, including the replacement
+two-direction lane independence test; one fixture failed at ensure_archive
+because macOS /var is a symlink. Safe local repair: canonicalize the temporary
+fixture root before deriving archive/database/project paths, preserving the
+production symlink guard. The full group rerun PASSED all 17 tests in 5.70s,
+test-review-replay-workers-2.log; session 80488 completed with exit 0.
+Initial evidence is test-review-replay-workers.log. Formatting/whitespace
+check session 86481 passed. Run final workspace gates and the second sealed
+review before publication or upgrade. The live service remains unchanged.
+
+The approved uncompiled duplicate removal and useful coverage comparison
+remain recorded below; its replacement compiled worker test has now passed.
+Earlier running-session notes below are historical unless named
+in this checkpoint.
+
+Priority repair, backend phase written: sync::InboxFetchOptions now has
+priority_before: Option<i64>, default None in every existing constructor.
+Direct and shared SQL apply the same CASE priority before LIMIT, and the
+combined result uses that priority before final truncation. project_mailbox
+owns priority_order_sql and inbox_priority. Added a real DB boundary regression
+with 1000 newer normal messages and older urgent messages (with and without
+ack requirements), for direct and shared delivery and unread/all/overdue
+filters. This code is unverified and NOT yet wired through MCP or robot CLI:
+queries.rs currently explicitly passes priority_before: None. Next: expose
+optional priority ordering through fetch_inbox, route robot inbox to it, and
+exercise real MCP candidate selection as the reviewer requested.
+
+Server test session 96450 is still compiling the pre-priority backend snapshot.
+Its success will cover the TUI receipt action, not the later DB ordering edits.
+Formatting session 50961 pending collection. No overlapping heavy build has
+been started. Identity race/failure regressions and full gates remain pending.
+
+Latest verification: pooled schema regression session 79086 PASSED, one test
+0.37s after 2m46s compile. Receipt-recipient helper regression also PASSED, one
+test 0.06s, test-review-receipt-recipients.log. Added a real TUI action regression
+using send_message for shared-only and mixed direct/shared mail, then actual
+handle_action mark-read/acknowledge calls. It checks recipient counts, direct
+precedence, independent shared receipt rows, and read timestamps retained on
+acknowledgement. Test compilation is active as session 96450, log
+/Users/shz/.local/state/mcp-agent-mail/integration/20261015-preservation/test-review-tui-shared-receipts.log.
+Formatting session 71931 passed. Collect 96450 before another heavy command.
+Priority ordering and identity race/failure regressions remain outstanding.
+
+LATEST remediation checkpoint: cursor regression PASSED (one actual test),
+test-review-shared-event-exact.log, 0.39s after 2m54s compile. Workspace all-target
+check session 45115 PASSED in 1m24s for the first receipt/registration repair
+version. A pooled regression was added while that check was running, so it is
+not evidence for the newest test source. Formatting sessions 86448 and 61336
+passed. No production-only check or strict Clippy has run on the repairs yet.
+
+TUI receipts now resolve actual recipient IDs through a new shared-mailbox
+helper, preflight all selected messages before writing, and use actual agent
+names. A database helper regression covers shared-only recipients, direct
+precedence, blocked viewers, unchanged peer receipts, and missing authority.
+Actual TUI action tests remain needed. Pooled regression now checks product
+inbox failure and bulk-read rollback when deliveries are renamed but receipts
+remain, followed by successful read after schema restoration. Its test process
+is active as session 79086; collect it before another heavy run.
+Log: /Users/shz/.local/state/mcp-agent-mail/integration/20261015-preservation/test-review-pooled-schema.log.
+
+Priority inbox repair remains unimplemented. Inspection confirms six ranking
+buckets, so merely adding an urgent fetch window would leave ack-required and
+read-unacked truncation defects. Prefer server-side priority ordering before
+the 1000-row limit, with identical direct/shared ordering and real boundary
+tests; fetch_inbox currently exposes no pagination or ordering option.
+
+2026-10-18 remediation continues (uncommitted): identity registration now
+propagates lookup errors other than NotFound and atomically creates explicit
+names before any upsert when session identity is enabled and lookup was absent.
+Concurrent creation and lookup-failure regressions are still required; this
+change has not been compiled yet. The pooled schema regressions are also pending.
+All review findings still require final verification; none is claimed closed.
+
+DB session 96205 completed compilation in 2m45s but selected ZERO tests due
+to the short exact filter. Corrected run is session 51006, log
+/Users/shz/.local/state/mcp-agent-mail/integration/20261015-preservation/test-review-shared-event-exact.log.
+Collect it before starting another heavy command. Formatting session 58141
+passed; subsequent formatting after the identity change is session 13213.
+Two-job host-load override remains authorized by the operator earlier in this
+thread. No re-review, commit, publication, or service cutover has occurred.
+
+2026-10-18 17:52Z remediation checkpoint: shared-schema guards now reuse the
+catalog check in all three pooled fallbacks and the event reader. Event reads
+also refuse retained shared events when both shared tables are absent. Added
+an event-cursor regression that renames/restores authority without deleting
+data. Pooled regressions and remaining review repairs are still pending.
+DB test compilation is active in session 96205, log at
+/Users/shz/.local/state/mcp-agent-mail/integration/20261015-preservation/test-review-shared-event.log.
+Its filter was passed with --exact without the module prefix; after collecting
+the compilation result, rerun using sync::tests::shared_event_cursor_rejects_missing_delivery_authority_until_restored.
+Formatting session 58141 is also pending collection. Neither is a test pass.
+
+Deletion authorization received verbatim: "Approve removing that duplicate
+after coverage comparison (Recommended)". At 2026-10-18T17:52:49Z, apply_patch
+Delete File removed crates/mcp-agent-mail-server/src/retention/pending/lane_workers.rs.
+The six tests were compared with compiled pending.rs/supervision.rs tests;
+the two-direction progress test was ported into pending.rs. Existing compiled
+tests cover stop-before-join, duplicate-start exclusion, fresh cancellation,
+restart/backoff, and joined shutdown. The replacement test passed on October 18.
+The deleted source
+remains recoverable from committed head d79eb636. No service mutation occurred.
+
+CURRENT 2026-10-18: review completed and was recovered through the supported
+journal projection. Run 2026-10-15_14-51-32-479-e93a537399f9 is sealed, rejected,
+317/317 files examined, five blocking findings and one debt finding. Exact
+reviewed head is d79eb63693d5b7dac37a095e07b5e208f6787cd1. No reviewer is live.
+No fork PR exists for this branch. The live symlink still selects the October 13
+release. The staged 0.3.39 release must be rebuilt after remediation.
+
+Review remediation ledger (Rust remediation and merge review workflow):
+- identity.rs:2795: registration confuses failed/absent lookup with atomic
+  creation, allowing unowned session binding. Fixed; two real-path registration
+  regressions pass (test-review-registration-admission-2.log).
+- queries.rs:11318: three pooled shared-mailbox fallbacks suppress incomplete
+  schema errors. Fixed; pooled rejection/rollback/restoration test passes.
+- sync.rs:717: event reader can advance past unavailable shared deliveries.
+  Fixed; cursor rejection/restoration regression passes.
+- tui_screens/messages.rs:1860: operator receipts treat project addresses as
+  agent names. Fixed; real shared-only/mixed TUI action regression passes.
+- robot_commands.rs:19365: capped server candidates omit older higher-priority
+  mail. Fixed through server-side priority ordering before the cap; DB and MCP
+  cap-boundary regressions pass. Final CLI checks still pending.
+- retention/pending/lane_workers.rs:1: uncompiled duplicate worker and tests.
+  Fixed after explicit removal approval and coverage comparison. Replacement
+  compiled worker independence regression passes. Full group rerun passes
+  all 17 tests after the isolated macOS fixture path correction above.
+
+This is the first completed review rejection. Repair the classes, add focused
+regressions, run the required checks, checkpoint, then obtain the second review.
+Do not publish or install the rejected version. Prior qualification remains
+baseline evidence, not evidence for future repair code.
+
 Local integration merge committed as3adb733859aa5d41e2e3b519cac08cc658ca3379.
 No hook was installed; no bypass was used. A dynamic staging command was
 blocked by the command guard; explicit literal paths succeeded instead.
