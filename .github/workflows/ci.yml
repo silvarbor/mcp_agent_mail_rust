@@ -195,7 +195,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Mode matrix harness (Rust)
-        run: cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -414,7 +415,8 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Semantic conformance suite
-        run: cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -472,7 +474,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Perf + security regression suite
-        run: cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -1001,7 +1004,8 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Verify help snapshots
-        run: cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
         env:
           COLUMNS: "120"
           DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
@@ -1308,7 +1312,8 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Fault injection integration tests
-        run: cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"
