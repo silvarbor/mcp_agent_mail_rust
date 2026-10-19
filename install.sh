@@ -3607,7 +3607,7 @@ prune_binary_transaction_history() {
   # whitespace; anything else is skipped by the exact-prefix check below.
   entries=$(ls -1dt -- \
     "$install_dir"/.mcp-agent-mail-install-transaction.committed.* \
-    "$install_dir"/.mcp-agent-mail-install-transaction.rolled-back.* 2>/dev/null) || true
+    "$install_dir"/.mcp-agent-mail-install-transaction.rolled-back.* 2>/dev/null || true)
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="${entry##*/}"
