@@ -180,6 +180,7 @@ case "${OS_NAME}" in
         fi
         STORAGE_ROOT="${TMPDIR%/}/archive-fsync-apfs-${RUN_ID}/storage"
         mkdir -p "${STORAGE_ROOT}"
+        STORAGE_ROOT="$(cd "${STORAGE_ROOT}" && pwd -P)"
         FS_LABEL="apfs"
         MOUNT_OPTIONS="runner-managed"
         FSYNC_MODE="barrier_only"
