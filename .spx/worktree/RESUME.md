@@ -1,5 +1,124 @@
 # Resume — local Agent Mail fork
 
+FINAL-SOURCE CHECKS COMPLETE: session 18414 exited zero. Workspace all-target
+check passed (49.26s), production lib/bins passed (28.83s), strict workspace
+Clippy passed (57.14s), and formatting passed. Combined evidence:
+evidence-root/group-sync-final-checks-20261019.log. No build remains active.
+Fourteen message-write regressions and three staged-write failure tests pass;
+matched APFS candidate gate passes with batch p95 261.344ms. Linux ext4/xfs
+qualification is still pending. Checkpoint this note and obtain independent
+review of the committed repair range before pushing the fork PR update.
+
+LOCAL CHECKPOINTS created with normal hooks on 2026-10-19:
+01d968f761dcb7db27eae2d1117c2110c9793aa0 — APFS probe mode/table correction;
+6cf0a3b1b89479e2324404be5be66b0e2cc7b173 — staged Apple device flush batching,
+single preparation pass and two failure regressions;
+044b2173453f1bce5c1e6df9ffd747bbbcf9094d — br-nwdr9 polling cost tracking.
+All are local, unpublished. Remaining tracked change is this resume note.
+Session 18414 final-source checks: all-target PASS 49.26s; production lib/bins
+PASS 28.83s; strict Clippy/format still running at this checkpoint. Collect
+terminal result, commit updated evidence note, then use required changes
+reviewer on clean exact range c48d05fa3ae24182a410a267e5c35c070c10c289..HEAD.
+APFS performance passes, Linux qualification remains open. No claim that all
+PR CI failures are repaired yet; no merge or installation change occurred.
+
+LATEST APFS PASS: session 55973 finished (14 message-write tests pass), and
+matched probe session 14884 finished: baseline batch p95 1886.281ms versus
+candidate 261.344ms, below unchanged 300ms; single 29.547 -> 24.704ms, below
+35ms. Both crash probes retained 100 messages/two commits. Evidence under
+evidence-root/fsync-single-preflight-matched-20261019/{baseline,candidate}.
+Final-source full checks running in session 18414: workspace all-target,
+production lib/bins, strict Clippy, fmt. Log group-sync-final-checks-20261019.log.
+Collect terminal result before another heavy task. Earlier failure reports
+below are historical. Linux ext4/xfs remain unqualified; no publication or
+upgrade yet. Prepare separate commits for storage performance, probe metadata,
+polling-debt tracking and resume evidence, then required independent review.
+
+LATEST: session 25203 finished successfully; strict workspace Clippy passed
+in 1m26s after the passing all-target check. Then removed duplicate batch
+preflight helper/pass: append_message_bundle_files still validates collisions
+while staging, and publication follows successful preparation of all entries.
+Preparation-error logging now reports zero published files. Formatting and
+diff whitespace pass. Session 55973 runs all 14 write_message_ regressions,
+then rebuilds the integration benchmark. Log:
+evidence-root/group-sync-single-preflight-20261019.log. Collect it next, then
+run a fresh baseline/candidate comparison before claiming further improvement.
+The prior full checks precede this final small optimization and need relevant
+revalidation before publication. No commit, push, merge or upgrade occurred.
+
+2026-10-19 current validation: session 25203 runs sequential all-target check
+then strict workspace Clippy. All-target check PASSED in 2m56s. Clippy has
+reached the CLI/conformance/application crates; collect its terminal result.
+Logs: evidence-root/group-sync-all-targets-20261019.log and
+group-sync-clippy-20261019.log. Source held fixed during these checks.
+Next bounded optimization: batch currently computes paths/renders JSON and
+checks each collision twice (reject_message_bundle_archive_collision_from_index
+then append_message_bundle_files). Staged publication now prevents visible
+message files until all entries succeed, so evaluate removing duplicate work
+while preserving the collision-before-publication test and temp cleanup.
+Do not remove checks without rerunning the existing rejection tests and a
+fresh matched performance comparison. Linux budgets remain unqualified.
+
+2026-10-19 Director report queued as br-nwdr9, P1, verified-important /
+peer-measured: remove per-request whole-host lsof scans and bound inbox polling
+cost. Original report preserved at evidence-root/director-lsof-finding-20261019.md.
+Measure installed vs candidate first: pool.rs already has a non-Linux
+subprocess-free mailbox_owner_executable_deleted path, and robot_commands.rs
+has cheap recovery-lock detection. Queue acceptance includes zero healthy-path
+lsof spawns, owner/recovery safety tests, and ids-after-cursor contract review.
+Revisit during integration qualification. Client standing waits are paused.
+
+Session 92365 COMPLETE: all 14 write_message_ tests passed; production
+cargo check --workspace --lib --bins passed in 5m08s. No build remains active
+from that session. Remaining workspace all-target/Clippy checks still pending.
+
+ACTIVE STORAGE REPAIR (2026-10-19). Full operator objective remains repair
+PR #3, merge fork, supervised local upgrade, 24-hour observation and cleanup.
+Current HEAD 0453bfaf; nine local commits unpublished. The live service is
+unchanged. Work is in upstream-integration, not the original checkout.
+
+LATEST RESULT: sessions 40382 and 59825 completed. Three staged-write failure
+tests pass; candidate probe compiled. Same-invocation baseline/candidate APFS
+comparison: single p95 32.683 -> 20.089ms; batch p95 1780.775 -> 526.342ms,
+batch median 1694.754 -> 277.825ms. Both crash probes retained 100 messages
+and two Git commits. Both batch gates FAIL the unchanged 300ms budget.
+Evidence: evidence-root/fsync-matched-group-sync-20261019/{baseline,candidate}/summary.json.
+Continue profiling remaining write/Git costs and Linux failures; this candidate
+is a measured improvement, not qualified for merge or installation.
+
+Nextest is unavailable (`cargo nextest --version`: no such command). Use
+bounded focused cargo-test commands for now; do not claim a full test run.
+A sequential command now runs storage --lib write_message_ with physical
+TMPDIR, then cargo check --workspace --lib --bins, two jobs/incremental off.
+Logs: group-sync-message-regressions-20261019.log and
+group-sync-production-check-20261019.log in the evidence root. Collect its
+session handle from the conversation before launching another heavy command.
+
+Uncommitted production change groups Apple device-cache flushes across staged
+message files. Each file is fsynced; one retained descriptor per device gets
+File::sync_data (F_FULLFSYNC) before publication. Message digests are appended
+after publication using the original prepared path/timestamp. Other platforms
+retain per-file sync_data. No latency budgets were changed. APFS metadata now
+truthfully says full_flush. Linux performance failures still require repair.
+
+Baseline message batch tests first failed at the macOS /var symlink guard.
+Rerunning with physical TMPDIR passed five batch tests and the staged cleanup
+test. Candidate also passes five batch tests. Added real staging-error and
+Apple device-sync-error tests; validation session 40382 is running those,
+then compiling storage --test it for the matched performance comparison.
+Log: evidence-root/group-sync-safety-20261019.log. Collect that session.
+The previous candidate compilation E0509 was corrected; second compile passed.
+
+Preserved baseline probe: evidence-root/fsync-baseline-0453bfaf/storage-tests,
+SHA256 0e4aa689c2d3f95004ceb722590860799f4f427ceadb1810925fe95ec7c4eec1.
+Run this and the newly built candidate in the same invocation on fresh stores
+with unchanged APFS single/batch budgets 35/300ms. Earlier APFS baseline was
+36.909/1860.073ms; it is not a matched comparison. Crash check passed.
+Schema validation session 33684 is complete: three passing tests.
+Full workspace checks, focused safety tests, review and qualification of the
+new runtime change remain before publication. Preserve all evidence and the
+qualified older binaries; the newer source is not qualified for installation.
+
 ACTIVE CI REPAIRS (2026-10-19). The new operator goal authorizes repairing
 all PR #3 failures autonomously, merging the fork, upgrading locally and
 observing for 24 hours. Earlier scope questions and blocked status are
