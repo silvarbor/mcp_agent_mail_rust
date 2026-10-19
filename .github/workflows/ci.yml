@@ -77,7 +77,9 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold dependency build exceeded 30 minutes during Clippy, before tests.
+    # Keep all validation steps; this is a job deadline, not a latency budget.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
