@@ -184,7 +184,7 @@ case "${OS_NAME}" in
         STORAGE_ROOT="$(cd "${STORAGE_ROOT}" && pwd -P)"
         FS_LABEL="apfs"
         MOUNT_OPTIONS="runner-managed"
-        FSYNC_MODE="barrier_only"
+        FSYNC_MODE="full_flush"
         SINGLE_BUDGET_MS="35"
         BATCH_BUDGET_MS="300"
         ;;

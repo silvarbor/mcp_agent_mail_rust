@@ -86,7 +86,7 @@ CI-covered budgets:
 | ext4 (`data=journal`) | Linux loopback | `normal` | < 40ms | < 350ms | Higher journal cost; use when durability policy is stricter than latency policy |
 | xfs | Linux loopback | `normal` | < 25ms | < 250ms | Recommended for low-variance Linux server writes |
 | btrfs | Linux loopback | `normal` | < 50ms | < 500ms | Supported but slower under CoW + metadata pressure |
-| APFS | macOS runner | `barrier_only` | < 35ms | < 300ms | Durable rename + barrier semantics differ from Linux flush semantics |
+| APFS | macOS runner | `full_flush` | < 35ms | < 300ms | Rust file synchronization uses `F_FULLFSYNC` to flush the device cache |
 | tmpfs | Linux tmpfs | `buffered` | < 15ms | < 150ms | Canary only; not durable and still pays Git/process overhead, so treat it as a logic floor rather than a near-zero write budget |
 
 Documented but not yet CI-gated:
