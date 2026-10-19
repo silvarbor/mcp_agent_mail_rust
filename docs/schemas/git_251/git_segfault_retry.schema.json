@@ -9,7 +9,6 @@
   "x-event-names": [
     "git_segfault_retry_attempt",
     "git_segfault_retry_succeeded",
-    "git_segfault_retry_exhausted",
     "guard_git_segfault_retry",
     "guard_git_segfault_retry_exhausted",
     "git_locked_exit_segfault_like"
