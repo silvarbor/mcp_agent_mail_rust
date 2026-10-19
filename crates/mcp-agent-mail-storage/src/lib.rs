@@ -9249,6 +9249,12 @@ struct MessageBundleCommitMeta {
     summary_line: String,
 }
 
+struct PreparedMessageBundle {
+    commit: MessageBundleCommitMeta,
+    canonical_path: PathBuf,
+    timestamp: String,
+}
+
 fn visible_recipient_label(visible_recipients: &[String]) -> String {
     if visible_recipients.is_empty() {
         "(hidden recipients)".to_string()
@@ -9326,31 +9332,13 @@ fn message_paths_for_bundle(
     Ok((paths, created, timestamp_str))
 }
 
-fn reject_message_bundle_archive_collision_from_index(
-    existing_ids: &HashMap<i64, Vec<PathBuf>>,
-    archive: &ProjectArchive,
-    message: &serde_json::Value,
-    body_md: &str,
-    sender: &str,
-    recipients: &[String],
-) -> Result<()> {
-    let (paths, _created, _timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
-    let full_content = render_message_bundle_content(message, body_md)?;
-    reject_canonical_message_id_collision_from_index(
-        existing_ids,
-        message,
-        &paths.canonical,
-        &full_content,
-    )
-}
-
 fn append_message_bundle_files(
     archive: &ProjectArchive,
     entry: MessageBundleBatchEntry<'_>,
     rel_paths: &mut Vec<String>,
     existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
-) -> Result<MessageBundleCommitMeta> {
+    writes: &mut StagedArchiveWrites,
+) -> Result<PreparedMessageBundle> {
     let message = entry.message;
     let body_md = entry.body_md;
     let sender = entry.sender;
@@ -9381,43 +9369,21 @@ fn append_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    write_text(&paths.canonical, &full_content, true)?;
+    writes.add(&paths.canonical, full_content.as_bytes())?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.canonical,
     )?);
 
-    write_text(&paths.outbox, &full_content, true)?;
+    writes.add(&paths.outbox, full_content.as_bytes())?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.outbox,
     )?);
 
     for inbox_path in &paths.inbox {
-        write_text(inbox_path, inbox_content_ref, true)?;
+        writes.add(inbox_path, inbox_content_ref.as_bytes())?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
-    }
-
-    if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
-        let thread_id = thread_id.trim();
-        if !thread_id.is_empty() {
-            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
-            if let Ok(digest_rel) = update_thread_digest(
-                archive,
-                thread_id,
-                sender,
-                &visible_recipients,
-                message
-                    .get("subject")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                &timestamp_str,
-                body_md,
-                &canonical_rel,
-            ) {
-                rel_paths.push(digest_rel);
-            }
-        }
     }
 
     for p in extra_paths {
@@ -9425,12 +9391,49 @@ fn append_message_bundle_files(
         rel_paths.push(p.to_string());
     }
 
-    Ok(build_message_bundle_commit_meta(
-        message,
-        sender,
-        &visible_recipients,
-        &timestamp_str,
-    ))
+    Ok(PreparedMessageBundle {
+        commit: build_message_bundle_commit_meta(
+            message,
+            sender,
+            &visible_recipients,
+            &timestamp_str,
+        ),
+        canonical_path: paths.canonical,
+        timestamp: timestamp_str,
+    })
+}
+
+fn append_message_bundle_digest(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    prepared: &PreparedMessageBundle,
+    rel_paths: &mut Vec<String>,
+) -> Result<()> {
+    let message = entry.message;
+    if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            let canonical_rel =
+                rel_path_cached(&archive.canonical_repo_root, &prepared.canonical_path)?;
+            if let Ok(digest_rel) = update_thread_digest(
+                archive,
+                thread_id,
+                entry.sender,
+                &message_visible_recipients(message),
+                message
+                    .get("subject")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                &prepared.timestamp,
+                entry.body_md,
+                &canonical_rel,
+            ) {
+                rel_paths.push(digest_rel);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn dedup_repo_relative_paths(rel_paths: &mut Vec<String>) {
@@ -9566,23 +9569,17 @@ pub fn write_message_batch_bundle(
     with_project_lock(archive, || {
         let existing_message_ids = collect_existing_batch_message_ids(archive, entries)?;
 
+        // Preparation checks every collision before publication. A later
+        // rejection drops all staged files without exposing earlier entries.
+        let mut writes = StagedArchiveWrites::default();
+        let mut prepared = Vec::with_capacity(entries.len());
         for entry in entries {
-            reject_message_bundle_archive_collision_from_index(
-                &existing_message_ids,
-                archive,
-                entry.message,
-                entry.body_md,
-                entry.sender,
-                entry.recipients,
-            )?;
-        }
-
-        for entry in entries {
-            let commit_meta = match append_message_bundle_files(
+            let bundle = match append_message_bundle_files(
                 archive,
                 *entry,
                 &mut rel_paths,
                 Some(&existing_message_ids),
+                &mut writes,
             ) {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -9597,7 +9594,7 @@ pub fn write_message_batch_bundle(
                         outcome = "error",
                         git_version = git_version,
                         batch_id = %args_hash,
-                        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+                        files_written = 0u64,
                         total_bytes = total_bytes,
                         error_kind = %error_kind,
                         "disk_phase"
@@ -9620,10 +9617,15 @@ pub fn write_message_batch_bundle(
                     return Err(err);
                 }
             };
+            prepared.push(bundle);
+        }
+        writes.publish()?;
+        for (entry, bundle) in entries.iter().zip(prepared) {
+            append_message_bundle_digest(archive, *entry, &bundle, &mut rel_paths)?;
             if entries.len() == 1 {
-                single_auto_commit_message = Some(commit_meta.auto_commit_message);
+                single_auto_commit_message = Some(bundle.commit.auto_commit_message);
             }
-            summary_lines.push(commit_meta.summary_line);
+            summary_lines.push(bundle.commit.summary_line);
         }
         Ok(())
     })?;
@@ -9720,10 +9722,14 @@ pub fn write_message_bundle(
             recipients,
             extra_paths,
         };
-        let commit_meta = append_message_bundle_files(archive, entry, &mut rel_paths, None)?;
+        let mut writes = StagedArchiveWrites::default();
+        let prepared =
+            append_message_bundle_files(archive, entry, &mut rel_paths, None, &mut writes)?;
+        writes.publish()?;
+        append_message_bundle_digest(archive, entry, &prepared, &mut rel_paths)?;
         let commit_message = commit_text
             .map(ToString::to_string)
-            .unwrap_or(commit_meta.auto_commit_message);
+            .unwrap_or(prepared.commit.auto_commit_message);
 
         enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
@@ -13435,7 +13441,7 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
 
-    let tmp_path = stage_atomic_write(path, data, sync)?;
+    let (tmp_path, _file) = stage_atomic_write(path, data, sync)?;
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err.into());
@@ -13443,31 +13449,58 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     Ok(())
 }
 
-/// Archive files written and synced under temp names beside their targets,
+/// Archive files staged under temp names beside their targets,
 /// then renamed into place together inside one archive mutation window
 /// (br-9bwnb). Staging needs no publication fence: readers only open named
 /// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
 /// Whatever is still staged when this drops is removed.
+#[derive(Default)]
 struct StagedArchiveWrites {
     /// `(temp path, target path)` pairs not yet renamed into place.
     staged: Vec<(PathBuf, PathBuf)>,
+    /// One open file per device keeps descriptor use independent of batch size.
+    #[cfg(target_vendor = "apple")]
+    devices: HashMap<u64, fs::File>,
 }
 
 impl StagedArchiveWrites {
-    /// Write and `fdatasync` each file under a temp name beside its target.
+    /// Stage every file; publication completes synchronization before renaming.
     fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
-        let mut writes = Self {
-            staged: Vec::with_capacity(files.len()),
-        };
+        let mut writes = Self::default();
+        writes.staged.reserve(files.len());
         for (path, data) in files {
-            let tmp_path = stage_atomic_write(&path, &data, true)?;
-            writes.staged.push((tmp_path, path));
+            writes.add(&path, &data)?;
         }
         Ok(writes)
     }
 
+    fn add(&mut self, path: &Path, data: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let (tmp_path, file) = stage_atomic_write(path, data, !cfg!(target_vendor = "apple"))?;
+        self.staged.push((tmp_path, path.to_path_buf()));
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            // Apple fsync writes this file to the device. F_FULLFSYNC also
+            // flushes the device cache, so perform that once per device after
+            // all files have reached it, before publishing any of them.
+            nix::unistd::fsync(&file).map_err(std::io::Error::from)?;
+            self.devices.entry(file.metadata()?.dev()).or_insert(file);
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        drop(file);
+        Ok(())
+    }
+
     /// Rename every staged file into place inside one archive mutation window.
     fn publish(mut self) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        for file in self.devices.values() {
+            file.sync_data()?;
+        }
         let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
             return Ok(());
         };
@@ -13493,9 +13526,9 @@ impl Drop for StagedArchiveWrites {
 }
 
 /// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
-/// return the temp path for the caller to rename into place. `create_new`
+/// return the temp path and open file for the caller to sync and publish. `create_new`
 /// means a pre-existing file or symlink at a temp name is never clobbered.
-fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<(PathBuf, fs::File)> {
     use std::io::Write as _;
 
     #[cfg(test)]
@@ -13528,7 +13561,7 @@ fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = atomic_write_tmp_path(parent, path, seq);
 
-        let result: std::io::Result<()> = (|| {
+        let result: std::io::Result<fs::File> = (|| {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -13537,11 +13570,11 @@ fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
             if sync {
                 f.sync_data()?;
             }
-            Ok(())
+            Ok(f)
         })();
 
         match result {
-            Ok(()) => return Ok(tmp_path),
+            Ok(file) => return Ok((tmp_path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -15418,6 +15451,51 @@ mod tests {
         assert!(staged_temp_files(tmp.path()).is_empty());
         assert_eq!(fs::read_to_string(blocked.join("keep")).unwrap(), "keep");
         assert!(!later.exists(), "publication stops at the failed rename");
+    }
+
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_staging_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let blocked_parent = tmp.path().join("not-a-directory");
+        fs::write(&blocked_parent, "keep").unwrap();
+
+        let result = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (blocked_parent.join("child.json"), b"{}".to_vec()),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert_eq!(fs::read_to_string(blocked_parent).unwrap(), "keep");
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_device_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let later = tmp.path().join("later.json");
+        let mut staged = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        // Exercise a real failing full-sync syscall at the device boundary.
+        // No file may be published even if every preceding file fsync passed.
+        for device in staged.devices.values_mut() {
+            *device = fs::File::open("/dev/null").unwrap();
+        }
+
+        let result = staged.publish();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert!(!later.exists());
+        assert!(staged_temp_files(tmp.path()).is_empty());
     }
 
     #[test]
