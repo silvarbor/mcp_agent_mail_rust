@@ -10,13 +10,9 @@
     "sentinel_path_unresolved_no_flock",
     "sentinel_parent_missing_no_flock",
     "flock_readonly_fallback",
-    "flock_acquired_nonblocking",
-    "flock_waiting",
-    "flock_acquired_after_wait",
-    "flock_timeout_aborting",
+    "flock_acquired",
     "flock_still_waiting",
-    "flock_unlock_failed",
-    "flock_acquire_failed"
+    "flock_unlock_failed"
   ],
   "x-drift-required-fields": [],
   "properties": {
@@ -41,6 +37,7 @@
         "sentinel_path": { "type": "string" },
         "wait_seconds": { "type": "number", "minimum": 0 },
         "waited_s": { "type": "integer", "minimum": 0 },
+        "waited_ms": { "type": "integer", "minimum": 0 },
         "wait_ms": { "type": "integer", "minimum": 0 },
         "readonly": { "type": "boolean" },
         "err": { "type": "string" },
