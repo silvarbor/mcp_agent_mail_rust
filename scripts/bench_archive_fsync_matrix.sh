@@ -78,6 +78,7 @@ require_cmd cargo
 require_cmd python3
 
 mkdir -p "${OUTPUT_DIR}"
+OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
 
 OS_NAME="$(uname -s)"
 STORAGE_ROOT=""

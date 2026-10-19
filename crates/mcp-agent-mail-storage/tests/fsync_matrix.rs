@@ -217,10 +217,19 @@ fn measure_batch_message(storage_root: &Path) -> PercentileSummary {
         let started = Instant::now();
         write_message_batch_bundle(&archive, &config, &entries, None)
             .expect("write batch message bundle");
+        let write_elapsed = started.elapsed();
         flush_async_commits();
+        let total_elapsed = started.elapsed();
         if run_idx > 0 {
-            samples.push(duration_to_micros(started.elapsed()));
+            samples.push(duration_to_micros(total_elapsed));
         }
+        // Log after measuring so diagnostics do not enter the latency sample.
+        eprintln!(
+            "batch sample {run_idx}: write_ms={:.3}, flush_ms={:.3}, total_ms={:.3}",
+            write_elapsed.as_secs_f64() * 1000.0,
+            total_elapsed.saturating_sub(write_elapsed).as_secs_f64() * 1000.0,
+            total_elapsed.as_secs_f64() * 1000.0,
+        );
     }
 
     PercentileSummary::from_micros(samples)
