@@ -62,7 +62,7 @@ Current blocker on `2026-04-18`:
 - Treat `<= 10%` p95 drift on the same host as noise.
 - Investigate `> 10%` drift; escalate at `>= 20%` or after three consecutive `> 10%` runs.
 - Cross-host comparisons are advisory only; NVMe model, filesystem, mount options, and kernel materially affect `fsync`-heavy workloads.
-- If a same-host rerun breaches the envelope after an archive-path change, follow [docs/OPERATOR_RUNBOOK.md](/data/projects/mcp_agent_mail_rust/docs/OPERATOR_RUNBOOK.md#emergency-roll-back-archive-batch-write-optimization).
+- If a same-host rerun breaches the envelope after an archive-path change, preserve the failing measurements and verify the previous qualified build on that host before choosing a rollback.
 
 ### Cross-Filesystem Fsync Matrix (br-8qdh0.11)
 
