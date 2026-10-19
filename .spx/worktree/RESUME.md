@@ -1,5 +1,52 @@
 # Resume — local Agent Mail fork
 
+ACTIVE CI REPAIRS (2026-10-19). The new operator goal authorizes repairing
+all PR #3 failures autonomously, merging the fork, upgrading locally and
+observing for 24 hours. Earlier scope questions and blocked status are
+superseded. The installed service remains unchanged.
+
+Integration review a91eead5 and supplemental workflow review c48d05fa passed.
+The 3600-second isolated workload passed 540 sends/540 read-ack cycles,
+three cold integrity/FK/exact-continuity checks and two restarts. Browser
+38 assertions and HTTP 102 assertions passed; matched CPU was comparable,
+unchanged DOM/arrays were retained, and max refresh concurrency was one.
+Full evidence and binary hashes are in
+~/.local/state/mcp-agent-mail/integration/20261015-preservation/review-qualification-status.md.
+
+Six new local commits end at 0b148f41249b99d5c68553299fdc782b6e8abe40:
+installer history ERR handling, ATC runner temp path, APFS physical path,
+dashboard lockfile package version, observability schemas/fixtures and
+native CI cold-build deadline. No runtime Rust implementation changed.
+Installer regressions: original source fails 6/52; repaired source passes
+52/52 and all four full signed-release install modes. Observability drift
+is zero with six checker unit tests and five negative-control E2E scenarios
+passing. Dashboard locked metadata passes against CI's pinned FrankenTUI.
+Actionlint, shell syntax and diff whitespace pass.
+
+Active validation: exec session 33684 runs CARGO_BUILD_JOBS=2,
+CARGO_INCREMENTAL=0 cargo test -p mcp-agent-mail-server --test it
+observability_schemas::. Log: evidence-root/observability-rust-20261019.log.
+Collect this process; do not start a duplicate. Build target was recreated
+after the earlier authorized cleanup; clean it after validation. Disk was
+12 GiB available during compilation. Minisign 0.12 was installed to run
+the signed installer proof; scratch installs are isolated from the live store.
+
+Remaining: collect schema test; review the committed CI repair scope;
+diagnose/fix unchanged ext4/xfs batch-write latency budget failures; rerun
+CI (archive perf's prior runner was shut down during compilation). Preserve
+latency budgets, symlink protection and tests. Then complete fork merge,
+supervised backup/upgrade/smoke and full 24-hour observation. PR #3 remains
+at c48d05fa until the new commits are reviewed/pushed. Older sections below
+are history; do not repeat completed reviews or qualification without a
+relevant source change.
+
+Filesystem diagnostic follow-up: downloaded ext4 artifact contained only
+environment.json. The script passed a relative output path while Cargo runs
+tests in the crate directory; canonicalizing OUTPUT_DIR fixes summary upload.
+The probe now reports write and flush durations after capturing each unchanged
+total sample. Formatting and whitespace checks pass; compiled validation is
+pending after schema session 33684. Use the same target directory sequentially.
+
 READY FOR SECOND REVIEW (2026-10-18). All repair source is committed through
 84b7ff8a60b495c2e3955f6d81f89ded980e97de. Session 72503 completed exit 0:
 13 session-identity integration tests, two registration regressions, strict
