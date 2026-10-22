@@ -13990,9 +13990,14 @@ fn append_atc_hot_path_observation_row(
     let started_at = Instant::now();
     let stratum_key = atc_experience_stratum_key(row);
     let feature_vector_size = atc_feature_vector_size(row);
-    match atc_ledger_block_on(|cx| async move {
-        mcp_agent_mail_db::queries::append_atc_experience(&cx, pool, row).await
-    }) {
+    let result = match mcp_agent_mail_db::queries::append_atc_experience_if_initialized(pool, row) {
+        Ok(Some(stored)) => asupersync::Outcome::Ok(stored),
+        Ok(None) => atc_ledger_block_on(|cx| async move {
+            mcp_agent_mail_db::queries::append_atc_experience(&cx, pool, row).await
+        }),
+        Err(error) => asupersync::Outcome::Err(error),
+    };
+    match result {
         asupersync::Outcome::Ok(stored) => {
             let latency_micros = atc_elapsed_micros(started_at);
             mcp_agent_mail_core::global_metrics()

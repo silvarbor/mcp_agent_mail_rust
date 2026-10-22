@@ -1386,60 +1386,61 @@ fn canonical_table_columns(
 
 fn inspect_canonical_atc_schema(pool: &DbPool) -> std::result::Result<Vec<String>, DbError> {
     let conn = open_canonical_atc_conn(pool, "inspect canonical ATC schema")?;
-    let result = (|| {
-        let mut missing = Vec::new();
-
-        let experience_columns = canonical_table_columns(
-            &conn,
-            "atc_experiences",
-            "inspect canonical ATC experience columns",
-        )?;
-        if experience_columns.is_empty() {
-            missing.push("table atc_experiences".to_string());
-        } else {
-            for column in REQUIRED_ATC_EXPERIENCE_COLUMNS {
-                if !experience_columns.contains(*column) {
-                    missing.push(format!("atc_experiences.{column}"));
-                }
-            }
-        }
-
-        let rollup_columns = canonical_table_columns(
-            &conn,
-            "atc_experience_rollups",
-            "inspect canonical ATC rollup columns",
-        )?;
-        if rollup_columns.is_empty() {
-            missing.push("table atc_experience_rollups".to_string());
-        } else {
-            for column in REQUIRED_ATC_ROLLUP_COLUMNS {
-                if !rollup_columns.contains(*column) {
-                    missing.push(format!("atc_experience_rollups.{column}"));
-                }
-            }
-        }
-
-        for (table_name, required_columns) in REQUIRED_ATC_AUXILIARY_TABLES {
-            let columns = canonical_table_columns(
-                &conn,
-                table_name,
-                "inspect canonical ATC auxiliary columns",
-            )?;
-            if columns.is_empty() {
-                missing.push(format!("table {table_name}"));
-                continue;
-            }
-            for column in *required_columns {
-                if !columns.contains(*column) {
-                    missing.push(format!("{table_name}.{column}"));
-                }
-            }
-        }
-
-        Ok(missing)
-    })();
+    let result = inspect_canonical_atc_schema_on_connection(&conn);
     close_canonical_db_conn(conn, "canonical ATC schema inspection connection");
     result
+}
+
+fn inspect_canonical_atc_schema_on_connection(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<Vec<String>, DbError> {
+    let mut missing = Vec::new();
+
+    let experience_columns = canonical_table_columns(
+        conn,
+        "atc_experiences",
+        "inspect canonical ATC experience columns",
+    )?;
+    if experience_columns.is_empty() {
+        missing.push("table atc_experiences".to_string());
+    } else {
+        for column in REQUIRED_ATC_EXPERIENCE_COLUMNS {
+            if !experience_columns.contains(*column) {
+                missing.push(format!("atc_experiences.{column}"));
+            }
+        }
+    }
+
+    let rollup_columns = canonical_table_columns(
+        conn,
+        "atc_experience_rollups",
+        "inspect canonical ATC rollup columns",
+    )?;
+    if rollup_columns.is_empty() {
+        missing.push("table atc_experience_rollups".to_string());
+    } else {
+        for column in REQUIRED_ATC_ROLLUP_COLUMNS {
+            if !rollup_columns.contains(*column) {
+                missing.push(format!("atc_experience_rollups.{column}"));
+            }
+        }
+    }
+
+    for (table_name, required_columns) in REQUIRED_ATC_AUXILIARY_TABLES {
+        let columns =
+            canonical_table_columns(conn, table_name, "inspect canonical ATC auxiliary columns")?;
+        if columns.is_empty() {
+            missing.push(format!("table {table_name}"));
+            continue;
+        }
+        for column in *required_columns {
+            if !columns.contains(*column) {
+                missing.push(format!("{table_name}.{column}"));
+            }
+        }
+    }
+
+    Ok(missing)
 }
 
 /// Summary returned by ATC feature-schema reprocessing.
@@ -2648,21 +2649,27 @@ fn canonical_fetch_atc_experience_by_decision_effect(
     effect_id: i64,
 ) -> std::result::Result<Option<ExperienceRow>, DbError> {
     let conn = open_canonical_atc_conn(pool, "fetch durable ATC experience by decision/effect")?;
-    let result = (|| {
-        let sql = format!(
-            "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
-        );
-        let params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
-        let rows = canonical_query_atc_rows(
-            &conn,
-            &sql,
-            &params,
-            "fetch durable ATC experience by decision/effect",
-        )?;
-        rows.first().map(decode_atc_experience_row).transpose()
-    })();
+    let result = canonical_select_atc_experience_by_decision_effect(&conn, decision_id, effect_id);
     close_canonical_db_conn(conn, "canonical ATC decision/effect fetch connection");
     result
+}
+
+fn canonical_select_atc_experience_by_decision_effect(
+    conn: &crate::CanonicalDbConn,
+    decision_id: i64,
+    effect_id: i64,
+) -> std::result::Result<Option<ExperienceRow>, DbError> {
+    let sql = format!(
+        "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
+    );
+    let params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
+    let rows = canonical_query_atc_rows(
+        conn,
+        &sql,
+        &params,
+        "fetch durable ATC experience by decision/effect",
+    )?;
+    rows.first().map(decode_atc_experience_row).transpose()
 }
 
 fn canonical_fetch_atc_experience_by_id(
@@ -2683,6 +2690,46 @@ fn canonical_fetch_atc_experience_by_id(
 
 fn append_atc_experience_file_backed(
     pool: &DbPool,
+    row: &ExperienceRow,
+) -> std::result::Result<ExperienceRow, DbError> {
+    let conn = open_canonical_atc_conn(pool, "append_atc_experience")?;
+    let result = append_atc_experience_on_connection(pool, &conn, row);
+    close_canonical_db_conn(conn, "canonical ATC append connection");
+    result
+}
+
+/// Append synchronously when the file-backed ATC schema is complete.
+///
+/// Returns `None` for in-memory pools or schemas needing migration; callers
+/// then use [`append_atc_experience`]. Every call revalidates filesystem
+/// authority and schema, and completes the same transaction and row ceiling
+/// before returning. Inspection, insertion and read-back share one connection.
+/// This lets synchronous observers avoid creating an async runtime per row.
+///
+/// # Errors
+/// Returns database, authority, validation or transaction errors without retrying
+/// a potentially committed append through the migration path.
+pub fn append_atc_experience_if_initialized(
+    pool: &DbPool,
+    row: &ExperienceRow,
+) -> std::result::Result<Option<ExperienceRow>, DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(None);
+    }
+    let conn = open_canonical_atc_conn(pool, "append initialized ATC experience")?;
+    let result = (|| {
+        if !inspect_canonical_atc_schema_on_connection(&conn)?.is_empty() {
+            return Ok(None);
+        }
+        append_atc_experience_on_connection(pool, &conn, row).map(Some)
+    })();
+    close_canonical_db_conn(conn, "initialized ATC append connection");
+    result
+}
+
+fn append_atc_experience_on_connection(
+    pool: &DbPool,
+    conn: &crate::CanonicalDbConn,
     row: &ExperienceRow,
 ) -> std::result::Result<ExperienceRow, DbError> {
     fn sql_i64_id(field: &str, value: u64) -> std::result::Result<i64, DbError> {
@@ -2706,9 +2753,8 @@ fn append_atc_experience_file_backed(
     let feature_ext_json = encode_json_optional(&feature_payload.feature_ext, "feature_ext_json")?;
     let context_json = encode_json_optional(&row.context, "context_json")?;
 
-    let conn = open_canonical_atc_conn(pool, "append_atc_experience")?;
     let write_result = (|| {
-        begin_canonical_atc_write_tx(&conn)?;
+        begin_canonical_atc_write_tx(conn)?;
         let insert_sql = "INSERT INTO atc_experiences \
             (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -2752,7 +2798,7 @@ fn append_atc_experience_file_backed(
             context_json.map_or(Value::Null, Value::Text),
         ];
         let inserted = canonical_execute_atc(
-            &conn,
+            conn,
             insert_sql,
             &insert_params,
             "append_atc_experience insert",
@@ -2763,7 +2809,7 @@ fn append_atc_experience_file_backed(
         // incident during the sweep interval.
         if inserted > 0 && pool.atc_experience_max_rows() > 0 {
             let evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
-                &conn,
+                conn,
                 pool.atc_experience_max_rows(),
             )?;
             if evicted > 0 {
@@ -2774,15 +2820,14 @@ fn append_atc_experience_file_backed(
                 );
             }
         }
-        commit_canonical_atc_write_tx(&conn)
+        commit_canonical_atc_write_tx(conn)
     })();
     if write_result.is_err() {
-        rollback_canonical_atc_write_tx(&conn);
+        rollback_canonical_atc_write_tx(conn);
     }
-    close_canonical_db_conn(conn, "canonical ATC append connection");
     write_result?;
 
-    canonical_fetch_atc_experience_by_decision_effect(pool, decision_id, effect_id)?.ok_or_else(
+    canonical_select_atc_experience_by_decision_effect(conn, decision_id, effect_id)?.ok_or_else(
         || {
             DbError::Internal(format!(
                 "ATC experience append succeeded but re-select failed for decision_id={decision_id} effect_id={effect_id}"
@@ -17977,6 +18022,11 @@ pub async fn append_atc_experience(
     row: &ExperienceRow,
 ) -> Outcome<ExperienceRow, DbError> {
     if pool.sqlite_path() != ":memory:" {
+        match append_atc_experience_if_initialized(pool, row) {
+            Ok(Some(stored)) => return Outcome::Ok(stored),
+            Ok(None) => {}
+            Err(error) => return Outcome::Err(error),
+        }
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
             Outcome::Err(error) => return Outcome::Err(error),
@@ -22295,6 +22345,14 @@ mod tests {
                 .await
                 .into_result()
                 .expect("second append");
+            let synchronous = append_atc_experience_if_initialized(&pool, &row)
+                .expect("synchronous duplicate append")
+                .expect("initialized sidecar uses the synchronous path");
+
+            assert_eq!(
+                synchronous, first,
+                "synchronous append must return the complete stored row"
+            );
 
             assert_eq!(
                 first.experience_id, second.experience_id,
@@ -23403,8 +23461,8 @@ mod tests {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("partial_atc_schema.db");
-        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
-            .expect("open canonical sqlite");
+        let atc_path = crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref());
+        let conn = crate::CanonicalDbConn::open_file(&atc_path).expect("open canonical sqlite");
         conn.execute_raw(crate::schema::PRAGMA_DB_INIT_BASE_SQL)
             .expect("apply base pragmas");
         conn.execute_raw(
@@ -23446,7 +23504,11 @@ mod tests {
             "ATC init should converge the partial schema to the full required surface"
         );
 
-        let verify_conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+        assert!(
+            !db_path.exists(),
+            "sidecar schema repair must not create the primary mailbox"
+        );
+        let verify_conn = crate::CanonicalDbConn::open_file(&atc_path)
             .expect("open canonical sqlite verification connection");
         verify_conn
             .execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
