@@ -18,6 +18,10 @@ jobs:
     name: Dashboard WASM + Exporter Matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Use the toolchain receiving this job's WASM target, rather than the
+      # native workspace's rust-toolchain.toml override.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
 
