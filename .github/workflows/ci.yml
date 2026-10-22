@@ -138,6 +138,21 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+      - name: Install pinned Beads CLI for real-command tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_tools="${RUNNER_TEMP}/beads-0.6.0-fixture-tools"
+          mkdir -p "$fixture_tools"
+          cd "$fixture_tools"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output br-0.6.0-linux_amd64.tar.gz \
+            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.6.0/br-0.6.0-linux_amd64.tar.gz
+          echo 'f6f9a1663bae31e94d2dcfec62163f15b17f822711c486e860183a654784829b  br-0.6.0-linux_amd64.tar.gz' | sha256sum --check --strict
+          tar -xzf br-0.6.0-linux_amd64.tar.gz br
+          ./br --version
+          echo "$fixture_tools" >> "$GITHUB_PATH"
+
       - name: Unit + integration tests
         run: cargo test --workspace
         env:
