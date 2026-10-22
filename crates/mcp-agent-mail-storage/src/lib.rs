@@ -24190,8 +24190,10 @@ mod tests {
         fs::write(&lock_path, "fake lock").unwrap();
         write_lock_owner(&archive.repo_root);
 
-        // Stale lock cleanup should NOT remove the lock (PID is alive)
-        let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
+        // Exercise a fresh live-owner lock with the archive's actual expiry.
+        // A zero threshold explicitly expires unknown-start-time owners on macOS.
+        let removed =
+            try_clean_stale_git_lock(&archive.repo_root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS);
         assert!(!removed, "should not remove lock owned by alive PID");
         assert!(lock_path.exists(), "lock file should still exist");
 
