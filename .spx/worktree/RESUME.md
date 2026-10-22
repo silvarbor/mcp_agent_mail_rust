@@ -1,5 +1,27 @@
 # Resume — local Agent Mail fork
 
+CURRENT: conformance36804 passed83/83 in32.05s under HTTP_PORT=1 and
+PROJECT_IDENTITY_MODE=git-common-dir. Initial68369 passed82/83, revealing the
+identity fixture leak after endpoint/catalog repairs; explicit dir-mode fix
+committed6a03d2b87614237b4b92702850230dc23631dcb4. fmt/diff90851 passed.
+No Rust compilation active. All-off negative-control10905 running:9fixed runs,
+same frozen candidate binary, identical off behavior in all positions. Script
+and log at evidence-root/atc-null-control-20261023{.py,.log}; results in same
+basename directory. Diagnostic only; collect same handle, don't start compiler
+until it exits. Designed to test false positives of sequential mode comparisons.
+Counterbalanced1424 completed0 with18runs/allintegrity checks pass; baseline
+shadow overhead1.28/23.84/36.42%, live25.19/18.01/-10.18%; candidate shadow
+22.03/-19.89/-41.68%,live18.04/47.33/6.79%. No gate pass claimed or limits changed.
+Evidence atc-counterbalanced-20261023/round-*/result.json. Timings alone cannot
+attribute these swings; direct shadow sample shows11ATC-observer samples vs
+1768archive-write samples (inclusive/overlapping). Preserve schema, authority,
+collision and durability protections while investigating.
+Required implementation auditor wrapper_manifest_review now checks exact Rust
+candidate8d5f6635..27c1efd0 for correctness; collect returned projection. Shell
+advisory review read both changed files withzero findings but failed scope due
+dirty unrelated files; reusable clean-tree review still required. Full goal
+remains CIrepairs, exact qualification, forkmerge, supervisedcutover,24hwatch.
+
 Current checkpoints: wrapper8d5f6635, ATC27c1efd03d28773f1cc5a7ea7df487ad929cebcd,
 conformance29971c31ce676e25f2a50a927f4129d1e6d2d496. Normal hooks, separate concerns.
 Conformance68369 still compiling at latest live poll; two jobs, disk7.7GiB free.
