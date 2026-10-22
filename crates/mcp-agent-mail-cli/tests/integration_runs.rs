@@ -3141,17 +3141,37 @@ fn guard_check_without_identity_warns_in_warn_mode_and_fails_when_enforcing() {
         let repo_str = guard_repo_with_foreign_reservation(&env);
         let mut child_env: Vec<_> = guard_blocking_env(&env)
             .into_iter()
+            .chain(env.hermetic_env())
             .filter(|(var, _)| var != "AGENT_NAME")
             .collect();
         child_env.push(("AGENT_MAIL_GUARD_MODE".to_string(), mode.to_string()));
-        let out = run_am(
-            &child_env,
-            Some(env.tmp.path()),
-            &["guard", "check", "--repo", &repo_str],
-            Some(b"foo.txt\n"),
-        );
+        let mut child = Command::new(am_bin())
+            .env_clear()
+            .envs(child_env)
+            .current_dir(env.tmp.path())
+            .args(["guard", "check", "--repo", &repo_str])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn guard without inherited identity");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("guard stdin")
+                .write_all(b"foo.txt\n")
+                .expect("write guard paths");
+        }
+        let out = child.wait_with_output().expect("wait for guard");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.success(), warned, "{mode}: stderr:\n{stderr}");
+        assert_eq!(
+            out.status.success(),
+            warned,
+            "{mode}: status {} stderr:\n{stderr}",
+            out.status
+        );
         assert_eq!(
             stderr.contains("no agent identity"),
             warned,

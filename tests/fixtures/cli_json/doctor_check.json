@@ -115,7 +115,7 @@
     {
       "category": "environment",
       "check": "binary_resolution",
-      "detail": "'am' resolves to <TMP_ROOT>/home/.local/bin/am (zsh)",
+      "detail": "'am' resolves to <TMP_ROOT>/home/.local/bin/am (<LOGIN_SHELL>)",
       "status": "ok"
     },
     {
