@@ -277,6 +277,8 @@ fn error_code_catalog_is_stable() {
         "INCONSISTENT_STATE",
         "INVALID_AGENT_NAME",
         "INVALID_ARGUMENT",
+        // Display labels reject control characters and excessive length.
+        "INVALID_DISPLAY_NAME",
         "INVALID_LIMIT",
         "INVALID_PATH",
         "INVALID_PATHS",
