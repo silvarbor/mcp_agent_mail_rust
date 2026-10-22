@@ -2,6 +2,359 @@
 
 ## Current resume checkpoint — active, 2026-10-22
 
+FINAL LOCAL GATES85181 terminal0: workspace all-target47.85s,production28.83s,
+strictClippy56.86s,formatting and whitespace PASS. No active heavy command.
+Repairs checkpointed by concern with normal hooks: CLI fixture de6f142a,
+storage fixture c4ee59fe,storage performance4a63da7a,benchmark repairb46eeb2a.
+Next required independent review spans remote PR head9271c52f through the
+new clean local head, including the two earlier workflow fixes. Full native
+CI/storage suite, Linux filesystem gates, final-binary runtime/browser proof,
+fork merge, supervised cutover and24h observation remain. Earlier candidate
+and check-active paragraphs below are historical. No publication or live change.
+
+DIGEST COMPARISON61630 terminal0: same-invocation APFS baseline and candidate
+both pass original35/300ms budgets. Batch p50/p95 baseline252.531/284.936ms,
+candidate242.350/270.019ms. Single p95 baseline22.915ms,candidate30.553ms.
+Both crash/reopen probes retain100messages/two commits. Evidence and binary
+hashes: fsync-digest-batch-matched-20261022/{baseline,candidate}. This supports
+a modest batch improvement on this run; no general speedup or Linux pass.
+Digest safety77024 PASS6/6,0.69s; integration probe build21.92s. Candidate
+message regressions14/14 also pass. Required workspace all-target,production,
+strictClippy and formatting now run sequentially; collect the current session
+before another heavy job. Logs digest-final-{all-targets,production,clippy}
+with -20261022.log. Full storage suite and independent review remain required;
+then publish reviewed repairs and obtain fresh CI. No service change.
+
+DIGEST BATCH candidate is now uncommitted in storage/lib.rs. Batch writes group
+rendered thread entries by sanitized digest filename, retain per-file input
+order and first header spelling, and append once per digest under the existing
+project lock/fence. Single-message formatting, path checks and best-effort
+digest publication remain. Git filtering and synchronization are unchanged.
+Existing digest baseline6/6 and layout baseline1/1 passed before edits.
+Candidate write_message_ group14/14 passes0.82s, including expanded complete
+archive comparison with interleaved threads and case-colliding filenames.
+Session77024 runs final digest safety group then rebuilds the integration
+probe; collect before measurement. Logs digest-batch-{safety,probe-build} and
+digest-batch-messages with -20261022.log. No performance claim yet. Compare
+preserved storage-before-tree-cache-20261022 against rebuilt probe sequentially
+in one invocation on fresh APFS stores, unchanged35/300ms budgets.
+
+RECOVERY UPDATE: session19579 completed. Matched baseline batch p95 was
+305.682ms; tree-cache candidate312.981ms, both above300ms. Single p95 was
+24.444/20.084ms; both crash probes retained100messages/two commits. The cache
+production change was reverted; its patch is preserved in evidence-root/
+tree-cache-experiment-20261022.patch. The real Git safety test remains as
+tree_updates_preserve_bases_deletions_and_update_order. Current compiled probe
+still contains the rejected experiment until rebuilt; do not qualify it as
+current source. Earlier candidate-active paragraphs below are historical.
+The full delivery goal remains active, with no pending operator choice.
+Inspection confirms flush_sync requests immediate worker readiness and polls
+completion every5ms; no evidence currently attributes the130ms flush duration
+to an intentional coalescing delay. Continue diagnosis of actual commit work.
+Missing /data/projects/AGENTS.md remains covered by operator-deferred br-rpa0b.
+Current-source tree regression17719 terminal0:1passed,0failed,0.02s after
+34.32s compile; log tree-semantics-after-revert-20261022.log. Whitespace check
+passes. No active heavy process remains. GitHub access succeeds; PR3 is OPEN
+at9271c52f with mergeStateStatus UNSTABLE. No new source commit or deployment.
+Profile inspection narrows the next investigation: sample.txt lines1161–1255
+show one worker's86active samples in blob_path, including attribute/filter
+lookup, canonicalization, object creation and object timestamp refresh. These
+sample counts are diagnostic, not elapsed-time attribution or qualification.
+git2 blob_path preserves path-dependent Git filters; substituting repo.blob
+would alter that behavior. Preserve filters, deletions and path safety in any
+candidate optimization. The earlier subtree-cache experiment gave no win.
+
+TREE CACHE candidate implemented, uncommitted: build_tree_with_updates now uses
+a per-call cache keyed by immutable base treeOID and exact ordered relative
+updates. Reuses identical canonical/inbox/outbox subtrees; preserves distinct
+bases, last-write order and deletion semantics. No sync/path guard changed.
+Real Git regression PASS1/1; lockfree group3/3; message-write group14/14.
+Session66825 terminal0 (unit compile35.61s, probe compile23.85s). Logs
+tree-cache-{safety,lockfree,messages,probe-build}-20261022.log.
+Pre-change probe preserved at evidence-root/storage-before-tree-cache-20261022,
+SHA256462f1cb930c78139de77ee4ac850a641177459130d7c20b0bbdff63c45d0c0f2.
+Session19579 runs same-invocation APFS baseline then candidate, independent
+stores, original35/300ms budgets, each process-group deadline180s. Collect it
+before another heavy run. Evidence fsync-tree-cache-matched-20261022/{baseline,
+candidate}/{probe.log,summary.json}; no passing performance claim yet.
+
+LATEST checks79486 terminal0: all-target18.15s,production11.92s,strictClippy18.13s,
+formatting/whitespace PASS. No heavy session remains. ATC gate has real-path local
+pass and56E2E assertions; final head still needs independent review and CI.
+Next bounded repair: storage batchp95 remains311.836/300ms. The profile shows
+repeated identical Git subtree construction across canonical/inbox/outbox.
+Evaluate a per-commit cache keyed by base treeOID plus exact ordered updates;
+preserve distinct bases, update/deletion order, all sync and path guards. Add
+real Git preservation tests and rerun the unchanged APFS/filesystem budgets.
+No cache edit exists yet. Keep source candidate stable per measured run; retain
+all current uncommitted CLI/ATC/storage repairs and do not rebuild the live app.
+
+ATC/benchmark final E2E61533 terminal0:56assertionspass,0fail,0skip,artifact
+validation passes; artifacts tests/artifacts/bench/20261022_205644 and log
+bench-e2e-final-20261022.log. New real-server negative case disables ATC behind
+the driver, completes sends, then correctly rejects live rowcount0. This proves
+successful fast requests cannot substitute for the durable ATC path.
+Bench unit26002 PASS26/26. Repaired general catalog full run succeeds with12
+supported commands; four dead entries removed after actual CLI parser refusal.
+Full E2E37556 had53pass/1fail solely because saved-baseline comparison returned
+valid regression3 (help p95 7.22→8.12ms). The test now accepts0or3 only and checks
+exit agrees with regression field; existing forced-regression test and5%ATC
+budget preserved. No pass gained by changing a performance limit.
+Required all-target/production/Clippy/fmt checks now run sequentially; collect
+the active session from the turn before another heavy command. Logs
+atc-transport-{all-targets,production,clippy}-20261022.log. Python Ruff/format/
+strict mypy and shellcheck/syntax pass. No remote publication or live change.
+Failed historical artifact bundle remains intact at bench/20261022_204441:
+command guard rejected relocation into the dot-state evidence directory; no
+move/deletion occurred. Its old malformed-input record is retained failure
+evidence; new runs use raw.stdout.txt and valid adjacent rejection JSON.
+
+ATC transport repair underway: new scripts/bench_atc_transport.py runs real
+persistent MCP stdio per mode, identical60seed+3warmup+50measured sends,
+isolated HOME/config/DB/archive, full integrity and exact113message/ATC-row
+checks after EOF. Live must persist113ATC rows; off/shadow0. Protocol/exit/
+persistence failures fail measurement. The shell gate invokes this driver;
+historical CLI process timings are explicitly incomparable,5%budget unchanged.
+First real gate43797 PASS: p95 off46.441459/shadow35.847750/live35.215959ms;
+three stores113messages/integrityok,live113ATC; separatecanary1ATCrow/quick_checkok.
+Evidence atc-transport-gate-20261022; no speedup claim from noisy negativeoverhead.
+Later helper edits add binarySHA provenance and reap peers even on brokenpipe.
+Ruff/mypy pass; shellcheck subshell-binary defect corrected without suppression.
+
+Full benchmark E2E73242 terminal1:50assertionspass,1full-run casefail; all new
+protocol/durability assertions passed. Artifact validation also rejected the
+deliberately malformed JSONL fixture: raw protocol fixture now has.stdout.txt
+extension with separate valid JSON rejection verdict. No evidence deleted.
+The full-run failures: lint/typecheck had no Cargo project; mail count is not a
+CLI command; inbox inherited server discovery. Direct CLI also rejects the
+three conditional stub-encode catalog entries. Repair in bench.rs removes four
+unsupported entries and validates every remaining entry against actual Clap;
+seeded runs pin HTTP127.0.0.1:1, independently proven by successful inbox run in
+bench-inbox-local-valid-20261022.json. E2E now creates a small real Cargo fixture.
+No performance threshold or >=10 benchmark assertion changed. Source uncommitted.
+Session26002 runs bench::tests:: (twojobs/singlethread); log
+bench-catalog-repair-20261022.log. Collect, then full E2E rerun, compiler checks
+and exact-head review. Prior failed E2E artifacts bench/20261022_204441 preserved.
+No service change, publication or observation start. Storage batch stillfails.
+
+Session92431 terminal0: workspace all-target and production lib/bins checks,
+strict Clippy, formatting and whitespace checks all PASS after the CLI fixture
+repairs. No heavy process remains from this continuation. CLI repairs remain
+uncommitted alongside the earlier storage/ATC work. Next complete real-transport
+ATC gate correction and storage batch-performance repair, then fresh review/CI
+and final-binary qualification. All deployment/24h obligations remain open.
+
+LATEST: focused guard28697 PASSED1/1 after5m57s compile. Parent identity stress
+run66573 guard group PASSED4/4 in2.17s with AGENT_NAME=ScarletGoose. Snapshot
+group initially3pass/1fail: products_inbox fixture omitted the delivered nullable
+sender_display_name and empty to_display_names fields. Added only those four
+JSON entries after checking the response contract; no golden regeneration.
+Final snapshot89823 PASSED4/4 in6.85s, including both shell normalization and
+negative cases preserving status, path and unsupported shell/details.
+Logs guard-suite-host-identity,cli-snapshots-portable,cli-snapshots-label-fields
+with -20261022.log under evidence-root; retain the failed intermediate evidence.
+Session92431 now runs sequential all-target,production,strictClippy,fmt/diff
+checks (cli-portability-{all-targets,production,clippy}-20261022.log). Collect
+before another heavy run. No commit, push, merge or installation change.
+Archive cancelled job log unavailable: gh reports log not found; attempt2 API
+download returns empty ZIP (archive-9271-attempt2-logs-20261022.zip). The45min
+deadline annotation is established, but compilation/runtime cause is unqualified.
+Its step metadata marks gate success at13min and skips artifact/verdict stages;
+do not infer a benchmark pass. Fresh CI must supply actual evidence.
+
+Recovery reconciled the operator goal with delivery: upstream inspection is
+complete separately; PR3 CI repair, exact-binary qualification, fork merge,
+supervised upgrade and full24h observation remain active. Authentication verified
+as simonheimlicher; PR3 remains OPEN at9271c52f. No operator question pending.
+Prior session87116 completed successfully: workspace all-target51.09s,
+production30.26s, strict Clippy1m03s and debug am build4m59s. No live change.
+
+Native CI39836909829 ended failure: CLI integration274pass/2fail/6ignored.
+Snapshot assumed zsh where Linux used bash; no-identity guard fixture inherited
+the host environment. Both repairs are now uncommitted: normalize only supported
+successful binary-resolution shell suffixes, preserve path/status; env_clear
+plus isolated HOME/config for the guard child. Session28697 runs focused guard
+test with two compiler jobs and physical TMPDIR; log guard-hermetic-20261022.log.
+Collect before another heavy command. Required full checks/review still pending.
+Archive Perf39836909647 attempt2 cancelled at45min job limit; no verdict.
+
+ATC real persistent-stdio diagnostic completed: off p95 31.621333ms,
+shadow32.848ms, live33.128292ms (live overhead4.77%). Independent stores each
+retain114messages and integrityok; live sidecar retains113ATC observations,
+off/shadow0. Evidence atc-real-stdio-_zx9vzww/results.json. This is diagnostic,
+not a CI gate pass. Existing CLI benchmark bypasses server ATC observation and
+runs modes on a growing shared store; replace gate timing with real transport
+and equivalent isolated stores before relying on its result. ATC policy tests
+now27pass (atc-sidecar-regression-p6c0tw5q/regression.log), shellcheck passes.
+The actual ATC database is sibling atc.sqlite3; canary now checks that sidecar.
+Storage batch remains311.836/300ms FAIL; no threshold waiver or deployment.
+
+ACTIVE HEAVY SESSION87116: sequential workspace all-target check, production
+lib/bins check, strict Clippy, then current debug am build. Two jobs/no
+incremental/physical TMPDIR. Logs storage-group-{all-targets,production,clippy}
+and atc-current-am-build with -20261022.log. Collect before any other heavy run.
+No pending operator question. Native CI39836909829 and Archive Perf attempt2
+39836909647 remained in_progress at last read. Reinspect before publication.
+
+APFS candidate gate4400 terminal101: single p95 32.895/35ms PASS, batch p95
+311.836/300ms FAIL. Crash probe retained100canonical messages and2commits.
+Evidence fsync-group-apfs-20261022/{summary,environment}.json and sibling.log.
+Batch write112–164ms, flush123–166ms. Do not claim threshold pass or retry until
+green. Diagnostic sampled repetition60075 also terminal101; numbers under
+sampling are NOT qualification. fsync-profile-qt3qhhre/sample.txt shows path
+canonicalization/metadata and Git build_tree_with_updates/ODB writes; fsync
+is only one contributor. Preserve all durability and symlink checks when
+choosing the next bounded optimization. No further production edit yet.
+Next run workspace correctness checks and build current debug am for genuine
+ATC protocol/path qualification; old binary handshake probes cannot establish
+current-head ATC persistence. Grouped-sync experiment remains uncommitted and
+performance-unqualified. No release/deployment/observation started.
+
+Storage full retry63198 terminal101:696passed,3failed,1ignored,990.26s.
+Terminal details confirm both filename fixtures failed at write with APFS
+errno92 and alive-PID fixture failed its no-removal assertion at zero expiry.
+All three repaired focused tests now PASS1/1 each (0.01/0.02/0.05s), logs
+storage-ref-portable,storage-detect-portable,storage-alive-pid-portable with
+-20261022.log. Staged safety rerun PASS6/6 (0.04s), storage-staged-final log.
+Session25705 now compiles integration probe --test it --no-run, two jobs.
+Collect it, then run existing APFS fsync-matrix script with workspace target and
+physical TMPDIR; budgets35ms single/300ms batch unchanged. No performance result
+yet. Full suite has not been rerun after fixture-only repairs; preserve exact
+aggregate/focused distinction. All workspace checks and required review remain.
+
+ATC final focused policy/protocol lane PASS24 assertions, session30328 terminal0,
+evidence atc-policy-final-fek0jmnj/regression.log. Added whole-gate failure probe
+using a rejecting stdio process: passing synthetic timings cannot hide protocol
+failure; exit1/runtime_error/protocol_failed all checked. Existing 5% regression
+and advisory policies remain unchanged. Source/validator run in separate shell
+so its globals cannot change the caller. shellcheck -x -P SCRIPTDIR passes.
+Storage retry63198 is in final wbq tests; await terminal diagnostic/result.
+nextest unavailable (cargo reports no such command); standard Cargo validation
+continues. Do not install another build tool or start duplicate heavy jobs.
+
+Third storage fixture repair staged in lib.rs: fresh alive-owner test passed
+max_age=0, which explicitly expires unknown-start-time owners on macOS in
+try_clean_stale_git_lock. It now uses ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS, keeping
+the same no-removal/existing-file assertions. No production expiry behavior
+changed. Await original suite terminal details and run all three repaired tests
+before full current-source validation. Current run63198 continues on old binary.
+
+ATC response regressions added to existing tests/e2e/test_bench.sh. Gate entry
+is now main() guarded by BASH_SOURCE so tests source its actual validator.
+Six protocol cases PASS; existing relative-overhead/advisory/zero-row cases also
+PASS (21 assertions total) via the unchanged case blocks, evidence
+atc-policy-regression-i95h7c5n/regression.log. shellcheck -x -P SCRIPTDIR and
+bash -n pass for both shell files. Full bench E2E/current binary still required.
+These tests do not validate actual ATC latency; original failure remains open.
+
+Raw filename probe invalid-ref-name-t7whj65j confirmed APFS errno92 for bad-ff
+bytes. Repaired both failed recovery fixtures to use raw packed-refs content,
+retaining refusal/no-publication/byte-preservation assertions on all platforms.
+Edits in recovery.rs and recovery/ref_backup.rs are uncompiled. Current full
+storage run uses the earlier binary and additionally reports
+stale_lock_cleanup_respects_alive_pid FAILED; collect terminal panic before
+diagnosis. Classification: active Rust validation repair, no deferral or pass.
+
+Latest active storage retry session63198 (two jobs/single test thread). It has
+reported failures in incomplete_ref_name_snapshot_is_never_published and
+detection_refuses_non_utf8_names_instead_of_inventing_a_prunable_name. Await
+terminal diagnostics; both fixtures write invalid UTF-8 filenames on APFS, but
+the exact failure is not yet collected. No fixture edit has been made.
+
+ATC canary defect confirmed in captured CI JSONL: requests2–5 all rejected with
+notifications/initialized required, while status.json claimed completed.
+scripts/bench_atc_perf_gate.sh is now DIRTY: sends initialized notification,
+validates exactly one successful response for ids1–5, clears inherited learning
+disable for the isolated canary, and propagates canary protocol failure to the
+gate verdict. bash -n and shellcheck pass. Captured failure now produces
+protocol_failed (rechecked_canary_status.json). Isolated real canary with older
+review-a91eead5 binary passes requests and quick_check, but has no ATC table:
+atc-handshake-h3cckra2 and atc-handshake-explicit-_c9_sh24. This establishes only
+protocol repair, not current-head durable ATC/performance qualification. Need
+fresh binary after current heavy job, focused regression coverage and review.
+The current candidate has no target/debug/am. Do not install older proof binary.
+Archive CI attempt2 log endpoint returned404 BlobNotFound while run still says
+in_progress; saved response archive-ci-9271-attempt2-20261022.log is no test
+verdict. Collect terminal run before deciding repair. No new push or cutover.
+
+Recovery continuation: authentication succeeds as simonheimlicher. Original
+delivery goal remains active; upstream inspection is separately complete.
+Storage run29656 was mistakenly interrupted after a buffered log suggested no
+progress. Sample storage-group-hang-sample-20261022.txt actually shows the later
+io_metrics_nonzero_after_archive_write test in bounded flush_sync; terminal101
+records SIGINT during test_find_commit_for_path. No hang or fixture failure is
+established. No fixture changed. Full suite restarted, log
+storage-group-full-retry-20261022.log, followed by probe compilation. Collect
+before further heavy commands. Preserve interrupted evidence; do not count pass.
+ATC39836909629 failed actual live overhead11.10% against5% (off235.647ms,
+shadow242.234ms,live261.806ms). Investigation: bench.rs seeds one shared mailbox,
+runs modes sequentially; local send calls messaging::send_message directly,
+whereas ATC observation recording lives in server post-processing. Establish
+actual path coverage and equivalent workloads before any benchmark repair.
+Artifacts at atc-9271-20261022/atc-perf-gate; no budget waiver authorized.
+
+Grouped staging focused tests PASS6/6, log staged-group-pipe-20261022.log,
+session29720 terminal0, tests0.06s after rebuild. First run25287 exited101 with
+5pass/1fail because macOS fsync(/dev/null) succeeds (F_FULLFSYNC fails later),
+so it did not inject the intended group-barrier failure. Changed both pending
+sync fixtures to real pipe descriptors; final-remainder case fails after one
+regular file synced. Existing Apple full-device failure fixture remains /dev/null.
+Full storage library tests followed by integration-probe compilation now running;
+logs storage-group-full-20261022.log and storage-group-probe-build-20261022.log.
+No performance claim or publication yet. Collect this active run before builds.
+
+Review setup inspected2026-10-22: origin/main branch-protection endpoint returns
+404 Branch not protected; repository Actions secret-name list is empty; no
+review workflow or CODEOWNERS path found under.github; PR reviews/comments empty.
+Local independent review evidence exists but no current-head CI review exists.
+Finish the authorized CI/source/qualification work before the merge decision;
+do not infer merge approval from absent branch protection or silently waive the
+required review. No credentials were printed, configured or copied.
+
+Latest CI infrastructure repair: APFS39836909679 was cancelled at its35min job
+deadline while still compiling fsqlite, no benchmark verdict. Log
+fsync-apfs-9271-20261022.log and GitHub check annotation confirm timeout. The
+matrix script selected a temporary target outside rust-cache. Commit
+72854661699b029041a9e7a398f799790fbae00b makes both platforms reuse workspace
+target, gives no-run compilation60min separately from30min probe and95min job,
+and saves failure caches. Actionlint/whitespace pass; no latency budget change.
+Not pushed. Local focused storage tests25287 remain active in dependency compile;
+do not start another heavy build. No candidate validation pass claimed.
+
+Latest continuation at PR head9271c52f: all five repair commits were pushed after
+review token2026-10-22_19-00-01-925-78aeab621d1e rendered approved,11files,0findings.
+Dashboard default/exporter tests and Clippy pass in CI; WASM failed because the
+action installed its target for stable while root rust-toolchain selected nightly.
+Local commit4975bb7128efbb90cf347075502ef14e1445d4f7 sets job RUSTUP_TOOLCHAIN=stable;
+actionlint/whitespace pass. Not pushed yet. Native CI39836909829 is still testing.
+Fsync39836909679: tmpfs/btrfs pass; batch p95 failures ext4-ordered322.605/250ms,
+ext4-journal399.018/350ms, xfs739.598/250ms. Singles pass. APFS still running.
+Archive Perf39836909647 attempt1 runner shut down during compilation (exit143),
+no benchmark verdict; rerun attempt2 requested with debug logging. No OOM claim.
+
+Storage experiment is UNCOMMITTED in src/lib.rs: stage at most64 open files,
+sync each group and the final remainder before publication, retain Apple final
+device flush. Three new real-filesystem cases cover bounds/content and both
+pending/group sync failures; existing Apple device-failure test still exercises
+its later barrier. No measured improvement or passing candidate claim yet.
+Focused tests run in session25287, two jobs/no incremental, configured single
+test thread; log staged-group-candidate-20261022.log. Collect before another
+heavy command. Existing unchanged baseline safety3/3pass is recorded in
+group-sync-safety-20261019.log; git diff3de..HEAD over storage was empty before
+this experiment. Baseline rebuild62963 was stopped130 after confirming that
+preserved evidence. Release build16921 was deliberately stopped130 because the
+new storage repair invalidates that candidate; dependencies preserved. No active
+release build remains, and no final binaries are qualified for installation.
+
+Qualification runtime_workload.py now points to installed adapter0.16.2 because
+cache0.16.0 disappeared; syntax/project-key/Ruff/strict mypy pass. This operational
+repair is outside the repository in evidence-root/qualification. Next complete
+focused and durability tests, compare filesystem measurements, full compiler
+checks and required review; publish only validated repairs, then finish CI,
+runtime/browser qualification, fork merge, supervised upgrade and full24h window.
+No service restart, upgrade or observation has occurred. Detailed continuation
+facts and CI logs are under evidence-root/recovery-continuation-20261022.txt.
+
 FINAL LOCAL CHECKS PASS: session74347 terminal0. Workspace all-target4m11s,
 production lib/bin2m41s, strict Clippy1m24s, root/dashboard formatting and
 diff whitespace all passed. CLI3021/0/7ignored; dashboard default146/0,
