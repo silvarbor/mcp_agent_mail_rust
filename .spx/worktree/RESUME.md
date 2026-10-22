@@ -1,5 +1,109 @@
 # Resume — local Agent Mail fork
 
+Current checkpoints: wrapper8d5f6635, ATC27c1efd03d28773f1cc5a7ea7df487ad929cebcd,
+conformance29971c31ce676e25f2a50a927f4129d1e6d2d496. Normal hooks, separate concerns.
+Conformance68369 still compiling at latest live poll; two jobs, disk7.7GiB free.
+Runtime qualification and matched gate status unchanged. wrapper_changes_review
+runner includes dirty files even with explicit committed endpoints; its shell
+review is advisory and unrelated paths must be marked unread. After this note
+checkpoint, request clean-tree review f15ee021..HEAD for all new repairs.
+Do not present optional/skipped implementation audit as substantive review.
+
+Wrapper implementation audit2026-10-22_22-50-26-610-7ed13bb8dba4 returned approved
+but both shell paths were optional/skipped coverage gaps: this supplies no
+substantive shell review. Required changes-reviewer wrapper_changes_review now
+reading exact f15ee021...8d5f6635 through review-changes runner. Collect its token
+and supported projection before claiming independently reviewed wrapper repair.
+
+LATEST recovery checkpoint: wrapper fix committed8d5f6635424ab57a495e145a4d2cfcc1b9f0abbb.
+Metadata regression38182 failed both preservation assertions before correction;
+green32887 passed14 checks. Evidence wrapper-metadata-{red,green}-20261023.log.
+Safe local metadata-reset defect fixed: append only absent wrapper file entries
+after original validation, preserving all original metadata/hashes. Syntax/diff
+pass. Required wrapper_manifest_review now auditing exact f15ee021...8d5f6635;
+initial attempt supplied no range and made no audit claim. Collect review result.
+Conformance68369 remains active (about12min compilation, two rustc jobs); no
+duplicate build. Disk7.9GiB free at latest check. Other four Rust files and this
+note remain dirty; no push/deployment. Continue same handle, then separate
+conformance and ATC checkpoints/reviews. ATC matched gate remains failing;
+full qualification, merge, supervised cutover and24h observation remain required.
+
+Recovery continuation: authorization file and checkpoint reread. Delivery remains
+active; no operator question pending. Session68369 still compiling conformance;
+all-target/production/strict Clippy/fmt/diff checks passed. Wrapper final regression
+49669 passed12 assertions, but inspection found full manifest regeneration resets
+delegate metadata via fresh e2e_lib counters/timestamps. Imperfection: test_helpers.sh
+wrapper finalization; safe local fix under artifact contract/Python author skills.
+Add preservation regression (38182 red run), then append only completed wrapper
+entries to validated original manifest. Preserve all original metadata and hashes.
+No deployment or publication has occurred.
+
+LATEST: active68369 full validation. All-target PASS67s,production PASS45.57s;
+strictClippy running,then fmt/diff,then full conformance --test it with inherited
+HTTP_HOST127.0.0.1/HTTP_PORT1. Logs atc-direct-{all-targets,production,clippy} and
+conformance-repair, all suffix20261023. Two jobs; collect before new heavy work.
+Candidate46629 terminal0:3append+4insert+1corrected schema tests pass,devbuild4m19s.
+Frozen am at evidence-root/atc-direct-candidate-20261023/am (source.patch retained),
+SHA256ff897c0c87cf67c79e7511f8154fa1ce37f1ead9ab9662541c5c0ae338c760a1.
+Matched95649 terminal3: both gatesfail; baseline off/shadow/livep95=
+35.830708/37.118542/54.477750ms (live52.04%); candidate32.297459/38.703708/
+33.725792ms (live4.42%passes,shadow19.84%fails). Both integrityok; evidence
+atc-direct-matched-20261023. Retain direct candidate; full ATCgate NOT passed.
+Shadow does not write sidecar or build durable rows; inspect actual shadow cost
+before further optimization. No retry-until-green or threshold relaxation.
+
+Native CI39856238367 finishedfailure: conformance81pass2fail; artifact validation
+4/9invalid. Full failed-step log ci-native-111ccfd8-failed-20261023.log.
+Conformance repairs now uncommitted: setup_fixture_env explicitly supplies
+Config::default HTTP host/port, insulating captured-default fixtures from CI's
+sentinelport1; error catalog adds authorized INVALID_DISPLAY_NAME with rationale.
+Validation is the full conformance suite under sentinel environment in68369.
+Artifact failure is live wrapper/stderr_capture.txt changing after delegate
+manifest: http4983->5281bytes, tui3163->3889. Governed by e2e artifact contract;
+safe local repair active. No shell edits yet. Next add regression to existing
+tests/e2e/test_artifacts_schema.sh using actual wrapper_exec + delegate that
+writes manifest then late stderr. Fix tests/e2e/test_helpers.sh by capturing
+stderr outside bundle until delegate exit, validating original delegate bundle
+before adding completed wrapper records, then re-sealing/validating. Preserve
+corruption detection: don't blindly rehash changed original artifacts. Include
+negative tampered-original test and preserve delegate nonzero exit.
+
+Diagnostics commits f15ee021 remain reviewed but unpushed. Native CI is now
+terminal, so cancellation concern ended. Fresh origin/main fetch remainsancestor.
+spx worktree status shows upstream-integration noholder (same br-rpa0b exception).
+Push preflight skill requires clean tree; finish/checkpoint current authorized
+repairs then review exact scope before publication. No permission question pending.
+
+CURRENT2026-10-23: direct ATC candidate in queries.rs/server lib.rs,uncommitted.
+Public append_atc_experience_if_initialized returns None for memory/incomplete
+schema, otherwise revalidates authority/schema and uses one canonical connection
+for inspection, transaction/row ceiling, post-COMMIT stored-row readback and close.
+Async append uses it too; server observation bypasses per-row worker/runtime
+only when ready. Missing schema retains existing migration worker; errors do
+not retry. No durability/cache/schema-check relaxation. Candidate not qualified.
+Baseline10206 passed3append+4insert tests; corrected sidecar-schema3668 passed1.
+New synchronous duplicate assertion compares complete stored row inside active
+runtime. Active46629 sequentially runs3append,4insert,1schema tests then builds
+development am. Logs atc-direct-candidate-{append,insert,schema,build}-20261023.log.
+Two jobs, no incremental. Collect before further heavy work; runtime source frozen.
+Next preserve candidate development binary/source diff and run SAME invocation
+baseline/candidate real ATC gate, both modes/results retained even when failing.
+Use frozen baseline evidence-root/atc-symbolized-profile-20261023/am; its runtime
+source matches111ccfd8. Candidate debug should match CI profile; release comparisons
+remain separate. Full gates, review, release/runtime/browser evidence still required.
+
+Diagnostics90253 completed0(devbuild6m7s);15488 completed0(563messages/ATC rows,
+integrityok). Symbolized profile at atc-symbolized-profile-20261023/sample.txt:
+370ATCthreads,1118thread samples; inclusive open_canonical_atc_conn521,
+schema inspection281,append797,readback298. Inclusive values overlap.
+Stacks confirm connection PRAGMA/schema parsing and runtime/timer-wheel creation.
+Sampling/debug timings are diagnostic only. Sidecar test fixture now seeds/checks
+atc_sidecar_sqlite_path and asserts primary remains absent; regression passed.
+
+Diagnostics headf15ee021cc71d9b87349cf0705eb4220aabc1ec1 committed,independent
+review2026-10-22_22-18-25-333-66b858505676 approved4/4 zero findings. Not pushed
+yet while native CI39856238367 remains in_progress; avoid cancelling its evidence.
+
 Active90253 builds baseline development am for symbolized diagnosis, two jobs,
 no incremental, existing target; log atc-symbolized-baseline-build-20261023.log.
 Runtime source equals111ccfd8. Collect before new heavy work. Preparing the
