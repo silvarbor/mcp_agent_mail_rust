@@ -31,18 +31,20 @@ mail-send hot path in three modes:
 The gate enforces:
   1. a relative overhead cap where shadow/live p95 must stay within 5% of no_atc
   2. a 3-warmup / 50-measurement sample plan so p95 is not just "worst of 10"
-  3. checked-in absolute baseline drift is reported for context, but it is advisory
+  3. real server requests, equal seeded stores, and durable ATC observations
+Historical CLI process timings are retained for context and are not comparable
+to this persistent MCP transport measurement.
 
 Options:
-  --baseline <path>             Checked-in baseline JSON for `am bench --baseline`
+  --baseline <path>             Historical baseline JSON retained for context
   --historical-baseline <path>  Optional checked-in artifact bundle copied into the output dir
   --output-dir <path>           Output directory for gate artifacts
   --threshold-pct <n>           Max allowed p95 overhead over no_atc (default: 5.0)
   --bench-report <path>         Reuse an existing `am bench` JSON report
   --canary-db <path>            Optional existing SQLite DB for quick_check + ATC row count
-  --skip-bench                  Skip running `cargo run ... am bench` and require --bench-report
+  --skip-bench                  Reuse --bench-report without running the transport benchmark
 Environment:
-  AM_BENCH_BIN                  Use this prebuilt `am` binary instead of `cargo run`
+  AM_BENCH_BIN                  Use this prebuilt `am` binary instead of building it
   AM_ATC_CANARY_REPORT_DIR      Directory for latest_canary_report.json operator surface
   -h, --help                    Show this help text
 USAGE
@@ -77,6 +79,24 @@ payload = {
     "stderr": sys.argv[5],
     "project": sys.argv[6],
 }
+if payload["status"] == "completed":
+    try:
+        responses = [
+            json.loads(line)
+            for line in pathlib.Path(payload["stdout"]).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for request_id in range(1, 6):
+            matching = [response for response in responses if response.get("id") == request_id]
+            if len(matching) != 1:
+                raise ValueError(f"request {request_id}: expected exactly one response")
+            response = matching[0]
+            result = response.get("result")
+            if "error" in response or not isinstance(result, dict) or result.get("isError"):
+                raise ValueError(f"request {request_id}: unsuccessful response: {response}")
+    except (OSError, ValueError, AttributeError) as error:
+        payload["status"] = "protocol_failed"
+        payload["reason"] = str(error)
 status_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -103,6 +123,7 @@ run_server_canary() {
     if [ -n "${server_binary}" ]; then
         DATABASE_URL="sqlite:///${db_path}" \
         STORAGE_ROOT="${storage_root}" \
+        ATC_LEARNING_DISABLED=0 \
         AM_ATC_WRITE_MODE=live \
         TUI_ENABLED=false \
         RUST_LOG=error \
@@ -112,6 +133,7 @@ run_server_canary() {
             cd "${PROJECT_ROOT}" &&
             DATABASE_URL="sqlite:///${db_path}" \
             STORAGE_ROOT="${storage_root}" \
+            ATC_LEARNING_DISABLED=0 \
             AM_ATC_WRITE_MODE=live \
             TUI_ENABLED=false \
             RUST_LOG=error \
@@ -123,6 +145,7 @@ run_server_canary() {
     {
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"atc-perf-gate","version":"1"}}}'
         sleep 0.5
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
         printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/am-atc-perf-canary"}}}'
         sleep 0.4
         printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/am-atc-perf-canary","name":"BlueLake","program":"bench","model":"bench","task_description":"server atc canary"}}}'
@@ -162,6 +185,7 @@ run_server_canary() {
         "${project_path}"
 }
 
+main() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --baseline)
@@ -225,7 +249,6 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
     BENCH_REPORT_PATH="${OUTPUT_DIR}/bench_report.json"
     bench_runtime_root="$(mktemp -d "${BENCH_TMPDIR_ROOT}/atc-perf-gate.XXXXXX")"
     bench_workspace="${bench_runtime_root}/bench-workspace"
-    bench_db_path="${bench_workspace}/bench.sqlite3"
     server_canary_db_path="${bench_runtime_root}/server-canary.sqlite3"
     if [ -z "${CANARY_DB_PATH}" ]; then
         CANARY_DB_PATH="${server_canary_db_path}"
@@ -239,32 +262,17 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
     elif [ -x "${PROJECT_ROOT}/target/debug/am" ]; then
         bench_binary="${PROJECT_ROOT}/target/debug/am"
     fi
+    if [ -z "${bench_binary}" ]; then
+        bench_binary="${CARGO_TARGET_DIR:-${PROJECT_ROOT}/target}/debug/am"
+    fi
     set +e
     (
         cd "${PROJECT_ROOT}"
-        if [ -n "${bench_binary}" ]; then
-            AM_BENCH_WORKSPACE="${bench_workspace}" \
-            STORAGE_ROOT="${bench_runtime_root}/storage" \
-            DATABASE_URL="sqlite:///${bench_db_path}" \
-            "${bench_binary}" \
-                bench \
-                --json \
-                --filter 'mail_send*' \
-                --warmup 3 \
-                --runs 50 \
-                --baseline "${BASELINE_PATH}"
-        else
-            AM_BENCH_WORKSPACE="${bench_workspace}" \
-            STORAGE_ROOT="${bench_runtime_root}/storage" \
-            DATABASE_URL="sqlite:///${bench_db_path}" \
-            cargo run -p mcp-agent-mail-cli --bin am -- \
-                bench \
-                --json \
-                --filter 'mail_send*' \
-                --warmup 3 \
-                --runs 50 \
-                --baseline "${BASELINE_PATH}"
+        if [ ! -x "${bench_binary}" ]; then
+            cargo build --locked -p mcp-agent-mail-cli --bin am >&2 || exit "$?"
         fi
+        python3 "${SCRIPT_DIR}/bench_atc_transport.py" \
+            --binary "${bench_binary}" --store-root "${bench_workspace}"
     ) >"${BENCH_REPORT_PATH}" 2>"${bench_log}"
     bench_rc=$?
     set -e
@@ -361,11 +369,24 @@ def read_db_health() -> dict:
             "atc_rows": None,
             "reason": "canary database path does not exist",
         }
+    # Runtime ATC telemetry lives beside the primary mailbox, not inside it.
+    # Explicit legacy/reused reports may still supply a self-contained database.
+    atc_db_path = canary_db_path.with_name("atc.sqlite3")
+    if not atc_db_path.is_file():
+        atc_db_path = canary_db_path
     try:
         conn = sqlite3.connect(f"file:{canary_db_path}?mode=ro", uri=True)
         try:
             quick_rows = conn.execute("PRAGMA quick_check").fetchall()
             quick_check = quick_rows[0][0] if quick_rows else "missing_result"
+        finally:
+            conn.close()
+        conn = sqlite3.connect(f"file:{atc_db_path}?mode=ro", uri=True)
+        try:
+            atc_quick_rows = conn.execute("PRAGMA quick_check").fetchall()
+            atc_quick_check = atc_quick_rows[0][0] if atc_quick_rows else "missing_result"
+            if quick_check == "ok" and atc_quick_check != "ok":
+                quick_check = f"atc: {atc_quick_check}"
             has_atc = (
                 conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='atc_experiences'"
@@ -383,6 +404,7 @@ def read_db_health() -> dict:
         return {
             "checked": True,
             "path": str(canary_db_path),
+            "atc_path": str(atc_db_path),
             "quick_check": "error",
             "atc_rows": None,
             "reason": str(error),
@@ -390,6 +412,7 @@ def read_db_health() -> dict:
     return {
         "checked": True,
         "path": str(canary_db_path),
+        "atc_path": str(atc_db_path),
         "quick_check": str(quick_check),
         "atc_rows": atc_rows,
         "reason": "",
@@ -618,6 +641,9 @@ allowed_p95 = round(base_p95 * (1.0 + threshold_pct / 100.0), 2)
 comparisons = []
 baseline_regressions = []
 advisories = []
+measurement = report.get("measurement", {})
+if measurement.get("absolute_baseline_comparable") is False:
+    advisories.append(measurement["baseline_note"])
 
 for name in required:
     entry = benchmarks[name]
@@ -644,10 +670,10 @@ status = "pass"
 reason = ""
 if failures:
     status = "benchmark_failed"
-    reason = f"`am bench` reported {len(failures)} failure(s)."
+    reason = f"ATC benchmark reported {len(failures)} failure(s)."
 elif bench_rc not in (0, 3):
     status = "benchmark_failed"
-    reason = f"`am bench` exited with code {bench_rc}."
+    reason = f"ATC benchmark exited with code {bench_rc}."
 
 overhead_regressions = [c["name"] for c in comparisons if c["overhead_regression"]]
 if baseline_regressions:
@@ -665,6 +691,11 @@ if status == "pass" and overhead_regressions:
         f"{threshold_pct:.1f}% p95 budget for: "
         + ", ".join(f"`{name}`" for name in overhead_regressions)
     )
+
+server_canary = read_server_canary_status()
+if server_canary.get("status") not in {"completed", "skipped"}:
+    status = "runtime_error"
+    reason = f"Server canary failed: {server_canary.get('reason', 'unknown failure')}"
 
 canary_report = write_canary_report(
     status,
@@ -787,3 +818,9 @@ case "${status}" in
         exit 1
         ;;
 esac
+}
+
+# Allow the protocol regression suite to exercise the same response validator.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
