@@ -1,5 +1,224 @@
 # Resume — local Agent Mail fork
 
+## Current resume checkpoint — active, 2026-10-22
+
+FINAL LOCAL CHECKS PASS: session74347 terminal0. Workspace all-target4m11s,
+production lib/bin2m41s, strict Clippy1m24s, root/dashboard formatting and
+diff whitespace all passed. CLI3021/0/7ignored; dashboard default146/0,
+exporter165+9/0; WASM release1m00s passed. Both modified CI workflows pass
+actionlint. Checkpoint the bounded repairs, then required independent review
+before PR update. ATC cold-build workflow repair has local lint only; actual
+CI rerun and all performance verdicts remain required. No heavy job active.
+
+FULL CLI SERIAL PASS: session1650 terminal0;3021passed,0failed,7ignored,
+579.23s tests after3m12s compilation. Log cli-full-serial-20261022.log. All ten
+failures of the incorrect two-test-thread invocation pass under the configured
+single test thread. No recovery production changes were made for those failures.
+Next: standalone dashboard default/exporter/lint/WASM matrix on toolchain1.99.0,
+two compiler jobs with debug info/incremental disabled; then workspace checks
+and required review. Filesystem CI performance and remaining CI jobs still need
+qualification. No merge, cutover, or24h observation has happened.
+
+Dashboard default PASS:145passed/0failed,8.92s; session52130 terminal0, log
+dashboard-default-green-20261022.log. First compiling run exposed two stale
+test assumptions (dashboard-default-20261022.log): seeded cursor stays at the
+start; slash already opens public search. Colon fixture now sends End before
+typing; encoded Ctrl+P runner test starts on dashboard without slash. Existing
+model test retains Ctrl+P non-escape from dashboard text entry. No input routing
+production change. Exporter matrix now running, collect before another build;
+log dashboard-exporter-20261022.log. Root formatting and whitespace passed.
+
+Exporter test run passed164library+9command tests. Strict Clippy then exposed
+unused shared agent renderer and native-only theme test lock in the browser.
+Fixed by using the width-aware label renderer for browser Agents/ATC rows and
+matching the lock's cfg to the native-only tests. Added duplicate Reviewer rows
+with BlueLake/RedStone address assertions. Final exporter rerun passed165+9;
+strict Clippy terminal0 (1.89s), logs dashboard-exporter-green-20261022.log and
+dashboard-exporter-clippy-green-20261022.log. No lint suppression or skipped tests.
+WASM release build active next, log dashboard-wasm-release-20261022.log; collect
+before more heavy commands. Shared theme cfg edit needs fresh native checks.
+WASM release now PASSED terminal0 in1m00s (session72377). Final default dashboard
+tests followed sequentially by required workspace all-target, production lib/bin,
+strict Clippy and fmt checks are running next. Logs dashboard-default-final,
+ci-repair-all-targets,ci-repair-production,ci-repair-clippy with -20261022.log
+under evidence-root. Two compiler jobs/no incremental/debug info disabled.
+Current validation session74347; default final146passed/0failed,9.01s. Collect
+remaining workspace checks; no duplicate build. ATC cancellation diagnosed:
+run39280462698 hit its30min job limit while compiling fsqlite-vdbe0.3.18;
+bench.log in ci-atc-artifacts-3de-20261022 contains no benchmark verdict.
+Workflow now gives cold build a separate60min step, benchmark retains30min,
+overall95min permits cleanup; explicit prebuilt am and cache-on-failure enabled.
+Actionlint passes. This does not establish an ATC benchmark pass; rerun CI.
+
+Recovery continuation: all ten original CLI failures have focused passing
+reruns. Inbox21passed; Beads23passed plus br_json_command3passed; shared-mailbox
+group19passed/2ignored after required-column failure injection; doctor group
+3passed after correcting the live-owner probe expectation to require refusal.
+Doctor evidence: doctor-probe-green-20261022.log, terminal0, compile1m46s,
+test0.51s. Production recovery admission remains unchanged. Full CLI suite now
+runs the compiled test binary with two test threads and verified br on PATH;
+log cli-full-repaired-20261022.log. Collect terminal status before next heavy job.
+Full run has now reported doctor_restore_uses_sidecar_safe_restore_path FAILED
+(log line2519); detailed panic remains buffered until completion. Reproduce and
+repair this failure next, before dashboard validation. All ten original CI
+failures still have focused passes; this additional failure prevents a suite
+pass. Classification: active safe-local diagnosis/repair under Rust test workflow.
+Correction: that run used --test-threads=2, overriding .cargo/config.toml:84
+RUST_TEST_THREADS=1. Terminal result3011passed/10failed/7ignored,679.31s.
+Nine failures were process-global recovery-admission contention; the tenth an
+inbox-open deadline. Restore isolated rerun passed1/1 in1.30s. Do not modify
+recovery admission for this invalid invocation. Rerun through Cargo using its
+configured single test thread, two compiler jobs, verified br on PATH. Preserve
+the failed parallel-run evidence; it is not the repository's CI configuration.
+Correct serial Cargo rerun is active in process session1650; log
+cli-full-serial-20261022.log. Collect it before another heavy command. It rebuilds
+the shared server formatter and CLI, then uses Cargo's RUST_TEST_THREADS=1.
+If any of the ten parallel-only failures remain, diagnose the actual serial
+failure; do not assume every failure was caused by test concurrency.
+Serial rerun compilation completed3m12s;3028tests are executing, session1650
+still live. Stable toolchain1.99.0 now has wasm32-unknown-unknown installed;
+use it for the standalone dashboard matrix after serial tests finish, with
+two jobs, incremental off and debug info disabled to bound disk use.
+
+Dashboard compile repairs are uncommitted and unqualified: portable MailScreen
+includes claims_key; search-limit test import restored; unused test trait import
+removed; shared label-width rendering formats its already-computed address
+directly, removing the native core-model dependency. Native/browser validation,
+required review and CI still remain. No merge, deployment or observation started.
+
+Recovery artifact check: /tmp/agent-mail-integration-publication.ZPzght and its
+upgrade-checklist.md are absent. The durable operator plan and qualification
+observer remain available. Reconstruct the cutover checklist from the approved
+plan with freshly qualified binary identities before deployment; never reuse
+the superseded staged binary identity. This is an authorized local preparation
+repair, owned by the integration delivery workflow.
+
+Replacement cutover checklist (durable replacement for missing scratch file):
+1. Finish all CI repairs, required checks/reviews at the exact candidate head,
+   runtime and browser qualification; record both binary SHA256 values and
+   package an immutable release directory. Do not use earlier staged binaries.
+2. Merge fork PR3 under the approved review workflow. Preserve source, current
+   installation target and rollback binaries; verify candidate source identity.
+3. Notify coordinating positions, gracefully stop launchd com.agent-mail and
+   confirm doctor drain permits mutation. No live-owner override or forced kill.
+4. Snapshot the stopped mailbox family (main/WAL/SHM and engine sidecars), archive,
+   supervisor plist and current release identity together. Verify backup hashes,
+   integrity and continuity before switching the current symlink.
+5. Install the qualified pair, restart the supervisor, confirm health, then send,
+   read and acknowledge fresh mail. Verify labels, routing and existing records.
+6. Start qualification/observe_service.py only after successful cutover; retain
+   a full24h of integrity, request-failure and resource observations. Preserve
+   every post-cutover message if rollback becomes necessary.
+7. Remove only authorized task build artifacts after qualification/installation;
+   preserve source, evidence, rollback and Time Machine snapshots. Update tracking
+   and this note with terminal outcomes before declaring the delivery complete.
+
+Observation preparation repair fixed: qualification/observe_service.py now
+requires --service-target and uses launchctl print for its supervised PID;
+processes() no longer calls lsof. Syntax and real read-only discovery passed:
+gui/502/com.agent-mail returned PID62353,381472KiB RSS,4.1% CPU. This session
+has not restarted/replaced the service; discover current ownership again before
+cutover. The full24h observer has not been started. Python implementation
+workflow governs this operational helper. Ruff and strict mypy both passed.
+
+Latest results: focused inbox session45292 exited0,21passed including both
+CI failures,4.65s test execution. Beads session59291 exited0,23passed,6.66s,
+using the verified br0.6.0 on PATH. The separate br_json_command filter is
+running next; log beads-command-20261022.log. Full CI remains unqualified.
+
+Goal reactivated. Prior native build30069 has no process handle and PID38061
+is absent; its log ends during compilation without a success verdict. Do not
+claim that build passed. No replacement service has been installed.
+CI at3de21b33 is terminal. Native CLI:3022passed,10failed,9ignored.
+Failure groups: six Beads fixtures cannot launch br; two direct inbox fixtures
+lack agents.display_name; one shared-mailbox scoped-query error assertion;
+one malformed-file doctor-probe expectation. Dashboard has five compile/lint
+errors (missing claims_key trait member, missing core models formatter in its
+portable facade, missing search-limit test import, unused MailScreen import).
+Archive Perf terminated143 after runner shutdown, so produced no verdict.
+Filesystem ext4-ordered/ext4-journal/xfs/apfs failed; btrfs/tmpfs passed.
+ATC cancelled. Installer jobs and observability passed; downstream native
+jobs skipped after native test failure. Preserve all these obligations.
+
+First repair in progress: add nullable display_name to the two direct-inbox
+fixture schemas, keeping assertions unchanged. Focused check_inbox_ tests
+session45292, two jobs/no incremental under standing operator load override.
+Log evidence-root/check-inbox-fixtures-20261022.log. No concurrent heavy job.
+Failed-job logs: ci-native-3de-failed-20261022.log and
+ci-archive-3de-failed-20261022.log. Next collect focused tests, then fix the
+next evidenced failure; full checks/review follow before publication.
+
+Beads fixture prerequisite prepared without another compile: official v0.6.0
+darwin_arm64 release and .sha256 downloaded into evidence-root/
+beads-0.6.0-fixture-tools; shasum check passed, extracted br reports0.6.0.
+Use that directory on PATH for subsequent Beads regression runs. No system
+binary was installed. CI still needs the equivalent pinned Linux prerequisite.
+The CI prerequisite is now patched in .github/workflows/ci.yml: official
+v0.6.0 linux_amd64 asset, pinned SHA256, extract only br into RUNNER_TEMP and
+publish its directory through GITHUB_PATH before workspace tests. actionlint
+passed. The six real-command tests remain enabled. Runtime validation with
+the prepared native br follows completion of test build45292.
+Filesystem log ci-fsync-3de-failed-20261022.log confirms batch p95 misses:
+ext4-ordered598.766/250ms, ext4-journal485.296/350ms, xfs323.410/250ms;
+APFS single67.121/35ms and batch363.481/300ms. These are failed gates,
+not qualified results. Preserve budgets while diagnosing the actual costs.
+
+## Prior paused checkpoint
+
+This section supersedes historical process/status statements below.
+The operator requested preparation to resume; the goal remains paused.
+Active checkout: /Users/shz/Code/silvarbor/agent-mail/upstream-integration.
+Branch work/upstream-integration-20261015, head3de21b33f44901583068a08bf9a69f5a1ba4a292.
+Only this resume note has uncommitted changes. Installed service is unchanged.
+
+- Existing native runtime build session30069 is still active, cargo PID38061,
+  with two compiler jobs. Log: evidence-root/build-storage-qualified-runtime-20261019.log.
+  Collect it; start no duplicate or competing heavy local command.
+- Linux container attempts26192 and73552 both ended101 with OOMKilled=true.
+  No task build container remains running. Do not repeat that VM build without
+  establishing sufficient memory. Other running containers belong to other work.
+- PR3 at the exact head above remains open. Fresh checks: Archive Perf Gate and
+  Dashboard WASM failed; both signed installer jobs, observability drift and
+  tmpfs passed. ATC, other filesystem probes and Build & Test are in progress;
+  Skip Guard queued. Formal reviews/comments remain empty.
+- First resume action: collect failed-job logs and classify their actual causes,
+  while collecting the existing native build. Fix one evidenced failure at a time.
+  Keep this candidate stable until a specific failure requires a source change.
+- Preserve build artifacts until the candidate is qualified and staged. Then
+  complete required CI/review, fork merge, supervised backup/upgrade/smoke,
+  full24h observation and authorized cleanup. None of these is complete.
+- Live lsof containment below remains applied. Director mail17069 delivered.
+  No waiter is intentionally left suspended; PID58747 was resumed after config.
+
+Report checkpoints as completed outcomes, current failing requirement, and next
+action. Introduce no unrelated cleanup or refactor into this delivery.
+
+## Earlier evidence and history
+
+2026-10-19 live lsof containment verified: operator requested stopping the
+scans. A five-second process-parent sample found lsof children of short-lived
+am CLI processes launched by wait_event.py PID58747, rather than children of
+HTTP server PID99745. Suspended only that waiter, configured HTTP_HOST=127.0.0.1
+and HTTP_PORT=8765 in ~/.config/mcp-agent-mail/config.env, then resumed it.
+Installed CLI source local_server_url discovers ownership when neither endpoint
+setting exists; explicit settings avoid this discovery. Ten seconds after
+resume: seven am children observed, zero lsof processes. Independent adapter
+inbox probe succeeded (exit0). No server restart or binary replacement.
+Backup config-before-explicit-endpoint-20261019.env is mode0600 under evidence-root;
+the live config is also mode0600. Preserve this credential-bearing backup and
+never publish its contents. Evidence: lsof-configured-endpoint-20261019.json and
+lsof-configured-inbox-20261019.json. br-nwdr9 remains the general unconfigured
+discovery-cost issue; do not claim a universal source fix from configuration.
+
+PR repair head3de21b33 is pushed and independently reviewed (19/19 files, no
+findings); GitHub watch session11074 remains active with checks queued.
+Linux two-job build26192 failed with Docker OOMKilled=true while compiling
+asupersync. Cache preserved in agent-mail-fsync-build-cache:20261019; one-job
+retry session73552/container agent-mail-fsync-serial-20261019 is active.
+Log: linux-fsync-build-serial-20261019.log. Loop-device preflight passed for
+ext4/xfs/btrfs. Continue collecting these handles, then remaining CI repairs,
+fork merge, qualified upgrade, full24h observation and cleanup.
+
 FINAL-SOURCE CHECKS COMPLETE: session 18414 exited zero. Workspace all-target
 check passed (49.26s), production lib/bins passed (28.83s), strict workspace
 Clippy passed (57.14s), and formatting passed. Combined evidence:
