@@ -101,6 +101,9 @@ pub trait MailScreen {
     fn consumes_text_input(&self) -> bool {
         false
     }
+    fn claims_key(&self, _key: &ftui::KeyEvent) -> bool {
+        false
+    }
     fn title(&self) -> &'static str {
         "Dashboard"
     }
@@ -826,7 +829,14 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
             .map(|agent| {
                 format!(
                     "● {:<20} {:<14} {:<16} {}",
-                    agent.name, agent.program, agent.model, agent.project
+                    crate::tui_events::agent_label_with_width(
+                        &agent.name,
+                        agent.display_name.as_deref(),
+                        20,
+                    ),
+                    agent.program,
+                    agent.model,
+                    agent.project
                 )
             })
             .collect(),
@@ -917,7 +927,14 @@ fn public_rows(screen: MailScreenId, state: &TuiSharedState) -> Vec<String> {
             .map(|agent| {
                 format!(
                     "● {:<20} {:<22} {:<14} {}",
-                    agent.name, agent.project, agent.program, agent.model
+                    crate::tui_events::agent_label_with_width(
+                        &agent.name,
+                        agent.display_name.as_deref(),
+                        20,
+                    ),
+                    agent.project,
+                    agent.program,
+                    agent.model
                 )
             })
             .collect(),
@@ -1277,7 +1294,7 @@ pub mod dashboard;
 #[cfg(test)]
 mod tests {
     use super::{
-        MailScreenId, PublicReplayScreen, public_derived_event_visit_count,
+        MAX_SEARCH_QUERY_CHARS, MailScreenId, PublicReplayScreen, public_derived_event_visit_count,
         public_event_format_count, public_rows, public_rows_generation,
         reset_public_derived_event_visit_count, reset_public_event_format_count,
         search_input_hit_area,
@@ -1341,6 +1358,27 @@ mod tests {
             .expect("rows should be materialized")
             .rows
             .clone()
+    }
+
+    #[test]
+    fn public_agent_rows_keep_distinct_addresses_with_duplicate_labels() {
+        let state = populated_state();
+        let mut stats = state.db_stats_snapshot().expect("agent roster");
+        stats.agents_list.truncate(2);
+        assert_eq!(stats.agents_list.len(), 2);
+        stats.agents_list[0].name = "BlueLake".to_string();
+        stats.agents_list[1].name = "RedStone".to_string();
+        for agent in &mut stats.agents_list {
+            agent.display_name = Some("Reviewer".to_string());
+        }
+        state.update_db_stats(stats);
+
+        for screen in [MailScreenId::Agents, MailScreenId::Atc] {
+            let rows = public_rows(screen, &state);
+            assert_eq!(rows.len(), 2);
+            assert!(rows[0].contains("Reviewer <BlueLake>"), "{}", rows[0]);
+            assert!(rows[1].contains("Reviewer <RedStone>"), "{}", rows[1]);
+        }
     }
 
     #[test]
