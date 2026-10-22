@@ -2911,7 +2911,7 @@ fn check_inbox_direct_uses_actual_opened_sqlite_path_for_native_reads() {
                 mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
             for stmt in [
                 "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                 "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]', topic TEXT)",
                 "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -2983,7 +2983,7 @@ fn check_inbox_daemon_and_direct_paths_agree_on_unread_count() {
             let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
             for stmt in [
                 "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                 "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, topic TEXT, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
                 "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -16141,8 +16141,9 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
         "an unopenable main file must still reconstruct: {strategy:?}"
     );
 
-    // The open-probe layer reports the composite cause with every branch
-    // readable instead of truncating it down to the first clause.
+    // The open-probe layer cannot establish damage independently while the
+    // live-owner guard refuses access. Preserve that refusal and all branch
+    // diagnostics even though the outer strategy proved main-file damage.
     let archive_root = dir.path().join("projects");
     let probe = doctor_database_fix_strategy_read_only_probes(
         &db_url,
@@ -16153,11 +16154,11 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
         None,
         true,
     )
-    .expect("open-probe strategy");
+    .expect_err("live-owner refusal must not authorize automatic reconstruction");
     match probe {
-        DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+        CliError::Other(detail) => {
             assert!(
-                detail.starts_with("Database open probe failed: "),
+                detail.starts_with("Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: "),
                 "{detail}"
             );
             for clause in [
@@ -16175,20 +16176,16 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
                 "the offline clause must carry the real guard refusal: {detail}"
             );
             assert!(
-                detail.contains("archive recovery is available under"),
-                "{detail}"
-            );
-            assert!(
                 detail.chars().count()
                     <= DOCTOR_OPEN_PROBE_DETAIL_LIMIT
-                        + "Database open probe failed: ".len()
-                        + "; archive recovery is available under ".len()
-                        + archive_root.display().to_string().len(),
+                        + "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: ".len(),
                 "open-probe detail must stay bounded ({} chars): {detail}",
                 detail.chars().count()
             );
         }
-        other => panic!("truncated main file must report an open-probe failure: {other:?}"),
+        other => {
+            panic!("live-owner refusal must report the composite open-probe failure: {other:?}")
+        }
     }
     drop(writer);
 }
