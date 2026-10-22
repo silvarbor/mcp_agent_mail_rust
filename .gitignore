@@ -1,5 +1,6 @@
 # Build outputs
 /target/
+/crates/mcp-agent-mail-dashboard-wasm/target/
 .cargo-target-*/
 target-codex*/
 target_*/
