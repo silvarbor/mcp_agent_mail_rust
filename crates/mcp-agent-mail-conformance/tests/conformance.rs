@@ -1371,6 +1371,8 @@ fn insert_test_message(
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
 fn setup_fixture_env() -> FixtureEnv {
     let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let default_config = mcp_agent_mail_core::Config::default();
+    let default_http_port = default_config.http_port.to_string();
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
@@ -1384,6 +1386,8 @@ fn setup_fixture_env() -> FixtureEnv {
     // Also explicitly disable tool filtering (otherwise tools may not be registered).
     let env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
+        ("HTTP_HOST", &default_config.http_host),
+        ("HTTP_PORT", &default_http_port),
         ("WORKTREES_ENABLED", "1"),
         ("STORAGE_ROOT", storage_root_str),
         ("TOOLS_FILTER_ENABLED", "0"),
