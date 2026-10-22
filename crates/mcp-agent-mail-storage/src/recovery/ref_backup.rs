@@ -324,18 +324,15 @@ mod tests {
         assert_eq!(std::fs::read(actual).unwrap(), b"original");
     }
 
-    #[cfg(unix)]
     #[test]
     fn incomplete_ref_name_snapshot_is_never_published() {
-        use std::os::unix::ffi::OsStringExt;
         let temp = TempDir::new().unwrap();
         let (repo, finding) = fixture(&temp);
-        let name = std::ffi::OsString::from_vec(b"bad-\xff".to_vec());
-        std::fs::write(
-            repo.path().join("refs/temp").join(name),
-            format!("{}\n", finding.target_sha),
-        )
-        .unwrap();
+        // Packed refs exercise raw Git names even on filesystems such as APFS
+        // that reject non-UTF-8 filenames before Git can read them.
+        let mut packed = format!("{} refs/temp/bad-", finding.target_sha).into_bytes();
+        packed.extend_from_slice(b"\xff\n");
+        std::fs::write(repo.path().join("packed-refs"), packed).unwrap();
         let destination = temp.path().join("backups/refs.txt");
         assert!(write_snapshot(repo.workdir().unwrap(), &destination, &[finding]).is_err());
         assert!(!temp.path().join("backups").exists());

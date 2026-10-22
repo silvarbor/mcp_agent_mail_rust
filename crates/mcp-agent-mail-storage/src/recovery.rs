@@ -757,19 +757,18 @@ mod tests {
         assert!(detect_missing_refs(tmp.path()).unwrap().is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn detection_refuses_non_utf8_names_instead_of_inventing_a_prunable_name() {
-        use std::os::unix::ffi::OsStringExt;
-
         let tmp = TempDir::new().unwrap();
         let repo = init_repo_with_commit(tmp.path());
-        let name = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
-        let path = repo.path().join("refs/heads").join(name);
-        let before = format!("{}\n", missing_oid());
+        // Keep the invalid bytes in Git's ref data so APFS filename validation
+        // cannot prevent the recovery parser from reaching this case.
+        let path = repo.path().join("packed-refs");
+        let mut before = format!("{} refs/heads/invalid-", missing_oid()).into_bytes();
+        before.extend_from_slice(b"\xff\n");
         std::fs::write(&path, &before).unwrap();
 
         assert!(detect_missing_refs(tmp.path()).is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }
