@@ -19,18 +19,35 @@ jobs:
   archive-perf-gate:
     name: Archive Perf Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 95
     env:
       GATE_OUTPUT_DIR: tests/artifacts/perf/archive_perf_gate/${{ github.run_id }}-${{ github.run_attempt }}
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build archive benchmark and startup probe
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GATE_OUTPUT_DIR}"
+          (
+            cargo bench --locked -p mcp-agent-mail --bench benchmarks --no-run
+            cargo build --locked --release -p mcp-agent-mail-cli --bin am
+          ) 2>&1 | tee "${GATE_OUTPUT_DIR}/build.log"
 
       - name: Run archive perf gate
         id: gate
+        timeout-minutes: 30
         continue-on-error: true
         shell: bash
         run: |
