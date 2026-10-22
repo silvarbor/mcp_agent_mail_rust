@@ -202,6 +202,23 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                 }
                 if let Some(check_name) = out.get("check").and_then(Value::as_str) {
                     match check_name {
+                        // Both supported login shells satisfy the same resolution contract.
+                        "binary_resolution"
+                            if out.get("status").and_then(Value::as_str) == Some("ok") =>
+                        {
+                            if let Some(detail) =
+                                out.get("detail").and_then(Value::as_str).map(str::to_owned)
+                                && detail.starts_with("'am' resolves to ")
+                                && let Some(path) = detail
+                                    .strip_suffix(" (zsh)")
+                                    .or_else(|| detail.strip_suffix(" (bash)"))
+                            {
+                                out.insert(
+                                    "detail".to_string(),
+                                    Value::String(format!("{path} (<LOGIN_SHELL>)")),
+                                );
+                            }
+                        }
                         // Environment-dependent connector inventory.
                         "installed_agents" => {
                             out.insert(
@@ -370,6 +387,50 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         &tmp_slugs,
         &search_index_root,
     )
+}
+
+#[test]
+fn normalize_json_preserves_binary_resolution_failures_and_paths() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for shell in ["bash", "zsh"] {
+        let normalized = normalize_json(
+            serde_json::json!({
+                "check": "binary_resolution", "status": "ok",
+                "detail": format!("'am' resolves to /unexpected/bin/am ({shell})"),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            normalized["detail"],
+            "'am' resolves to /unexpected/bin/am (<LOGIN_SHELL>)"
+        );
+        assert_eq!(normalized["status"], "ok");
+    }
+    for (check, status, detail) in [
+        (
+            "binary_resolution",
+            "warn",
+            "'am' resolves to /unexpected/bin/am (bash)",
+        ),
+        (
+            "binary_resolution",
+            "fail",
+            "'am' is aliased in zsh: alias am=python",
+        ),
+        (
+            "binary_resolution",
+            "ok",
+            "'am' resolves to /unexpected/bin/am (fish)",
+        ),
+        (
+            "other_check",
+            "ok",
+            "'am' resolves to /unexpected/bin/am (bash)",
+        ),
+    ] {
+        let original = serde_json::json!({"check": check, "status": status, "detail": detail});
+        assert_eq!(normalize_json(original.clone(), tmp.path()), original);
+    }
 }
 
 #[test]
