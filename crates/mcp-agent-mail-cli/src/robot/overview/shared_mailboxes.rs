@@ -1401,10 +1401,14 @@ mod tests {
             state: Collector::prepare(&conn, &mut work).unwrap(),
         };
         assert!(matches!(&collector.state, State::Scoped(_)));
-        // Simulate a refused verified-index query. Production holds the schema
-        // stable in a snapshot; even an unexpected engine refusal must not be
-        // converted into successful zero counts or an incomplete population.
-        execute(&conn, "DROP INDEX agents_project");
+        // Remove a required query column after preparation. A missing INDEXED
+        // BY target does not reliably fail on every supported engine. Production
+        // holds the schema stable in a snapshot; an unexpected query refusal
+        // must still propagate instead of producing successful empty counts.
+        execute(
+            &conn,
+            "ALTER TABLE agents RENAME COLUMN inception_ts TO unavailable_inception_ts",
+        );
         let mut counts = HashMap::new();
         assert!(
             collector
