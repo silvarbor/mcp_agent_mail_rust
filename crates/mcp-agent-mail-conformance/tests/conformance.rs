@@ -1389,6 +1389,9 @@ fn setup_fixture_env() -> FixtureEnv {
         ("HTTP_HOST", &default_config.http_host),
         ("HTTP_PORT", &default_http_port),
         ("WORKTREES_ENABLED", "1"),
+        // The captured identity fixtures use directory routing, independently
+        // of the operator's project identity configuration.
+        ("PROJECT_IDENTITY_MODE", "dir"),
         ("STORAGE_ROOT", storage_root_str),
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
