@@ -19,7 +19,7 @@ jobs:
   atc-perf-gate:
     name: ATC Perf Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 95
     env:
       GATE_OUTPUT_DIR: tests/artifacts/perf/atc_perf_gate/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -28,13 +28,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build ATC benchmark binary
+        timeout-minutes: 60
+        run: cargo build --locked -p mcp-agent-mail-cli --bin am
 
       - name: Run ATC perf gate
         id: gate
+        timeout-minutes: 30
         continue-on-error: true
         shell: bash
         env:
           ATC_GATE_TMPDIR_ROOT: ${{ runner.temp }}/atc-perf
+          AM_BENCH_BIN: ${{ github.workspace }}/target/debug/am
         run: |
           set -euo pipefail
           chmod +x scripts/bench_atc_perf_gate.sh
