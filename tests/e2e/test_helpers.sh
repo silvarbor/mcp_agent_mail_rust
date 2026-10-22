@@ -78,6 +78,44 @@ _wrapper_save_artifact() {
     echo "$content" > "$dest"
 }
 
+_wrapper_complete_manifest() {
+    python3 - "$_WRAPPER_ARTIFACT_DIR" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest = root / "bundle.json"
+bundle = json.loads(manifest.read_text(encoding="utf-8"))
+recorded = {entry["path"] for entry in bundle["files"]}
+# Original entries have already passed validation. Only add the wrapper's
+# completed records; preserve delegate metadata and every original hash.
+for path in sorted((root / "wrapper").iterdir()):
+    relative = path.relative_to(root).as_posix()
+    if relative in recorded:
+        continue
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Unexpected wrapper artifact: {path}")
+    content = path.read_bytes()
+    bundle["files"].append({
+        "path": relative,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "bytes": len(content),
+        "kind": "opaque",
+        "schema": None,
+    })
+with tempfile.NamedTemporaryFile(
+    mode="w", encoding="utf-8", dir=root, prefix=".wrapper-manifest-", delete=False,
+) as output:
+    json.dump(bundle, output, indent=2, sort_keys=True)
+    output.write("\n")
+os.replace(output.name, manifest)
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -116,17 +154,22 @@ wrapper_exec() {
     # background children can inherit its pipe and keep the native runner's
     # stderr reader alive after the delegate exits.
     local stderr_file="${_WRAPPER_ARTIFACT_DIR}/wrapper/stderr_capture.txt"
+    # The delegate seals its own bundle before its EXIT cleanup finishes.
+    # Keep this growing capture outside that bundle until the delegate exits.
+    local stderr_capture
+    stderr_capture="$(mktemp "${TMPDIR:-/tmp}/am-e2e-wrapper-stderr.XXXXXX")"
     local start_epoch
     start_epoch="$(date +%s)"
 
     set +e
     if [ $# -gt 0 ]; then
-        bash "$script_path" "$@" 2>"$stderr_file"
+        bash "$script_path" "$@" 2>"$stderr_capture"
     else
-        bash "$script_path" 2>"$stderr_file"
+        bash "$script_path" 2>"$stderr_capture"
     fi
     local exit_code=$?
     set -e
+    mv "$stderr_capture" "$stderr_file"
 
     if [ -s "$stderr_file" ]; then
         cat "$stderr_file" >&2 || true
@@ -158,6 +201,25 @@ wrapper_exec() {
   \"exit_code\": ${exit_code},
   \"wrapper_version\": \"br-aazao.8.4\"
 }"
+
+    if [ -f "${_WRAPPER_ARTIFACT_DIR}/bundle.json" ]; then
+        # Verify the delegate's sealed files before adding wrapper records to
+        # the manifest. Rehashing first would conceal post-seal corruption.
+        if ! (
+            E2E_SUITE="$WRAPPER_SUITE"
+            E2E_TIMESTAMP="$_WRAPPER_TIMESTAMP"
+            # shellcheck source=../../scripts/e2e_lib.sh
+            source "${_WRAPPER_PROJECT_ROOT}/scripts/e2e_lib.sh"
+            e2e_validate_bundle_manifest "$_WRAPPER_ARTIFACT_DIR" \
+                && _wrapper_complete_manifest \
+                && e2e_validate_bundle_manifest "$_WRAPPER_ARTIFACT_DIR"
+        ); then
+            _wrapper_log "Artifact validation failed; preserving delegate evidence"
+            if [ "$exit_code" -eq 0 ]; then
+                exit_code=1
+            fi
+        fi
+    fi
 
     if [ "$exit_code" -ne 0 ]; then
         _wrapper_log "Delegate exited with code ${exit_code} (artifacts in ${_WRAPPER_ARTIFACT_DIR}/wrapper/)"
