@@ -1,6 +1,115 @@
 # Resume — local Agent Mail fork
 
+Active90253 builds baseline development am for symbolized diagnosis, two jobs,
+no incremental, existing target; log atc-symbolized-baseline-build-20261023.log.
+Runtime source equals111ccfd8. Collect before new heavy work. Preparing the
+workflow diagnostics changes for independent review/publication so Linux probe
+artifacts become available; performance budgets/durability remain unchanged.
+Native CI39856238367 still in_progress at fresh check, dashboard success.
+
+Diagnostic12592 terminal0: frozen release baseline,500measured sends plus63seed/
+warmup,563messages and563ATC rows,full integrityok. External profile wrapper
+enables debug logs and15s macOS sample; timings are diagnostic only. Evidence
+at evidence-root/atc-release-profile-20261023/{sample.txt,diagnostic.json,
+store/server.log}. Append debug563observations median4744us,p957471us.
+Sample has395atc-ledger threads/1021thread samples; selected syscall samples
+open134,close96,pwrite160,fsync67,fcntl22. Release symbols stripped, so no
+Rust-function-level attribution. Do not infer a dominant individual subcost.
+Next inspect lifecycle/schema checks with symbolized diagnostic evidence before
+another production candidate; no duplicate heavy command is active.
+
+MATCHED RESULT77457 terminal3: baseline and candidate both fail original5%gate.
+Baseline off/shadow/live p95=31.443916/33.734583/32.402542ms; shadow7.28%fails.
+Candidate off/shadow/live p95=30.368084/30.781375/37.274458ms; live22.74%fails.
+Both transport commands succeeded and canary quick_check=ok with1ATC row.
+Connection-reuse experiment REVERTED manually; queries.rs now byte-identical
+to HEAD (git diff --exit-code passes). Candidate source.patch/binaries/results
+remain preserved. No win claimed, no retries to obtain a passing sample.
+No heavy command remains active. target/release still contains the rejected
+candidate: use frozen release-111ccfd8-binaries for baseline, never install
+target/release as current source. Continue diagnosing synchronous ATC costs
+and filesystem latency; workflow repairs remain uncommitted, service unchanged.
+
+LATEST: build54394 terminal0; both release executables finished16m33s. Frozen
+at evidence-root/qualification/release-atc-reuse-20261023-binaries, together
+with source.patch, base-commit.txt and SHA256SUMS. am0.3.39 hash
+505547cac8dc228401e5a24b8771522f22284f931062d15f39e38e4c70abf6cd;
+server09159220ae2c66fd6cf54dc855f2615fa27cd7fbcca005da7143e29fe509cbd1.
+Active77457 runs matched real ATC gate baseline then candidate sequentially,
+using frozen release binaries and separate isolated stores. Both run even if
+baseline fails. Evidence-root/atc-reuse-matched-20261023 holds logs, results,
+stores and exit codes. Each has600s process-group deadline; original5%limit.
+No compiler overlaps the comparison. Collect77457 before new heavy work.
+
+Recovery 2026-10-23: operator acceptance file reread; full delivery remains
+active with no pending question. Build54394 still active; collect same handle.
+GitHub authentication succeeds. New active imperfection: APFS CI job120095063098
+fails single p95=69.844ms/35ms and batch p95=417.516ms/300ms at head111ccfd8.
+Evidence: evidence-root/fsync-apfs-111ccfd8-failed-20261023.log, assertion at
+crates/mcp-agent-mail-storage/tests/fsync_matrix.rs:404. Classification: safe
+local diagnosis/repair under CI inspection and Rust performance workflow.
+Retain budgets and durability; earlier local APFS pass does not close this.
+Native Build & Test remains pending; other recorded CI results unchanged.
+
 ## Current resume checkpoint — active, 2026-10-22
+
+Current54394 has passed all-target59.31s, production36.28s, strictClippy72s,
+formatting and whitespace; BOTH release executables are now compiling. Keep
+runtime source fixed until collection. New workflow-only repairs also exist:
+Archive Perf has a separate60min locked build (logs retained),30min measurement,
+95min job, two compiler jobs, pinned repository compiler and cache-on-failure.
+Bench commands/budgets remain. SIGTERM143 cause is still unqualified; this
+prepares a bounded diagnosable rerun, not a claimed CI pass. Linux fsync now
+preserves one probe binary as a7day artifact for local diagnosis without the
+failed Linux VM compilation. Actionlint and whitespace pass. Toolchain comment
+now describes the workspace requirement without the stale FastMCP version.
+
+Candidate97083 completed0: append3/3 and insert4/4 pass (0.06s/0.15s),
+including full-row round-trip property coverage. Active54394 runs sequential
+workspace all-target check, production lib/bins check, strictClippy, fmt/whitespace,
+then builds BOTH release binaries. Two jobs, no incremental, physical TMPDIR,
+compiler library path restored. Logs atc-reuse-{all-targets,production,clippy,
+release}-20261022.log under evidence-root. Collect the same handle; later logs
+exist only after earlier gates pass. Source remains the uncommitted DB helper/
+read-back change plus this note. No performance pass, review, push or deployment.
+
+ATC read-back candidate now exists in DB queries.rs, uncommitted. It extracts
+the existing canonical SELECT into a connection-borrowing helper and performs
+read-back after successful COMMIT on the insert connection, before closing it.
+Schema inspection, row-cap enforcement, transaction/rollback and stored-row
+decoding remain. Baseline61174 passed3append tests after12m35s compilation;
+baseline82202 passed4insert tests including full-row property coverage.
+Candidate97083 now runs those same groups sequentially. Formatting91346 and
+whitespace pass. Collect tests before another heavy job; no performance result
+or full compiler/Clippy result is claimed for this candidate yet.
+Use frozen release111ccfd8 for the matched comparison, since its exact source
+identity is known. Source parity for the preserved debug executable has not been
+established; do not treat it as an exact-head comparison. Build the candidate release
+after focused tests, compare both in one invocation, then full gates/review.
+
+Latest continuation: reviewed/pushed head111ccfd8 remains the source baseline.
+Release build38320 completed successfully in18m28s. Both executables are frozen
+under evidence-root/qualification/release-111ccfd8-binaries; hashes and current
+process handles are in evidence-root/continuation-111ccfd8-20261022.txt.
+These are baseline binaries; installation remains unqualified. The live service
+is unchanged. Full delivery, fork merge, cutover and24h observation remain active.
+
+Current CI passes dashboard WASM, both installers, observability, btrfs,
+tmpfs and ext4-journal. ATC fails10.06%overhead against5%; ext4-ordered and
+xfs batchp95 fail387.395/404.659ms against250ms. Archive Perf terminated143
+during cold compilation, without a benchmark verdict. Its termination actor
+is unqualified. Native tests and APFS remain running. These are active repairs,
+not deferred findings. Exact logs/artifacts are in the external checkpoint.
+
+ATC append diagnostic:113successful durable observations, median2906us in
+the synchronous append path. It includes schema inspection, connection setup,
+write and read-back; no individual subcost attribution. Diagnostic overlapped
+compilation and supplies no performance qualification. Source inspection found
+an avoidable read-back connection reopen. Before editing, focused unchanged
+DB append tests compile in session61174, twojobs/single test thread; collect
+atc-append-baseline-20261022.log before another heavy command. No ATC source
+change yet. Next run preservation tests, make the bounded connection change,
+then matched real-transport comparison with the unchanged budget.
 
 FINAL LOCAL GATES85181 terminal0: workspace all-target47.85s,production28.83s,
 strictClippy56.86s,formatting and whitespace PASS. No active heavy command.
