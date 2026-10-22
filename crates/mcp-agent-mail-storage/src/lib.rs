@@ -9408,6 +9408,7 @@ fn append_message_bundle_digest(
     entry: MessageBundleBatchEntry<'_>,
     prepared: &PreparedMessageBundle,
     rel_paths: &mut Vec<String>,
+    pending: Option<&mut BTreeMap<String, (String, String)>>,
 ) -> Result<()> {
     let message = entry.message;
     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
@@ -9415,9 +9416,7 @@ fn append_message_bundle_digest(
         if !thread_id.is_empty() {
             let canonical_rel =
                 rel_path_cached(&archive.canonical_repo_root, &prepared.canonical_path)?;
-            if let Ok(digest_rel) = update_thread_digest(
-                archive,
-                thread_id,
+            let digest_entry = render_thread_digest_entry(
                 entry.sender,
                 &message_visible_recipients(message),
                 message
@@ -9427,7 +9426,15 @@ fn append_message_bundle_digest(
                 &prepared.timestamp,
                 entry.body_md,
                 &canonical_rel,
-            ) {
+            );
+            if let Some(pending) = pending {
+                // Different thread spellings can share a sanitized filename.
+                // Preserve their original order and the first entry's header.
+                let (_, contents) = pending
+                    .entry(sanitize_thread_id(thread_id))
+                    .or_insert_with(|| (thread_id.to_string(), String::new()));
+                contents.push_str(&digest_entry);
+            } else if let Ok(digest_rel) = append_thread_digest(archive, thread_id, &digest_entry) {
                 rel_paths.push(digest_rel);
             }
         }
@@ -9620,12 +9627,24 @@ pub fn write_message_batch_bundle(
             prepared.push(bundle);
         }
         writes.publish()?;
+        let mut digests = BTreeMap::new();
         for (entry, bundle) in entries.iter().zip(prepared) {
-            append_message_bundle_digest(archive, *entry, &bundle, &mut rel_paths)?;
+            append_message_bundle_digest(
+                archive,
+                *entry,
+                &bundle,
+                &mut rel_paths,
+                Some(&mut digests),
+            )?;
             if entries.len() == 1 {
                 single_auto_commit_message = Some(bundle.commit.auto_commit_message);
             }
             summary_lines.push(bundle.commit.summary_line);
+        }
+        for (thread_id, contents) in digests.values() {
+            if let Ok(digest_rel) = append_thread_digest(archive, thread_id, contents) {
+                rel_paths.push(digest_rel);
+            }
         }
         Ok(())
     })?;
@@ -9726,7 +9745,7 @@ pub fn write_message_bundle(
         let prepared =
             append_message_bundle_files(archive, entry, &mut rel_paths, None, &mut writes)?;
         writes.publish()?;
-        append_message_bundle_digest(archive, entry, &prepared, &mut rel_paths)?;
+        append_message_bundle_digest(archive, entry, &prepared, &mut rel_paths, None)?;
         let commit_message = commit_text
             .map(ToString::to_string)
             .unwrap_or(prepared.commit.auto_commit_message);
@@ -9794,25 +9813,14 @@ fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
     Utc::now()
 }
 
-/// Update (append to) a thread-level digest file.
-#[allow(clippy::too_many_arguments)]
-fn update_thread_digest(
-    archive: &ProjectArchive,
-    thread_id: &str,
+fn render_thread_digest_entry(
     sender: &str,
     recipients: &[String],
     subject: &str,
     timestamp: &str,
     body_md: &str,
     canonical_rel: &str,
-) -> Result<String> {
-    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
-    let project_root = archive_project_root_checked(archive)?;
-    let digest_dir = project_root.join("messages").join("threads");
-    ensure_dir(&digest_dir)?;
-
-    let safe_thread_id = sanitize_thread_id(thread_id);
-    let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
+) -> String {
     let recipients_str = if recipients.is_empty() {
         "(hidden recipients)".to_string()
     } else {
@@ -9836,17 +9844,28 @@ fn update_thread_digest(
         preview.to_string()
     };
 
-    let entry = format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n");
+    format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n")
+}
+
+/// Append ordered entries to one thread digest while holding the archive fence.
+fn append_thread_digest(
+    archive: &ProjectArchive,
+    thread_id: &str,
+    entries: &str,
+) -> Result<String> {
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let project_root = archive_project_root_checked(archive)?;
+    let digest_dir = project_root.join("messages").join("threads");
+    ensure_dir(&digest_dir)?;
+    let safe_thread_id = sanitize_thread_id(thread_id);
+    let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
 
     // Append to digest. Use create_new to atomically determine if this is
     // the first entry (eliminates TOCTOU race between exists() + create).
     //
-    // CORRECTNESS: Build the full payload in memory and write it with a
-    // single `write_all()` call. On most filesystems, writes under the
-    // `PIPE_BUF` limit (~4 KB on Linux) to an O_APPEND fd are atomic with
-    // respect to other appenders. Even for larger payloads, combining
-    // header + entry into one write avoids interleaving from concurrent
-    // writers between the two calls.
+    // Message writers hold the project lock through this append. Assemble the
+    // header and entries together; write_all may need multiple system calls,
+    // so serialization comes from the locks rather than a payload-size limit.
     let (mut file, is_new) = match create_new_archive_append_file(&digest_path) {
         Ok(f) => (f, true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -9856,11 +9875,11 @@ fn update_thread_digest(
         Err(e) => return Err(e.into()),
     };
 
-    // Single write: header (if new) + entry — no interleaving possible.
+    // Include the header only when this call created the digest.
     let payload = if is_new {
-        format!("# Thread {thread_id}\n\n{entry}")
+        format!("# Thread {thread_id}\n\n{entries}")
     } else {
-        entry
+        entries.to_string()
     };
     file.write_all(payload.as_bytes())?;
 
@@ -13449,6 +13468,8 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     Ok(())
 }
 
+const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
+
 /// Archive files staged under temp names beside their targets,
 /// then renamed into place together inside one archive mutation window
 /// (br-9bwnb). Staging needs no publication fence: readers only open named
@@ -13458,6 +13479,9 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
 struct StagedArchiveWrites {
     /// `(temp path, target path)` pairs not yet renamed into place.
     staged: Vec<(PathBuf, PathBuf)>,
+    /// Bound open descriptors while allowing a group of writes to reach the
+    /// filesystem before its first synchronization barrier.
+    pending_sync: Vec<fs::File>,
     /// One open file per device keeps descriptor use independent of batch size.
     #[cfg(target_vendor = "apple")]
     devices: HashMap<u64, fs::File>,
@@ -13478,25 +13502,36 @@ impl StagedArchiveWrites {
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
-        let (tmp_path, file) = stage_atomic_write(path, data, !cfg!(target_vendor = "apple"))?;
+        let (tmp_path, file) = stage_atomic_write(path, data, false)?;
         self.staged.push((tmp_path, path.to_path_buf()));
-        #[cfg(target_vendor = "apple")]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-
-            // Apple fsync writes this file to the device. F_FULLFSYNC also
-            // flushes the device cache, so perform that once per device after
-            // all files have reached it, before publishing any of them.
-            nix::unistd::fsync(&file).map_err(std::io::Error::from)?;
-            self.devices.entry(file.metadata()?.dev()).or_insert(file);
+        self.pending_sync.push(file);
+        if self.pending_sync.len() >= ARCHIVE_SYNC_GROUP_FILES {
+            self.sync_pending()?;
         }
-        #[cfg(not(target_vendor = "apple"))]
-        drop(file);
+        Ok(())
+    }
+
+    fn sync_pending(&mut self) -> Result<()> {
+        for file in self.pending_sync.drain(..) {
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+
+                // Apple fsync writes this file to the device. F_FULLFSYNC also
+                // flushes the device cache, so perform that once per device after
+                // all files have reached it, before publishing any of them.
+                nix::unistd::fsync(&file).map_err(std::io::Error::from)?;
+                self.devices.entry(file.metadata()?.dev()).or_insert(file);
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            file.sync_data()?;
+        }
         Ok(())
     }
 
     /// Rename every staged file into place inside one archive mutation window.
     fn publish(mut self) -> Result<()> {
+        self.sync_pending()?;
         #[cfg(target_vendor = "apple")]
         for file in self.devices.values() {
             file.sync_data()?;
@@ -15472,6 +15507,71 @@ mod tests {
         assert!(staged_temp_files(tmp.path()).is_empty());
     }
 
+    #[test]
+    fn staged_archive_writes_bound_pending_files_and_publish_complete_contents() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        for index in 0..=ARCHIVE_SYNC_GROUP_FILES {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+            assert!(staged.pending_sync.len() < ARCHIVE_SYNC_GROUP_FILES);
+            assert!(!tmp.path().join(index.to_string()).exists());
+        }
+
+        staged.publish().unwrap();
+
+        for index in 0..=ARCHIVE_SYNC_GROUP_FILES {
+            assert_eq!(
+                fs::read(tmp.path().join(index.to_string())).unwrap(),
+                index.to_le_bytes()
+            );
+        }
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_pending_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let later = tmp.path().join("later.json");
+        let mut staged = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        // The real filesystem refuses synchronization of a pipe.
+        // The publication boundary must propagate that failure before any rename.
+        staged.pending_sync[1] = nix::unistd::pipe().unwrap().0.into();
+
+        assert!(staged.publish().is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert!(!later.exists());
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_clean_up_when_a_full_sync_group_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        staged.add(&tmp.path().join("first"), b"first").unwrap();
+        staged.pending_sync[0] = nix::unistd::pipe().unwrap().0.into();
+        for index in 1..ARCHIVE_SYNC_GROUP_FILES - 1 {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+        }
+
+        assert!(staged.add(&tmp.path().join("last"), b"last").is_err());
+        assert!(!tmp.path().join("first").exists());
+        assert!(!tmp.path().join("last").exists());
+        drop(staged);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
     #[cfg(target_vendor = "apple")]
     #[test]
     fn staged_archive_writes_preserve_targets_when_device_sync_fails() {
@@ -15486,6 +15586,7 @@ mod tests {
         .unwrap();
         // Exercise a real failing full-sync syscall at the device boundary.
         // No file may be published even if every preceding file fsync passed.
+        staged.sync_pending().unwrap();
         for device in staged.devices.values_mut() {
             *device = fs::File::open("/dev/null").unwrap();
         }
@@ -16193,6 +16294,20 @@ mod tests {
                 "thread_id": "TKT-BATCH",
                 "project": "proj",
             }),
+            serde_json::json!({
+                "id": 3,
+                "subject": "Separate Thread",
+                "created_ts": "2026-01-15T10:02:00Z",
+                "thread_id": "TKT-OTHER",
+                "project": "proj",
+            }),
+            serde_json::json!({
+                "id": 4,
+                "subject": "Same Digest Different Spelling",
+                "created_ts": "2026-01-15T10:03:00Z",
+                "thread_id": "tkt-batch",
+                "project": "proj",
+            }),
         ];
         let recipients = vec!["RecipientAgent".to_string()];
 
@@ -16228,6 +16343,13 @@ mod tests {
             snapshot_archive_files(&archive_single.root),
             snapshot_archive_files(&archive_batch.root)
         );
+        let digest =
+            fs::read_to_string(archive_batch.root.join("messages/threads/tkt-batch.md")).unwrap();
+        assert_eq!(digest.matches("# Thread TKT-BATCH\n").count(), 1);
+        assert_eq!(digest.matches("\n---\n").count(), 3);
+        assert!(digest.find("Batch Layout One") < digest.find("Batch Layout Two"));
+        assert!(digest.find("Batch Layout Two") < digest.find("Same Digest Different Spelling"));
+        assert!(!digest.contains("Separate Thread"));
     }
 
     #[test]
@@ -22237,15 +22359,10 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, &digest_path).unwrap();
 
-        let err = update_thread_digest(
+        let err = append_thread_digest(
             &archive,
             "T-1",
-            "SenderAgent",
-            &["ReceiverAgent".to_string()],
-            "Subject",
-            "2026-05-05T12:00:00Z",
-            "body",
-            "messages/2026/05/message.md",
+            "digest entry must not reach the outside file",
         )
         .unwrap_err();
 
@@ -23403,6 +23520,90 @@ mod tests {
         assert_eq!(
             archive_index_sync_backoff(Duration::from_millis(500)),
             Duration::from_millis(15_000)
+        );
+    }
+
+    #[test]
+    fn tree_updates_preserve_bases_deletions_and_update_order() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let left_blob = repo.blob(b"left retained content").unwrap();
+        let right_blob = repo.blob(b"right retained content").unwrap();
+        let first_blob = repo.blob(b"first replacement").unwrap();
+        let last_blob = repo.blob(b"last replacement").unwrap();
+        let mut left = repo.treebuilder(None).unwrap();
+        left.insert("kept", left_blob, 0o100_644).unwrap();
+        left.insert("old", first_blob, 0o100_644).unwrap();
+        let left = left.write().unwrap();
+        let mut right = repo.treebuilder(None).unwrap();
+        right.insert("kept", right_blob, 0o100_644).unwrap();
+        right.insert("old", first_blob, 0o100_644).unwrap();
+        let right = right.write().unwrap();
+        let mut base = repo.treebuilder(None).unwrap();
+        base.insert("left", left, 0o040_000).unwrap();
+        base.insert("mirror", left, 0o040_000).unwrap();
+        base.insert("right", right, 0o040_000).unwrap();
+        let base = repo.find_tree(base.write().unwrap()).unwrap();
+        let mut updates = Vec::new();
+        for prefix in ["left", "mirror", "right"] {
+            updates.push((format!("{prefix}/new"), Some(first_blob)));
+            updates.push((format!("{prefix}/old"), None));
+            updates.push((format!("{prefix}/new"), Some(last_blob)));
+        }
+        updates.push(("other/new".to_string(), Some(last_blob)));
+        updates.push(("other/new".to_string(), Some(first_blob)));
+        let tree = repo
+            .find_tree(build_tree_with_updates(&repo, Some(&base), &updates).unwrap())
+            .unwrap();
+        assert_eq!(
+            tree.get_path(Path::new("left/kept")).unwrap().id(),
+            left_blob
+        );
+        assert_eq!(
+            tree.get_path(Path::new("right/kept")).unwrap().id(),
+            right_blob
+        );
+        assert_eq!(
+            tree.get_name("left").unwrap().id(),
+            tree.get_name("mirror").unwrap().id()
+        );
+        for prefix in ["left", "mirror", "right"] {
+            assert_eq!(
+                tree.get_path(Path::new(&format!("{prefix}/new")))
+                    .unwrap()
+                    .id(),
+                last_blob
+            );
+            assert!(tree.get_path(Path::new(&format!("{prefix}/old"))).is_err());
+        }
+        assert_eq!(
+            tree.get_path(Path::new("other/new")).unwrap().id(),
+            first_blob
+        );
+        assert!(tree.get_path(Path::new("other/kept")).is_err());
+
+        // A subsequent commit must use its own base and updates.
+        let next = repo
+            .find_tree(
+                build_tree_with_updates(
+                    &repo,
+                    Some(&tree),
+                    &[("left/new".to_string(), Some(first_blob))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            next.get_path(Path::new("left/new")).unwrap().id(),
+            first_blob
+        );
+        assert_eq!(
+            next.get_path(Path::new("mirror/new")).unwrap().id(),
+            last_blob
+        );
+        assert_eq!(
+            next.get_path(Path::new("left/kept")).unwrap().id(),
+            left_blob
         );
     }
 
