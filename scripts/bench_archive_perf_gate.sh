@@ -111,12 +111,15 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
         exit 2
     fi
 
-    (
-        cd "${BENCH_ROOT}"
+    if (
+        cd "${BENCH_ROOT}" || exit
         MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
             cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch
-    ) 2>&1 | tee "${bench_log}"
-    bench_rc="${PIPESTATUS[0]}"
+    ) 2>&1 | tee "${bench_log}"; then
+        bench_rc=0
+    else
+        bench_rc=$?
+    fi
 else
     printf 'skip-bench=1; reusing %s\n' "${SUMMARY_CSV_PATH}" | tee "${bench_log}"
     bench_rc=0
