@@ -8,10 +8,13 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_DIR="${PROJECT_ROOT}/tests/artifacts/perf/archive_fsync_matrix/${RUN_ID}"
 FILESYSTEM=""
 TARGET_DIR="${TMPDIR:-/tmp}/target-$(whoami)-am"
+TRACE_SYSCALLS=0
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>]
+Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>] [--trace-syscalls]
+
+--trace-syscalls records Linux diagnostic timing; use a separate output directory.
 
 Supported filesystems:
   Linux:  ext4-ordered, ext4-journal, xfs, btrfs, tmpfs
@@ -54,6 +57,10 @@ while [ $# -gt 0 ]; do
             TARGET_DIR="${2:-}"
             shift 2
             ;;
+        --trace-syscalls)
+            TRACE_SYSCALLS=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -81,6 +88,17 @@ mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
 
 OS_NAME="$(uname -s)"
+PROBE_RUNNER=(cargo)
+if [ "${TRACE_SYSCALLS}" -eq 1 ]; then
+    if [ "${OS_NAME}" != "Linux" ]; then
+        printf 'error: --trace-syscalls requires Linux\n' >&2
+        exit 1
+    fi
+    require_cmd strace
+    PROBE_RUNNER=(strace -f -c -o "${OUTPUT_DIR}/syscalls.txt" cargo)
+    printf 'Diagnostic syscall tracing enabled; these timings are not qualification evidence.\n' \
+        | tee "${OUTPUT_DIR}/diagnostic.txt"
+fi
 STORAGE_ROOT=""
 FS_LABEL=""
 MOUNT_OPTIONS=""
@@ -234,6 +252,6 @@ AM_FSYNC_MATRIX_ARTIFACT_DIR="${OUTPUT_DIR}" \
 AM_FSYNC_MATRIX_SINGLE_P95_BUDGET_MS="${SINGLE_BUDGET_MS}" \
 AM_FSYNC_MATRIX_BATCH_100_P95_BUDGET_MS="${BATCH_BUDGET_MS}" \
 CARGO_TARGET_DIR="${TARGET_DIR}" \
-cargo test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
+"${PROBE_RUNNER[@]}" test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
 
 printf 'artifact summary: %s\n' "${OUTPUT_DIR}/summary.json"

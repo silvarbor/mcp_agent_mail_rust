@@ -45,13 +45,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y btrfs-progs e2fsprogs xfsprogs
+          sudo apt-get install -y btrfs-progs e2fsprogs xfsprogs strace
 
       - name: Build archive fsync probe
         timeout-minutes: 60
         run: cargo test --locked -p mcp-agent-mail-storage --test it --no-run
 
       - name: Run archive fsync matrix probe
+        id: probe
         timeout-minutes: 30
         shell: bash
         run: |
@@ -61,6 +62,19 @@ jobs:
             --filesystem "${{ matrix.fs }}" \
             --target-dir "${{ github.workspace }}/target" \
             --output-dir "${MATRIX_OUTPUT_DIR}"
+
+      - name: Trace failed Linux archive probe
+        if: failure() && steps.probe.outcome == 'failure'
+        timeout-minutes: 10
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/bench_archive_fsync_matrix.sh \
+            --filesystem "${{ matrix.fs }}" \
+            --target-dir "${{ github.workspace }}/target" \
+            --output-dir "${MATRIX_OUTPUT_DIR}/diagnostic" \
+            --trace-syscalls
 
       - name: Upload archive fsync artifacts
         if: always()
