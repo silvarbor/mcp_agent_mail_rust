@@ -2,7 +2,55 @@
 
 ## Recovery on 2026-10-23
 
-CURRENT: committed implementation audit
+CURRENT: wrapper-lifetime repair after canonical gate failure.
+Profile command 15706 and macOS
+sample command 35177 both exited 0. Evidence lives under
+atc-schema-profile-20261023. All six stores passed integrity and counts;
+sampled treatment timings are diagnostic only. The live sample includes 61
+connection-open samples and 41 connection-drop samples under
+record_atc_message_observations_from_tool_payload. That caller reconstructs a
+DbPool wrapper for each observation; from_shared_pool_with_authority initializes
+a new append cache, so wrapper Drop closes it after each request. Clone-only
+reuse evidence did not cover this production reconstruction boundary.
+Current imperfection: cache lifetime does not follow the shared pool across
+wrappers (pool.rs constructors; live-sample.txt lines 1840 and 2120). Safe local
+fix under Rust implementation/test guidance: share cache ownership through weak
+registry references keyed by underlying pool identity, with wrappers owning the
+cache and final-wrapper drop releasing it. New actual factory-path regression
+checks retained WAL between wrappers and closure after final-owner drop. RED
+command 47973 exited 101 at fixture setup: canonicalizing the configured database
+URL changed the test-only ephemeral archive root, so authority validation
+correctly refused the wrapper. The fixture now reuses the original configured
+URL spelling. This first failure supplies no cache-lifetime RED evidence.
+Corrected RED command 36692 exited 101 at the retained-WAL assertion after
+dropping the transient wrapper, establishing the actual lifetime failure.
+Logs: atc-wrapper-red-20261023.log and atc-wrapper-red-authority-20261023.log.
+Both pool constructors now obtain an append cache from a weak registry keyed by
+underlying pool identity. All reconstructed wrappers retain the same cache;
+neither registry reference keeps a pool or connection alive. Formatting and
+diffcheck passed. GREEN command 99256 passed the retention assertion and nine
+existing append tests, then failed the added final-owner shutdown assertion.
+Lifetime diagnostics 26444 and 89576 confirmed a remaining strong owner:
+counts were 2 before/after transient wrappers and 1 after the test owner dropped.
+Source inspection found the intended bounded resident owner in pool_registry.rs.
+The test now evicts the production resident set using its declared capacity,
+then requires both weak-cache expiry and WAL cleanup; no assertion was removed.
+Temporary ownership prints are removed. GREEN command 29702 exited 0 with all
+ten append tests passing, including cache expiry and WAL cleanup after residency
+eviction. Production/test repair committed as
+cec33fb274eafa38f71722d782396402c4fb50ca. Fresh sync-base returned already_current
+against 0b289a5afea198449b26d6b974b76a4948404ca6. Validation command 79127 is active:
+workspace all-targets check, production lib/bins check, strict workspace Clippy,
+fmt and diffcheck, sequentially. Collect the same handle before another heavy
+command. Logs are atc-wrapper-check-all-20261023.log,
+atc-wrapper-check-production-20261023.log and atc-wrapper-clippy-20261023.log.
+Regression logs:
+atc-wrapper-{green,lifetime,owners,residency-green}-20261023.log.
+Workspace checks, strict Clippy, committed review and performance remain pending
+for this ownership repair. No publication or live mutation has occurred.
+
+Previous checkpoint:
+committed implementation audit
 2026-10-23_08-14-12-558-05b0a2e930a5 approved the exact range
 88026bb2...a6dbf200 with zero findings; supported journal projection consumed.
 Candidate build 47872 exited 0 in 6m09s. Frozen development binary is
