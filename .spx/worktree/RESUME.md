@@ -2,13 +2,95 @@
 
 ## Recovery on 2026-10-23
 
-Continuation checkpoint: host-load waiter and candidate diagnostic remain active
-under exec session 76977; collect this handle before launching heavy work. The
-guarded command uses /opt/homebrew/bin/python3.13 and the retained interleaved
-prototype, candidate at `atc-direct-candidate-20261023/am`, output root
-`atc-candidate-profile-20261023-resumed` under the preservation directory.
-The benchmark has emitted no result yet. When treatment servers run, sample
-the live-mode process to distinguish connection/schema/commit/close cost.
+Connection-reuse candidate is committed as
+622292162537767e5b78349a46d4c9577e18f1ff in pool.rs, queries.rs and the
+atc_queries.rs test helper. A real
+baseline run of `cargo test -p mcp-agent-mail-db --lib
+append_atc_reuses_connection_with_committed_rows_visible_to_fresh_readers --
+--nocapture` ran one test and failed at the retained-WAL assertion. The earlier
+attempt with an unqualified `--exact` filter ran zero tests and supplies no
+evidence. Candidate uses a pool-shared asupersync try-lock, a fresh connection
+when contended, per-call authority/schema checks, Unix device/inode generation
+checks, and FULL synchronous commits for all canonical ATC writers. Added real
+SQLite tests cover committed independent reads, contention, schema changes,
+authority rejection, and replacement with preservation of original rows.
+Focused candidate command 58289 passed seven append tests. Command 54828
+subsequently passed eight, adding an abrupt process-exit test that bypasses
+Drop/checkpoint and recovers the committed row, plus per-pool durability
+isolation. Command 40190 passed 29 ATC query/rollup tests, both required
+workspace checks (all-targets and production lib/bins), strict workspace Clippy,
+fmt and diffcheck. No performance qualification, publication or installation.
+
+The process-global relaxed-durability test override was replaced with a
+test-only per-pool flag. The real-connection test observes OFF in the rollup
+fixture and FULL in an independent append pool; 29 rollup tests also pass.
+Nextest is unavailable here; selected Cargo tests use timeout with process-group
+termination rather than leaving a long test run unbounded.
+
+Advisory implementation audit 2026-10-23_07-43-34-922-2dc1d51ba2fb rejected the
+candidate with one blocking finding: a panic after BEGIN IMMEDIATE can leave
+the cached connection/transaction inside a poisoned mutex, blocking subsequent
+fresh writers. Current ledger classification: safe local ownership repair in
+queries.rs, governed by Rust remediation and the operator's integrity and
+responsiveness requirements. Proposed repair takes the connection out of the
+cache during schema/transaction work and restores it only on successful return;
+unwinding then drops the connection and rolls back. A real SQLite regression
+uses an eviction tracing callback panic and a zero-wait independent write-lock
+probe. RED command 49592 ran one test and failed with database-is-locked at
+that zero-wait probe after the intended observer panic (exit 101). The ownership
+repair is applied: take the connection out of the cache before inspection and
+transaction work, restore it after successful readback only. GREEN and full
+validation command 78470 passed the post-panic write-lock probe but failed the
+later append readback: its terminal row shared the old rows' resolution time,
+so documented cutoff-tie compaction removed it too. The later append now uses
+a later timestamp; the RED lock-probe scenario and assertion are unchanged.
+Command 39658 passed nine append tests, 29 rollup tests, all-targets check and
+production lib/bins check. Strict Clippy found two test-code issues: callback
+type complexity and manual if/panic. These are repaired with an EventObserver
+type alias and the suggested assert form of the injected panic. Command 19247
+completed exit 0: nine append tests, strict workspace Clippy, fmt, diffcheck.
+Production code did not change after both workspace checks passed. The unwind
+defect is fixed with red/green real-SQLite evidence; fresh committed review and
+the candidate binary build/performance comparison remain required. Commit hooks
+ran normally; no source changes remain outside the committed checkpoint.
+
+External paired diagnostic at preservation-directory
+atc-paired-diagnostic-20261023.py passed Ruff and strict mypy. Smoke command
+43413 exited 0 using the same frozen baseline in both positions, one measured
+sample per store plus 63 seed/warmup sends. All twelve stores passed integrity,
+message counts and mode-specific ATC counts. Results are in
+atc-paired-smoke-20261023; smoke timings are not performance evidence.
+The full diagnostic keeps both binaries' off/shadow/live servers in the same
+invocation, balances request order, and includes all-off controls. Defaults to
+300 samples per store and retains qualification:false. It has not yet run
+against the new candidate, which still needs a binary build after remediation.
+
+Continuation checkpoint: candidate diagnostic 76977 completed with exit 0;
+sampling command 74531 also completed with exit 0. The host waiter admitted
+the run after 512 seconds at normalized load 0.373/0.689/0.733. No heavy command
+remains active. Results and live-sample.txt are under the preservation directory
+`atc-candidate-profile-20261023-resumed`. All six stores passed integrity/count
+checks; treatment live retained 363 ATC rows and the other modes retained zero.
+The all-off control measured -1.842%/-0.867%; treatment measured shadow 0.893%
+and live 62.658%. The live process was sampled during treatment, so those
+treatment timings are diagnostic and cannot qualify performance.
+
+Candidate profile localizes the next optimization: 47 inclusive samples in
+connection opening, 39 in closing, 30 in append/readback, and 10 in schema
+inspection. WAL close includes checkpoint/fsync/unmap/unlink work. Investigate
+a pool-owned reusable canonical ATC append connection while retaining per-call
+filesystem-authority checks, schema checks, transactional row ceiling and
+post-commit readback. Reuse must detect sidecar replacement and preserve commit
+durability; retaining a NORMAL connection without the current last-close
+checkpoint can change power-loss behavior. A FULL-synchronous reusable WAL
+connection is a candidate to investigate, not an approved implementation.
+Concurrency, replacement, shutdown/crash and durability evidence are required.
+
+Independent review 2026-10-23_07-19-13-017-053bcf3430d5 approved all 11 changed
+files with zero findings at clean committed head
+88026bb2d237f2cda221071e51d1789bfb9e22fd against 111ccfd864eb. Projection was
+read through spx journal render. No push or installation occurred. Review
+approval establishes code review only; performance qualification still fails.
 
 Fresh GitHub inspection confirms PR #3 remains OPEN at 111ccfd864eb. Failed
 logs for 39856238361, 39856238377 and 39856238404 are preserved as
