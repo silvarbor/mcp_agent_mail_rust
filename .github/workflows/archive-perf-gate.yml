@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 95
     env:
       GATE_OUTPUT_DIR: tests/artifacts/perf/archive_perf_gate/${{ github.run_id }}-${{ github.run_attempt }}
-      # Two release compilations exhausted runner memory and drove swap to 3 GiB.
+      # The two-job build reached 3 GiB of swap before termination.
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
