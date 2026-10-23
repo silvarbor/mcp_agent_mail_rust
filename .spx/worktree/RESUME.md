@@ -1,5 +1,52 @@
 # Resume — local Agent Mail fork
 
+## Current checkpoint: 988337c4 and path-resolution repair
+
+Published HEAD is 988337c44d7a98646e2703470911c61e9c56a6dd. The diagnostic
+follow-up audit 2026-10-23_11-39-57-336-9e6cc0ac3e87 sealed approved with
+zero findings; its three paths were optional registry coverage gaps.
+Watch 16140 completed with exit 1 on the ext4/XFS batch failures.
+
+Direct-executable Linux traces now validate the tracing repair: both ext4 and
+XFS execute 236225 readlink calls, versus 236308 with Cargo included. Each has
+3336 fdatasync calls. Overlapping thread elapsed totals are not wall-time shares.
+Uninstrumented ext4 batch p95 is 428.437ms and XFS is 353.263ms against 250ms;
+single writes pass and crash checks retain 100 canonical messages and two commits.
+Artifacts are fsync-ext4-ordered-988337c4-20261023 and fsync-xfs-988337c4-20261023
+under the preservation root. Instrumented timings are diagnostic only.
+
+Current CI: ATC 39948186015 fails its regression gate. Installer, observability,
+dashboard, btrfs, ext4-journal and tmpfs pass. Build & Test, ArchivePerf and APFS
+were still running at the latest check. ArchivePerf uses one compiler job;
+its memory-pressure repair still needs a completed result.
+
+Local candidate 5ada6dcd27b9b93477c58f635924e6b0570214e7 removes a duplicate
+target canonicalization in rel_path_cached.
+The existing-prefix helper already attempts the target before its ancestors;
+symlink resolution, containment checks and synchronization remain in place.
+Both existing rel_path_cached regressions passed before editing (63975 exit 0)
+and after editing (70861 exit 0; two tests). Formatting and whitespace pass
+(10997 exit 0). The full storage unit suite is active under handle 1808, with
+completed cases passing; collect that same handle before any new heavy command.
+Audit 2026-10-23_11-56-50-813-b93e5cc0f7aa sealed approved with zero findings,
+covering required Rust code and architecture for 988337c4...5ada6dcd.
+Workspace all-targets check, production lib/bins check, strict Clippy and matched
+baseline/candidate performance comparison remain unestablished. No speedup is claimed.
+Next: collect suite, complete those checks, then publish the validated candidate.
+The preserved Mac baseline is archive-enumeration-candidate-20261023/storage-tests;
+its SHA-256 is 9ff554b6d86085894b534d5c666bf27b546ceee0ffe79b9ed2369ca587c9eb47.
+Build the candidate's integration-test executable before comparing both in one
+invocation with independent stores and the unchanged APFS 35ms/300ms budgets.
+No installation has occurred.
+
+Latest ATC artifact download 33099 completed successfully into
+atc-ci-988337c4-20261023. Qualification p95: off 23.132447ms, shadow
+107.268421ms, live 133.073329ms. All-off control p95 values are 93.575481ms,
+197.492898ms and 96.020264ms: spikes also occur without ATC writes. This does
+not identify their cause or clear the unchanged 5% gate.
+
+## Historical diagnostic results
+
 ## CI diagnostic results at published 3a0c2063
 
 Published PR head is 3a0c206397b7b9c220e2b920bf4a275af5b51135; push 62027
