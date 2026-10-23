@@ -1,6 +1,34 @@
 # Resume — local Agent Mail fork
 
-## Current checkpoint: 988337c4 and path-resolution repair
+## Current checkpoint: rejected path-resolution experiment
+
+Local source checkpoint a1420a14758d41393bc26af841cee8f33962244c restores
+the published 988337c4 storage implementation exactly. The duplicate-walk
+experiment 5ada6dcd was reverted after its matched APFS comparison failed:
+baseline batch p95 305.164ms; candidate 388.339ms; unchanged budget 300ms.
+Single-message p95 was 31.264ms versus 32.305ms, both under 35ms. Both crash
+checks retained 100 canonical messages and two commits. Comparison 91559 exited
+1; each probe exited 101. Evidence: path-resolution-comparison-20261023/.
+No performance improvement is claimed and no changed runtime was published.
+
+The experiment's production check passed (22498 exit 0, 1m10s after a
+120.009-second load wait), as did strict Clippy (84530 exit 0, 2m22s).
+Probe build 93041 exited 0 in 55.92s. Its preserved binary is
+path-resolution-candidate-5ada6dcd-20261023/storage-tests, SHA-256
+ac1b0277e68f831618724a0b4fe270e344abc144a3dbdc41d1c0075096d29e41.
+No local command is active. All following experiment status is historical.
+
+Next investigation: the retained archive-enumeration-profile-20261023/sample.txt
+shows substantial commit-worker samples in git_blob_create_from_disk, including
+attribute loading/path resolution and object creation. Matched baseline batch
+flush phases take about 143–150ms. commit_paths_lockfree calls blob_path once
+per path. Preserve Git filtering: archive initialization writes *.md text eol=lf
+and the local libgit2 source confirms blob_path applies filters. A raw-blob
+replacement would change semantics. Inspect a batched filtered-blob creation
+route without touching the shared index, weakening sync, or losing staged evidence.
+No next implementation has been chosen. Do not rerun the rejected candidate.
+
+## Historical path-resolution experiment validation
 
 Published HEAD is 988337c44d7a98646e2703470911c61e9c56a6dd. The diagnostic
 follow-up audit 2026-10-23_11-39-57-336-9e6cc0ac3e87 sealed approved with
