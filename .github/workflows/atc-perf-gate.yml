@@ -48,6 +48,27 @@ jobs:
           chmod +x scripts/bench_atc_perf_gate.sh
           scripts/bench_atc_perf_gate.sh --output-dir "${GATE_OUTPUT_DIR}"
 
+      - name: Measure identical ATC-off controls
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/bench_atc_transport.py \
+            --binary "${GITHUB_WORKSPACE}/target/debug/am" \
+            --store-root "${RUNNER_TEMP}/atc-off-control-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --diagnostic-all-off \
+            > "${GATE_OUTPUT_DIR}/all_off_control.json"
+
+      - name: Preserve ATC binary for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atc-linux-binary
+          path: target/debug/am
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Upload ATC perf artifacts
         if: always()
         uses: actions/upload-artifact@v4
