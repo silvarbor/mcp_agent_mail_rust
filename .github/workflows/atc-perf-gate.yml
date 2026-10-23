@@ -74,7 +74,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: atc-perf-gate
-          path: ${{ env.GATE_OUTPUT_DIR }}/
+          path: |
+            ${{ env.GATE_OUTPUT_DIR }}/
+            !${{ env.GATE_OUTPUT_DIR }}/server_canary.stdin.*
           retention-days: 30
           if-no-files-found: error
 
