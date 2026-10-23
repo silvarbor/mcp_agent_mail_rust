@@ -36,7 +36,7 @@ cleanup() {
         sudo umount "${BIND_MOUNT_POINT}" >/dev/null 2>&1 || return
     fi
     if [ -n "${MOUNT_POINT:-}" ] && mount | grep -q " on ${MOUNT_POINT} "; then
-        sudo umount "${MOUNT_POINT}" >/dev/null 2>&1 || true
+        sudo umount "${MOUNT_POINT}" >/dev/null 2>&1 || return
     fi
     if [ -n "${MOUNT_POINT:-}" ] && [ -d "${MOUNT_POINT}" ]; then
         rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true
