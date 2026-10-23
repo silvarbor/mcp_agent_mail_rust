@@ -3,10 +3,12 @@
 ## CI diagnostic results at published 3a0c2063
 
 Published PR head is 3a0c206397b7b9c220e2b920bf4a275af5b51135; push 62027
-completed successfully. Watch 31865 exited 1 on APFS failure. No local heavy
-command is active except compiler-artifact validation 77984, currently waiting
-for host-load admission. Collect that same handle; its output is
-fsync-probe-artifacts-20261023.jsonl in the preservation root.
+completed successfully. Watch 31865 exited 1 on APFS failure. Compiler-artifact
+validation 77984 completed with exit 0 after 276.022 seconds of load admission;
+the build took 1.36 seconds. Check 4638 resolved exactly one executable from
+that real JSON and confirmed its --list output contains the exact fsync probe.
+No local heavy command is active. The output is fsync-probe-artifacts-20261023.jsonl
+in the preservation root.
 
 Fsync 39945424677 failed APFS (single 39.016ms/35ms; batch 330.761ms/300ms),
 ext4-ordered (batch 374.0ms/250ms), XFS (batch 430.798ms/250ms), and
@@ -16,17 +18,27 @@ Trace artifacts under fsync-{ext4,xfs,btrfs}-3a0c2063-20261023/diagnostic
 contain 3336 fdatasync calls and 236308 readlink calls but include Cargo startup;
 their overlapping thread wall times cannot identify archive-only proportions.
 Local repair 61343c93e3d2ae0c3100e87ee24a520bd2ff1d56 resolves the test
-executable from Cargo JSON before tracing. Static checks pass; actual artifact
-resolution validation 77984 is pending. This repair has not been published.
+executable from Cargo JSON before tracing. Follow-up dffa2b10 preserves repository
+Cargo configuration when invoked from another directory. Static checks and actual
+artifact resolution pass. Linux tracing execution remains pending. These repairs
+have not been published.
 
 ATC 39945424829 failed: off p95 25.089426ms, shadow 29.127276ms,
 live 27.096125ms. Identical off controls measured 25.834693, 26.810769,
 25.263811ms, all with 113 messages, integrity okay and zero ATC rows. These
 controls do not establish that the qualification failure is measurement noise.
 Keep the 5% limit. Artifacts: atc-ci-3a0c2063-20261023.
-ArchivePerf 39945424703/job 120386796582 remains in progress; its live log
-was unavailable at 11:33:36Z. Collect terminal output before diagnosing the
-resource samples. Detailed machine record: diagnostic-ci-3a0c2063-20261023.json.
+ArchivePerf 39945424703/job 120386796582 failed with exit 143. The final vmstat
+samples show cache reclamation and swap growth to 3144148 KiB before termination.
+Memory pressure is the leading cause; the signal sender remains unconfirmed.
+Local repair 4bf20736 sets CARGO_BUILD_JOBS=1 without changing release/benchmark
+profiles or budgets. Actionlint passes; CI confirmation remains pending.
+Log: archive-perf-failed-3a0c2063-20261023.log. Focused audit
+2026-10-23_11-39-57-336-9e6cc0ac3e87 is open for 3a0c2063...dffa2b10;
+the registry selects only optional coverage gaps for these shell/workflow/note
+paths. Collect its final record, then publish the validated follow-up changes.
+Fresh base sync returned already_current at dffa2b10 against origin/main 0b289a5a.
+Detailed machine record: diagnostic-ci-3a0c2063-20261023.json.
 No merge, installation, restart or 24-hour observation has occurred.
 
 ## Resumed diagnostics on 2026-10-23
