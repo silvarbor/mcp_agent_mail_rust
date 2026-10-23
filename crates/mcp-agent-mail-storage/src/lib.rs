@@ -8922,8 +8922,8 @@ struct MessageFileStamp {
 }
 
 #[cfg(unix)]
-fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
-    use std::os::unix::fs::MetadataExt as _;
+fn message_file_stamp(metadata: &cap_std::fs::Metadata) -> Option<MessageFileStamp> {
+    use cap_std::fs::MetadataExt as _;
 
     Some(MessageFileStamp {
         len: metadata.len(),
@@ -8938,7 +8938,7 @@ fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
 
 /// Without a change time a rewritten file cannot be told apart: never cache.
 #[cfg(not(unix))]
-const fn message_file_stamp(_metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+const fn message_file_stamp(_metadata: &cap_std::fs::Metadata) -> Option<MessageFileStamp> {
     None
 }
 
@@ -9044,6 +9044,11 @@ impl CanonicalScanDirectory {
         Ok(())
     }
 
+    fn entries(&self) -> std::io::Result<cap_std::fs::ReadDir> {
+        let directory = &self.chain.last().expect("root directory is retained").1;
+        cap_std::fs::Dir::from_std_file(directory.try_clone()?).entries()
+    }
+
     fn read_frontmatter(
         &self,
         name: &std::ffi::OsStr,
@@ -9068,7 +9073,7 @@ impl CanonicalScanDirectory {
         )
         .map_err(std::io::Error::from)?;
         let mut file = fs::File::from(fd);
-        let before = file.metadata()?;
+        let before = cap_std::fs::Metadata::from_file(&file)?;
         if !before.is_file() || before.len() > MAX_MESSAGE_FILE_BYTES {
             return Err(StorageError::InvalidPath(
                 "scan entry is not a bounded regular message file".into(),
@@ -9084,7 +9089,7 @@ impl CanonicalScanDirectory {
             ));
         }
         let before = message_file_stamp(&before);
-        let after = message_file_stamp(&file.metadata()?);
+        let after = message_file_stamp(&cap_std::fs::Metadata::from_file(&file)?);
         if before != after {
             return Err(StorageError::InvalidPath(
                 "canonical message changed while being scanned".into(),
@@ -9136,7 +9141,11 @@ fn collect_canonical_message_id_index_with_window(
         }
         Err(error) => return Err(error),
     };
-    let year_entries = match fs::read_dir(messages_root) {
+    #[cfg(unix)]
+    let year_entries = root_directory.entries();
+    #[cfg(not(unix))]
+    let year_entries = fs::read_dir(messages_root);
+    let year_entries = match year_entries {
         Ok(entries) => entries,
         #[cfg(not(unix))]
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((index, parsed)),
@@ -9155,7 +9164,7 @@ fn collect_canonical_message_id_index_with_window(
     let mut seen = HashSet::with_capacity(cache.files.len());
     for year_entry in year_entries {
         let year_entry = year_entry?;
-        let year_path = year_entry.path();
+        let year_path = messages_root.join(year_entry.file_name());
         let year_type = year_entry.file_type()?;
         if !year_type.is_dir() || year_type.is_symlink() {
             continue;
@@ -9169,10 +9178,13 @@ fn collect_canonical_message_id_index_with_window(
 
         #[cfg(unix)]
         let year_directory = CanonicalScanDirectory::open(&year_path)?;
+        #[cfg(unix)]
+        let month_entries = year_directory.entries()?;
+        #[cfg(not(unix))]
         let month_entries = fs::read_dir(&year_path)?;
         for month_entry in month_entries {
             let month_entry = month_entry?;
-            let month_path = month_entry.path();
+            let month_path = year_path.join(month_entry.file_name());
             let month_type = month_entry.file_type()?;
             if !month_type.is_dir() || month_type.is_symlink() {
                 continue;
@@ -9186,10 +9198,13 @@ fn collect_canonical_message_id_index_with_window(
 
             #[cfg(unix)]
             let scan_directory = CanonicalScanDirectory::open(&month_path)?;
+            #[cfg(unix)]
+            let file_entries = scan_directory.entries()?;
+            #[cfg(not(unix))]
             let file_entries = fs::read_dir(&month_path)?;
             for file_entry in file_entries {
                 let file_entry = file_entry?;
-                let file_path = file_entry.path();
+                let file_path = month_path.join(file_entry.file_name());
                 let file_type = file_entry.file_type()?;
                 if !file_type.is_file()
                     || file_type.is_symlink()
@@ -9198,11 +9213,10 @@ fn collect_canonical_message_id_index_with_window(
                     continue;
                 }
 
-                let stamp = file_entry
-                    .metadata()
-                    .ok()
-                    .as_ref()
-                    .and_then(message_file_stamp);
+                let metadata = file_entry.metadata().ok();
+                #[cfg(not(unix))]
+                let metadata = metadata.map(cap_std::fs::Metadata::from_just_metadata);
+                let stamp = metadata.as_ref().and_then(message_file_stamp);
                 seen.insert(file_path.clone());
                 let cached = stamp.and_then(|stamp| {
                     cache
@@ -15953,6 +15967,31 @@ mod tests {
                 .unwrap()
                 .0["id"],
             2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_enumerates_retained_entries_across_temporary_replacement() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(tmp.path().join("month/message.md"), "existing message").unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("retained")).unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        let entries = directory
+            .entries()
+            .unwrap()
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("replacement")).unwrap();
+        fs::rename(tmp.path().join("retained"), tmp.path().join("month")).unwrap();
+        assert!(directory.validate_binding().is_ok());
+        assert_eq!(
+            entries,
+            [OsString::from("message.md")],
+            "temporary pathname replacement must not hide the retained directory's entries"
         );
     }
 
