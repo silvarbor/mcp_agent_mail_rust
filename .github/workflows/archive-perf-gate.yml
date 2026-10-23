@@ -41,10 +41,14 @@ jobs:
           set -euo pipefail
           mkdir -p "${GATE_OUTPUT_DIR}"
           (
+            vmstat 15 &
+            resource_monitor_pid=$!
             trap '
               build_exit=$?
               trap - EXIT
               set +e
+              kill "$resource_monitor_pid" 2>/dev/null
+              wait "$resource_monitor_pid" 2>/dev/null
               printf "Archive build exited with status %s at " "$build_exit"
               date -u "+%Y-%m-%dT%H:%M:%SZ"
               free -m
