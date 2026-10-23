@@ -32,6 +32,9 @@ require_cmd() {
 
 cleanup() {
     set +e
+    if [ -n "${BIND_MOUNT_POINT:-}" ]; then
+        sudo umount "${BIND_MOUNT_POINT}" >/dev/null 2>&1 || return
+    fi
     if [ -n "${MOUNT_POINT:-}" ] && mount | grep -q " on ${MOUNT_POINT} "; then
         sudo umount "${MOUNT_POINT}" >/dev/null 2>&1 || true
     fi
@@ -269,6 +272,21 @@ PY
 printf '==> archive fsync matrix on %s (%s)\n' "${FS_LABEL}" "${FSYNC_MODE}"
 
 cd "${PROJECT_ROOT}"
+if [ "${OS_NAME}" = "Linux" ]; then
+    BIND_ROOT="${STORAGE_ROOT}/bind_mount_probe"
+    BIND_SOURCE="${BIND_ROOT}/inbox-source"
+    BIND_TARGET="${BIND_ROOT}/projects/fsync-bind/agents/RecipientAgent/inbox"
+    mkdir -p "${BIND_SOURCE}" "${BIND_TARGET}"
+    sudo mount --bind "${BIND_SOURCE}" "${BIND_TARGET}"
+    BIND_MOUNT_POINT="${BIND_TARGET}"
+    AM_FSYNC_BIND_ROOT="${BIND_ROOT}" CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test --locked -p mcp-agent-mail-storage --test it \
+        fsync_matrix::archive_same_device_bind_mount_probe -- --ignored --exact --nocapture \
+        2>&1 | tee "${OUTPUT_DIR}/bind-mount-probe.log"
+    sudo umount "${BIND_MOUNT_POINT}"
+    BIND_MOUNT_POINT=""
+fi
+
 AM_FSYNC_MATRIX_FS_LABEL="${FS_LABEL}" \
 AM_FSYNC_MATRIX_MOUNT_OPTIONS="${MOUNT_OPTIONS}" \
 AM_FSYNC_MATRIX_FSYNC_MODE="${FSYNC_MODE}" \

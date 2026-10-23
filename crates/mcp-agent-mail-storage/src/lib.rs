@@ -13671,6 +13671,13 @@ struct StagedDirectoryBinding {
     chain: Vec<(PathBuf, fs::Metadata)>,
 }
 
+struct StagedArchiveFile {
+    temporary: PathBuf,
+    target: PathBuf,
+    #[cfg(unix)]
+    staging_index: usize,
+}
+
 #[cfg(unix)]
 impl StagedDirectoryBinding {
     fn capture(directory: &CanonicalScanDirectory) -> Result<Self> {
@@ -13740,15 +13747,15 @@ impl StagedDirectoryBinding {
 /// Whatever is still staged when this drops is removed.
 #[derive(Default)]
 struct StagedArchiveWrites {
-    /// `(temp path, target path)` pairs not yet renamed into place.
-    staged: Vec<(PathBuf, PathBuf)>,
+    /// Owned temporary files not yet renamed into place.
+    staged: Vec<StagedArchiveFile>,
     /// Destination identities do not hold open directory descriptors.
     #[cfg(unix)]
     directories: HashMap<PathBuf, StagedDirectoryBinding>,
-    /// One retained source directory per filesystem owns all staged names.
+    /// One retained source per rename-compatible mount owns the staged names.
     #[cfg(unix)]
-    staging_directories: HashMap<u64, CanonicalScanDirectory>,
-    /// Only the bounded cache and per-device staging roots own strong handles.
+    staging_directories: Vec<CanonicalScanDirectory>,
+    /// Only the bounded cache and staging roots own strong handles.
     #[cfg(unix)]
     directory_handles: HashMap<PathBuf, std::sync::Weak<fs::File>>,
     #[cfg(unix)]
@@ -13777,23 +13784,25 @@ impl StagedArchiveWrites {
             ensure_dir(parent)?;
         }
         #[cfg(unix)]
-        let (tmp_path, file) = {
+        let (tmp_path, file, staging_index) = {
             let parent = path.parent().unwrap_or(Path::new("."));
             let index = self.destination_index(parent)?;
             let destination = &self.directory_cache[index].1;
             if !self.directories.contains_key(parent) {
                 let binding = StagedDirectoryBinding::capture(destination)?;
-                self.staging_directories
-                    .entry(binding.device())
-                    .or_insert_with(|| destination.clone());
                 self.directories.insert(parent.to_path_buf(), binding);
             }
-            let source = &self.staging_directories[&self.directories[parent].device()];
             let (tmp_path, file) = stage_archive_write_at(destination, path, data)?;
             // Creation in the destination preserves inherited ACLs and group
             // ownership. Relocation retains the inode and uses no-replace.
-            match retain_archive_temp(destination, source, &tmp_path, path) {
-                Ok(retained_path) => (retained_path, file),
+            match retain_archive_temp_for_mount(
+                destination,
+                &mut self.staging_directories,
+                self.directories[parent].device(),
+                &tmp_path,
+                path,
+            ) {
+                Ok((retained_path, index)) => (retained_path, file, index),
                 Err(err) => {
                     let _ = nix::unistd::unlinkat(
                         destination.file(),
@@ -13806,7 +13815,12 @@ impl StagedArchiveWrites {
         };
         #[cfg(not(unix))]
         let (tmp_path, file) = stage_atomic_write(path, data, false)?;
-        self.staged.push((tmp_path, path.to_path_buf()));
+        self.staged.push(StagedArchiveFile {
+            temporary: tmp_path,
+            target: path.to_path_buf(),
+            #[cfg(unix)]
+            staging_index,
+        });
         self.pending_sync.push(file);
         if self.pending_sync.len() >= ARCHIVE_SYNC_GROUP_FILES {
             self.sync_pending()?;
@@ -13839,7 +13853,7 @@ impl StagedArchiveWrites {
         for file in self.devices.values() {
             file.sync_data()?;
         }
-        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+        let Some(anchor) = self.staged.first().map(|file| file.target.clone()) else {
             return Ok(());
         };
         let _mutation = ArchiveMutationGuard::begin_at(&anchor);
@@ -13848,17 +13862,17 @@ impl StagedArchiveWrites {
             directory.validate_binding()?;
         }
         #[cfg(unix)]
-        for directory in self.staging_directories.values() {
+        for directory in &self.staging_directories {
             directory.validate_binding()?;
         }
         let mut pending = std::mem::take(&mut self.staged).into_iter();
-        while let Some((tmp_path, path)) = pending.next() {
+        while let Some(staged) = pending.next() {
             #[cfg(unix)]
-            let result = self.publish_at(&tmp_path, &path);
+            let result = self.publish_at(&staged);
             #[cfg(not(unix))]
-            let result = fs::rename(&tmp_path, &path).map_err(StorageError::from);
+            let result = fs::rename(&staged.temporary, &staged.target).map_err(StorageError::from);
             if let Err(err) = result {
-                self.staged.push((tmp_path, path));
+                self.staged.push(staged);
                 self.staged.extend(pending);
                 return Err(err);
             }
@@ -13868,7 +13882,7 @@ impl StagedArchiveWrites {
             directory.validate_binding()?;
         }
         #[cfg(unix)]
-        for directory in self.staging_directories.values() {
+        for directory in &self.staging_directories {
             directory.validate_binding()?;
         }
         Ok(())
@@ -13900,18 +13914,20 @@ impl StagedArchiveWrites {
     }
 
     #[cfg(unix)]
-    fn publish_at(&mut self, tmp_path: &Path, path: &Path) -> Result<()> {
-        let parent = path.parent().unwrap_or(Path::new("."));
+    fn publish_at(&mut self, staged: &StagedArchiveFile) -> Result<()> {
+        let parent = staged.target.parent().unwrap_or(Path::new("."));
         let index = self.destination_index(parent)?;
-        let binding = &self.directories[parent];
         let destination = &self.directory_cache[index].1;
         destination.validate_binding()?;
-        let source = &self.staging_directories[&binding.device()];
+        let source = &self.staging_directories[staged.staging_index];
         nix::fcntl::renameat(
             source.file(),
-            tmp_path.file_name().expect("staged file has a name"),
+            staged
+                .temporary
+                .file_name()
+                .expect("staged file has a name"),
             destination.file(),
-            path.file_name().expect("target file has a name"),
+            staged.target.file_name().expect("target file has a name"),
         )
         .map_err(std::io::Error::from)?;
         destination.validate_binding()?;
@@ -13922,11 +13938,10 @@ impl StagedArchiveWrites {
 impl Drop for StagedArchiveWrites {
     fn drop(&mut self) {
         for staged in &self.staged {
-            let tmp_path = &staged.0;
+            let tmp_path = &staged.temporary;
             #[cfg(unix)]
             {
-                let binding = &self.directories[staged.1.parent().unwrap_or(Path::new("."))];
-                let directory = &self.staging_directories[&binding.device()];
+                let directory = &self.staging_directories[staged.staging_index];
                 let _ = nix::unistd::unlinkat(
                     directory.file(),
                     tmp_path.file_name().expect("staged file has a name"),
@@ -13940,13 +13955,39 @@ impl Drop for StagedArchiveWrites {
 }
 
 #[cfg(unix)]
+fn retain_archive_temp_for_mount(
+    destination: &CanonicalScanDirectory,
+    staging: &mut Vec<CanonicalScanDirectory>,
+    device: u64,
+    tmp_path: &Path,
+    target: &Path,
+) -> Result<(PathBuf, usize)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for (index, directory) in staging.iter().enumerate() {
+        if directory.file().metadata()?.dev() != device {
+            continue;
+        }
+        match retain_archive_temp(destination, directory, tmp_path, target) {
+            Ok(path) => return Ok((path, index)),
+            // Bind mounts can share a device ID but reject cross-mount moves.
+            // EXDEV leaves the owned file in its destination directory.
+            Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(err) => return Err(err),
+        }
+    }
+    staging.push(destination.clone());
+    Ok((tmp_path.to_path_buf(), staging.len() - 1))
+}
+
+#[cfg(unix)]
 fn retain_archive_temp(
     destination: &CanonicalScanDirectory,
     staging: &CanonicalScanDirectory,
     tmp_path: &Path,
     target: &Path,
 ) -> Result<PathBuf> {
-    if destination.path() == staging.path() {
+    if std::ptr::eq(destination.file(), staging.file()) {
         return Ok(tmp_path.to_path_buf());
     }
     let old_name = tmp_path.file_name().expect("staged file has a name");
