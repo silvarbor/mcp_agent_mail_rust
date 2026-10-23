@@ -1,5 +1,77 @@
 # Resume — local Agent Mail fork
 
+## Recovery on 2026-10-23
+
+Continuation checkpoint: host-load waiter and candidate diagnostic remain active
+under exec session 76977; collect this handle before launching heavy work. The
+guarded command uses /opt/homebrew/bin/python3.13 and the retained interleaved
+prototype, candidate at `atc-direct-candidate-20261023/am`, output root
+`atc-candidate-profile-20261023-resumed` under the preservation directory.
+The benchmark has emitted no result yet. When treatment servers run, sample
+the live-mode process to distinguish connection/schema/commit/close cost.
+
+Fresh GitHub inspection confirms PR #3 remains OPEN at 111ccfd864eb. Failed
+logs for 39856238361, 39856238377 and 39856238404 are preserved as
+`ci-resume-<run>-failed-20261023.log`; the archive run's empty failed-step
+projection required its full log, retained with `-full-` in place of `-failed-`.
+Archive fsync failures: APFS single p95 69.844ms / 35ms and batch 417.516ms /
+300ms; ext4 batch 387.395ms / 250ms; XFS batch 404.659ms / 250ms. ATC reports
+regression. Archive benchmark exited 143 during compilation; the local workflow
+already separates build and measurement deadlines, still awaiting new CI.
+
+Safe local reporting defect fixed in scripts/bench_archive_perf_gate.sh:
+errexit previously bypassed bench_rc capture and summary/comment publication on
+Cargo failure. The guarded pipeline retains a nonzero status and reaches report
+generation; explicit cd failure still stops the subshell. A real invalid Cargo
+manifest reproduces exit 101 with only bench.log before the fix. After the fix,
+the gate exits 1 and emits summary.json with runtime_error and bench_exit_code
+101 plus comment.md. Red/green/final evidence is under preservation-directory
+`archive-gate-failure-20261023`. Shell syntax and git diff --check pass. This
+repair is committed as 321fe263 and changes failure reporting only; no performance gate passes
+are claimed. Required review remains pending with the other local repairs.
+
+The operator requested continuation in a fresh session. The original delivery
+authorization was recovered from
+`/Users/shz/.local/state/codex/accounts/outcomeeng/attachments/ff887783-3b13-4aed-90a0-55e382ea9c25/pasted-text-1.txt`.
+Its scope remains CI repairs, required reviews, fork PR #3 merge, supervised
+installation, a full 24-hour observation, and authorized build cleanup with
+rollback material retained. A continuing goal now tracks that scope here.
+
+Checkout inspection found HEAD `653fd585`, ten commits ahead of the locally
+recorded remote branch, with only this resume file modified. Remote currency
+has not yet been refreshed. Preserve the pending notes.
+
+The formerly active baseline sensitivity command completed with exit 0 after
+the old turn ended. Its retained `atc-interleaved-baseline-20261023` results
+report all-off control differences of -4.557% / -1.079%, and treatment shadow
+/ live overhead of -1.189% / 15.813%. Each treatment store retained 363 messages,
+passed integrity, and had the expected ATC row count (0 / 0 / 363). These are
+diagnostic results with `qualification: false`. The earlier candidate live
+result of 7.317% also exceeds the unchanged 5% budget. Separate invocations do
+not establish a matched baseline/candidate performance win.
+
+Next: inspect the measurement protocol and retained candidate evidence, resolve
+the outstanding performance failure, then complete exact-source validation and
+required reviews before publication and supervised installation. Historical
+active-command statements below are superseded by completed evidence where
+explicitly recorded. Missing suite instructions remain tracked under the
+operator-approved deferral br-rpa0b.
+
+LATEST: no compiler active. All-offcontrol10905 terminal0: identical off-mode
+runs produced73.64% apparent overhead, proving local sequential-method false
+positives. Interleavedprototype35037 terminal0:300samples/mode,363messages/store,
+all integrity/ATCcounts pass. Nullcontrol differences0.905/0.793%; actualshadow
+4.840%,live7.317% (live stillfails5%). Externalprototype only; no gatechanged.
+Baseline sensitivity run now active via sameprototype script/frozenoriginal am;
+root/log atc-interleaved-baseline-20261023. Collect handle before heavywork.
+Rust candidate implementation audit2026-10-22_23-07-37-319-3870bba5a51e approved
+4requiredcode/architecture units,zero findings for8d5f6635..27c1efd0. Correctness
+evidence only. Fullcleanbranchreview stillpending.
+Authorized cargo clean --release19432 succeeded at2026-10-23T01:11:39+0200:
+8470files/3.7GiBremoved,8.3GiBfree. Onlyobsolete targetrelease; rollback/frozen
+binaries/evidence/live data and targetdebug preserved. Original benchmark script
+copied to evidence-root/bench_atc_transport-before-interleave-20261023.py.
+
 CURRENT: conformance36804 passed83/83 in32.05s under HTTP_PORT=1 and
 PROJECT_IDENTITY_MODE=git-common-dir. Initial68369 passed82/83, revealing the
 identity fixture leak after endpoint/catalog repairs; explicit dir-mode fix
