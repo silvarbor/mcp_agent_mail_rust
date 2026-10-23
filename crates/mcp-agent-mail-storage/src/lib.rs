@@ -9577,21 +9577,24 @@ fn append_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    writes.add(&paths.canonical, full_content.as_bytes())?;
-    rel_paths.push(rel_path_cached(
+    rel_paths.push(writes.add_repo_file(
         &archive.canonical_repo_root,
         &paths.canonical,
+        full_content.as_bytes(),
     )?);
 
-    writes.add(&paths.outbox, full_content.as_bytes())?;
-    rel_paths.push(rel_path_cached(
+    rel_paths.push(writes.add_repo_file(
         &archive.canonical_repo_root,
         &paths.outbox,
+        full_content.as_bytes(),
     )?);
 
     for inbox_path in &paths.inbox {
-        writes.add(inbox_path, inbox_content_ref.as_bytes())?;
-        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
+        rel_paths.push(writes.add_repo_file(
+            &archive.canonical_repo_root,
+            inbox_path,
+            inbox_content_ref.as_bytes(),
+        )?);
     }
 
     for p in extra_paths {
@@ -13790,6 +13793,26 @@ struct StagedArchiveWrites {
 }
 
 impl StagedArchiveWrites {
+    fn add_repo_file(&mut self, canonical_base: &Path, path: &Path, data: &[u8]) -> Result<String> {
+        self.add(path, data)?;
+        // On Unix, add opened the parent chain without following symlinks and
+        // recorded its binding for publication. A missing leaf needs no further
+        // canonical walk when its absolute spelling is already below the base.
+        // Existing leaves retain canonical resolution, as do non-normal paths.
+        #[cfg(unix)]
+        if path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+            && fs::symlink_metadata(path)
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+            && let Ok(relative) = path.strip_prefix(canonical_base)
+        {
+            return Ok(relative.to_string_lossy().replace('\\', "/"));
+        }
+        rel_path_cached(canonical_base, path)
+    }
+
     /// Stage every file; publication completes synchronization before renaming.
     fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
         let mut writes = Self::default();
@@ -17330,6 +17353,76 @@ mod tests {
         let resolved = resolve_archive_relative_path(&archive, "target.txt").unwrap();
         assert!(resolved.starts_with(&other.root));
         assert!(!resolved.starts_with(tmp.path().join("projects").join("proj")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_repo_file_preserves_missing_target_path_and_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert_eq!(
+            writes
+                .add_repo_file(&root, &root.join("messages/new.md"), b"message body")
+                .unwrap(),
+            "messages/new.md"
+        );
+        assert!(!root.join("messages/new.md").exists());
+        writes.publish().unwrap();
+        assert_eq!(
+            fs::read(root.join("messages/new.md")).unwrap(),
+            b"message body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_repo_file_rejects_target_outside_base() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("archive")).unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert!(matches!(
+            writes.add_repo_file(&root.join("archive"), &root.join("outside.md"), b"body"),
+            Err(StorageError::InvalidPath(_))
+        ));
+        drop(writes);
+        assert!(!root.join("outside.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_repo_file_rejects_existing_leaf_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("archive")).unwrap();
+        fs::write(root.join("archive/existing.md"), b"existing").unwrap();
+        fs::write(root.join("outside.md"), b"outside").unwrap();
+        std::os::unix::fs::symlink("existing.md", root.join("archive/inside-link.md")).unwrap();
+        std::os::unix::fs::symlink("../outside.md", root.join("archive/outside-link.md")).unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert!(matches!(
+            writes.add_repo_file(
+                &root.join("archive"),
+                &root.join("archive/inside-link.md"),
+                b"replacement",
+            ),
+            Err(StorageError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            writes.add_repo_file(
+                &root.join("archive"),
+                &root.join("archive/outside-link.md"),
+                b"replacement",
+            ),
+            Err(StorageError::InvalidPath(_))
+        ));
+        drop(writes);
+        assert_eq!(
+            fs::read(root.join("archive/existing.md")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(fs::read(root.join("outside.md")).unwrap(), b"outside");
     }
 
     #[cfg(unix)]
