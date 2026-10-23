@@ -8990,19 +8990,14 @@ struct CanonicalScanDirectory {
 struct CanonicalDirectoryHandle {
     file: fs::File,
     /// An open descriptor pins this identity even when its path is replaced.
-    identity: (u64, u64),
+    identity: rustix::fs::Stat,
 }
 
 #[cfg(unix)]
 impl CanonicalDirectoryHandle {
     fn new(file: fs::File) -> std::io::Result<Self> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let metadata = file.metadata()?;
-        Ok(Self {
-            file,
-            identity: (metadata.dev(), metadata.ino()),
-        })
+        let identity = rustix::fs::fstat(&file)?;
+        Ok(Self { file, identity })
     }
 }
 
@@ -9080,11 +9075,22 @@ impl CanonicalScanDirectory {
     }
 
     fn validate_binding(&self) -> Result<()> {
-        use std::os::unix::fs::MetadataExt as _;
+        use rustix::fs::{AtFlags, CWD, FileType, statat};
 
-        for (path, file) in &self.chain {
-            let current = fs::symlink_metadata(path)?;
-            if !current.is_dir() || (current.dev(), current.ino()) != file.identity {
+        for (index, (path, file)) in self.chain.iter().enumerate() {
+            // Check every parent-child edge through its pinned parent. Rewalking
+            // the absolute prefix for each edge repeats the same kernel lookups.
+            // Root and non-normal suffixes retain absolute-path resolution.
+            let current = match (index.checked_sub(1), path.file_name()) {
+                (Some(parent), Some(name)) => {
+                    statat(&self.chain[parent].1.file, name, AtFlags::SYMLINK_NOFOLLOW)
+                }
+                _ => statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW),
+            }
+            .map_err(std::io::Error::from)?;
+            if FileType::from_raw_mode(current.st_mode) != FileType::Directory
+                || (current.st_dev, current.st_ino) != (file.identity.st_dev, file.identity.st_ino)
+            {
                 return Err(StorageError::InvalidPath(format!(
                     "canonical scan directory was replaced: {}",
                     path.display()
