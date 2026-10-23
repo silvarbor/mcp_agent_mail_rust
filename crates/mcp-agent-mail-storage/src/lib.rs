@@ -8983,7 +8983,27 @@ static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalI
 #[cfg(unix)]
 #[derive(Clone)]
 struct CanonicalScanDirectory {
-    chain: Vec<(PathBuf, Arc<fs::File>)>,
+    chain: Vec<(PathBuf, Arc<CanonicalDirectoryHandle>)>,
+}
+
+#[cfg(unix)]
+struct CanonicalDirectoryHandle {
+    file: fs::File,
+    /// An open descriptor pins this identity even when its path is replaced.
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+impl CanonicalDirectoryHandle {
+    fn new(file: fs::File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        Ok(Self {
+            file,
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -8994,7 +9014,7 @@ impl CanonicalScanDirectory {
 
     fn open_cached(
         path: &Path,
-        handles: &mut HashMap<PathBuf, std::sync::Weak<fs::File>>,
+        handles: &mut HashMap<PathBuf, std::sync::Weak<CanonicalDirectoryHandle>>,
     ) -> Result<Self> {
         use nix::fcntl::{OFlag, openat};
         use nix::sys::stat::Mode;
@@ -9004,7 +9024,7 @@ impl CanonicalScanDirectory {
         let root = if let Some(file) = handles.get(&current).and_then(std::sync::Weak::upgrade) {
             file
         } else {
-            let file = Arc::new(fs::File::open(&current)?);
+            let file = Arc::new(CanonicalDirectoryHandle::new(fs::File::open(&current)?)?);
             handles.insert(current.clone(), Arc::downgrade(&file));
             file
         };
@@ -9027,7 +9047,7 @@ impl CanonicalScanDirectory {
                 continue;
             }
             let fd = openat(
-                parent.as_ref(),
+                &parent.file,
                 name,
                 OFlag::O_RDONLY
                     | OFlag::O_DIRECTORY
@@ -9037,7 +9057,7 @@ impl CanonicalScanDirectory {
                 Mode::empty(),
             )
             .map_err(std::io::Error::from)?;
-            let file = Arc::new(fs::File::from(fd));
+            let file = Arc::new(CanonicalDirectoryHandle::new(fs::File::from(fd))?);
             handles.insert(current.clone(), Arc::downgrade(&file));
             chain.push((current.clone(), file));
         }
@@ -9047,7 +9067,12 @@ impl CanonicalScanDirectory {
     }
 
     fn file(&self) -> &fs::File {
-        &self.chain.last().expect("root directory is retained").1
+        &self
+            .chain
+            .last()
+            .expect("root directory is retained")
+            .1
+            .file
     }
 
     fn path(&self) -> &Path {
@@ -9058,12 +9083,8 @@ impl CanonicalScanDirectory {
         use std::os::unix::fs::MetadataExt as _;
 
         for (path, file) in &self.chain {
-            let retained = file.metadata()?;
             let current = fs::symlink_metadata(path)?;
-            if !current.is_dir()
-                || current.dev() != retained.dev()
-                || current.ino() != retained.ino()
-            {
+            if !current.is_dir() || (current.dev(), current.ino()) != file.identity {
                 return Err(StorageError::InvalidPath(format!(
                     "canonical scan directory was replaced: {}",
                     path.display()
@@ -9075,7 +9096,7 @@ impl CanonicalScanDirectory {
 
     fn entries(&self) -> std::io::Result<cap_std::fs::ReadDir> {
         let directory = &self.chain.last().expect("root directory is retained").1;
-        cap_std::fs::Dir::from_std_file(directory.try_clone()?).entries()
+        cap_std::fs::Dir::from_std_file(directory.file.try_clone()?).entries()
     }
 
     fn read_frontmatter(
@@ -9095,7 +9116,7 @@ impl CanonicalScanDirectory {
         }
         let parent = &self.chain.last().expect("root directory is retained").1;
         let fd = openat(
-            parent.as_ref(),
+            &parent.file,
             path,
             OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
             Mode::empty(),
@@ -13684,7 +13705,7 @@ impl StagedDirectoryBinding {
         let chain = directory
             .chain
             .iter()
-            .map(|(path, file)| Ok((path.clone(), file.metadata()?)))
+            .map(|(path, file)| Ok((path.clone(), file.file.metadata()?)))
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok(Self { chain })
     }
@@ -13729,7 +13750,7 @@ impl StagedDirectoryBinding {
         for ((expected_path, expected), (current_path, file)) in
             self.chain.iter().zip(&directory.chain)
         {
-            if expected_path != current_path || !Self::matches(expected, &file.metadata()?) {
+            if expected_path != current_path || !Self::matches(expected, &file.file.metadata()?) {
                 return Err(StorageError::InvalidPath(format!(
                     "staged archive destination was replaced: {}",
                     directory.path().display()
@@ -13757,7 +13778,7 @@ struct StagedArchiveWrites {
     staging_directories: Vec<CanonicalScanDirectory>,
     /// Only the bounded cache and staging roots own strong handles.
     #[cfg(unix)]
-    directory_handles: HashMap<PathBuf, std::sync::Weak<fs::File>>,
+    directory_handles: HashMap<PathBuf, std::sync::Weak<CanonicalDirectoryHandle>>,
     #[cfg(unix)]
     directory_cache: Vec<(PathBuf, CanonicalScanDirectory)>,
     /// Bound open data descriptors while allowing a group of writes to reach the
@@ -13781,6 +13802,11 @@ impl StagedArchiveWrites {
 
     fn add(&mut self, path: &Path, data: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
+            #[cfg(unix)]
+            if !self.directories.contains_key(parent) {
+                ensure_dir(parent)?;
+            }
+            #[cfg(not(unix))]
             ensure_dir(parent)?;
         }
         #[cfg(unix)]
@@ -13918,7 +13944,6 @@ impl StagedArchiveWrites {
         let parent = staged.target.parent().unwrap_or(Path::new("."));
         let index = self.destination_index(parent)?;
         let destination = &self.directory_cache[index].1;
-        destination.validate_binding()?;
         let source = &self.staging_directories[staged.staging_index];
         nix::fcntl::renameat(
             source.file(),
