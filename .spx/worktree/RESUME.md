@@ -1,5 +1,34 @@
 # Resume — local Agent Mail fork
 
+## CI diagnostic results at published 3a0c2063
+
+Published PR head is 3a0c206397b7b9c220e2b920bf4a275af5b51135; push62027
+completed successfully. Watch31865 exited1 on APFS failure. No local heavy
+command is active except compiler-artifact validation77984, currently waiting
+for host-load admission. Collect that same handle; its output is
+fsync-probe-artifacts-20261023.jsonl in the preservation root.
+
+Fsync39945424677 failed APFS (single39.016ms/35ms; batch330.761ms/300ms),
+ext4-ordered(batch374.0ms/250ms), XFS(batch430.798ms/250ms), and
+btrfs(batch617.184ms). Ext4-journal and tmpfs passed. Downloaded Linux
+summaries preserve 100 canonical messages and two commits in every crash check.
+Trace artifacts under fsync-{ext4,xfs,btrfs}-3a0c2063-20261023/diagnostic
+contain3336fdatasync calls and236308readlink calls but include Cargo startup;
+their overlapping thread wall times cannot identify archive-only proportions.
+Local repair61343c93e3d2ae0c3100e87ee24a520bd2ff1d56 resolves the test
+executable from Cargo JSON before tracing. Static checks pass; actual artifact
+resolution validation77984 is pending. This repair has not been published.
+
+ATC39945424829 failed: off p95 25.089426ms, shadow29.127276ms,
+live27.096125ms. Identical off controls measured25.834693,26.810769,
+25.263811ms, all with113messages, integrity okay andzeroATCrows. These
+controls do not establish that the qualification failure is measurement noise.
+Keep the5%limit. Artifacts: atc-ci-3a0c2063-20261023.
+ArchivePerf39945424703/job120386796582 remains in progress; its live log
+was unavailable at11:33:36Z. Collect terminal output before diagnosing the
+resource samples. Detailed machine record: diagnostic-ci-3a0c2063-20261023.json.
+No merge, installation, restart or24-hour observation has occurred.
+
 ## Resumed diagnostics on 2026-10-23
 
 Latest local source checkpoint: e5b02b9dbc6ef24fa51fb26a8c12d77728d80d6e.
