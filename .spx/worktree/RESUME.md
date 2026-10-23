@@ -1,5 +1,69 @@
 # Resume — local Agent Mail fork
 
+## Current continuation: Linux batch latency
+
+Published HEAD is 86d668fde813e3f417565d2788e7a110b33a34d6 (push54668
+exit0, PR head verified). Local HEAD is
+8c7e32084deb4412fed914474c5d1e1567eab8a6. The local performance trial is
+not publication-ready. No command handle remains active; CI runs listed below
+were confirmed in progress and must be collected, never restarted for delay.
+
+Current-head Linux bind-mount regression passes on ext4 and XFS. Fsync CI
+39965213685 is terminal failure: uninstrumented ext4-ordered batch p95
+1621.978ms/250ms and XFS360.480ms/250ms; singles pass. btrfs, ext4-journal
+and tmpfs pass. Downloaded ext4 evidence is fsync-ext4-86d668fd-20261023/;
+its diagnostic trace has346623statx and236224readlink calls. Traced timing is
+diagnostic only. APFS artifact exists; collect its outcome and summary.
+Watch81249 exited1 on ext4/XFS failures; its log is pr3-86d668fd-watch-20261023.log.
+
+ATC CI39965213644 failed5% gate: offp95~25.58ms, shadow27.38ms(+7.03%),
+live27.46ms(+7.36%). Local build89766 passed in3m57s; current am SHA256
+9b84816fd6011412545200a50c0eb50009b08e78b9556b61b405e43e15057ae0.
+Local real-server run6149 passed, and the gate's read-only report evaluation
+also passed: off32.953167ms, shadow32.824833ms, live33.97125ms; live113ATCrows,
+all stores retain113messages and integrity passes. Local pass does not clear CI.
+Artifacts: atc-local-86d668fd-20261023.json, matching-stem-stores/ and -gate/.
+Explicit canary report output was isolated under the preservation root.
+
+ArchivePerf39965213569 and native CI39965213601 are still in progress at the
+last authoritative read. Installer39965213552 and observability39965213587
+passed. No formal or inline PR review exists; the PR comment is the ATC gate.
+Publication record: publication-readiness-86d668fd-20261023.json.
+
+Trial8c7a02511b31550825d9473398db782cccf88460 caches immutable dev/ino with
+each retained directory descriptor, skips ensure_dir for known staging parents,
+and removes duplicate pre-rename validation (destination_index already performs
+it). Current pathname checks, fd retention, synchronization and cleanup remain.
+Build87372 passed50.59s. Focused command0d7f17 passed9staging+4scan+2relocation
+tests plus256parents under128FD. Formatting/whitespace pass10029.
+Paired comparison80840 failed: baseline single31.236/batch331.319ms, candidate
+22.098/325.226ms, unchanged35/300ms budgets. Both retain100canonical messages
+and2commits. No qualifying speedup is claimed. Candidate binary/source.patch
+are preserved under retained-identity-candidate-20261023/; binary SHA256
+9c8a0d64bdd970f58b5a03b2fdf668843ff3e3bbfb34e14e4a7467cb1ac84968.
+Do not rerun the same trial without a new change or unresolved measurement question.
+
+Next performance investigation: append_message_bundle_files calls rel_path_cached
+after each writes.add, walking parents already validated through retained no-follow
+handles. PreparedMessageBundle also stores canonical_path and walks it again for
+the digest. A replacement must preserve confinement, existing leaf-symlink behavior,
+Windows normalization, and target-binding checks. No such replacement exists yet.
+Do not weaken sync or collision checks. Full checks and review need refreshing
+after the next implementation; the published source's green results below do not
+qualify this trial.
+
+Workflow follow-up8c7e32084deb4412fed914474c5d1e1567eab8a6 excludes only
+server_canary.stdin.* from the ATC upload set. CI's ENTRYNOTSUPPORTED warning
+identified the FIFO; regular artifacts uploaded successfully. No pipe was deleted.
+Actionlint passes; runtime confirmation awaits a future push.
+Mount-repair audits and both shell follow-ups sealed approved:
+2026-10-23_13-46-39-775-23414ef5221c,
+2026-10-23_13-51-01-718-89e818438ab2,
+2026-10-23_13-52-22-346-ad99c0405a4c. Shell/test registry gaps remain explicit.
+Fresh occupancy claim for session01a16792-cc58-7ee2-aa39-4dd77f9c3de4 was
+recorded; spx status showed this assigned worktree running underPID7923.
+Live service remains unchanged; merge, installation and24hour observation remain.
+
 ## Current repair: distinguish same-device mount boundaries
 
 Current implementation checkpoint is
