@@ -8981,6 +8981,7 @@ static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalI
 /// follow a substituted symlink; validating the retained chain before returning
 /// the scan prevents a replaced directory from yielding an accepted result.
 #[cfg(unix)]
+#[derive(Clone)]
 struct CanonicalScanDirectory {
     chain: Vec<(PathBuf, Arc<fs::File>)>,
 }
@@ -8991,17 +8992,20 @@ impl CanonicalScanDirectory {
         Self::open_cached(path, &mut HashMap::new())
     }
 
-    fn open_cached(path: &Path, handles: &mut HashMap<PathBuf, Arc<fs::File>>) -> Result<Self> {
+    fn open_cached(
+        path: &Path,
+        handles: &mut HashMap<PathBuf, std::sync::Weak<fs::File>>,
+    ) -> Result<Self> {
         use nix::fcntl::{OFlag, openat};
         use nix::sys::stat::Mode;
 
         let path = std::path::absolute(path)?;
         let mut current = PathBuf::from("/");
-        let root = if let Some(file) = handles.get(&current) {
-            Arc::clone(file)
+        let root = if let Some(file) = handles.get(&current).and_then(std::sync::Weak::upgrade) {
+            file
         } else {
             let file = Arc::new(fs::File::open(&current)?);
-            handles.insert(current.clone(), Arc::clone(&file));
+            handles.insert(current.clone(), Arc::downgrade(&file));
             file
         };
         let mut chain = vec![(current.clone(), root)];
@@ -9018,8 +9022,8 @@ impl CanonicalScanDirectory {
             };
             let parent = &chain.last().expect("root directory is retained").1;
             current.push(name);
-            if let Some(file) = handles.get(&current) {
-                chain.push((current.clone(), Arc::clone(file)));
+            if let Some(file) = handles.get(&current).and_then(std::sync::Weak::upgrade) {
+                chain.push((current.clone(), file));
                 continue;
             }
             let fd = openat(
@@ -9034,7 +9038,7 @@ impl CanonicalScanDirectory {
             )
             .map_err(std::io::Error::from)?;
             let file = Arc::new(fs::File::from(fd));
-            handles.insert(current.clone(), Arc::clone(&file));
+            handles.insert(current.clone(), Arc::downgrade(&file));
             chain.push((current.clone(), file));
         }
         let directory = Self { chain };
@@ -9043,11 +9047,11 @@ impl CanonicalScanDirectory {
     }
 
     fn file(&self) -> &fs::File {
-        self.chain
-            .last()
-            .expect("root directory is retained")
-            .1
-            .as_ref()
+        &self.chain.last().expect("root directory is retained").1
+    }
+
+    fn path(&self) -> &Path {
+        &self.chain.last().expect("root directory is retained").0
     }
 
     fn validate_binding(&self) -> Result<()> {
@@ -13657,8 +13661,79 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
 }
 
 const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
+#[cfg(unix)]
+const ARCHIVE_PUBLICATION_DIRECTORY_CACHE: usize = 4;
 
-/// Archive files staged under temp names beside their targets,
+/// Destination identities consume memory, without retaining a descriptor per
+/// recipient. Publication reopens through no-follow directory handles.
+#[cfg(unix)]
+struct StagedDirectoryBinding {
+    chain: Vec<(PathBuf, fs::Metadata)>,
+}
+
+#[cfg(unix)]
+impl StagedDirectoryBinding {
+    fn capture(directory: &CanonicalScanDirectory) -> Result<Self> {
+        let chain = directory
+            .chain
+            .iter()
+            .map(|(path, file)| Ok((path.clone(), file.metadata()?)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self { chain })
+    }
+
+    fn device(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+
+        self.chain
+            .last()
+            .expect("root directory is recorded")
+            .1
+            .dev()
+    }
+
+    fn matches(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        current.is_dir()
+            && current.dev() == expected.dev()
+            && current.ino() == expected.ino()
+            && current.created().ok() == expected.created().ok()
+    }
+
+    fn validate_binding(&self) -> Result<()> {
+        for (path, expected) in &self.chain {
+            if !Self::matches(expected, &fs::symlink_metadata(path)?) {
+                return Err(StorageError::InvalidPath(format!(
+                    "staged archive destination was replaced: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_directory(&self, directory: &CanonicalScanDirectory) -> Result<()> {
+        if directory.chain.len() != self.chain.len() {
+            return Err(StorageError::InvalidPath(
+                "staged archive destination chain changed".into(),
+            ));
+        }
+        for ((expected_path, expected), (current_path, file)) in
+            self.chain.iter().zip(&directory.chain)
+        {
+            if expected_path != current_path || !Self::matches(expected, &file.metadata()?) {
+                return Err(StorageError::InvalidPath(format!(
+                    "staged archive destination was replaced: {}",
+                    directory.path().display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Archive files staged under temp names on their target filesystems,
 /// then renamed into place together inside one archive mutation window
 /// (br-9bwnb). Staging needs no publication fence: readers only open named
 /// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
@@ -13667,12 +13742,18 @@ const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
 struct StagedArchiveWrites {
     /// `(temp path, target path)` pairs not yet renamed into place.
     staged: Vec<(PathBuf, PathBuf)>,
-    /// Retain each parent and share ancestor descriptors across the batch.
+    /// Destination identities do not hold open directory descriptors.
     #[cfg(unix)]
-    directories: HashMap<PathBuf, CanonicalScanDirectory>,
+    directories: HashMap<PathBuf, StagedDirectoryBinding>,
+    /// One retained source directory per filesystem owns all staged names.
     #[cfg(unix)]
-    directory_handles: HashMap<PathBuf, Arc<fs::File>>,
-    /// Bound open descriptors while allowing a group of writes to reach the
+    staging_directories: HashMap<u64, CanonicalScanDirectory>,
+    /// Only the bounded cache and per-device staging roots own strong handles.
+    #[cfg(unix)]
+    directory_handles: HashMap<PathBuf, std::sync::Weak<fs::File>>,
+    #[cfg(unix)]
+    directory_cache: Vec<(PathBuf, CanonicalScanDirectory)>,
+    /// Bound open data descriptors while allowing a group of writes to reach the
     /// filesystem before its first synchronization barrier.
     pending_sync: Vec<fs::File>,
     /// One open file per device keeps descriptor use independent of batch size.
@@ -13698,12 +13779,30 @@ impl StagedArchiveWrites {
         #[cfg(unix)]
         let (tmp_path, file) = {
             let parent = path.parent().unwrap_or(Path::new("."));
+            let index = self.destination_index(parent)?;
+            let destination = &self.directory_cache[index].1;
             if !self.directories.contains_key(parent) {
-                let directory =
-                    CanonicalScanDirectory::open_cached(parent, &mut self.directory_handles)?;
-                self.directories.insert(parent.to_path_buf(), directory);
+                let binding = StagedDirectoryBinding::capture(destination)?;
+                self.staging_directories
+                    .entry(binding.device())
+                    .or_insert_with(|| destination.clone());
+                self.directories.insert(parent.to_path_buf(), binding);
             }
-            stage_archive_write_at(&self.directories[parent], path, data)?
+            let source = &self.staging_directories[&self.directories[parent].device()];
+            let (tmp_path, file) = stage_archive_write_at(destination, path, data)?;
+            // Creation in the destination preserves inherited ACLs and group
+            // ownership. Relocation retains the inode and uses no-replace.
+            match retain_archive_temp(destination, source, &tmp_path, path) {
+                Ok(retained_path) => (retained_path, file),
+                Err(err) => {
+                    let _ = nix::unistd::unlinkat(
+                        destination.file(),
+                        tmp_path.file_name().expect("staged file has a name"),
+                        nix::unistd::UnlinkatFlags::NoRemoveDir,
+                    );
+                    return Err(err);
+                }
+            }
         };
         #[cfg(not(unix))]
         let (tmp_path, file) = stage_atomic_write(path, data, false)?;
@@ -13748,41 +13847,86 @@ impl StagedArchiveWrites {
         for directory in self.directories.values() {
             directory.validate_binding()?;
         }
+        #[cfg(unix)]
+        for directory in self.staging_directories.values() {
+            directory.validate_binding()?;
+        }
         let mut pending = std::mem::take(&mut self.staged).into_iter();
         while let Some((tmp_path, path)) = pending.next() {
             #[cfg(unix)]
-            let result = {
-                let directory = &self.directories[path.parent().unwrap_or(Path::new("."))];
-                nix::fcntl::renameat(
-                    directory.file(),
-                    tmp_path.file_name().expect("staged file has a name"),
-                    directory.file(),
-                    path.file_name().expect("target file has a name"),
-                )
-                .map_err(std::io::Error::from)
-            };
+            let result = self.publish_at(&tmp_path, &path);
             #[cfg(not(unix))]
-            let result = fs::rename(&tmp_path, &path);
+            let result = fs::rename(&tmp_path, &path).map_err(StorageError::from);
             if let Err(err) = result {
                 self.staged.push((tmp_path, path));
                 self.staged.extend(pending);
-                return Err(err.into());
+                return Err(err);
             }
         }
         #[cfg(unix)]
-        for directory in self.directories.values() {
+        for (_, directory) in &self.directory_cache {
             directory.validate_binding()?;
         }
+        #[cfg(unix)]
+        for directory in self.staging_directories.values() {
+            directory.validate_binding()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn destination_index(&mut self, parent: &Path) -> Result<usize> {
+        let index = if let Some(index) = self
+            .directory_cache
+            .iter()
+            .position(|(key, _)| key == parent)
+        {
+            index
+        } else {
+            if self.directory_cache.len() == ARCHIVE_PUBLICATION_DIRECTORY_CACHE {
+                let (_, evicted) = self.directory_cache.remove(0);
+                evicted.validate_binding()?;
+            }
+            let directory =
+                CanonicalScanDirectory::open_cached(parent, &mut self.directory_handles)?;
+            if let Some(binding) = self.directories.get(parent) {
+                binding.validate_directory(&directory)?;
+            }
+            self.directory_cache.push((parent.to_path_buf(), directory));
+            self.directory_cache.len() - 1
+        };
+        self.directory_cache[index].1.validate_binding()?;
+        Ok(index)
+    }
+
+    #[cfg(unix)]
+    fn publish_at(&mut self, tmp_path: &Path, path: &Path) -> Result<()> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let index = self.destination_index(parent)?;
+        let binding = &self.directories[parent];
+        let destination = &self.directory_cache[index].1;
+        destination.validate_binding()?;
+        let source = &self.staging_directories[&binding.device()];
+        nix::fcntl::renameat(
+            source.file(),
+            tmp_path.file_name().expect("staged file has a name"),
+            destination.file(),
+            path.file_name().expect("target file has a name"),
+        )
+        .map_err(std::io::Error::from)?;
+        destination.validate_binding()?;
         Ok(())
     }
 }
 
 impl Drop for StagedArchiveWrites {
     fn drop(&mut self) {
-        for (tmp_path, _) in &self.staged {
+        for staged in &self.staged {
+            let tmp_path = &staged.0;
             #[cfg(unix)]
             {
-                let directory = &self.directories[tmp_path.parent().unwrap_or(Path::new("."))];
+                let binding = &self.directories[staged.1.parent().unwrap_or(Path::new("."))];
+                let directory = &self.staging_directories[&binding.device()];
                 let _ = nix::unistd::unlinkat(
                     directory.file(),
                     tmp_path.file_name().expect("staged file has a name"),
@@ -13793,6 +13937,65 @@ impl Drop for StagedArchiveWrites {
             let _ = fs::remove_file(tmp_path);
         }
     }
+}
+
+#[cfg(unix)]
+fn retain_archive_temp(
+    destination: &CanonicalScanDirectory,
+    staging: &CanonicalScanDirectory,
+    tmp_path: &Path,
+    target: &Path,
+) -> Result<PathBuf> {
+    if destination.path() == staging.path() {
+        return Ok(tmp_path.to_path_buf());
+    }
+    let old_name = tmp_path.file_name().expect("staged file has a name");
+    for _ in 0..64 {
+        let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let retained_path = atomic_write_tmp_path(staging.path(), target, seq);
+        let new_name = retained_path.file_name().expect("staged file has a name");
+        match relocate_archive_temp(destination.file(), old_name, staging.file(), new_name) {
+            Ok(()) => return Ok(retained_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate a retained archive temporary name",
+    )
+    .into())
+}
+
+/// Never replace another writer's temporary file while consolidating staging.
+#[cfg(unix)]
+fn relocate_archive_temp(
+    from: &fs::File,
+    old_name: &std::ffi::OsStr,
+    to: &fs::File,
+    new_name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    match rustix::fs::renameat_with(
+        from,
+        old_name,
+        to,
+        new_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    // Filesystems without no-replace rename can link the same inode without
+    // overwriting the new name, then release its original directory entry.
+    rustix::fs::linkat(from, old_name, to, new_name, rustix::fs::AtFlags::empty())?;
+    if let Err(err) = rustix::fs::unlinkat(from, old_name, rustix::fs::AtFlags::empty()) {
+        let _ = rustix::fs::unlinkat(to, new_name, rustix::fs::AtFlags::empty());
+        return Err(err.into());
+    }
+    Ok(())
 }
 
 /// Create and fill a new temporary file through the retained parent handle.
@@ -13820,7 +14023,7 @@ fn stage_archive_write_at(
             path.display()
         )));
     }
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = directory.path();
     for _ in 0..64 {
         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = atomic_write_tmp_path(parent, path, seq);
@@ -15839,6 +16042,35 @@ mod tests {
         assert!(!retained.join("message.md").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_reject_replaced_destination_and_clean_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let retained = tmp.path().join("retained");
+        let staged = StagedArchiveWrites::stage(vec![
+            (source.join("first.md"), b"first".to_vec()),
+            (destination.join("second.md"), b"second".to_vec()),
+        ])
+        .unwrap();
+        fs::rename(&destination, &retained).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("second.md"), b"foreign target").unwrap();
+
+        assert!(staged.publish().is_err());
+
+        assert_eq!(
+            fs::read(destination.join("second.md")).unwrap(),
+            b"foreign target"
+        );
+        assert!(!source.join("first.md").exists());
+        assert!(!retained.join("second.md").exists());
+        assert!(staged_temp_files(&source).is_empty());
+        assert!(staged_temp_files(&destination).is_empty());
+        assert!(staged_temp_files(&retained).is_empty());
+    }
+
     #[test]
     fn staged_archive_writes_bound_pending_files_and_publish_complete_contents() {
         let tmp = TempDir::new().unwrap();
@@ -15860,6 +16092,90 @@ mod tests {
             );
         }
         assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    /// Also run with a 128-descriptor process limit: recipient fanout must not
+    /// retain one descriptor per destination directory until publication.
+    #[test]
+    fn staged_archive_writes_publish_many_distinct_parents() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        for index in 0..ARCHIVE_SYNC_GROUP_FILES * 4 {
+            staged
+                .add(
+                    &tmp.path().join(index.to_string()).join("message.md"),
+                    &index.to_le_bytes(),
+                )
+                .unwrap();
+        }
+
+        staged.publish().unwrap();
+
+        for index in 0..ARCHIVE_SYNC_GROUP_FILES * 4 {
+            assert_eq!(
+                fs::read(tmp.path().join(index.to_string()).join("message.md")).unwrap(),
+                index.to_le_bytes()
+            );
+            assert!(staged_temp_files(&tmp.path().join(index.to_string())).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_temp_relocation_preserves_foreign_destination() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("from")).unwrap();
+        fs::create_dir(tmp.path().join("to")).unwrap();
+        fs::write(tmp.path().join("from/temp"), b"owned").unwrap();
+        fs::write(tmp.path().join("to/temp"), b"foreign").unwrap();
+
+        let result = relocate_archive_temp(
+            &fs::File::open(tmp.path().join("from")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+            &fs::File::open(tmp.path().join("to")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+        );
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(tmp.path().join("from/temp")).unwrap(), b"owned");
+        assert_eq!(fs::read(tmp.path().join("to/temp")).unwrap(), b"foreign");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_temp_relocation_preserves_created_inode_and_permissions() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("from")).unwrap();
+        fs::create_dir(tmp.path().join("to")).unwrap();
+        fs::write(tmp.path().join("from/temp"), b"owned").unwrap();
+        fs::set_permissions(
+            tmp.path().join("from/temp"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let before = fs::metadata(tmp.path().join("from/temp")).unwrap();
+
+        relocate_archive_temp(
+            &fs::File::open(tmp.path().join("from")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+            &fs::File::open(tmp.path().join("to")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+        )
+        .unwrap();
+
+        let after = fs::metadata(tmp.path().join("to/temp")).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(fs::read(tmp.path().join("to/temp")).unwrap(), b"owned");
+        assert!(!tmp.path().join("from/temp").exists());
     }
 
     #[cfg(unix)]
