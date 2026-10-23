@@ -210,6 +210,7 @@ def measure(binary: Path, root: Path, mode: str) -> dict[str, object]:
         raise RuntimeError(f"{mode}: unexpected durable ATC row count: {atc_rows}")
     ordered = sorted(samples)
     return {
+        "mode": mode,
         "median_ms": statistics.median(samples),
         "mean_ms": statistics.mean(samples),
         "p95_ms": ordered[math.ceil(len(ordered) * 0.95) - 1],
@@ -226,6 +227,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--store-root", type=Path, required=True)
+    parser.add_argument(
+        "--diagnostic-all-off",
+        action="store_true",
+        help="Measure three independent ATC-off stores; emit diagnostic-only names.",
+    )
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     with binary.open("rb") as executable:
@@ -234,9 +240,13 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=False)
     benchmarks: dict[str, object] = {}
     failures: list[dict[str, str]] = []
-    for mode, name in MODES.items():
+    for position, (mode, name) in enumerate(MODES.items(), start=1):
+        if args.diagnostic_all_off:
+            mode = "off"
+            name = f"mail_send_off_control_{position}"
+        store_name = name if args.diagnostic_all_off else mode
         try:
-            benchmarks[name] = measure(binary, root / mode, mode)
+            benchmarks[name] = measure(binary, root / store_name, mode)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             failures.append({"benchmark": name, "error": str(error)})
             break
@@ -244,6 +254,11 @@ def main() -> int:
         json.dumps(
             {
                 "measurement": {
+                    "purpose": (
+                        "diagnostic_all_off"
+                        if args.diagnostic_all_off
+                        else "qualification"
+                    ),
                     "binary": str(binary),
                     "binary_sha256": binary_sha256,
                     "transport": "persistent_mcp_stdio",

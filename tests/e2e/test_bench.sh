@@ -589,6 +589,23 @@ e2e_assert_contains "missing live observations retain their diagnostic" \
     "$(jq -r '.failures[0].error' "${ATC_PROTOCOL_DIR}/disabled-atc-report.json")" \
     "live: unexpected durable ATC row count: 0"
 
+e2e_case_banner "atc_transport_all_off_control"
+python3 "${PROJECT_ROOT}/scripts/bench_atc_transport.py" \
+    --binary "${AM_BIN}" \
+    --store-root "${ATC_PROTOCOL_DIR}/all-off-store" \
+    --diagnostic-all-off \
+    >"${ATC_PROTOCOL_DIR}/all-off-report.json"
+e2e_assert_eq "all-off measurements are marked diagnostic" diagnostic_all_off \
+    "$(jq -r '.measurement.purpose' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "all-off control reports three measurements" 3 \
+    "$(jq '.summary.benchmarks | length' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "all-off control retains three independent stores" 3 \
+    "$(jq '[.summary.benchmarks[].store] | unique | length' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "control runs preserve messages without ATC writes" true \
+    "$(jq '[.summary.benchmarks[] | .mode == "off" and .atc_rows == 0 and .messages > 0 and .integrity == "ok"] | all' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "diagnostic results cannot replace qualification measurements" false \
+    "$(jq '.summary.benchmarks | has("mail_send_atc_live") or has("mail_send_atc_shadow") or has("mail_send_no_atc")' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+
 popd >/dev/null
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
