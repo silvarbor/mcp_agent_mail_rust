@@ -95,7 +95,7 @@ if [ "${TRACE_SYSCALLS}" -eq 1 ]; then
         exit 1
     fi
     require_cmd strace
-    PROBE_RUNNER=(strace -f -c -o "${OUTPUT_DIR}/syscalls.txt" cargo)
+    PROBE_RUNNER=(strace -f -c -w -o "${OUTPUT_DIR}/syscalls.txt" cargo)
     printf 'Diagnostic syscall tracing enabled; these timings are not qualification evidence.\n' \
         | tee "${OUTPUT_DIR}/diagnostic.txt"
 fi
