@@ -2,32 +2,32 @@
 
 ## CI diagnostic results at published 3a0c2063
 
-Published PR head is 3a0c206397b7b9c220e2b920bf4a275af5b51135; push62027
-completed successfully. Watch31865 exited1 on APFS failure. No local heavy
-command is active except compiler-artifact validation77984, currently waiting
+Published PR head is 3a0c206397b7b9c220e2b920bf4a275af5b51135; push 62027
+completed successfully. Watch 31865 exited 1 on APFS failure. No local heavy
+command is active except compiler-artifact validation 77984, currently waiting
 for host-load admission. Collect that same handle; its output is
 fsync-probe-artifacts-20261023.jsonl in the preservation root.
 
-Fsync39945424677 failed APFS (single39.016ms/35ms; batch330.761ms/300ms),
-ext4-ordered(batch374.0ms/250ms), XFS(batch430.798ms/250ms), and
-btrfs(batch617.184ms). Ext4-journal and tmpfs passed. Downloaded Linux
+Fsync 39945424677 failed APFS (single 39.016ms/35ms; batch 330.761ms/300ms),
+ext4-ordered (batch 374.0ms/250ms), XFS (batch 430.798ms/250ms), and
+btrfs (batch 617.184ms). Ext4-journal and tmpfs passed. Downloaded Linux
 summaries preserve 100 canonical messages and two commits in every crash check.
 Trace artifacts under fsync-{ext4,xfs,btrfs}-3a0c2063-20261023/diagnostic
-contain3336fdatasync calls and236308readlink calls but include Cargo startup;
+contain 3336 fdatasync calls and 236308 readlink calls but include Cargo startup;
 their overlapping thread wall times cannot identify archive-only proportions.
-Local repair61343c93e3d2ae0c3100e87ee24a520bd2ff1d56 resolves the test
+Local repair 61343c93e3d2ae0c3100e87ee24a520bd2ff1d56 resolves the test
 executable from Cargo JSON before tracing. Static checks pass; actual artifact
-resolution validation77984 is pending. This repair has not been published.
+resolution validation 77984 is pending. This repair has not been published.
 
-ATC39945424829 failed: off p95 25.089426ms, shadow29.127276ms,
-live27.096125ms. Identical off controls measured25.834693,26.810769,
-25.263811ms, all with113messages, integrity okay andzeroATCrows. These
+ATC 39945424829 failed: off p95 25.089426ms, shadow 29.127276ms,
+live 27.096125ms. Identical off controls measured 25.834693, 26.810769,
+25.263811ms, all with 113 messages, integrity okay and zero ATC rows. These
 controls do not establish that the qualification failure is measurement noise.
-Keep the5%limit. Artifacts: atc-ci-3a0c2063-20261023.
-ArchivePerf39945424703/job120386796582 remains in progress; its live log
-was unavailable at11:33:36Z. Collect terminal output before diagnosing the
+Keep the 5% limit. Artifacts: atc-ci-3a0c2063-20261023.
+ArchivePerf 39945424703/job 120386796582 remains in progress; its live log
+was unavailable at 11:33:36Z. Collect terminal output before diagnosing the
 resource samples. Detailed machine record: diagnostic-ci-3a0c2063-20261023.json.
-No merge, installation, restart or24-hour observation has occurred.
+No merge, installation, restart or 24-hour observation has occurred.
 
 ## Resumed diagnostics on 2026-10-23
 
