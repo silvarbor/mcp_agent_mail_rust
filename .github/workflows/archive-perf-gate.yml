@@ -41,6 +41,22 @@ jobs:
           set -euo pipefail
           mkdir -p "${GATE_OUTPUT_DIR}"
           (
+            trap '
+              build_exit=$?
+              trap - EXIT
+              set +e
+              printf "Archive build exited with status %s at " "$build_exit"
+              date -u "+%Y-%m-%dT%H:%M:%SZ"
+              free -m
+              df -h .
+              if [[ -r /sys/fs/cgroup/memory.events ]]; then
+                cat /sys/fs/cgroup/memory.events
+              fi
+              ps -eo pid,ppid,stat,rss,comm --sort=-rss | head -20
+              exit "$build_exit"
+            ' EXIT
+            trap 'echo "Archive build received SIGTERM"; exit 143' TERM
+            trap 'echo "Archive build received SIGINT"; exit 130' INT
             cargo bench --locked -p mcp-agent-mail --bench benchmarks --no-run
             cargo build --locked --release -p mcp-agent-mail-cli --bin am
           ) 2>&1 | tee "${GATE_OUTPUT_DIR}/build.log"
