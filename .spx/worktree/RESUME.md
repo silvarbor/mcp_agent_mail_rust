@@ -38,8 +38,18 @@ conditions, so it does not alone establish resolution of the earlier CI failures
 Workspace validation command 13591 exited 0: all-targets check (49.81s), production
 lib/bins check (27.65s), strict workspace Clippy (55.51s), fmt and diffcheck.
 Final focused test command 62081 passed all fourteen tests against the committed
-candidate. No heavy command remains active. Log prefix: archive-scan-*. Full committed
-implementation audit and branch review remain required before publication.
+candidate. No heavy command remains active. Log prefix: archive-scan-*.
+Implementation audit /root/audit_archive_scan opened run
+2026-10-23_10-05-09-929-a97afc9f3c40 for daeb2a75...3aa52f81. Its initial
+missing-/data/projects/AGENTS.md stop was answered with the operator-approved
+tracked deferral br-rpa0b; the same run is continuing, with no verdict yet.
+The current merging-standards merge-policy.md authority-gates table explicitly
+selects no evidence audit or local review for a repository without spx/; its
+deterministic publication predicate applies here. Earlier notes requiring an
+additional full-branch pre-push review were incorrect. The implementation audit
+still follows the separate required code-audit instruction. Publication can
+proceed with the passing local checks; merge still requires fresh CI and the
+applicable review predicates. No audit approval is presumed.
 
 CURRENT: wrapper-lifetime repair cec33fb274eafa38f71722d782396402c4fb50ca
 passes all ten append tests, both workspace compilation checks, strict Clippy,
