@@ -1,5 +1,28 @@
 # Resume — local Agent Mail fork
 
+## ATC control diagnostic in progress
+
+Published PR head is f4862dd508d4e1a99358392436a4ccac62f78a14. New runs:
+ATC39940880639, ArchivePerf39940880614, FsyncMatrix39940880641,
+CI39940880706, Installer39940880629, Observability39940880619.
+Local checkpoints c992380df460116a37752fdce37cc80af99a1e01 and
+c3c6b2dbd1e831b4fd9b38086a3362e583867987 add --diagnostic-all-off to the
+transport driver, its real-server e2e scenario, CI control capture and exact
+Linux binary retention. Defaults, qualification report names and 5% budget
+are unchanged. Diagnostic names are mail_send_off_control_1/2/3, purpose is
+diagnostic_all_off, and all three independent stores must retain zero ATC rows.
+Ruff, format, strict mypy, actionlint, bash syntax and diffcheck passed.
+Parser RED command returned exit2 for the unimplemented flag before the edit.
+Real-server command 52809 is still waiting for host-load admission; collect that
+same handle before any heavy command. It was queued before the source edit but
+has not started the driver, so its eventual result is GREEN-side evidence. Its
+historical output path is atc-control-red-20261023.log and its store root has
+the same stem; do not misclassify it as RED. It uses the frozen eaf47423-source
+binary at atc-wrapper-candidate-20261023/am, whose behavior is unchanged by this
+Python-only diagnostic. After collection, run the actual benchmark e2e checks
+and default qualification path, then the required fresh implementation audit.
+These checkpoints are not published and have no runtime/audit approval yet.
+
 ## Latest validated checkpoint on 2026-10-23
 
 Source repair 9752fcf4af6bdb8b992bea7be38ec135f5fe760d enumerates root/year/month
