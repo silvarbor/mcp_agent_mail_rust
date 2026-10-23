@@ -1,5 +1,56 @@
 # Resume — local Agent Mail fork
 
+## Active repair: bound retained staging resources
+
+Storage checkpoint 1303d39c2b79349fad1d9659018faece7ff1e80a retains Unix directory handles for staging,
+publication and cleanup, sharing ancestor descriptors within a batch. The new
+real-filesystem regression replaces a staged file's parent and plants a foreign
+temporary file at the same name. Before the repair, command 46455 exited 101
+at the expected rejection assertion (15693): publication incorrectly succeeded.
+Focused staging command 85299 exited zero: seven tests pass, including the new
+replaced-parent case. Four existing retained-directory scan tests also pass.
+No performance result exists for this repair. Required implementation audit
+2026-10-23_12-52-49-834-e75f6f47d3f3 sealed rejected with one blocking finding:
+directory_handles retains every distinct ancestor until batch drop. A default
+256-message batch with distinct sender/recipient pairs needs over 2,048
+directory descriptors; supported 4,096-message batches need over 32,768.
+The 64-file synchronization group does not bound this second descriptor class.
+Do not publish this checkpoint or claim the defect resolved before redesign.
+
+Next implementation must bound live staging directory descriptors while keeping
+all-file staging before publication, sync barriers, substituted-parent refusal,
+and cleanup of owned temporary files. One design to investigate is staging
+temporary files under a retained directory per device, with recorded target
+bindings revalidated through no-follow directory opens at publication. This is
+an unimplemented proposal: evaluate inode replacement/ABA and cross-filesystem
+semantics before adopting it. Do not weaken collision preflight or sync checks.
+
+Latest published-head CI now includes twelve failing database tests because
+their exact child-process selectors use pool::tests, while their registered
+module is pool_impl::tests. Child output reports zero tests; the causal witness
+assertions detect the mistake. All twelve selectors are corrected in local
+commit 9e24c8078a439cd87e5a360c181fe631cf7aa8ac.
+Command 25748 exited zero after a 5m26s build: abrupt recovery lineage passes
+with the real child exits. Command 81743 is collecting the remaining three
+Unix child-probe cases behind the load guard; collect the same handle.
+Linux-only probes require CI. Evidence is build-test-988337c4-20261023.log
+under the preservation root. Formatting and actionlint passed in 88858.
+
+APFS CI failed: single p95 64.301ms (35ms budget), batch p95 495.696ms
+(300ms budget). Archive Perf also failed: its serialized cold build was still
+compiling the final crates at the 60-minute step limit, with 60KiB swap and no
+swap-in/out in the final vmstat samples. Local workflow commit
+4825bf1c30cd98a240e3883ec7d7bbe68bd3f358 allows
+90 minutes for compilation and 125 minutes overall; runtime probe timeout and
+thresholds are unchanged. It skips the comment step when the probe was skipped
+and explicitly fails when no summary exists. Remote verification is pending.
+Implementation audit run 2026-10-23_13-01-16-602-93d8da035828 covers the
+two follow-up commits; its registry selects no workflow concern and only
+implementation concerns for the test-only database edits. Those coverage gaps
+do not establish test-evidence or workflow approval. Collect its final result.
+Installation and observation await qualification. The following checkpoint
+describes the prior rejected experiment.
+
 ## Current checkpoint: rejected path-resolution experiment
 
 Local source checkpoint a1420a14758d41393bc26af841cee8f33962244c restores
