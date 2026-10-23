@@ -96,9 +96,11 @@ if [ "${TRACE_SYSCALLS}" -eq 1 ]; then
         exit 1
     fi
     require_cmd strace
-    CARGO_TARGET_DIR="${TARGET_DIR}" cargo test --locked \
-        -p mcp-agent-mail-storage --test it --no-run --message-format=json \
-        > "${OUTPUT_DIR}/compiler-artifacts.jsonl"
+    (
+        cd "${PROJECT_ROOT}"
+        CARGO_TARGET_DIR="${TARGET_DIR}" cargo test --locked \
+            -p mcp-agent-mail-storage --test it --no-run --message-format=json
+    ) > "${OUTPUT_DIR}/compiler-artifacts.jsonl"
     PROBE_BINARY="$(python3 - "${OUTPUT_DIR}/compiler-artifacts.jsonl" <<'PY'
 import json
 import pathlib
