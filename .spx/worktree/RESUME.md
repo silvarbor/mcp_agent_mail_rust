@@ -26,17 +26,30 @@ The existing-prefix helper already attempts the target before its ancestors;
 symlink resolution, containment checks and synchronization remain in place.
 Both existing rel_path_cached regressions passed before editing (63975 exit 0)
 and after editing (70861 exit 0; two tests). Formatting and whitespace pass
-(10997 exit 0). The full storage unit suite is active under handle 1808, with
-completed cases passing; collect that same handle before any new heavy command.
+(10997 exit 0). The full storage unit suite completed (1808 exit 0): 705 passed,
+zero failed, one ignored, in 1006.01 seconds. A one-second stack sample of that
+suite is preserved as storage-suite-5ada6dcd-sample-20261023.txt: the historical
+inbox test waits in CommitCoalescer::flush_sync. The cause of pending queue work
+is unproven; the sampled process has since exited successfully.
 Audit 2026-10-23_11-56-50-813-b93e5cc0f7aa sealed approved with zero findings,
 covering required Rust code and architecture for 988337c4...5ada6dcd.
-Workspace all-targets check, production lib/bins check, strict Clippy and matched
+Workspace all-targets check passed (52823 exit 0, 1m50s), with output preserved
+in path-resolution-all-targets-20261023.log. Production lib/bins check is active
+under handle 22498, waiting for load admission at the latest collection; collect
+that same handle before any new heavy command. Its log destination is
+path-resolution-production-20261023.log. Strict Clippy and the matched
 baseline/candidate performance comparison remain unestablished. No speedup is claimed.
-Next: collect suite, complete those checks, then publish the validated candidate.
+Next: collect production check, run strict Clippy, build the integration-test
+probe, compare both binaries, then publish the validated candidate.
 The preserved Mac baseline is archive-enumeration-candidate-20261023/storage-tests;
 its SHA-256 is 9ff554b6d86085894b534d5c666bf27b546ceee0ffe79b9ed2369ca587c9eb47.
 Build the candidate's integration-test executable before comparing both in one
 invocation with independent stores and the unchanged APFS 35ms/300ms budgets.
+The prepared execution helper is
+/private/tmp/archive-enumeration-checkpoint.HQm3eV/compare-path-resolution.sh;
+it accepts baseline binary, candidate binary and a new comparison directory,
+retains both gate exit statuses, and has passed bash syntax checking. It has not
+run. The baseline hash was rechecked successfully during this continuation.
 No installation has occurred.
 
 Latest ATC artifact download 33099 completed successfully into
