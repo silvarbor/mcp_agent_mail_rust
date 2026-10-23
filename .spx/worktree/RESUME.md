@@ -1,5 +1,42 @@
 # Resume — local Agent Mail fork
 
+## Resumed diagnostics on 2026-10-23
+
+Latest local source checkpoint: 82193b3e1ed7d4ae616c1692c5a5ee8b58f1c129.
+Published head remains f4862dd508d4e1a99358392436a4ccac62f78a14.
+Real-server control 52809 completed with exit 0: independent stores each
+retained 113 messages, zero ATC rows and integrity okay; control p95 values
+were 32.232, 30.352208 and 30.4015ms. Historical output names contain "red"
+but this is GREEN-side evidence. Watch 15851 exited 1 on XFS failure.
+
+Full benchmark E2E 36996 exited 1: the ATC gate's default /data/tmp could
+not be created on macOS (read-only /data). Safe local repair 82193b3e
+uses TMPDIR or /tmp and isolates the test's scratch path. Shell syntax
+passes. Rerun 39475 is the ONLY active heavy command: collect this same
+handle through host-load admission and completion before starting another.
+Its artifact/log stem is atc-control-bench-e2e-portable-20261023 under the
+preservation root. Runtime approval and fresh implementation audit remain
+pending; no diagnostic changes have been published.
+
+CI ATC39940880639 completed successfully at the published head: live overhead
+4.75% versus 5%. Fsync39940880641 failed ext4-ordered (batch p95 384.143ms)
+and XFS (311.221ms), both against 250ms. Single writes passed; most batch
+latency occurs in the write phase. The ext4 failure log is preserved as
+fsync-ext4-ordered-f4862dd5-20261023.log. ArchivePerf39940880614 failed in
+compilation again with exit 143. Neither EXIT nor TERM diagnostic printed;
+all post-build steps were skipped. Its failed-step log is preserved as
+archive-perf-failed-f4862dd5-20261023.log. Cause remains unconfirmed.
+
+Local checkpoint 62bd35f1b81dd3f70d9ea1baa8eb23f44cee71db adds optional
+Linux syscall tracing to the fsync driver and a failed-probe diagnostic CI
+step. Separate diagnostic output, original failure and budgets are retained.
+Bash syntax, actionlint and whitespace checks pass. Linux execution remains
+unverified. Next: collect E2E, validate default transport qualification,
+fresh implementation audit and publish diagnostics; then use Linux syscall
+evidence to repair archive batch costs. No merge, installation, restart or
+24-hour observation has occurred. Existing approved instruction-file deferral
+br-rpa0b remains unchanged. All failures above are active authorized repairs.
+
 ## ATC control diagnostic in progress
 
 Published PR head is f4862dd508d4e1a99358392436a4ccac62f78a14. New runs:
