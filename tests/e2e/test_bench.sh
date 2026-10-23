@@ -76,6 +76,7 @@ run_bench_case() {
 }
 
 WORKDIR="$(e2e_mktemp bench-e2e)"
+export ATC_GATE_TMPDIR_ROOT="${WORKDIR}/atc-tmp"
 ATC_CANARY_STATE_DIR="${E2E_ARTIFACT_DIR}/atc_canary_state"
 mkdir -p "${ATC_CANARY_STATE_DIR}"
 export AM_ATC_CANARY_REPORT_DIR="${ATC_CANARY_STATE_DIR}"
