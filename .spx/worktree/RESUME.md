@@ -1,5 +1,45 @@
 # Resume — local Agent Mail fork
 
+## Published staged-path repair: fresh CI still fails performance
+
+Published head6a07d839a5c973c4bcf796fa26a5a31e69389bb3 includes source
+bc0377916dafc7841f49da53f7052e753efde03d. Push21664 exited0 and PR head
+was verified. Base sync48510 returned already_current against
+0b289a5afea198449b26d6b974b76a4948404ca6 with no base delta. Occupancy
+remains assigned/running PID7923. Audit2026-10-23_14-21-22-231-93db66374a25
+sealed approved with zero findings for storage code/architecture; workflow and
+RESUME remain optional registry gaps. Actionlint passed. The256-parent
+publication test also passed under128FD in3d0004. Publication readiness record:
+publication-readiness-6a07d839-20261023.json under the preservation root.
+
+Current fsync CI39969826591 is terminal failure. Uninstrumented results:
+APFS job120469242264 single59.246ms/35ms and batch539.716ms/300ms;
+XFS job120469242456 single9.062ms/25ms, batch433.971ms/250ms;
+ext4-ordered job120469242486 single8.897ms/25ms, batch257.456ms/250ms.
+Real same-device bind-mount probes pass on XFS and ext4. tmpfs, ext4-journal
+and btrfs jobs passed. Traced follow-up measurements are diagnostic only.
+
+ATC CI39969826605 job120469240904 failed overhead: offp9517.90ms,
+shadow19.77ms(+10.41%), live22.81ms(+27.42%) against5%; quick_checkok,
+canary row1. PR comment updated2026-10-23T14:33:02Z. FIFO artifact exclusion
+produced no ENTRYNOTSUPPORTED warning in this job. Installer39969826652
+and observability39969826545 passed. Native39969826531 and ArchivePerf
+39969826672 were confirmed in progress; collect their terminal evidence.
+Watch60169 exited1 due to a GraphQL read timeout, not a job verdict. Direct
+connector reads established the terminal performance failures above. Watch log:
+pr3-6a07d839-watch-20261023.log. No local command handle remains active.
+
+Current-source CLI/server build52496 passed in3m22s. Preserved binaries:
+qualification/staged-path-6a07d839-binaries/ under the preservation root.
+am SHA256b0c95e71d1a98ba276c17f00eb1e6dff4d6e624a0ca8478a41f6d53c37b9228b;
+server SHA256fc52c5f11fd1fcccd3b0523415db5646756d6b6e28e9c5625cc18f1b0fd5bfa8.
+These are optimized dev-profile binaries; no new hour workload was started.
+Next: inspect fresh diagnostic artifacts to select a substantive performance
+repair, especially XFS/APFS costs and ATC overhead. Do not rerun unchanged
+gates hoping for green or weaken thresholds. Required review, merge, final
+runtime/browser qualification, supervised installation and24h observation remain.
+Live service and mailbox are unchanged.
+
 ## Active experiment: missing staged-file relative paths
 
 Local source checkpoint is bc0377916dafc7841f49da53f7052e753efde03d; published HEAD remains
