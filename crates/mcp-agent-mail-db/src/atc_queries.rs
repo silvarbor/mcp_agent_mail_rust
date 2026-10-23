@@ -1847,10 +1847,9 @@ mod tests {
 
     fn test_pool() -> DbPool {
         // These pools exercise rollup arithmetic, not durability: every ATC
-        // sidecar connection in this process runs with synchronous=OFF so 256
+        // sidecar connection for this pool runs with synchronous=OFF so 256
         // proptest cases don't grind hundreds of WAL fsyncs each (br-j5l8s;
         // 380s -> seconds for refresh_rollups_conserves_counts standalone).
-        crate::queries::ATC_CONN_TEST_RELAXED_DURABILITY.store(true, Ordering::Relaxed);
         let pool_id = TEST_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(format!("atc_rollup_test_{pool_id}.db"));
@@ -1882,7 +1881,7 @@ mod tests {
             .expect("apply ATC canonical follow-up schema");
         crate::queries::close_canonical_db_conn(init_conn, "ATC rollup test init connection");
 
-        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+        let mut pool = crate::create_pool(&crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
@@ -1898,6 +1897,7 @@ mod tests {
                 .push(dir);
         })
         .expect("create file-backed ATC test pool");
+        pool.atc_test_relaxed_durability = true;
 
         // ATC telemetry now lives in the dedicated sidecar DB (br-bvq1x.11.7);
         // canonical ATC IO opens the sidecar, so its schema must be initialized

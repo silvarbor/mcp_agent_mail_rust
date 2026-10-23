@@ -3027,6 +3027,12 @@ pub struct DbPool {
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
     atc_experience_max_rows: i64,
+    /// Relax only throwaway rollup fixtures; other pools keep commit durability.
+    #[cfg(test)]
+    pub(crate) atc_test_relaxed_durability: bool,
+    #[cfg(unix)]
+    atc_append_connection:
+        Arc<asupersync::sync::Mutex<Option<crate::queries::AtcAppendConnection>>>,
     init_sql: Arc<String>,
     /// Desired connection-local `journal_size_limit` for this shared pool.
     ///
@@ -3456,6 +3462,10 @@ impl DbPool {
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
             atc_experience_max_rows,
+            #[cfg(test)]
+            atc_test_relaxed_durability: false,
+            #[cfg(unix)]
+            atc_append_connection: Arc::new(asupersync::sync::Mutex::new(None)),
             init_sql,
             journal_size_limit_state,
             run_migrations: config.run_migrations,
@@ -3515,6 +3525,10 @@ impl DbPool {
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
             atc_experience_max_rows,
+            #[cfg(test)]
+            atc_test_relaxed_durability: false,
+            #[cfg(unix)]
+            atc_append_connection: Arc::new(asupersync::sync::Mutex::new(None)),
             init_sql,
             journal_size_limit_state,
             run_migrations: config.run_migrations,
@@ -3667,6 +3681,13 @@ impl DbPool {
                 message: error.to_string(),
             })?;
         Ok(Some(atc_path))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn atc_append_connection(
+        &self,
+    ) -> &asupersync::sync::Mutex<Option<crate::queries::AtcAppendConnection>> {
+        &self.atc_append_connection
     }
 
     /// Return the frozen archive authority after proving its path has not

@@ -2528,17 +2528,6 @@ pub(crate) fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'s
     drop(conn);
 }
 
-/// Test-only relaxed-durability switch for canonical ATC sidecar connections.
-///
-/// Throwaway test pools grind hundreds of WAL fsyncs per proptest case at the
-/// production `synchronous = NORMAL` setting (br-j5l8s: one proptest alone
-/// took 380s standalone under host IO pressure). Tests that exercise rollup
-/// arithmetic — not durability — flip this so every ATC sidecar connection
-/// adds `synchronous = OFF`. Compiled out of production builds entirely.
-#[cfg(test)]
-pub(crate) static ATC_CONN_TEST_RELAXED_DURABILITY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub(crate) fn open_canonical_atc_conn(
     pool: &DbPool,
     purpose: &'static str,
@@ -2557,8 +2546,12 @@ pub(crate) fn open_canonical_atc_conn(
         .map_err(|error| DbError::Sqlite(format!("{purpose}: open failed: {error}")))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
         .map_err(|error| DbError::Sqlite(format!("{purpose}: init pragmas failed: {error}")))?;
+    // A retained append connection keeps the WAL open. Every canonical ATC
+    // writer must sync its own commit rather than rely on last-close cleanup.
+    conn.execute_raw("PRAGMA synchronous = FULL;")
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: full durability failed: {error}")))?;
     #[cfg(test)]
-    if ATC_CONN_TEST_RELAXED_DURABILITY.load(std::sync::atomic::Ordering::Relaxed) {
+    if pool.atc_test_relaxed_durability {
         conn.execute_raw("PRAGMA synchronous = OFF;")
             .map_err(|error| {
                 DbError::Sqlite(format!(
@@ -2705,6 +2698,8 @@ fn append_atc_experience_file_backed(
 /// authority and schema, and completes the same transaction and row ceiling
 /// before returning. Inspection, insertion and read-back share one connection.
 /// This lets synchronous observers avoid creating an async runtime per row.
+/// Unix pools retain an idle connection across calls; concurrent calls use
+/// independent connections when the retained connection is busy.
 ///
 /// # Errors
 /// Returns database, authority, validation or transaction errors without retrying
@@ -2716,6 +2711,14 @@ pub fn append_atc_experience_if_initialized(
     if pool.sqlite_path() == ":memory:" {
         return Ok(None);
     }
+    #[cfg(unix)]
+    if let Ok(mut cached) = pool.atc_append_connection().try_lock() {
+        let result = append_atc_experience_with_cached_connection(pool, &mut cached, row);
+        if !matches!(result, Ok(Some(_))) {
+            *cached = None;
+        }
+        return result;
+    }
     let conn = open_canonical_atc_conn(pool, "append initialized ATC experience")?;
     let result = (|| {
         if !inspect_canonical_atc_schema_on_connection(&conn)?.is_empty() {
@@ -2725,6 +2728,70 @@ pub fn append_atc_experience_if_initialized(
     })();
     close_canonical_db_conn(conn, "initialized ATC append connection");
     result
+}
+
+/// A pool-owned connection whose open descriptor pins the recorded inode.
+#[cfg(unix)]
+pub(crate) struct AtcAppendConnection {
+    conn: crate::CanonicalDbConn,
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+fn atc_file_identity(path: &str) -> std::result::Result<Option<(u64, u64)>, DbError> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DbError::Sqlite(format!("inspect ATC identity: {error}"))),
+    }
+}
+
+#[cfg(unix)]
+fn append_atc_experience_with_cached_connection(
+    pool: &DbPool,
+    cached: &mut Option<AtcAppendConnection>,
+    row: &ExperienceRow,
+) -> std::result::Result<Option<ExperienceRow>, DbError> {
+    let path = pool
+        .validated_atc_sqlite_path("reuse initialized ATC connection")?
+        .ok_or_else(|| DbError::Internal("cached ATC append requires a file".to_owned()))?;
+    let identity = atc_file_identity(&path)?;
+    if cached
+        .as_ref()
+        .is_some_and(|entry| Some(entry.identity) != identity)
+    {
+        // SQLite detects the moved database on close and leaves its old WAL
+        // untouched. Retire that generation before opening the replacement.
+        *cached = None;
+    }
+    if cached.is_none() {
+        let conn = open_canonical_atc_conn(pool, "retain initialized ATC connection")?;
+        let opened_identity = atc_file_identity(&path)?.ok_or_else(|| {
+            DbError::Sqlite("ATC file disappeared while opening its connection".to_owned())
+        })?;
+        if identity.is_some_and(|before| before != opened_identity) {
+            return Err(DbError::Sqlite(
+                "ATC file changed while opening its connection".to_owned(),
+            ));
+        }
+        *cached = Some(AtcAppendConnection {
+            conn,
+            identity: opened_identity,
+        });
+    }
+    // Own the connection locally while a transaction can be active. Unwinding
+    // must drop it and roll back, even if the surrounding cache mutex poisons.
+    let entry = cached
+        .take()
+        .ok_or_else(|| DbError::Internal("ATC append connection was not retained".to_owned()))?;
+    if !inspect_canonical_atc_schema_on_connection(&entry.conn)?.is_empty() {
+        return Ok(None);
+    }
+    let stored = append_atc_experience_on_connection(pool, &entry.conn, row)?;
+    *cached = Some(entry);
+    Ok(Some(stored))
 }
 
 fn append_atc_experience_on_connection(
@@ -19803,11 +19870,14 @@ mod tests {
         assert!(!write_intent.observe_execute_statement("END"));
     }
 
+    type EventObserver = Arc<dyn Fn(&CapturedEvent) + Send + Sync>;
+
     #[derive(Clone, Default)]
     struct EventCapture {
         events: Arc<Mutex<Vec<CapturedEvent>>>,
         next_id: Arc<AtomicU64>,
         retry_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+        event_observer: Option<EventObserver>,
     }
 
     impl EventCapture {
@@ -19879,13 +19949,17 @@ mod tests {
             {
                 observer();
             }
+            let captured = CapturedEvent {
+                target: event.metadata().target(),
+                fields: fields.fields,
+            };
+            if let Some(observer) = &self.event_observer {
+                observer(&captured);
+            }
             self.events
                 .lock()
                 .expect("event capture lock poisoned")
-                .push(CapturedEvent {
-                    target: event.metadata().target(),
-                    fields: fields.fields,
-                });
+                .push(captured);
         }
 
         fn enter(&self, _span: &Id) {}
@@ -22378,6 +22452,316 @@ mod tests {
 
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_reuses_connection_with_committed_rows_visible_to_fresh_readers() {
+        let (_cx, pool, _dir) = setup_test_pool("reused_atc_connection.db");
+        let row = make_insert_experience_test_row(
+            501,
+            601,
+            ExperienceState::Planned,
+            1_700_000_100_000_000,
+        );
+        let stored = append_atc_experience_if_initialized(&pool, &row)
+            .expect("append")
+            .expect("initialized schema");
+        assert_eq!(
+            canonical_fetch_atc_experience_by_decision_effect(&pool, 501, 601)
+                .expect("fresh independent reader"),
+            Some(stored.clone())
+        );
+        assert_eq!(
+            append_atc_experience_if_initialized(&pool.clone(), &row)
+                .expect("append through pool clone"),
+            Some(stored)
+        );
+        assert!(
+            std::path::Path::new(&format!(
+                "{}-wal",
+                pool.atc_sqlite_path().expect("file-backed sidecar")
+            ))
+            .is_file(),
+            "the pool keeps the WAL connection open between committed appends"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_cached_connection_syncs_commits_and_allows_contended_appends() {
+        let (_cx, pool, _dir) = setup_test_pool("contended_atc_connection.db");
+        let (_relaxed_cx, mut relaxed_pool, _relaxed_dir) =
+            setup_test_pool("relaxed_rollup_connection.db");
+        relaxed_pool.atc_test_relaxed_durability = true;
+        let relaxed_conn =
+            open_canonical_atc_conn(&relaxed_pool, "rollup fixture").expect("open relaxed fixture");
+        let relaxed_settings = canonical_query_atc_rows(
+            &relaxed_conn,
+            "PRAGMA synchronous",
+            &[],
+            "read fixture durability",
+        )
+        .expect("fixture setting");
+        assert_eq!(relaxed_settings.first().and_then(row_first_i64), Some(0));
+        let first = make_insert_experience_test_row(
+            501,
+            601,
+            ExperienceState::Planned,
+            1_700_000_100_000_000,
+        );
+        append_atc_experience_if_initialized(&pool, &first).expect("prime connection");
+        let guard = pool.atc_append_connection().try_lock().expect("hold cache");
+        let conn = &guard.as_ref().expect("retained connection").conn;
+        let settings = canonical_query_atc_rows(conn, "PRAGMA synchronous", &[], "read durability")
+            .expect("durability setting");
+        assert_eq!(settings.first().and_then(row_first_i64), Some(2));
+
+        let mut second = first.clone();
+        second.decision_id += 1;
+        second.effect_id += 1;
+        let stored = append_atc_experience_if_initialized(&pool.clone(), &second)
+            .expect("busy cache uses independent connection")
+            .expect("initialized schema");
+        assert_eq!(
+            canonical_fetch_atc_experience_by_decision_effect(
+                &pool,
+                second.decision_id.try_into().expect("small decision ID"),
+                second.effect_id.try_into().expect("small effect ID"),
+            )
+            .expect("independent committed read"),
+            Some(stored)
+        );
+        drop(guard);
+        assert!(
+            append_atc_experience_if_initialized(&pool, &first)
+                .expect("cached connection remains usable")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_cached_connection_rechecks_schema_and_filesystem_authority() {
+        use std::os::unix::fs::symlink;
+
+        let (_cx, pool, dir) = setup_test_pool("rechecked_atc_connection.db");
+        let row = make_insert_experience_test_row(
+            501,
+            601,
+            ExperienceState::Planned,
+            1_700_000_100_000_000,
+        );
+        append_atc_experience_if_initialized(&pool, &row).expect("prime connection");
+        let conn = open_canonical_atc_conn(&pool, "change schema").expect("open schema writer");
+        conn.execute_raw("DROP TABLE atc_experiences")
+            .expect("change schema");
+        drop(conn);
+        assert_eq!(
+            append_atc_experience_if_initialized(&pool, &row)
+                .expect("incomplete schema requests migration"),
+            None
+        );
+        assert!(
+            pool.atc_append_connection()
+                .try_lock()
+                .expect("cache")
+                .is_none()
+        );
+
+        let path = pool.atc_sqlite_path().expect("sidecar path");
+        let moved = dir.path().join("moved-atc.sqlite3");
+        std::fs::rename(&path, &moved).expect("preserve sidecar");
+        symlink(&moved, &path).expect("replace sidecar leaf with symlink");
+        assert!(matches!(
+            append_atc_experience_if_initialized(&pool, &row),
+            Err(DbError::InvalidArgument { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_cached_connection_reopens_replaced_database_without_changing_old_rows() {
+        let (_cx, pool, dir) = setup_test_pool("original_atc_connection.db");
+        let row = make_insert_experience_test_row(
+            501,
+            601,
+            ExperienceState::Planned,
+            1_700_000_100_000_000,
+        );
+        append_atc_experience_if_initialized(&pool, &row).expect("prime original connection");
+        let (_replacement_cx, replacement, _replacement_dir) =
+            setup_test_pool("replacement_atc_connection.db");
+        let replacement_path = replacement.atc_sqlite_path().expect("replacement path");
+        drop(replacement);
+        let original_path = pool.atc_sqlite_path().expect("original path");
+        let quarantine = dir.path().join("original-generation");
+        std::fs::create_dir(&quarantine).expect("create quarantine");
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::rename(
+                format!("{original_path}{suffix}"),
+                quarantine.join(format!("atc.sqlite3{suffix}")),
+            )
+            .expect("preserve original database family");
+        }
+        std::fs::copy(&replacement_path, &original_path).expect("install replacement fixture");
+        let mut next = row.clone();
+        next.decision_id += 1;
+        next.effect_id += 1;
+        let stored = append_atc_experience_if_initialized(&pool, &next)
+            .expect("append in replacement generation")
+            .expect("replacement schema");
+        assert_eq!(
+            canonical_fetch_atc_experience_by_decision_effect(
+                &pool,
+                next.decision_id.try_into().expect("small decision ID"),
+                next.effect_id.try_into().expect("small effect ID"),
+            )
+            .expect("read replacement"),
+            Some(stored)
+        );
+        assert_eq!(
+            canonical_fetch_atc_experience_by_decision_effect(
+                &pool,
+                row.decision_id.try_into().expect("small decision ID"),
+                row.effect_id.try_into().expect("small effect ID"),
+            )
+            .expect("old row absent from replacement"),
+            None
+        );
+
+        let old = crate::CanonicalDbConn::open_file(
+            quarantine
+                .join("atc.sqlite3")
+                .to_str()
+                .expect("UTF-8 fixture path"),
+        )
+        .expect("open preserved original");
+        let rows = canonical_query_atc_rows(
+            &old,
+            "SELECT decision_id FROM atc_experiences",
+            &[],
+            "read old generation",
+        )
+        .expect("read original row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.first().and_then(row_first_i64), Some(501));
+        let integrity =
+            canonical_query_atc_rows(&old, "PRAGMA integrity_check", &[], "check old generation")
+                .expect("original integrity");
+        assert_eq!(integrity[0].get(0), Some(&Value::Text("ok".to_owned())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_cached_commit_survives_process_exit_without_connection_cleanup() {
+        if let Some(path) = std::env::var_os("ATC_COMMIT_EXIT_FIXTURE") {
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", Path::new(&path).display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("child pool");
+            let row = make_insert_experience_test_row(
+                501,
+                601,
+                ExperienceState::Planned,
+                1_700_000_100_000_000,
+            );
+            append_atc_experience_if_initialized(&pool, &row)
+                .expect("child commit")
+                .expect("initialized schema");
+            // Exit deliberately bypasses Drop, including SQLite close/checkpoint.
+            std::process::exit(17);
+        }
+        let (_cx, pool, dir) = setup_test_pool("abrupt_atc_exit.db");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "queries::tests::append_atc_cached_commit_survives_process_exit_without_connection_cleanup",
+                "--nocapture",
+            ])
+            .env("ATC_COMMIT_EXIT_FIXTURE", dir.path().join("abrupt_atc_exit.db"))
+            .status().expect("run abrupt-exit child");
+        assert_eq!(status.code(), Some(17));
+        assert!(Path::new(&format!("{}-wal", pool.atc_sqlite_path().expect("sidecar"))).is_file());
+        let stored = canonical_fetch_atc_experience_by_decision_effect(&pool, 501, 601)
+            .expect("reopen after exit")
+            .expect("committed row survived");
+        assert_eq!(stored.decision_id, 501);
+        assert_eq!(stored.effect_id, 601);
+        assert_eq!(stored.state, ExperienceState::Planned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_atc_cached_connection_releases_transaction_during_unwind() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_EXPERIENCE_MAX_ROWS", "2")],
+            || {
+                let (_cx, pool, _dir) = setup_test_pool("unwinding_atc_connection.db");
+                for offset in 0..2 {
+                    let row = make_insert_experience_test_row(
+                        501 + offset,
+                        601 + offset,
+                        ExperienceState::Resolved,
+                        1_700_000_100_000_000,
+                    );
+                    append_atc_experience_if_initialized(&pool, &row).expect("seed rows");
+                }
+                let capture = EventCapture {
+                    event_observer: Some(Arc::new(|event| {
+                        assert!(
+                            !event.fields.iter().any(|(name, _)| name == "evicted"),
+                            "injected ATC eviction observer panic"
+                        );
+                    })),
+                    ..EventCapture::default()
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracing::subscriber::with_default(capture, || {
+                        let row = make_insert_experience_test_row(
+                            503,
+                            603,
+                            ExperienceState::Resolved,
+                            1_700_000_100_000_000,
+                        );
+                        append_atc_experience_if_initialized(&pool, &row)
+                    })
+                }));
+                let panic = result.expect_err("observer interrupts the active transaction");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"injected ATC eviction observer panic")
+                );
+                let conn = open_canonical_atc_conn(&pool, "probe post-panic writer")
+                    .expect("open independent writer");
+                conn.execute_raw("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;")
+                    .expect("unwinding released the write lock");
+                conn.execute_raw("ROLLBACK;")
+                    .expect("release probe transaction");
+                drop(conn);
+                assert_eq!(
+                    canonical_fetch_atc_experience_by_decision_effect(&pool, 503, 603)
+                        .expect("read rolled-back append"),
+                    None
+                );
+                let row = make_insert_experience_test_row(
+                    504,
+                    604,
+                    ExperienceState::Resolved,
+                    1_700_000_100_010_000,
+                );
+                assert!(
+                    append_atc_experience_if_initialized(&pool, &row)
+                        .expect("append after poisoned cache")
+                        .is_some()
+                );
+            },
+        );
     }
 
     #[test]
