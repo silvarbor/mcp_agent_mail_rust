@@ -13690,6 +13690,23 @@ const ARCHIVE_PARALLEL_SYNC_MIN_FILES: usize = 16;
 #[cfg(unix)]
 const ARCHIVE_PUBLICATION_DIRECTORY_CACHE: usize = 4;
 
+/// Keep blocking work inside the staging operation even while unwinding.
+struct ArchiveSyncTasks(Vec<asupersync::runtime::BlockingTaskHandle>);
+
+impl ArchiveSyncTasks {
+    fn wait(&self) {
+        for task in &self.0 {
+            task.wait();
+        }
+    }
+}
+
+impl Drop for ArchiveSyncTasks {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
 fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
     for file in files {
         // Apple fsync reaches the device; publication subsequently performs
@@ -13801,6 +13818,9 @@ struct StagedArchiveWrites {
     /// Bound open data descriptors while allowing a group of writes to reach the
     /// filesystem before its first synchronization barrier.
     pending_sync: Vec<fs::File>,
+    /// Owned blocking workers are created only for larger groups. Every submitted
+    /// task is waited before publication or dropping this staging operation.
+    sync_pool: Option<asupersync::runtime::BlockingPool>,
     /// One open file per device keeps descriptor use independent of batch size.
     #[cfg(target_vendor = "apple")]
     devices: HashMap<u64, fs::File>,
@@ -13895,29 +13915,39 @@ impl StagedArchiveWrites {
         if self.pending_sync.len() < ARCHIVE_PARALLEL_SYNC_MIN_FILES {
             sync_archive_file_group(&self.pending_sync)?;
         } else {
-            std::thread::scope(|scope| -> std::io::Result<()> {
-                let mut workers = Vec::with_capacity(ARCHIVE_SYNC_WORKERS);
-                let chunk_size = self.pending_sync.len().div_ceil(ARCHIVE_SYNC_WORKERS);
-                for chunk in self.pending_sync.chunks(chunk_size) {
-                    workers.push(
-                        std::thread::Builder::new()
-                            .name("archive-sync".into())
-                            .spawn_scoped(scope, || sync_archive_file_group(chunk))?,
-                    );
-                }
-                let mut result = Ok(());
-                for worker in workers {
-                    let synced = worker.join().unwrap_or_else(|_| {
-                        Err(std::io::Error::other(
-                            "archive synchronization worker panicked",
-                        ))
-                    });
-                    if result.is_ok() {
-                        result = synced;
-                    }
-                }
-                result
+            let pool = self.sync_pool.get_or_insert_with(|| {
+                asupersync::runtime::BlockingPool::new(0, ARCHIVE_SYNC_WORKERS)
+            });
+            let files = Arc::new(std::mem::take(&mut self.pending_sync));
+            let chunk_size = files.len().div_ceil(ARCHIVE_SYNC_WORKERS);
+            let mut tasks = ArchiveSyncTasks(Vec::with_capacity(ARCHIVE_SYNC_WORKERS));
+            let mut results = Vec::with_capacity(ARCHIVE_SYNC_WORKERS);
+            for start in (0..files.len()).step_by(chunk_size) {
+                let end = (start + chunk_size).min(files.len());
+                let chunk_files = Arc::clone(&files);
+                let result = Arc::new(asupersync::sync::OnceCell::new());
+                let completion = Arc::clone(&result);
+                let task = pool.spawn(move || {
+                    // This task is the cell's only writer.
+                    let _ = completion.set(sync_archive_file_group(&chunk_files[start..end]));
+                });
+                tasks.0.push(task);
+                results.push(result);
+            }
+            tasks.wait();
+            self.pending_sync = Arc::try_unwrap(files).map_err(|_| {
+                std::io::Error::other("archive synchronization retained file ownership")
             })?;
+            for result in results {
+                Arc::try_unwrap(result)
+                    .map_err(|_| {
+                        std::io::Error::other("archive synchronization retained result ownership")
+                    })?
+                    .into_inner()
+                    .ok_or_else(|| {
+                        std::io::Error::other("archive synchronization task did not complete")
+                    })??;
+            }
         }
         // All workers have finished before descriptors are released or any
         // device flush/publication can begin. A failed group remains unpublished.
