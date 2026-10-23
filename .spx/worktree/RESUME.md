@@ -1,5 +1,41 @@
 # Resume — local Agent Mail fork
 
+## Active experiment: missing staged-file relative paths
+
+Local source checkpoint is bc0377916dafc7841f49da53f7052e753efde03d; published HEAD remains
+86d668fde813e3f417565d2788e7a110b33a34d6. Storage changes add
+StagedArchiveWrites::add_repo_file and route message bundle staging through it.
+After add validates and retains the parent binding, Unix missing leaves with
+absolute normal components beneath the canonical base use their relative spelling.
+Existing leaves and all other cases retain rel_path_cached. Publication still
+revalidates directory bindings. No synchronization or latency budget changed.
+
+Evidence design: real filesystem tests exercise relative paths and published bytes,
+outside-base rejection, and rejection of existing leaf symlinks pointing both inside
+and outside the archive. Staging already rejects leaf symlinks; the initial test's
+acceptance expectation was corrected after baseline execution exposed that contract.
+Baseline command70736 passes all three cases; postchange66043 passes all three
+and built the integration probe in24.20s. Paired benchmark12420 passes unchanged
+APFS35/300ms limits: published baseline single22.404/batch286.224ms; candidate
+single29.921/batch254.770ms. Candidate crash probe retains100canonical messages
+and2commits. Single latency regressed while batch improved in this invocation;
+no Linux qualification claim. Evidence is missing-staged-path-comparison-20261023/.
+Candidate binary/source.patch are preserved in missing-staged-path-candidate-20261023/;
+binary SHA256 is7feb8b9e70c6e0a381cd4e9d4c1f14868c67aeafaf97c513754cea5da937e20a.
+Validation command89766 is terminal exit0: all-targets44.76s, production
+lib/bins29.85s, strict Clippy58.22s, formatting pass, full storage unit suite
+713passed/1skipped94.952s. No build/test command remains active.
+Mandatory audit requested from audit_archive_scan; committed scope is now
+86d668fde813e3f417565d2788e7a110b33a34d6...bc0377916dafc7841f49da53f7052e753efde03d.
+Audit token2026-10-23_14-21-22-231-93db66374a25 is in progress; no concrete
+finding reported yet. Collect its sealed result before publication. Then refresh
+base/occupancy/publication state and push the qualified source for fresh CI.
+
+Fresh remote status: native CI39965213601 and ArchivePerf39965213569 remain running;
+fsync and ATC gates failed, installer and observability passed. Live service unchanged.
+Published APFS job120453179021 also failed: single66.947ms/35ms and
+batch649.457ms/300ms. Fresh CI is required after local qualification.
+
 ## Current continuation: Linux batch latency
 
 Published HEAD is 86d668fde813e3f417565d2788e7a110b33a34d6 (push54668
