@@ -1,5 +1,80 @@
 # Resume — local Agent Mail fork
 
+## Current repair: distinguish same-device mount boundaries
+
+Current implementation checkpoint is
+6bd2ab22b69b359c490cf4b5f8d6e38856b98149. Published HEAD remains
+988337c44d7a98646e2703470911c61e9c56a6dd. The live service is unchanged.
+
+The bounded-handle checkpoint 646a93452941beedaa5bf0516647f360a3e6e5ad
+passed 15 focused staging, relocation and scan tests plus the 256-parent
+publication case under a 128-descriptor limit (command 70074). Its workspace
+all-targets check passed (39177). Audit
+2026-10-23_13-23-43-866-dd74f1ed0e2c rejected one issue: equal device IDs
+do not establish rename compatibility across Linux bind mounts. The proposed
+directory-incarnation ABA finding was withdrawn before the sealed verdict.
+
+The current repair selects retained staging roots through actual relocation;
+EXDEV retains a separate source root. Each staged file records its source
+index, preserving ownership during publication and cleanup. The Linux matrix
+now sets up a real same-device bind mount and runs a dedicated regression
+outside timed measurements. The regression first requires the kernel's EXDEV
+response, then writes through the real bundle API and compares canonical,
+outbox and inbox bytes. Existing performance thresholds are unchanged.
+
+Evidence design: the audit's same-device bind-mount case selects this finite
+scenario at L2. The production subject is write_message_bundle; the kernel
+owns the cross-mount error oracle, and persisted copies must retain the input
+body and equal canonical bytes. Reverting to one source per device makes the
+publication expectation fail with EXDEV. The shell harness owns mount setup
+and teardown; the Rust test owns the behavioral assertions. No canonical
+spec-tree node or local evidence overlay exists for this repair.
+
+Formatting, bash syntax and diff checks pass. Focused staging command 73582
+passed all nine tests after 190.045 seconds of load admission and a 36.62-second
+build. Two relocation tests and four retained-directory scan tests also pass.
+The 256-parent test passes under a 128-descriptor limit with TMPDIR=/private/tmp
+(16a523). The initial direct invocation omitted that temporary-root setting and
+correctly rejected macOS's symlinked /var path; the corrected invocation passed.
+Workspace checks in 49786 passed: all targets 48.36 seconds, production lib/bins
+38.01 seconds, strict Clippy 1m11s. Full storage unit suite 47448 passed
+710 tests with one skipped in 93.591 seconds under nextest with two workers.
+
+Script follow-up ac4a63714ea9f0737661680d6c3fda447df26dca replaces shell
+word expansion of mount options with an explicit argument array. Shellcheck
+and bash syntax pass. Implementation re-audit has been requested from
+audit_archive_scan against both committed checkpoints. Linux execution and
+performance qualification remain required. Cleanup follow-up
+5a435900d053330edd44795cb2af58d4767ce2ed preserves the backing image if
+outer unmount fails; shellcheck and bash syntax pass. Integration probe build
+29577 passed in 24.86 seconds. Compiler artifacts are saved to
+mount-staging-probe-artifacts-20261023.jsonl under the preservation root.
+
+Paired APFS comparison 18813 passed with unchanged single/batch budgets
+35/300ms. Baseline p95: 21.977/232.324ms; candidate: 22.105/294.924ms.
+Both crash checks retain 100 canonical messages and two commits. The candidate
+is slower than the baseline; this is a local budget pass, with little batch
+margin, and no speedup claim. Candidate binary and manifest are preserved in
+mount-staging-candidate-6bd2ab22-20261023/ (SHA-256
+803e292fe0c73d3342457cba1e4290485fb7dbde76ade7491b1956bff89896a5).
+Comparison evidence: mount-staging-comparison-20261023/.
+No build or test command remains active. Implementation audit
+2026-10-23_13-46-39-775-23414ef5221c sealed approved for 6bd2ab22;
+the registry leaves the shell and new test evidence as optional coverage gaps.
+The reviewer separately found the real bind-mount fixture viable by inspection;
+this does not establish Linux execution or formal test-evidence approval.
+Script follow-up review is still pending. Fresh base synchronization 62798
+reported already_current at origin/main0b289a5afea198449b26d6b974b76a4948404ca6,
+with no base change. Final formatting and whitespace checks pass (12062).
+Next: collect script follow-up review, finish the publication gate, push the
+qualified follow-ups to PR3, and collect Linux, ATC and archive CI outcomes.
+Linux CI must still be established before merge or installation.
+
+The three additional Unix database child probes completed successfully in
+81743. The selector/workflow audit 2026-10-23_13-01-16-602-93d8da035828
+sealed approved with zero findings, with the previously documented optional
+coverage gaps. The historical pending descriptions below are superseded.
+
 ## Active repair: bound retained staging resources
 
 Storage checkpoint 1303d39c2b79349fad1d9659018faece7ff1e80a retains Unix directory handles for staging,
