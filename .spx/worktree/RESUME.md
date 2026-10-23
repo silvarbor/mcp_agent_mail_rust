@@ -16,10 +16,16 @@ passes. Rerun 39475 completed with exit 0: 61 assertions passed, zero failed
 or skipped, across 15 cases. Its waiter admitted the run after 578.029 seconds
 and three wait cycles. The artifact/log stem is
 atc-control-bench-e2e-portable-20261023 under the preservation root.
-Default off/shadow/live driver check 77621 is now the ONLY active heavy command:
-collect this same handle before starting another. Its output is
-atc-default-e5b02b9d-20261023.json, using freshly built target/debug/am.
-No diagnostic changes have been published.
+Default off/shadow/live driver check 77621 completed with exit 0 after load
+admission waited 308.014 seconds in two cycles. All three stores retained 113
+messages with integrity okay; off/shadow had zero ATC rows and live had 113.
+Its output is atc-default-e5b02b9d-20261023.json, using freshly built target/debug/am
+(SHA-256 8920a0ff7cdda6367ed524818cb2cbf93b61b8bdfbe81c263de4b7445703c341).
+Default qualification names and purpose are preserved. Functional validation
+passes; latency does not qualify: off p95 31.840667ms, shadow 33.134292ms,
+live 36.959833ms (16.08% versus the unchanged 5% limit). No active local heavy
+command remains. The diagnostic changes are ready for publication to collect
+CI evidence; this is no merge or installation readiness claim.
 
 Audit 2026-10-23_11-05-22-454-7a2110280057 approved committed scope
 f4862dd508d4e1a99358392436a4ccac62f78a14...60d103246a3026ba5e75ebbcd5e47a6f238446d8
@@ -41,13 +47,17 @@ fsync-ext4-ordered-f4862dd5-20261023.log. ArchivePerf39940880614 failed in
 compilation again with exit 143. Neither EXIT nor TERM diagnostic printed;
 all post-build steps were skipped. Its failed-step log is preserved as
 archive-perf-failed-f4862dd5-20261023.log. Cause remains unconfirmed.
+APFS also failed single-message p95 43.161ms against 35ms, while its batch p95
+275.886ms passed 300ms. Matrix failed-step logs are preserved in
+fsync-matrix-failed-f4862dd5-20261023.log. The fork has no GitHub rulesets,
+main branch protection, or configured automated review workflow; completed
+local audits are recorded separately and no remote review is presumed.
 
 Local checkpoint 62bd35f1b81dd3f70d9ea1baa8eb23f44cee71db adds optional
 Linux syscall tracing to the fsync driver and a failed-probe diagnostic CI
 step. Separate diagnostic output, original failure and budgets are retained.
 Bash syntax, actionlint and whitespace checks pass. Linux execution remains
-unverified. Next: collect default transport check 77621 and publish validated
-diagnostics; then use Linux syscall
+unverified. Next: publish validated diagnostics; then use Linux syscall
 evidence to repair archive batch costs. No merge, installation, restart or
 24-hour observation has occurred. Existing approved instruction-file deferral
 br-rpa0b remains unchanged. All failures above are active authorized repairs.
