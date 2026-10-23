@@ -13411,13 +13411,9 @@ fn append_trailers(message: &str) -> String {
 /// nearest existing ancestor and append the missing suffix so symlinked parent
 /// directories are still resolved correctly.
 fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
-    let canonical_target = match target.canonicalize() {
-        Ok(p) => p,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            canonicalize_with_existing_prefix(target).map_err(StorageError::Io)?
-        }
-        Err(err) => return Err(StorageError::Io(err)),
-    };
+    // The helper attempts the target first, then resolves its existing prefix.
+    // Calling canonicalize here too repeats the full walk for every staged file.
+    let canonical_target = canonicalize_with_existing_prefix(target)?;
 
     // GH#216: `fs::canonicalize` returns the extended-length (`\\?\C:\...`)
     // spelling on Windows while `canonical_base` is kept in the simplified
