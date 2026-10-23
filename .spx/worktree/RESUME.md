@@ -28,9 +28,22 @@ which takes precedence over skill source-reading restrictions. No spec
 conformance is claimed; actual repository instructions and Rust standards apply.
 No replacement audit run was opened and no approval is claimed yet.
 
-Archive probe build command 94717 is active (storage --test it --no-run).
-Collect before the current-source APFS gate or any other heavy command.
-Log: archive-current-probe-build-20261023.log. The preserved Linux serial build
+Archive probe build command 94717 exited 0 in 1m18s (storage --test it --no-run).
+Current-source APFS gate 52869 exited 101: single p95 27.504ms passes 35ms;
+batch-100 p95 323.050ms fails 300ms. Batch writes grow from 118.217ms to roughly
+173ms while flush remains around 150ms. Crash/reopen retained 100 canonical
+messages and two commits. Evidence: archive-current-apfs-20261023{,.log}.
+Intrusive profile commands 22224 (probe exit 101) and 86956 (sample exit 0)
+completed; archive-profile-20261023/sample.txt localizes repeated canonical-ID
+scan reads and Git blob_path work. Within the scan, sampled read_message_file
+stacks include 35 prefix-check lstat samples and 24 open samples, versus three
+JSON-parser samples. Counts are inclusive, not elapsed-time attribution.
+The profile omitted the required load admission and was instrumented; it is
+localization evidence only, never qualification. Restore load admission before
+the next heavy operation; do not rerun unchanged timing gates until green.
+No heavy command remains active. Investigate reducing repeated path traversal
+while preserving symlink/authority and collision protections; no storage
+implementation change has been made. The preserved Linux serial build
 is terminal exit 101/SIGKILL and supplies no probe result; the reviewed workflow
 artifact change is prepared to retain the CI-built Linux probe after publication.
 No push, merge, live installation or restart has occurred in this continuation.
