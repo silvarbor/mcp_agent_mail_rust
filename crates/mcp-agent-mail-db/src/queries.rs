@@ -2735,6 +2735,40 @@ pub fn append_atc_experience_if_initialized(
 pub(crate) struct AtcAppendConnection {
     conn: crate::CanonicalDbConn,
     identity: (u64, u64),
+    inspected_schema_version: Option<i64>,
+}
+
+#[cfg(unix)]
+fn canonical_atc_schema_version(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<i64, DbError> {
+    canonical_query_atc_rows(
+        conn,
+        "PRAGMA main.schema_version",
+        &[],
+        "read ATC schema version",
+    )?
+    .first()
+    .and_then(row_first_i64)
+    .ok_or_else(|| DbError::Sqlite("ATC schema version is missing".to_owned()))
+}
+
+#[cfg(unix)]
+fn cached_atc_schema_is_complete(
+    entry: &mut AtcAppendConnection,
+) -> std::result::Result<bool, DbError> {
+    let version = canonical_atc_schema_version(&entry.conn)?;
+    if entry.inspected_schema_version == Some(version) {
+        return Ok(true);
+    }
+    if !inspect_canonical_atc_schema_on_connection(&entry.conn)?.is_empty() {
+        return Ok(false);
+    }
+    // DDL from another connection can interleave with the inspection queries.
+    // Retain a result only when SQLite's schema cookie stayed unchanged.
+    entry.inspected_schema_version =
+        (canonical_atc_schema_version(&entry.conn)? == version).then_some(version);
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -2779,14 +2813,15 @@ fn append_atc_experience_with_cached_connection(
         *cached = Some(AtcAppendConnection {
             conn,
             identity: opened_identity,
+            inspected_schema_version: None,
         });
     }
     // Own the connection locally while a transaction can be active. Unwinding
     // must drop it and roll back, even if the surrounding cache mutex poisons.
-    let entry = cached
+    let mut entry = cached
         .take()
         .ok_or_else(|| DbError::Internal("ATC append connection was not retained".to_owned()))?;
-    if !inspect_canonical_atc_schema_on_connection(&entry.conn)?.is_empty() {
+    if !cached_atc_schema_is_complete(&mut entry)? {
         return Ok(None);
     }
     let stored = append_atc_experience_on_connection(pool, &entry.conn, row)?;
@@ -22554,6 +22589,13 @@ mod tests {
         );
         append_atc_experience_if_initialized(&pool, &row).expect("prime connection");
         let conn = open_canonical_atc_conn(&pool, "change schema").expect("open schema writer");
+        conn.execute_raw("CREATE INDEX atc_schema_refresh_probe ON atc_experiences(decision_id)")
+            .expect("advance schema version without removing required columns");
+        assert!(
+            append_atc_experience_if_initialized(&pool, &row)
+                .expect("reinspect complete schema after DDL")
+                .is_some()
+        );
         conn.execute_raw("DROP TABLE atc_experiences")
             .expect("change schema");
         drop(conn);
