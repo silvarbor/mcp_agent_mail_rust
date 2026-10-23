@@ -2,6 +2,45 @@
 
 ## Recovery on 2026-10-23
 
+Archive scan candidate caea737240e604ca0248c4fef87d653033287031 is committed
+in storage lib.rs. It retains no-follow
+directory handles during canonical collision scans, reads uncached files relative
+to the month handle with nonblocking no-follow opens and a bounded read, checks
+opened-file stamps before/after reading, and validates directory bindings before
+accepting the scan. The existing two-second cache window is unchanged. Scan
+errors now propagate through single and batch collision checks. New tests cover
+symlinked roots, retained reads after replacement, ancestor replacement,
+symlinked leaves, FIFO rejection and traversal rejection.
+Baseline command 43637 failed because the default macOS TMPDIR uses the /var
+symlink; corrected command 89749 used TMPDIR=/private/tmp and passed all ten
+canonical tests. New symlink-root regression 36281 failed at its intended
+assertion before the repair. Candidate command 27867 passed all fourteen
+canonical tests. Broader message command 91032 exited 0: 193 tests passed in
+278.53s, including recovery, routing, BCC privacy and write-behind delivery.
+Two subsequent local refinements
+preserve parent-component paths and reject a file whose stamp changes during
+read; focused validation command 9465 passed all fourteen tests. Final refinement
+propagates disappearance after the root has been pinned instead of treating it
+as an initially absent root. Probe build 15861 exited 0. Baseline benchmark binary is
+archive-scan-baseline-20261023/storage-tests, SHA-256
+a56bbefe3f131176c7970c6b93ddd10445775c0f4532bf57e8ed4124414de7e8.
+Candidate binary archive-scan-candidate-20261023/storage-tests has SHA-256
+e50335360832fbf4685e96dbd702784f00f985b7d6dd6312e7d09fc935b5b83d.
+The external ABBA driver archive-scan-paired-20261023.sh completed as command
+9249, exit 0, with load admission before each run. In run order, batch p95 was
+baseline 258.472ms, candidate 251.272ms, candidate 240.986ms, baseline 255.001ms.
+All four passed both original budgets and crash/reopen checks (100 canonical
+messages, two commits). Evidence: archive-scan-paired-20261023/.
+Canonical APFS gate 38510 passed: single p95 28.093ms under 35ms, batch p95
+244.993ms under 300ms. Evidence: archive-scan-gate-20261023{,.log}.
+This comparison supports improvement; the baseline also passed under these run
+conditions, so it does not alone establish resolution of the earlier CI failures.
+Workspace validation command 13591 exited 0: all-targets check (49.81s), production
+lib/bins check (27.65s), strict workspace Clippy (55.51s), fmt and diffcheck.
+Final focused test command 62081 passed all fourteen tests against the committed
+candidate. No heavy command remains active. Log prefix: archive-scan-*. Full committed
+implementation audit and branch review remain required before publication.
+
 CURRENT: wrapper-lifetime repair cec33fb274eafa38f71722d782396402c4fb50ca
 passes all ten append tests, both workspace compilation checks, strict Clippy,
 fmt and diffcheck (validation command 79127 exited 0). Build 59364 exited 0 in
@@ -33,7 +72,7 @@ implementation coverage gaps; this does not substitute for test-evidence review
 or the required full-branch review before publication.
 
 Archive probe build command 94717 exited 0 in 1m18s (storage --test it --no-run).
-Current-source APFS gate 52869 exited 101: single p95 27.504ms passes 35ms;
+Before the scan repair, APFS gate 52869 exited 101: single p95 27.504ms passes 35ms;
 batch-100 p95 323.050ms fails 300ms. Batch writes grow from 118.217ms to roughly
 173ms while flush remains around 150ms. Crash/reopen retained 100 canonical
 messages and two commits. Evidence: archive-current-apfs-20261023{,.log}.
@@ -45,14 +84,13 @@ JSON-parser samples. Counts are inclusive, not elapsed-time attribution.
 The profile omitted the required load admission and was instrumented; it is
 localization evidence only, never qualification. Restore load admission before
 the next heavy operation; do not rerun unchanged timing gates until green.
-No heavy command remains active. Investigate reducing repeated path traversal
-while preserving symlink/authority and collision protections; no storage
-implementation change has been made. The preserved Linux serial build
+That profile is terminal. It motivated the directory-handle repair above.
+The preserved Linux serial build
 is terminal exit 101/SIGKILL and supplies no probe result; the reviewed workflow
 artifact change is prepared to retain the CI-built Linux probe after publication.
 No push, merge, live installation or restart has occurred in this continuation.
 
-Path-scan investigation: read_message_file (storage lib.rs:12219) walks every
+Pre-repair path-scan investigation: read_message_file (then storage lib.rs:12219) walks every
 ancestor with symlink_metadata, stats the leaf again, then opens by pathname.
 The index calls that reader once per uncached/recent file. Its two-second
 RACY_STAMP_WINDOW protects against same-tick rewrites and must remain intact.
@@ -63,9 +101,8 @@ be symlinks, while archive reads reject symlinks at every prefix. A candidate
 must pin the archive directory chain once, open files relative to the retained
 month handle, obtain cache stamps from the opened file, and detect directory
 replacement before accepting collision-scan results. Merely omitting repeated
-prefix checks would weaken the existing boundary. No candidate is implemented
-or benchmark-qualified yet. The scan currently returns an infallible map and
-skips read errors, so fail-closed replacement handling needs explicit error
+prefix checks would weaken the existing boundary. At that checkpoint the scan
+returned an infallible map and skipped read errors, so fail-closed replacement handling needed explicit error
 propagation through both single-message and batch collision checks, with real
 filesystem regression evidence before any timing claim.
 
