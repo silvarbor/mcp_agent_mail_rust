@@ -88,14 +88,37 @@ mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
 
 OS_NAME="$(uname -s)"
-PROBE_RUNNER=(cargo)
+PROBE_RUNNER=(cargo test -p mcp-agent-mail-storage --test it
+    fsync_matrix::archive_fsync_matrix_probe --)
 if [ "${TRACE_SYSCALLS}" -eq 1 ]; then
     if [ "${OS_NAME}" != "Linux" ]; then
         printf 'error: --trace-syscalls requires Linux\n' >&2
         exit 1
     fi
     require_cmd strace
-    PROBE_RUNNER=(strace -f -c -w -o "${OUTPUT_DIR}/syscalls.txt" cargo)
+    CARGO_TARGET_DIR="${TARGET_DIR}" cargo test --locked \
+        -p mcp-agent-mail-storage --test it --no-run --message-format=json \
+        > "${OUTPUT_DIR}/compiler-artifacts.jsonl"
+    PROBE_BINARY="$(python3 - "${OUTPUT_DIR}/compiler-artifacts.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+artifacts = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+executables = {
+    artifact["executable"]
+    for artifact in artifacts
+    if artifact.get("reason") == "compiler-artifact"
+    and artifact.get("target", {}).get("name") == "it"
+    and artifact.get("executable")
+}
+if len(executables) != 1:
+    raise SystemExit(f"expected one archive test executable, found {len(executables)}")
+print(executables.pop())
+PY
+)"
+    PROBE_RUNNER=(strace -f -c -w -o "${OUTPUT_DIR}/syscalls.txt"
+        "${PROBE_BINARY}" fsync_matrix::archive_fsync_matrix_probe)
     printf 'Diagnostic syscall tracing enabled; these timings are not qualification evidence.\n' \
         | tee "${OUTPUT_DIR}/diagnostic.txt"
 fi
@@ -252,6 +275,6 @@ AM_FSYNC_MATRIX_ARTIFACT_DIR="${OUTPUT_DIR}" \
 AM_FSYNC_MATRIX_SINGLE_P95_BUDGET_MS="${SINGLE_BUDGET_MS}" \
 AM_FSYNC_MATRIX_BATCH_100_P95_BUDGET_MS="${BATCH_BUDGET_MS}" \
 CARGO_TARGET_DIR="${TARGET_DIR}" \
-"${PROBE_RUNNER[@]}" test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
+"${PROBE_RUNNER[@]}" --ignored --exact --nocapture
 
 printf 'artifact summary: %s\n' "${OUTPUT_DIR}/summary.json"
