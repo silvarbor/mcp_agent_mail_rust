@@ -8901,12 +8901,13 @@ fn collect_canonical_message_paths_with_id(
     messages_root: &Path,
     message_id: i64,
     matches: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
     let wanted_ids = HashSet::from([message_id]);
-    let index = collect_canonical_message_id_index(messages_root, &wanted_ids);
+    let index = collect_canonical_message_id_index(messages_root, &wanted_ids)?;
     if let Some(paths) = index.get(&message_id) {
         matches.extend(paths.iter().cloned());
     }
+    Ok(())
 }
 
 /// Stat identity of a canonical message file; see [`CanonicalIdCache`].
@@ -8976,6 +8977,123 @@ const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
 static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalIdCache>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Pins a month's directory chain for one collision scan. File opens cannot
+/// follow a substituted symlink; validating the retained chain before returning
+/// the scan prevents a replaced directory from yielding an accepted result.
+#[cfg(unix)]
+struct CanonicalScanDirectory {
+    chain: Vec<(PathBuf, fs::File)>,
+}
+
+#[cfg(unix)]
+impl CanonicalScanDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        let path = std::path::absolute(path)?;
+        let mut current = PathBuf::from("/");
+        let mut chain = vec![(current.clone(), fs::File::open(&current)?)];
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir => std::ffi::OsStr::new(".."),
+                _ => {
+                    return Err(StorageError::InvalidPath(
+                        "invalid scan directory component".into(),
+                    ));
+                }
+            };
+            let parent = &chain.last().expect("root directory is retained").1;
+            let fd = openat(
+                parent,
+                name,
+                OFlag::O_RDONLY
+                    | OFlag::O_DIRECTORY
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            current.push(name);
+            chain.push((current.clone(), fs::File::from(fd)));
+        }
+        let directory = Self { chain };
+        directory.validate_binding()?;
+        Ok(directory)
+    }
+
+    fn validate_binding(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for (path, file) in &self.chain {
+            let retained = file.metadata()?;
+            let current = fs::symlink_metadata(path)?;
+            if !current.is_dir()
+                || current.dev() != retained.dev()
+                || current.ino() != retained.ino()
+            {
+                return Err(StorageError::InvalidPath(format!(
+                    "canonical scan directory was replaced: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_frontmatter(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> Result<(Option<MessageFileStamp>, serde_json::Value)> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        let path = Path::new(name);
+        if !matches!(path.components().next(), Some(Component::Normal(_)))
+            || path.components().count() != 1
+        {
+            return Err(StorageError::InvalidPath(
+                "invalid scan file component".into(),
+            ));
+        }
+        let parent = &self.chain.last().expect("root directory is retained").1;
+        let fd = openat(
+            parent,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut file = fs::File::from(fd);
+        let before = file.metadata()?;
+        if !before.is_file() || before.len() > MAX_MESSAGE_FILE_BYTES {
+            return Err(StorageError::InvalidPath(
+                "scan entry is not a bounded regular message file".into(),
+            ));
+        }
+        let mut content = String::new();
+        (&mut file)
+            .take(MAX_MESSAGE_FILE_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > MAX_MESSAGE_FILE_BYTES {
+            return Err(StorageError::InvalidPath(
+                "message grew beyond scan size limit".into(),
+            ));
+        }
+        let before = message_file_stamp(&before);
+        let after = message_file_stamp(&file.metadata()?);
+        if before != after {
+            return Err(StorageError::InvalidPath(
+                "canonical message changed while being scanned".into(),
+            ));
+        }
+        Ok((after, parse_message_content(content)?.0))
+    }
+}
+
 fn unix_time_ns(time: SystemTime) -> i128 {
     time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
         i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX)
@@ -8985,8 +9103,13 @@ fn unix_time_ns(time: SystemTime) -> i128 {
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
-) -> HashMap<i64, Vec<PathBuf>> {
-    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    Ok(collect_canonical_message_id_index_with_window(
+        messages_root,
+        wanted_ids,
+        RACY_STAMP_WINDOW,
+    )?
+    .0)
 }
 
 /// The id index for `wanted_ids`, and how many files had to be parsed.
@@ -8994,23 +9117,30 @@ fn collect_canonical_message_id_index_with_window(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
     racy_window: Duration,
-) -> (HashMap<i64, Vec<PathBuf>>, usize) {
+) -> Result<(HashMap<i64, Vec<PathBuf>>, usize)> {
     let mut index = HashMap::new();
     let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return (index, parsed);
+        return Ok((index, parsed));
     }
-    if !path_is_nonsymlink_dir(messages_root) {
-        return (index, parsed);
+    if path_existing_prefix_has_symlink(messages_root)? {
+        return Err(StorageError::InvalidPath(
+            "symlinked canonical scan root".into(),
+        ));
     }
-    // `read_message_file` refuses every file under a symlinked prefix, so no
-    // file can match; cached ids must not be served through one either.
-    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
-        return (index, parsed);
-    }
-
-    let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return (index, parsed);
+    #[cfg(unix)]
+    let root_directory = match CanonicalScanDirectory::open(messages_root) {
+        Ok(directory) => directory,
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((index, parsed));
+        }
+        Err(error) => return Err(error),
+    };
+    let year_entries = match fs::read_dir(messages_root) {
+        Ok(entries) => entries,
+        #[cfg(not(unix))]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((index, parsed)),
+        Err(error) => return Err(error.into()),
     };
     let cache = {
         let mut caches = CANONICAL_ID_CACHES
@@ -9023,11 +9153,10 @@ fn collect_canonical_message_id_index_with_window(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
     let mut seen = HashSet::with_capacity(cache.files.len());
-    for year_entry in year_entries.flatten() {
+    for year_entry in year_entries {
+        let year_entry = year_entry?;
         let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
-            continue;
-        };
+        let year_type = year_entry.file_type()?;
         if !year_type.is_dir() || year_type.is_symlink() {
             continue;
         }
@@ -9038,14 +9167,13 @@ fn collect_canonical_message_id_index_with_window(
             continue;
         }
 
-        let Ok(month_entries) = fs::read_dir(&year_path) else {
-            continue;
-        };
-        for month_entry in month_entries.flatten() {
+        #[cfg(unix)]
+        let year_directory = CanonicalScanDirectory::open(&year_path)?;
+        let month_entries = fs::read_dir(&year_path)?;
+        for month_entry in month_entries {
+            let month_entry = month_entry?;
             let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
-                continue;
-            };
+            let month_type = month_entry.file_type()?;
             if !month_type.is_dir() || month_type.is_symlink() {
                 continue;
             }
@@ -9056,14 +9184,13 @@ fn collect_canonical_message_id_index_with_window(
                 continue;
             }
 
-            let Ok(file_entries) = fs::read_dir(&month_path) else {
-                continue;
-            };
-            for file_entry in file_entries.flatten() {
+            #[cfg(unix)]
+            let scan_directory = CanonicalScanDirectory::open(&month_path)?;
+            let file_entries = fs::read_dir(&month_path)?;
+            for file_entry in file_entries {
+                let file_entry = file_entry?;
                 let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
-                    continue;
-                };
+                let file_type = file_entry.file_type()?;
                 if !file_type.is_file()
                     || file_type.is_symlink()
                     || file_path.extension().is_none_or(|ext| ext != "md")
@@ -9089,10 +9216,22 @@ fn collect_canonical_message_id_index_with_window(
                 } else {
                     parsed += 1;
                     let parsed_at_ns = unix_time_ns(SystemTime::now());
-                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                        // Never cache a failed read: it may be transient.
-                        cache.files.remove(&file_path);
-                        continue;
+                    #[cfg(unix)]
+                    let read = scan_directory.read_frontmatter(&file_entry.file_name());
+                    #[cfg(not(unix))]
+                    let read =
+                        read_message_file(&file_path).map(|(frontmatter, _)| (stamp, frontmatter));
+                    let (stamp, frontmatter) = match read {
+                        Ok(value) => value,
+                        Err(StorageError::Json(_)) => {
+                            // Never cache a failed read: it may be transient.
+                            cache.files.remove(&file_path);
+                            continue;
+                        }
+                        Err(error) => {
+                            cache.files.remove(&file_path);
+                            return Err(error);
+                        }
                     };
                     let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
                     if let Some(stamp) = stamp {
@@ -9104,6 +9243,8 @@ fn collect_canonical_message_id_index_with_window(
                                 id,
                             },
                         );
+                    } else {
+                        cache.files.remove(&file_path);
                     }
                     id
                 };
@@ -9117,10 +9258,16 @@ fn collect_canonical_message_id_index_with_window(
                         .push(file_path);
                 }
             }
+            #[cfg(unix)]
+            scan_directory.validate_binding()?;
         }
+        #[cfg(unix)]
+        year_directory.validate_binding()?;
     }
+    #[cfg(unix)]
+    root_directory.validate_binding()?;
     cache.files.retain(|path, _| seen.contains(path));
-    (index, parsed)
+    Ok((index, parsed))
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -9163,7 +9310,7 @@ fn reject_canonical_message_id_collision(
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
     let mut matches = Vec::new();
-    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches);
+    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches)?;
     reject_canonical_message_id_collision_against_matches(
         message_id,
         &matches,
@@ -9210,10 +9357,7 @@ fn collect_existing_batch_message_ids(
     }
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
-    Ok(collect_canonical_message_id_index(
-        &messages_root,
-        &wanted_ids,
-    ))
+    collect_canonical_message_id_index(&messages_root, &wanted_ids)
 }
 
 fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
@@ -12234,7 +12378,7 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
             format!("message path is not a regular file: {}", path.display()),
         )));
     }
-    if meta.len() > 50 * 1024 * 1024 {
+    if meta.len() > MAX_MESSAGE_FILE_BYTES {
         // 50MB safety limit
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -12246,7 +12390,12 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
     }
 
     let content = fs::read_to_string(path)?;
+    parse_message_content(content)
+}
 
+const MAX_MESSAGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn parse_message_content(content: String) -> Result<(serde_json::Value, String)> {
     // Parse ---json frontmatter
     if let Some(rest) = content.strip_prefix("---json\n")
         && let Some(end_idx) = rest.find("\n---\n")
@@ -15726,11 +15875,11 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 9]);
 
         let (first, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 3);
         assert_eq!(names(&first, 2), ["b__2.md"]);
         let (second, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0, "unchanged files must be served from the cache");
         assert_eq!(second, first);
 
@@ -15738,14 +15887,14 @@ mod tests {
         // keep reporting id 2 and miss a collision on id 9.
         write("b__2.md", 9, "b, rewritten under another id");
         let (rewritten, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 1);
         assert!(names(&rewritten, 2).is_empty());
         assert_eq!(names(&rewritten, 9), ["b__2.md"]);
 
         fs::remove_file(month.join("c__3.md")).unwrap();
         let (deleted, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0);
         assert!(names(&deleted, 3).is_empty());
 
@@ -15754,8 +15903,108 @@ mod tests {
             &root,
             &wanted,
             Duration::from_secs(3600),
-        );
+        )
+        .unwrap();
         assert_eq!(parsed, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_id_scan_rejects_symlinked_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), tmp.path().join("messages"))
+            .unwrap();
+        assert!(
+            collect_canonical_message_id_index(&tmp.path().join("messages"), &HashSet::from([1]),)
+                .is_err(),
+            "a symlinked archive must not produce a successful empty collision scan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_retains_reads_and_rejects_replacement() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("month/message.md"),
+            "---json\n{\"id\":1}\n---\nbody",
+        )
+        .unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("retained")).unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("month/message.md"),
+            "---json\n{\"id\":2}\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("message.md"))
+                .unwrap()
+                .1["id"],
+            1
+        );
+        assert!(directory.validate_binding().is_err());
+        assert_eq!(
+            read_message_file(&tmp.path().join("month/message.md"))
+                .unwrap()
+                .0["id"],
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_refuses_symlink_and_nonregular_entries() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("outside.md"),
+            "---json\n{\"id\":1}\n---\nbody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("outside.md"),
+            tmp.path().join("month/link.md"),
+        )
+        .unwrap();
+        nix::unistd::mkfifo(
+            &tmp.path().join("month/pipe.md"),
+            nix::sys::stat::Mode::S_IRUSR,
+        )
+        .unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("link.md"))
+                .is_err()
+        );
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("pipe.md"))
+                .is_err()
+        );
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("../outside.md"))
+                .is_err()
+        );
+        assert!(directory.validate_binding().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_rejects_symlinked_ancestor_after_open() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("year/month")).unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("year/month")).unwrap();
+        fs::rename(tmp.path().join("year"), tmp.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("retained"), tmp.path().join("year")).unwrap();
+        assert!(directory.validate_binding().is_err());
+        assert!(CanonicalScanDirectory::open(&tmp.path().join("year/month")).is_err());
     }
 
     #[test]
