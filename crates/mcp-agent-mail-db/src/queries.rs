@@ -22524,6 +22524,80 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn append_atc_retains_connection_across_reconstructed_pool_wrappers() {
+        let (_cx, owner, dir) = setup_test_pool("reconstructed_atc_connection.db");
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!(
+                "sqlite:///{}",
+                dir.path().join("reconstructed_atc_connection.db").display()
+            ),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let row = make_insert_experience_test_row(
+            501,
+            601,
+            ExperienceState::Planned,
+            1_700_000_100_000_000,
+        );
+        let wal = std::path::PathBuf::from(format!(
+            "{}-wal",
+            owner.atc_sqlite_path().expect("file-backed sidecar")
+        ));
+        let cache_lifetime = std::sync::Arc::downgrade(owner.atc_append_connection());
+        let transient = crate::pool::get_or_reuse_compatible_memory_pool(&config)
+            .expect("reconstruct observation pool wrapper");
+        let stored = append_atc_experience_if_initialized(&transient, &row)
+            .expect("append through transient wrapper")
+            .expect("initialized schema");
+        drop(transient);
+        assert!(
+            wal.is_file(),
+            "the live pool retains the observation connection"
+        );
+        let next = crate::pool::get_or_reuse_compatible_memory_pool(&config)
+            .expect("reconstruct next observation wrapper");
+        assert_eq!(
+            append_atc_experience_if_initialized(&next, &row).expect("idempotent append"),
+            Some(stored.clone())
+        );
+        assert_eq!(
+            canonical_fetch_atc_experience_by_decision_effect(&owner, 501, 601)
+                .expect("independent committed read"),
+            Some(stored)
+        );
+        drop(next);
+        drop(owner);
+        // The public factory deliberately retains bounded idle ownership.
+        // Replace that resident set before asserting final-owner cleanup.
+        for index in 0..crate::pool::WRITE_POOL_RESIDENT_CAPACITY {
+            let eviction_config = crate::pool::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    dir.path().join(format!("resident-{index}.db")).display()
+                ),
+                ..config.clone()
+            };
+            drop(
+                crate::pool::get_or_reuse_compatible_memory_pool(&eviction_config)
+                    .expect("replace idle resident"),
+            );
+        }
+        assert!(
+            cache_lifetime.upgrade().is_none(),
+            "the registry does not retain the cache"
+        );
+        assert!(
+            !wal.exists(),
+            "the final wrapper closes and checkpoints its connection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn append_atc_cached_connection_syncs_commits_and_allows_contended_appends() {
         let (_cx, pool, _dir) = setup_test_pool("contended_atc_connection.db");
         let (_relaxed_cx, mut relaxed_pool, _relaxed_dir) =

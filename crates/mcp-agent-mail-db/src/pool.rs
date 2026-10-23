@@ -3031,8 +3031,7 @@ pub struct DbPool {
     #[cfg(test)]
     pub(crate) atc_test_relaxed_durability: bool,
     #[cfg(unix)]
-    atc_append_connection:
-        Arc<asupersync::sync::Mutex<Option<crate::queries::AtcAppendConnection>>>,
+    atc_append_connection: Arc<AtcAppendCache>,
     init_sql: Arc<String>,
     /// Desired connection-local `journal_size_limit` for this shared pool.
     ///
@@ -3125,6 +3124,42 @@ static JOURNAL_SIZE_LIMITS: OnceLock<Mutex<HashMap<usize, JournalSizeLimitEntry>
     OnceLock::new();
 
 const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
+
+#[cfg(unix)]
+type AtcAppendCache = asupersync::sync::Mutex<Option<crate::queries::AtcAppendConnection>>;
+
+#[cfg(unix)]
+struct AtcAppendCacheEntry {
+    pool: Weak<Pool<DbConn>>,
+    cache: Weak<AtcAppendCache>,
+}
+
+#[cfg(unix)]
+static ATC_APPEND_CACHES: OnceLock<Mutex<HashMap<usize, AtcAppendCacheEntry>>> = OnceLock::new();
+
+/// Reconstructed wrappers share the connection with the live pool's owner.
+/// Both registry handles are weak: the last wrapper drops the connection,
+/// and a new pool generation cannot inherit a retired pool's connection.
+#[cfg(unix)]
+fn shared_atc_append_cache(pool: &Arc<Pool<DbConn>>) -> Arc<AtcAppendCache> {
+    let registry = ATC_APPEND_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    entries.retain(|_, entry| entry.pool.strong_count() > 0 && entry.cache.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some(cache) = entries.get(&key).and_then(|entry| entry.cache.upgrade()) {
+        return cache;
+    }
+    let cache = Arc::new(AtcAppendCache::new(None));
+    entries.insert(
+        key,
+        AtcAppendCacheEntry {
+            pool: Arc::downgrade(pool),
+            cache: Arc::downgrade(&cache),
+        },
+    );
+    drop(entries);
+    cache
+}
 
 fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
@@ -3452,6 +3487,8 @@ impl DbPool {
             authority.sqlite_identity.as_deref(),
             &authority.storage_root,
         )?;
+        #[cfg(unix)]
+        let atc_append_connection = shared_atc_append_cache(&pool);
 
         Ok(Self {
             pool,
@@ -3465,7 +3502,7 @@ impl DbPool {
             #[cfg(test)]
             atc_test_relaxed_durability: false,
             #[cfg(unix)]
-            atc_append_connection: Arc::new(asupersync::sync::Mutex::new(None)),
+            atc_append_connection,
             init_sql,
             journal_size_limit_state,
             run_migrations: config.run_migrations,
@@ -3515,6 +3552,8 @@ impl DbPool {
             authority.sqlite_identity.as_deref(),
             &authority.storage_root,
         )?;
+        #[cfg(unix)]
+        let atc_append_connection = shared_atc_append_cache(&pool);
 
         Ok(Self {
             pool,
@@ -3528,7 +3567,7 @@ impl DbPool {
             #[cfg(test)]
             atc_test_relaxed_durability: false,
             #[cfg(unix)]
-            atc_append_connection: Arc::new(asupersync::sync::Mutex::new(None)),
+            atc_append_connection,
             init_sql,
             journal_size_limit_state,
             run_migrations: config.run_migrations,
@@ -3684,9 +3723,7 @@ impl DbPool {
     }
 
     #[cfg(unix)]
-    pub(crate) fn atc_append_connection(
-        &self,
-    ) -> &asupersync::sync::Mutex<Option<crate::queries::AtcAppendConnection>> {
+    pub(crate) fn atc_append_connection(&self) -> &Arc<AtcAppendCache> {
         &self.atc_append_connection
     }
 

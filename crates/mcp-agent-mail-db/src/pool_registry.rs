@@ -20,7 +20,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 // idle ownership across mailbox/config churn instead of pinning every engine
 // ever opened by a long-lived process. Active, evicted pools remain findable
 // through the weak generation index until their last actual borrower drops.
-const WRITE_POOL_RESIDENT_CAPACITY: usize = 4;
+pub(crate) const WRITE_POOL_RESIDENT_CAPACITY: usize = 4;
 
 struct Residency<T> {
     capacity: usize,
