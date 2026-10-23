@@ -1,5 +1,49 @@
 # Resume — local Agent Mail fork
 
+## Current repair: bounded Asupersync file synchronization
+
+Current source495447dd570a6eed7eb5bc0fe1480b5250283afe replaces serial
+synchronization for groups of at least16files with an owned Asupersync blocking
+pool capped at4workers. Each worker retains fsync on Apple / sync_data elsewhere.
+Every task is waited before file ownership/result inspection, device flush or
+publication. ArchiveSyncTasks also waits during unwind. The pool is lazy and
+owned by StagedArchiveWrites; small groups remain serial. File descriptor cap64
+and Apple per-device full flush remain. No new async runtime or dependency.
+
+New real pipe failure near the end of a full group preserves an existing target,
+publishes no later file, and removes owned temporary files. Baseline22888 passed
+all10staging tests. Latest79257 passes10tests and builds integration probe.
+Full validation55184 exited0: all-targets50.45s, production31.49s, strict
+Clippy57.63s, fmtpass,714unit tests passed/1skipped86.903s.
+
+Paired APFS97181 passes unchanged35/300ms budgets: published baseline
+single21.985/batch256.131ms; candidate28.480/258.713ms. No APFS speedup
+claim; Linux synchronization benefit still requires CI. Evidence:
+asupersync-sync-comparison-20261023/ under preservation root. Candidate binary
+and manifest: asupersync-sync-candidate-20261023/, SHA256
+e811228f1f10a71795d1ebadb82447eed9133eae5153e3049575e80e88b551f1.
+Audit2026-10-23_15-14-45-635-5747140a8c7e sealed approved zero findings
+for code and architecture. Initial OS-thread checkpoint04a33f8d was rejected
+by audit2026-10-23_15-08-34-988-736c11afe95c under concurrency-runtime-policy;
+495447dd repairs that finding. Initial OS-thread timing3532failedoverall:
+baseline22.348/301.700ms, candidate43.102/248.901ms. Reverse diagnostic62435
+also exited1: candidatefirst21.290/275.599, publishedsecond20.973/300.391.
+Its interpretation.json records reversed directory labels and qualification:false.
+Neither earlier run is overwritten or used to qualify the Asupersync version.
+
+Publication preflight47572: already_current against0b289a5afea198449b26d6b974b76a4948404ca6,
+no base delta. Occupancy assigned/running PID7923; explicit push destination
+remains work/upstream-integration-20261015. PR3open/nondraft, published6a07d839,
+no formalreviews/threads; ATC failure comment unchanged. Next publish this qualified
+source and collect fresh CI. Native39969826531 and ArchivePerf39969826672 remain
+running on previous publishedhead; never restart solely for delay.
+
+Prepared diagnostic wrapperatc-trace-6a07d839-20261023/trace-am.sh enables
+server debug logging on preserved published am (b0c95e71...). It has not run.
+Use isolated bench_atc_transport stores, label output diagnostic_logging and
+qualification:false; inspect hot-path append latency to localize unresolved ATC
+overhead. Live service, final qualification, merge/install and24h observation remain.
+
 ## Discarded trial: relative directory-binding validation
 
 Local HEAD9b1d049932dd551086b2d3def8dc4b155983218c restores the exact
