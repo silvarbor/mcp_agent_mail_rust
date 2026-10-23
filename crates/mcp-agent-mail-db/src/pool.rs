@@ -19995,7 +19995,7 @@ mod tests {
     fn guarded_read_only_helpers_preserve_valid_live_wal_byte_identically() {
         const WAL_CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_WAL_WRITER_PATH";
         const WAL_CHILD_TEST_NAME: &str =
-            "pool::tests::guarded_read_only_helpers_preserve_valid_live_wal_byte_identically";
+            "pool_impl::tests::guarded_read_only_helpers_preserve_valid_live_wal_byte_identically";
         const WAL_CHILD_READY: &str = "guarded-read-only-wal-writer-ready";
 
         if let Some(path) = std::env::var_os(WAL_CHILD_PATH_ENV) {
@@ -20295,8 +20295,7 @@ mod tests {
     #[test]
     fn guarded_read_only_franken_preflight_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_RO_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str =
-            "pool::tests::guarded_read_only_franken_preflight_preserves_same_process_writer_lock";
+        const CHILD_TEST_NAME: &str = "pool_impl::tests::guarded_read_only_franken_preflight_preserves_same_process_writer_lock";
         const CHILD_WITNESS: &str = "guarded-read-only-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
@@ -20501,7 +20500,7 @@ mod tests {
     fn automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_PATH";
         const CHILD_MODE_ENV: &str = "MCP_AGENT_MAIL_BREAKER_FINGERPRINT_LOCK_MODE";
-        const CHILD_TEST_NAME: &str = "pool::tests::automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal";
+        const CHILD_TEST_NAME: &str = "pool_impl::tests::automatic_recovery_admission_fingerprint_preserves_live_locks_and_tracks_wal";
         const CHILD_WITNESS: &str = "breaker-fingerprint-child-observed-busy";
 
         if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
@@ -20653,7 +20652,7 @@ mod tests {
     #[test]
     fn live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ANALYZE_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str = "pool::tests::live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback";
+        const CHILD_TEST_NAME: &str = "pool_impl::tests::live_analyze_preserves_writer_lock_and_populates_statistics_after_rollback";
         const CHILD_WITNESS: &str = "live-analyze-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
@@ -20733,7 +20732,7 @@ mod tests {
     fn live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_VACUUM_LOCK_PROBE_PATH";
         const CHILD_TEST_NAME: &str =
-            "pool::tests::live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback";
+            "pool_impl::tests::live_vacuum_preserves_writer_lock_and_reclaims_pages_after_rollback";
         const CHILD_WITNESS: &str = "live-vacuum-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
@@ -20806,7 +20805,7 @@ mod tests {
     #[test]
     fn live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CHECKPOINT_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str = "pool::tests::live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback";
+        const CHILD_TEST_NAME: &str = "pool_impl::tests::live_checkpoint_preserves_writer_lock_and_checkpoints_frames_after_rollback";
         const CHILD_WITNESS: &str = "live-checkpoint-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
@@ -20902,7 +20901,7 @@ mod tests {
     #[test]
     fn startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_STARTUP_PRAGMA_LOCK_PROBE_PATH";
-        const CHILD_TEST_NAME: &str = "pool::tests::startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle";
+        const CHILD_TEST_NAME: &str = "pool_impl::tests::startup_runtime_pragma_probe_preserves_writer_lock_and_checks_live_handle";
         const CHILD_WITNESS: &str = "startup-pragma-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
@@ -21297,7 +21296,7 @@ mod tests {
     fn archive_id_floor_advance_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_ID_FLOOR_LOCK_PROBE_PATH";
         const CHILD_TEST_NAME: &str =
-            "pool::tests::archive_id_floor_advance_preserves_same_process_writer_lock";
+            "pool_impl::tests::archive_id_floor_advance_preserves_same_process_writer_lock";
         const CHILD_WITNESS: &str = "id-floor-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
@@ -21431,7 +21430,7 @@ mod tests {
         const CHILD_CWD_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_CWD_B";
         const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_STORAGE";
         const CHILD_TEST_NAME: &str =
-            "pool::tests::relative_sqlite_authority_is_frozen_across_cwd_change";
+            "pool_impl::tests::relative_sqlite_authority_is_frozen_across_cwd_change";
         const CHILD_WITNESS: &str = "relative-pool-authority-frozen";
 
         if let Some(cwd_b) = std::env::var_os(CHILD_CWD_B_ENV) {
@@ -21553,7 +21552,8 @@ mod tests {
         const CHILD_DB_A_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_A";
         const CHILD_DB_B_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_DB_B";
         const CHILD_STORAGE_ENV: &str = "MCP_AGENT_MAIL_POOL_AUTHORITY_SYMLINK_STORAGE";
-        const CHILD_TEST_NAME: &str = "pool::tests::symlink_retarget_cannot_cross_sqlite_authority";
+        const CHILD_TEST_NAME: &str =
+            "pool_impl::tests::symlink_retarget_cannot_cross_sqlite_authority";
         const CHILD_WITNESS: &str = "symlink-pool-authority-frozen";
 
         if let Some(alias) = std::env::var_os(CHILD_ALIAS_ENV) {
@@ -29821,7 +29821,7 @@ mod tests {
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "pool::tests::abrupt_recovery_exit_preserves_lineage_across_restarts",
+                    "pool_impl::tests::abrupt_recovery_exit_preserves_lineage_across_restarts",
                     "--nocapture",
                 ])
                 .env(CHILD_PATH, &db)
@@ -31687,7 +31687,7 @@ mod tests {
     fn proactive_backup_preserves_same_process_writer_lock() {
         const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_PROACTIVE_BACKUP_LOCK_PATH";
         const CHILD_TEST_NAME: &str =
-            "pool::tests::proactive_backup_preserves_same_process_writer_lock";
+            "pool_impl::tests::proactive_backup_preserves_same_process_writer_lock";
         const CHILD_WITNESS: &str = "proactive-backup-child-observed-busy";
 
         if maintenance_lock_probe_child_branch(CHILD_PATH_ENV, CHILD_WITNESS) {
