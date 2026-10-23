@@ -29,8 +29,29 @@ now creates a valid index, verifies append still works, then drops the experienc
 table and requires the migration result. Authoritative semantics were checked at
 https://www.sqlite.org/pragma.html#pragma_schema_version. Command 63152 completed
 exit 0: nine append tests, both workspace checks, strict Clippy, fmt and diffcheck.
-This schema-cache candidate still needs its committed audit and binary comparison;
-the previous approval covers 62229216/a6dbf200 only. No heavy command is active.
+Committed schema-cache audit 2026-10-23_08-42-52-064-46d55b62438e approved
+the code and architecture units with zero findings; supported journal projection
+consumed. Build 29028 exited 0 in 5m05s. Frozen binary
+atc-schema-candidate-20261023/am has SHA-256
+f1f3f6dd371dee762e2929afa40f5f0d5224ebf30fe4a86fd30e2f6f2182404c;
+source-commit.txt records a8b6bbd604eeb24f75a751d0e02fe08a776902ba.
+Paired comparison command 30028 completed exit 0, using the original baseline and this
+candidate, 300 samples per store, with a 900s process-group deadline. Output is
+atc-schema-paired-20261023{,.log}. Host-load admission was immediate. The all-off
+control completed: baseline shadow/live 1.373964%/-2.925047%, candidate
+-1.660405%/-3.922220%. Treatment baseline live overhead was 12.023015%,
+candidate 4.905465%; candidate live p95 was 6.235367% below baseline in the
+same invocation. All twelve stores passed integrity and exact message/ATC
+counts. This remains diagnostic evidence with qualification false. Fresh
+sync-base returned already_current against main at
+0b289a5afea198449b26d6b974b76a4948404ca6 with unchanged branch diff.
+Canonical gate command 74504 completed exit 3 (regression), using the same frozen
+candidate and isolated runtime/canary directories at atc-schema-gate-20261023*.
+Off p95 was 34.300208ms, shadow 35.321750ms (+2.98%), live 38.160916ms
+(+11.26%, above 5%). Canary quick_check passed with one ATC row; benchmark
+execution itself exited 0. No fallback was applied. Profile the remaining
+live-write cost before another candidate; do not repeat the gate until it passes
+or treat the paired diagnostic as qualification. No heavy command is active.
 No push, merge, live installation or restart has occurred in this continuation.
 
 Connection-reuse candidate is committed as
