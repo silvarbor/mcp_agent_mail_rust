@@ -2,7 +2,40 @@
 
 ## Recovery on 2026-10-23
 
-CURRENT: wrapper-lifetime repair after canonical gate failure.
+CURRENT: wrapper-lifetime repair cec33fb274eafa38f71722d782396402c4fb50ca
+passes all ten append tests, both workspace compilation checks, strict Clippy,
+fmt and diffcheck (validation command 79127 exited 0). Build 59364 exited 0 in
+5m08s. Frozen binary atc-wrapper-candidate-20261023/am has SHA-256
+035c8b1e0c08248ba27796d074a938b706bbbbe055591f9d23b442815929193e;
+source-commit.txt records eaf47423039131f00c33e7852df553b25b4b1dcf.
+Canonical gate 9817 PASSED unchanged: off p95 37.936167ms, shadow 36.713459ms,
+live 36.644292ms, allowed 39.83ms; canary quick_check passed with one ATC row.
+Evidence: atc-wrapper-gate-20261023*.
+
+Paired diagnostic 47902 exited 0, 300 samples per store, same invocation with
+original baseline. Treatment live overhead baseline 14.655074%, candidate
+1.648694%; candidate live p95 9.486760% lower. Treatment shadow baseline
+-2.346038%, candidate 1.028690%. All twelve stores passed integrity and exact
+message/ATC counts. All-off controls varied: baseline shadow/live
+7.465622%/6.280847%, candidate 3.251386%/0.139844%. Keep those controls with the
+timing results; diagnostic qualification remains false. Evidence:
+atc-wrapper-paired-20261023{,.log}. Fresh CI remains required.
+
+Implementation audit run 2026-10-23_09-21-57-445-699dd5402eb4 is active for
+02927908...eaf47423. It initially stopped on absent spx governance; the same
+auditor resumed under the operator's explicit source-repair/review authorization,
+which takes precedence over skill source-reading restrictions. No spec
+conformance is claimed; actual repository instructions and Rust standards apply.
+No replacement audit run was opened and no approval is claimed yet.
+
+Archive probe build command 94717 is active (storage --test it --no-run).
+Collect before the current-source APFS gate or any other heavy command.
+Log: archive-current-probe-build-20261023.log. The preserved Linux serial build
+is terminal exit 101/SIGKILL and supplies no probe result; the reviewed workflow
+artifact change is prepared to retain the CI-built Linux probe after publication.
+No push, merge, live installation or restart has occurred in this continuation.
+
+Wrapper-lifetime repair evidence:
 Profile command 15706 and macOS
 sample command 35177 both exited 0. Evidence lives under
 atc-schema-profile-20261023. All six stores passed integrity and counts;
