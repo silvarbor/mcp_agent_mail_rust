@@ -21,12 +21,16 @@ message/ATC counts. All-off controls varied: baseline shadow/live
 timing results; diagnostic qualification remains false. Evidence:
 atc-wrapper-paired-20261023{,.log}. Fresh CI remains required.
 
-Implementation audit run 2026-10-23_09-21-57-445-699dd5402eb4 is active for
+Implementation audit run 2026-10-23_09-21-57-445-699dd5402eb4 approved
 02927908...eaf47423. It initially stopped on absent spx governance; the same
 auditor resumed under the operator's explicit source-repair/review authorization,
 which takes precedence over skill source-reading restrictions. No spec
 conformance is claimed; actual repository instructions and Rust standards apply.
-No replacement audit run was opened and no approval is claimed yet.
+No replacement audit run was opened. The sealed result has zero findings and
+audited code and architecture units for pool.rs and pool_registry.rs. The
+coordination note and test-only queries.rs delta were recorded as optional
+implementation coverage gaps; this does not substitute for test-evidence review
+or the required full-branch review before publication.
 
 Archive probe build command 94717 exited 0 in 1m18s (storage --test it --no-run).
 Current-source APFS gate 52869 exited 101: single p95 27.504ms passes 35ms;
@@ -47,6 +51,23 @@ implementation change has been made. The preserved Linux serial build
 is terminal exit 101/SIGKILL and supplies no probe result; the reviewed workflow
 artifact change is prepared to retain the CI-built Linux probe after publication.
 No push, merge, live installation or restart has occurred in this continuation.
+
+Path-scan investigation: read_message_file (storage lib.rs:12219) walks every
+ancestor with symlink_metadata, stats the leaf again, then opens by pathname.
+The index calls that reader once per uncached/recent file. Its two-second
+RACY_STAMP_WINDOW protects against same-tick rewrites and must remain intact.
+core/src/journal_io.rs already uses safe nix openat with O_NOFOLLOW and retained
+directory handles; core/src/setup.rs walks each ancestor through no-follow
+directory opens. Neither helper is directly reusable here: journal roots may
+be symlinks, while archive reads reject symlinks at every prefix. A candidate
+must pin the archive directory chain once, open files relative to the retained
+month handle, obtain cache stamps from the opened file, and detect directory
+replacement before accepting collision-scan results. Merely omitting repeated
+prefix checks would weaken the existing boundary. No candidate is implemented
+or benchmark-qualified yet. The scan currently returns an infallible map and
+skips read errors, so fail-closed replacement handling needs explicit error
+propagation through both single-message and batch collision checks, with real
+filesystem regression evidence before any timing claim.
 
 Wrapper-lifetime repair evidence:
 Profile command 15706 and macOS
