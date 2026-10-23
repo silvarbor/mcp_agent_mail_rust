@@ -13685,8 +13685,22 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
 }
 
 const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
+const ARCHIVE_SYNC_WORKERS: usize = 4;
+const ARCHIVE_PARALLEL_SYNC_MIN_FILES: usize = 16;
 #[cfg(unix)]
 const ARCHIVE_PUBLICATION_DIRECTORY_CACHE: usize = 4;
+
+fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
+    for file in files {
+        // Apple fsync reaches the device; publication subsequently performs
+        // the full device-cache flush after every file has synchronized.
+        #[cfg(target_vendor = "apple")]
+        nix::unistd::fsync(file).map_err(std::io::Error::from)?;
+        #[cfg(not(target_vendor = "apple"))]
+        file.sync_data()?;
+    }
+    Ok(())
+}
 
 /// Destination identities consume memory, without retaining a descriptor per
 /// recipient. Publication reopens through no-follow directory handles.
@@ -13878,20 +13892,43 @@ impl StagedArchiveWrites {
     }
 
     fn sync_pending(&mut self) -> Result<()> {
-        for file in self.pending_sync.drain(..) {
-            #[cfg(target_vendor = "apple")]
-            {
-                use std::os::unix::fs::MetadataExt as _;
-
-                // Apple fsync writes this file to the device. F_FULLFSYNC also
-                // flushes the device cache, so perform that once per device after
-                // all files have reached it, before publishing any of them.
-                nix::unistd::fsync(&file).map_err(std::io::Error::from)?;
-                self.devices.entry(file.metadata()?.dev()).or_insert(file);
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            file.sync_data()?;
+        if self.pending_sync.len() < ARCHIVE_PARALLEL_SYNC_MIN_FILES {
+            sync_archive_file_group(&self.pending_sync)?;
+        } else {
+            std::thread::scope(|scope| -> std::io::Result<()> {
+                let mut workers = Vec::with_capacity(ARCHIVE_SYNC_WORKERS);
+                let chunk_size = self.pending_sync.len().div_ceil(ARCHIVE_SYNC_WORKERS);
+                for chunk in self.pending_sync.chunks(chunk_size) {
+                    workers.push(
+                        std::thread::Builder::new()
+                            .name("archive-sync".into())
+                            .spawn_scoped(scope, || sync_archive_file_group(chunk))?,
+                    );
+                }
+                let mut result = Ok(());
+                for worker in workers {
+                    let synced = worker.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other(
+                            "archive synchronization worker panicked",
+                        ))
+                    });
+                    if result.is_ok() {
+                        result = synced;
+                    }
+                }
+                result
+            })?;
         }
+        // All workers have finished before descriptors are released or any
+        // device flush/publication can begin. A failed group remains unpublished.
+        #[cfg(target_vendor = "apple")]
+        for file in self.pending_sync.drain(..) {
+            use std::os::unix::fs::MetadataExt as _;
+
+            self.devices.entry(file.metadata()?.dev()).or_insert(file);
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        self.pending_sync.clear();
         Ok(())
     }
 
@@ -16307,6 +16344,31 @@ mod tests {
         assert!(!tmp.path().join("last").exists());
         drop(staged);
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_late_group_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("existing"), b"original").unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        staged
+            .add(&tmp.path().join("existing"), b"replacement")
+            .unwrap();
+        for index in 1..ARCHIVE_SYNC_GROUP_FILES - 1 {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+        }
+        // A real failing descriptor near the end must prevent publication even
+        // when earlier files in the same group synchronized successfully.
+        staged.pending_sync[ARCHIVE_SYNC_GROUP_FILES - 2] = nix::unistd::pipe().unwrap().0.into();
+
+        assert!(staged.add(&tmp.path().join("last"), b"last").is_err());
+        assert_eq!(fs::read(tmp.path().join("existing")).unwrap(), b"original");
+        assert!(!tmp.path().join("last").exists());
+        drop(staged);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[cfg(target_vendor = "apple")]
