@@ -1,5 +1,37 @@
 # Resume — local Agent Mail fork
 
+## Latest validated checkpoint on 2026-10-23
+
+Source repair 9752fcf4af6bdb8b992bea7be38ec135f5fe760d enumerates root/year/month
+through retained cap-std handles and uses descriptor-relative metadata. The
+replacement/restoration regression failed before repair and now passes. Focused
+65965 passed 15 tests; workspace 71159 passed both checks, strict Clippy, fmt and
+diffcheck; broader message 39801 passed all 193 tests in 285.00s.
+Audit 2026-10-23_10-33-09-240-2d08d7545b3b approved the repaired scope
+43cb6786631d02c3b26357a020892b430e103f95...e0ec124e2b446831c5170494532bcb3843aa03da
+with zero findings. Code and architecture were audited; Cargo manifests/lock
+and this coordination note are optional registry coverage gaps. The previous
+retained-directory-enumeration finding is repaired.
+Probe build 54596 and APFS gate 66565 exited 0. Frozen binary:
+archive-enumeration-candidate-20261023/storage-tests, SHA-256
+9ff554b6d86085894b534d5c666bf27b546ceee0ffe79b9ed2369ca587c9eb47.
+APFS single p95 28.191ms/35ms; batch p95 227.190ms/300ms; crash/reopen kept
+100 messages and two commits. Instrumented profile 50520 exited 101 because
+sampling perturbed timing; its stacks localize staging opens, sync and renames.
+It is diagnosis only, never qualification or a speedup claim.
+CI diagnostic commit 763e36a846303f1dedc6dcf0fe8b751311748871 records exit,
+signals and resource state for the unexplained Archive Perf compilation exit143.
+Actionlint passes; extracted shell preserves simulated cargo statuses 0/23/143.
+PR head 43cb6786 ATC run39936963992 failed: off p95 20.016919ms,
+shadow19.568984ms, live21.795499ms (8.89% versus unchanged5% limit).
+Canary quick_check passed. Evidence: atc-ci-43cb6786-20261023/summary.json.
+This is active repair work alongside ext4/XFS batch performance and build143.
+The earlier local ATC pass does not establish current-head Linux qualification.
+Before changing measurement policy, reproduce the sequential all-off control
+on the CI platform; the local interleaved prototype remains diagnostic only.
+No release candidate, merge, installation, restart or 24h observation yet.
+All local commands above are terminal. Update publication state after push.
+
 ## Recovery on 2026-10-23
 
 Retained-directory enumeration repair now passes all 15 focused canonical tests:
