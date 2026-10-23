@@ -140,6 +140,8 @@ linux_mount_loopback() {
     local image_size="$1"
     local filesystem_kind="$2"
     local mount_opts="$3"
+    local -a mount_args
+    read -r -a mount_args <<< "${mount_opts}"
 
     require_cmd sudo
     MOUNT_POINT="$(mktemp -d "/tmp/archive-fsync-${FILESYSTEM}.XXXXXX")"
@@ -160,7 +162,7 @@ linux_mount_loopback() {
             exit 1
             ;;
     esac
-    sudo mount ${mount_opts} "${IMAGE_PATH}" "${MOUNT_POINT}"
+    sudo mount "${mount_args[@]}" "${IMAGE_PATH}" "${MOUNT_POINT}"
     sudo chown "$(id -u):$(id -g)" "${MOUNT_POINT}"
     STORAGE_ROOT="${MOUNT_POINT}/storage"
     mkdir -p "${STORAGE_ROOT}"
