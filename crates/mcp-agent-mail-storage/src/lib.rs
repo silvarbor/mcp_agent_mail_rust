@@ -8982,18 +8982,29 @@ static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalI
 /// the scan prevents a replaced directory from yielding an accepted result.
 #[cfg(unix)]
 struct CanonicalScanDirectory {
-    chain: Vec<(PathBuf, fs::File)>,
+    chain: Vec<(PathBuf, Arc<fs::File>)>,
 }
 
 #[cfg(unix)]
 impl CanonicalScanDirectory {
     fn open(path: &Path) -> Result<Self> {
+        Self::open_cached(path, &mut HashMap::new())
+    }
+
+    fn open_cached(path: &Path, handles: &mut HashMap<PathBuf, Arc<fs::File>>) -> Result<Self> {
         use nix::fcntl::{OFlag, openat};
         use nix::sys::stat::Mode;
 
         let path = std::path::absolute(path)?;
         let mut current = PathBuf::from("/");
-        let mut chain = vec![(current.clone(), fs::File::open(&current)?)];
+        let root = if let Some(file) = handles.get(&current) {
+            Arc::clone(file)
+        } else {
+            let file = Arc::new(fs::File::open(&current)?);
+            handles.insert(current.clone(), Arc::clone(&file));
+            file
+        };
+        let mut chain = vec![(current.clone(), root)];
         for component in path.components() {
             let name = match component {
                 Component::RootDir | Component::CurDir => continue,
@@ -9006,8 +9017,13 @@ impl CanonicalScanDirectory {
                 }
             };
             let parent = &chain.last().expect("root directory is retained").1;
+            current.push(name);
+            if let Some(file) = handles.get(&current) {
+                chain.push((current.clone(), Arc::clone(file)));
+                continue;
+            }
             let fd = openat(
-                parent,
+                parent.as_ref(),
                 name,
                 OFlag::O_RDONLY
                     | OFlag::O_DIRECTORY
@@ -9017,12 +9033,21 @@ impl CanonicalScanDirectory {
                 Mode::empty(),
             )
             .map_err(std::io::Error::from)?;
-            current.push(name);
-            chain.push((current.clone(), fs::File::from(fd)));
+            let file = Arc::new(fs::File::from(fd));
+            handles.insert(current.clone(), Arc::clone(&file));
+            chain.push((current.clone(), file));
         }
         let directory = Self { chain };
         directory.validate_binding()?;
         Ok(directory)
+    }
+
+    fn file(&self) -> &fs::File {
+        self.chain
+            .last()
+            .expect("root directory is retained")
+            .1
+            .as_ref()
     }
 
     fn validate_binding(&self) -> Result<()> {
@@ -9066,7 +9091,7 @@ impl CanonicalScanDirectory {
         }
         let parent = &self.chain.last().expect("root directory is retained").1;
         let fd = openat(
-            parent,
+            parent.as_ref(),
             path,
             OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
             Mode::empty(),
@@ -13642,6 +13667,11 @@ const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
 struct StagedArchiveWrites {
     /// `(temp path, target path)` pairs not yet renamed into place.
     staged: Vec<(PathBuf, PathBuf)>,
+    /// Retain each parent and share ancestor descriptors across the batch.
+    #[cfg(unix)]
+    directories: HashMap<PathBuf, CanonicalScanDirectory>,
+    #[cfg(unix)]
+    directory_handles: HashMap<PathBuf, Arc<fs::File>>,
     /// Bound open descriptors while allowing a group of writes to reach the
     /// filesystem before its first synchronization barrier.
     pending_sync: Vec<fs::File>,
@@ -13665,6 +13695,17 @@ impl StagedArchiveWrites {
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
+        #[cfg(unix)]
+        let (tmp_path, file) = {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            if !self.directories.contains_key(parent) {
+                let directory =
+                    CanonicalScanDirectory::open_cached(parent, &mut self.directory_handles)?;
+                self.directories.insert(parent.to_path_buf(), directory);
+            }
+            stage_archive_write_at(&self.directories[parent], path, data)?
+        };
+        #[cfg(not(unix))]
         let (tmp_path, file) = stage_atomic_write(path, data, false)?;
         self.staged.push((tmp_path, path.to_path_buf()));
         self.pending_sync.push(file);
@@ -13703,13 +13744,34 @@ impl StagedArchiveWrites {
             return Ok(());
         };
         let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        #[cfg(unix)]
+        for directory in self.directories.values() {
+            directory.validate_binding()?;
+        }
         let mut pending = std::mem::take(&mut self.staged).into_iter();
         while let Some((tmp_path, path)) = pending.next() {
-            if let Err(err) = fs::rename(&tmp_path, &path) {
-                let _ = fs::remove_file(&tmp_path);
+            #[cfg(unix)]
+            let result = {
+                let directory = &self.directories[path.parent().unwrap_or(Path::new("."))];
+                nix::fcntl::renameat(
+                    directory.file(),
+                    tmp_path.file_name().expect("staged file has a name"),
+                    directory.file(),
+                    path.file_name().expect("target file has a name"),
+                )
+                .map_err(std::io::Error::from)
+            };
+            #[cfg(not(unix))]
+            let result = fs::rename(&tmp_path, &path);
+            if let Err(err) = result {
+                self.staged.push((tmp_path, path));
                 self.staged.extend(pending);
                 return Err(err.into());
             }
+        }
+        #[cfg(unix)]
+        for directory in self.directories.values() {
+            directory.validate_binding()?;
         }
         Ok(())
     }
@@ -13718,9 +13780,80 @@ impl StagedArchiveWrites {
 impl Drop for StagedArchiveWrites {
     fn drop(&mut self) {
         for (tmp_path, _) in &self.staged {
+            #[cfg(unix)]
+            {
+                let directory = &self.directories[tmp_path.parent().unwrap_or(Path::new("."))];
+                let _ = nix::unistd::unlinkat(
+                    directory.file(),
+                    tmp_path.file_name().expect("staged file has a name"),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+            }
+            #[cfg(not(unix))]
             let _ = fs::remove_file(tmp_path);
         }
     }
+}
+
+/// Create and fill a new temporary file through the retained parent handle.
+#[cfg(unix)]
+fn stage_archive_write_at(
+    directory: &CanonicalScanDirectory,
+    path: &Path,
+    data: &[u8],
+) -> Result<(PathBuf, fs::File)> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use std::io::Write as _;
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    if path.file_name().is_none() {
+        return Err(StorageError::InvalidPath(
+            "archive target has no file name".into(),
+        ));
+    }
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to write through symlink: {}",
+            path.display()
+        )));
+    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    for _ in 0..64 {
+        let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = atomic_write_tmp_path(parent, path, seq);
+        let name = tmp_path.file_name().expect("temporary file has a name");
+        let fd = match openat(
+            directory.file(),
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::from_bits_truncate(0o666),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(err) => return Err(std::io::Error::from(err).into()),
+        };
+        let mut file = fs::File::from(fd);
+        if let Err(err) = file.write_all(data) {
+            let _ = nix::unistd::unlinkat(
+                directory.file(),
+                name,
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            );
+            return Err(err.into());
+        }
+        return Ok((tmp_path, file));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique temp file in {}",
+            parent.display()
+        ),
+    )
+    .into())
 }
 
 /// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
@@ -15668,6 +15801,42 @@ mod tests {
         assert_eq!(fs::read_to_string(existing).unwrap(), "original");
         assert_eq!(fs::read_to_string(blocked_parent).unwrap(), "keep");
         assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_reject_replaced_parent_and_keep_foreign_temp() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let retained = tmp.path().join("retained");
+        fs::create_dir(&parent).unwrap();
+        let staged = StagedArchiveWrites::stage(vec![(
+            parent.join("message.md"),
+            b"intended message".to_vec(),
+        )])
+        .unwrap();
+        let temp_name = staged_temp_files(&parent).pop().unwrap();
+        fs::rename(&parent, &retained).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join(&temp_name), b"foreign staged content").unwrap();
+        fs::write(parent.join("message.md"), b"foreign target").unwrap();
+
+        let result = staged.publish();
+
+        assert!(
+            result.is_err(),
+            "a replaced parent cannot authorize publication"
+        );
+        assert_eq!(
+            fs::read(parent.join("message.md")).unwrap(),
+            b"foreign target"
+        );
+        assert_eq!(
+            fs::read(parent.join(temp_name)).unwrap(),
+            b"foreign staged content"
+        );
+        assert!(staged_temp_files(&retained).is_empty());
+        assert!(!retained.join("message.md").exists());
     }
 
     #[test]
