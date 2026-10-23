@@ -2,6 +2,39 @@
 
 ## Recovery on 2026-10-23
 
+Retained-directory enumeration repair now passes all 15 focused canonical tests:
+command 65965 exited 0, including the replacement/restoration regression that
+previously failed at its intended assertion. Workspace command 71159 exited 0:
+all-targets check 43.05s, production check 24.71s, strict Clippy 48.48s, format
+and whitespace checks passed. Fresh implementation audit and archive performance
+validation remain required for this repair.
+Current PR head remains 43cb6786. Archive Perf Gate failed during compilation
+with exit 143 on Ubuntu 24.04; logs identify no cause and no measurement ran.
+The ext4-ordered and XFS matrix jobs reached measurements and failed the unchanged
+250ms batch p95 budget: 417.076ms and 322.182ms respectively; single-message
+writes passed. Their logs are preserved as fsync-{ext4-ordered,xfs}-43cb6786-20261023.log
+in the evidence root. Fresh profiling must explain the batch write costs.
+These CI failures remain active authorized repairs under inspect-github-actions.
+
+Published head 43cb6786631d02c3b26357a020892b430e103f95 is NOT merge-ready.
+Archive audit 2026-10-23_10-05-09-929-a97afc9f3c40 rejected one blocking class:
+retained-directory-enumeration. Root/year/month enumeration still uses pathnames;
+a temporary empty replacement restored before final binding validation can hide
+an existing ID. Repair all three enumeration sites through the retained handles
+and add a deterministic replacement/restoration regression. Governing workflow:
+Rust implementation remediation and required implementation audit. Classification:
+safe authorized repair in progress. No finding is deferred.
+Release build 83562 was interrupted deliberately with SIGINT to its own timeout
+PID 14438; terminal exit 130, no finished candidate binary. Build caches remain.
+CI is still running for the published head; collect it as evidence, but this
+audit rejection prevents merge regardless of CI results. External status records:
+archive-scan-publication-20261023.json and cutover-preflight-43cb6786-20261023.json.
+Live health command 68628 exited 0 and reports one orphaned page (leaked-pages
+only, all rows readable), reservation parity 13/13, ATC quick_check okay. The
+orphaned-page repair is part of supervised cutover after verified stopped backup;
+no live repair/restart has occurred. Current installed target remains
+retention-thread-digests-3659c270-20261013, launchd PID 62353 on port 8765.
+
 Archive scan candidate caea737240e604ca0248c4fef87d653033287031 is committed
 in storage lib.rs. It retains no-follow
 directory handles during canonical collision scans, reads uncached files relative
