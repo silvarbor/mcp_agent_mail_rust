@@ -19,7 +19,7 @@ jobs:
   atc-perf-gate:
     name: ATC Perf Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 95
     env:
       GATE_OUTPUT_DIR: tests/artifacts/perf/atc_perf_gate/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -28,22 +28,55 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build ATC benchmark binary
+        timeout-minutes: 60
+        run: cargo build --locked -p mcp-agent-mail-cli --bin am
 
       - name: Run ATC perf gate
         id: gate
+        timeout-minutes: 30
         continue-on-error: true
         shell: bash
+        env:
+          ATC_GATE_TMPDIR_ROOT: ${{ runner.temp }}/atc-perf
+          AM_BENCH_BIN: ${{ github.workspace }}/target/debug/am
         run: |
           set -euo pipefail
           chmod +x scripts/bench_atc_perf_gate.sh
           scripts/bench_atc_perf_gate.sh --output-dir "${GATE_OUTPUT_DIR}"
+
+      - name: Measure identical ATC-off controls
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/bench_atc_transport.py \
+            --binary "${GITHUB_WORKSPACE}/target/debug/am" \
+            --store-root "${RUNNER_TEMP}/atc-off-control-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --diagnostic-all-off \
+            > "${GATE_OUTPUT_DIR}/all_off_control.json"
+
+      - name: Preserve ATC binary for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atc-linux-binary
+          path: target/debug/am
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Upload ATC perf artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: atc-perf-gate
-          path: ${{ env.GATE_OUTPUT_DIR }}/
+          path: |
+            ${{ env.GATE_OUTPUT_DIR }}/
+            !${{ env.GATE_OUTPUT_DIR }}/server_canary.stdin.*
           retention-days: 30
           if-no-files-found: error
 

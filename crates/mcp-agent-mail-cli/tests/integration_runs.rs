@@ -692,7 +692,13 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     conn.close_sync().unwrap();
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
 
-    assert_idle_stdio_reconciles(&env, "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md", 1);
+    assert_idle_stdio_reconciles(
+        &env,
+        &[(
+            "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md".to_string(),
+            1,
+        )],
+    );
 }
 
 #[test]
@@ -842,10 +848,337 @@ fn serve_stdio_recovers_accepted_send_after_archive_failure_and_restart() {
         "{}__idle-recovery__{message_id}.md",
         created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
     );
-    assert_idle_stdio_reconciles(&env, &filename, message_id);
+    assert_idle_stdio_reconciles(&env, &[(filename, message_id)]);
 }
 
-fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) {
+struct ArchivePressureServer {
+    child: Option<std::process::Child>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    next_id: i64,
+}
+
+impl ArchivePressureServer {
+    fn start(env: &TestEnv) -> Self {
+        let stdout_path = env.tmp.path().join("archive-pressure.stdout");
+        let stderr_path = env.tmp.path().join("archive-pressure.stderr");
+        let child = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false")
+            .env("RETENTION_REPORT_ENABLED", "false")
+            .env("QUOTA_ENABLED", "false")
+            .env("AM_WBQ_CHANNEL_CAPACITY", "256")
+            .env("AM_WBQ_DRAIN_BATCH_CAP", "16")
+            .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+            .env("AM_ARCHIVE_BACKLOG_CAP", "1")
+            .env("RUST_LOG", "warn")
+            .current_dir(env.hostile_repo())
+            .arg("serve-stdio")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .expect("start private archive-pressure server");
+        let mut server = Self {
+            child: Some(child),
+            stdout_path,
+            stderr_path,
+            next_id: 2,
+        };
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            initialize_request()
+        )
+        .unwrap();
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        )
+        .unwrap();
+        server
+    }
+
+    fn request_batch(&mut self, requests: Vec<(&str, Value)>) -> Vec<Value> {
+        let ids: Vec<_> = requests
+            .into_iter()
+            .map(|(name, arguments)| {
+                let id = self.next_id;
+                self.next_id += 1;
+                writeln!(
+                    self.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+                    "{}",
+                    tool_call(id, name, arguments)
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let stdout = std::fs::read_to_string(&self.stdout_path).unwrap_or_default();
+            let responses: BTreeMap<_, _> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|response| response["id"].as_i64().map(|id| (id, response)))
+                .collect();
+            if ids.iter().all(|id| responses.contains_key(id)) {
+                return ids
+                    .iter()
+                    .map(|id| {
+                        let response = &responses[id];
+                        assert!(response.get("error").is_none(), "{response}");
+                        assert_ne!(response["result"]["isError"], true, "{response}");
+                        serde_json::from_str(
+                            response["result"]["content"][0]["text"].as_str().unwrap(),
+                        )
+                        .expect("tool payload")
+                    })
+                    .collect();
+            }
+            assert!(
+                Instant::now() < deadline
+                    && self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "pressure request did not complete; stderr={}",
+                std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn request(&mut self, name: &str, arguments: Value) -> Value {
+        self.request_batch(vec![(name, arguments)])
+            .pop()
+            .expect("one tool result")
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ArchivePressureServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[test]
+fn serve_stdio_recovers_journal_failure_and_full_backlog_after_restart() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        env.hostile_repo.to_str().unwrap(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    conn.execute_raw("UPDATE agents SET contact_policy = 'open'")
+        .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    let config = mcp_agent_mail_core::Config {
+        storage_root: env.storage_root.clone(),
+        ..mcp_agent_mail_core::Config::default()
+    };
+    let archive = mcp_agent_mail_storage::ensure_archive(&config, "idle-recovery").unwrap();
+    let unrelated = archive.root.join("operator-note.txt");
+    std::fs::write(&unrelated, b"retain unrelated operator content").unwrap();
+    // Hold the actual private archive flock, not a mocked write failure. The
+    // server remains able to accept DB writes while both archive drains wait.
+    let archive_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&archive.lock_path)
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&archive_lock).unwrap();
+    let blocked_journal = env.storage_root.join(".archive_backlog");
+    std::fs::write(&blocked_journal, b"retain journal obstruction").unwrap();
+    let mut server = ArchivePressureServer::start(&env);
+
+    let message_arguments = json!({
+        "project_key": env.hostile_repo.display().to_string(),
+        "sender_name": "BlueLake", "to": ["GreenStone"],
+        "subject": "idle recovery", "body_md": "Retain this accepted message.",
+        "topic": "pressure-recovery", "thread_id": "pressure-recovery"
+    });
+    // First occupy the drain with a real accepted message bundle. The held
+    // project flock prevents its archive write from completing.
+    let first = server.request("send_message", message_arguments.clone());
+    assert_eq!(first["count"], 1, "{first}");
+    let mut accepted_ids = vec![first["deliveries"][0]["payload"]["id"].as_i64().unwrap()];
+
+    // Enqueue only the observed free capacity. Profiles fill the WBQ without
+    // creating mail rows or consuming the one-entry fallback backlog. The
+    // stdio dispatcher admits at most 64 pending requests, so pipeline the
+    // profiles in batches well below that bound.
+    const PROFILE_BATCH: u64 = 32;
+    let mut health = server.request("health_check", json!({}));
+    assert_eq!(health["queues"]["wbq"]["capacity"], 256, "{health}");
+    for _ in 0..16 {
+        let depth = health["queues"]["wbq"]["depth"].as_u64().unwrap();
+        if depth == 256 {
+            break;
+        }
+        let profiles = (depth..(depth + PROFILE_BATCH).min(256))
+            .map(|_| {
+                (
+                    "register_agent",
+                    json!({
+                        "project_key": env.hostile_repo.display().to_string(),
+                        "name": "BlueLake", "program": "test", "model": "test",
+                        "task_description": "private queue pressure"
+                    }),
+                )
+            })
+            .collect();
+        server.request_batch(profiles);
+        health = server.request("health_check", json!({}));
+    }
+    assert_eq!(health["queues"]["wbq"]["depth"], 256, "{health}");
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_ephemeral_total"], 0,
+        "{health}"
+    );
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_dropped_total"], 0,
+        "{health}"
+    );
+
+    // Six more accepted messages exceed the production four-repair batch
+    // bound. Only the first fits the ephemeral backlog; the other five must
+    // be recovered from the DB after the process and its queues are gone.
+    for index in 0..6 {
+        let response = server.request("send_message", message_arguments.clone());
+        assert_eq!(response["count"], 1, "{response}");
+        accepted_ids.push(response["deliveries"][0]["payload"]["id"].as_i64().unwrap());
+        health = server.request("health_check", json!({}));
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_ephemeral_total"], 1,
+            "{health}"
+        );
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_dropped_total"], index,
+            "{health}"
+        );
+    }
+    server
+        .stop()
+        .expect("reap pressure server before restoring archive access");
+    let stderr = std::fs::read_to_string(&server.stderr_path).unwrap();
+    assert!(stderr.contains("message archive write project=idle-recovery; WBQ unavailable and archive journal write failed"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "message archive write project=idle-recovery; WBQ unavailable and retry backlog full"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_journal).unwrap(),
+        b"retain journal obstruction"
+    );
+    std::fs::rename(
+        &blocked_journal,
+        env.tmp.path().join("pressure-journal.saved"),
+    )
+    .unwrap();
+    drop(archive_lock);
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync(
+            "SELECT id, created_ts, body_md, topic, thread_id FROM messages ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        7,
+        "every accepted message must survive process death"
+    );
+    let mut expected = Vec::new();
+    let mut newest = 0;
+    for (row, accepted_id) in rows.iter().zip(&accepted_ids) {
+        let message_id = row.get_named::<i64>("id").unwrap();
+        assert_eq!(message_id, *accepted_id);
+        assert_eq!(
+            row.get_named::<String>("body_md").unwrap(),
+            "Retain this accepted message."
+        );
+        assert_eq!(
+            row.get_named::<String>("topic").unwrap(),
+            "pressure-recovery"
+        );
+        assert_eq!(
+            row.get_named::<String>("thread_id").unwrap(),
+            "pressure-recovery"
+        );
+        let created_ts = row.get_named::<i64>("created_ts").unwrap();
+        newest = newest.max(created_ts);
+        let created = chrono::DateTime::from_timestamp_micros(created_ts).unwrap();
+        expected.push((
+            format!(
+                "{}__idle-recovery__{message_id}.md",
+                created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
+            ),
+            message_id,
+        ));
+    }
+    conn.close_sync().unwrap();
+    for (filename, _) in &expected {
+        for location in [
+            "messages",
+            "agents/BlueLake/outbox",
+            "agents/GreenStone/inbox",
+        ] {
+            assert!(
+                !archive.root.join(location).join(filename).exists(),
+                "the pressure phase must leave every accepted archive copy missing"
+            );
+        }
+    }
+    let wait_us = newest
+        .saturating_add(31_000_000)
+        .saturating_sub(mcp_agent_mail_db::now_micros());
+    if wait_us > 0 {
+        thread::sleep(Duration::from_micros(u64::try_from(wait_us).unwrap()));
+    }
+    assert_idle_stdio_reconciles(&env, &expected);
+    for (filename, message_id) in &expected {
+        let path = archive.root.join("messages").join(filename);
+        let (metadata, body) = mcp_agent_mail_storage::read_message_file(&path).unwrap();
+        assert_eq!(metadata["id"], *message_id);
+        assert_eq!(metadata["topic"], "pressure-recovery");
+        assert_eq!(metadata["thread_id"], "pressure-recovery");
+        assert_eq!(metadata["to"], json!(["GreenStone"]));
+        assert_eq!(body, "Retain this accepted message.");
+        let canonical_bytes = std::fs::read(&path).unwrap();
+        for mailbox in ["agents/BlueLake/outbox", "agents/GreenStone/inbox"] {
+            assert_eq!(
+                std::fs::read(archive.root.join(mailbox).join(filename)).unwrap(),
+                canonical_bytes
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(unrelated).unwrap(),
+        b"retain unrelated operator content"
+    );
+}
+
+fn assert_idle_stdio_reconciles(env: &TestEnv, expected: &[(String, i64)]) {
     let stdout_path = env.tmp.path().join("stdio.stdout");
     let stderr_path = env.tmp.path().join("stdio.stderr");
     let mut child = Command::new(am_bin())
@@ -872,12 +1205,20 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
     );
     let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     let project = env.storage_root.join("projects/idle-recovery");
-    let paths = [
-        format!("messages/{filename}"),
-        format!("agents/BlueLake/outbox/{filename}"),
-        format!("agents/GreenStone/inbox/{filename}"),
-    ];
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let paths: Vec<_> = expected
+        .iter()
+        .flat_map(|(filename, _)| {
+            [
+                format!("messages/{filename}"),
+                format!("agents/BlueLake/outbox/{filename}"),
+                format!("agents/GreenStone/inbox/{filename}"),
+            ]
+        })
+        .collect();
+    // More than four messages need a second production maintenance tick:
+    // ten-second startup delay plus the unchanged sixty-second cadence.
+    let timeout_secs = if expected.len() > 4 { 105 } else { 45 };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut committed = false;
     while sent.is_ok() && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
@@ -894,6 +1235,8 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
                         out.status.success()
                             && String::from_utf8_lossy(&out.stdout)
                                 .contains("Retain this accepted message.")
+                            && std::fs::read(project.join(path))
+                                .is_ok_and(|bytes| bytes == out.stdout)
                     })
             });
             if committed {
@@ -921,15 +1264,17 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
         "idle stdio did not commit all archive copies: {stderr}"
     );
     let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
-    let rows = conn
-        .query_sync(
-            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
-            &[SqlValue::BigInt(message_id)],
-        )
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
-    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    for (_, message_id) in expected {
+        let rows = conn
+            .query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                &[SqlValue::BigInt(*message_id)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+        assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    }
     conn.close_sync().unwrap();
 }
 
@@ -2742,26 +3087,9 @@ fn guard_install_status_uninstall_smoke() {
 #[test]
 fn guard_check_conflict_exits_1_when_not_advisory() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    // Active exclusive reservation held by someone else.
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -2783,25 +3111,9 @@ fn guard_check_conflict_exits_1_when_not_advisory() {
 #[test]
 fn guard_check_advisory_does_not_exit_1() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--advisory", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -2817,6 +3129,133 @@ fn guard_check_advisory_does_not_exit_1() {
         "expected conflict marker in stderr, got:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Without an agent identity the guard cannot tell whose reservations are
+/// foreign: warn mode (which never blocks) says nothing was checked and
+/// exits 0, while enforcing mode still refuses.
+#[test]
+fn guard_check_without_identity_warns_in_warn_mode_and_fails_when_enforcing() {
+    for (mode, warned) in [("warn", true), ("block", false)] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        let mut child_env: Vec<_> = guard_blocking_env(&env)
+            .into_iter()
+            .chain(env.hermetic_env())
+            .filter(|(var, _)| var != "AGENT_NAME")
+            .collect();
+        child_env.push(("AGENT_MAIL_GUARD_MODE".to_string(), mode.to_string()));
+        let mut child = Command::new(am_bin())
+            .env_clear()
+            .envs(child_env)
+            .current_dir(env.tmp.path())
+            .args(["guard", "check", "--repo", &repo_str])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn guard without inherited identity");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("guard stdin")
+                .write_all(b"foo.txt\n")
+                .expect("write guard paths");
+        }
+        let out = child.wait_with_output().expect("wait for guard");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.success(),
+            warned,
+            "{mode}: status {} stderr:\n{stderr}",
+            out.status
+        );
+        assert_eq!(
+            stderr.contains("no agent identity"),
+            warned,
+            "{mode}: stderr:\n{stderr}"
+        );
+    }
+}
+
+/// An archive root holding one active exclusive reservation on `foo.txt` by
+/// another agent.
+fn guard_repo_with_foreign_reservation(env: &TestEnv) -> String {
+    let repo = env.tmp.path().join("archive_root");
+    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
+    let reservation = serde_json::json!({
+        "path_pattern": "foo.txt",
+        "agent_name": "OtherAgent",
+        "exclusive": true,
+        "expires_ts": "2999-01-01T00:00:00Z",
+        "released_ts": serde_json::Value::Null,
+    });
+    std::fs::write(
+        repo.join("file_reservations").join("res.json"),
+        serde_json::to_string_pretty(&reservation).unwrap(),
+    )
+    .expect("write reservation");
+    repo.to_string_lossy().to_string()
+}
+
+/// The guard switches pinned to "enforce", so a value exported in the shell
+/// running the tests (the hook's own refusal suggests
+/// AGENT_MAIL_GUARD_MODE=warn) cannot flip these results.
+fn guard_blocking_env(env: &TestEnv) -> Vec<(String, String)> {
+    let mut child_env = env.base_env();
+    for (var, value) in [
+        ("AGENT_MAIL_BYPASS", "0"),
+        ("AGENT_MAIL_GUARD_MODE", "block"),
+        ("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true"),
+    ] {
+        child_env.push((var.to_string(), value.to_string()));
+    }
+    child_env
+}
+
+/// `am guard check` honors the installed hook's switches; without one, the
+/// same conflict exits 1 (guard_check_conflict_exits_1_when_not_advisory).
+#[test]
+fn guard_check_honors_bypass_warn_mode_and_disabled_enforcement() {
+    for (var, value, expect_conflict_listed, marker) in [
+        ("AGENT_MAIL_BYPASS", "1", false, "AGENT_MAIL_BYPASS is set"),
+        ("AGENT_MAIL_GUARD_MODE", "warn", true, "not blocking"),
+        (
+            "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+            "false",
+            false,
+            "enforcement is disabled",
+        ),
+    ] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        // The pinned values first; the switch under test overrides one.
+        let mut child_env = guard_blocking_env(&env);
+        child_env.push((var.to_string(), value.to_string()));
+        let out = run_am(
+            &child_env,
+            Some(env.tmp.path()),
+            &["guard", "check", "--repo", &repo_str],
+            Some(b"foo.txt\n"),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{var}={value}: expected exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("CONFLICT: pattern"),
+            expect_conflict_listed,
+            "{var}={value}: conflict listing\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(marker) || stderr.contains(marker),
+            "{var}={value}: expected '{marker}'\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -3064,6 +3503,55 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
     assert!(
         !target_archive_file.exists(),
         "dry-run should not create target artifacts"
+    );
+}
+
+#[test]
+fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
+    let env = TestEnv::new();
+    let project_dir = env.tmp.path().join("create-proj");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    let project_key = project_dir.display().to_string();
+    let create = |extra: &[&str]| {
+        let mut args = vec![
+            "agents",
+            "create",
+            "-p",
+            project_key.as_str(),
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        run_am(&env.base_env(), Some(env.tmp.path()), &args, None)
+    };
+
+    // No daemon answers (HTTP_PORT=1), so this is the local path; it must
+    // apply the tool's validation rather than write the row directly.
+    let bad = create(&["--attachments-policy", "bogus"]);
+    assert!(
+        !bad.status.success(),
+        "an invalid attachments policy must be refused offline too\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let out = create(&["-n", "BlueLake"]);
+    assert!(
+        out.status.success(),
+        "expected success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["name"], "BlueLake", "{value}");
+    assert!(
+        value["registration_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "an offline-created agent gets a sender token: {value}"
     );
 }
 
@@ -5359,6 +5847,95 @@ fn clear_and_reset_with_force_and_no_archive_succeeds() {
     );
 }
 
+/// A running server holds the mailbox activity locks for its whole life. The
+/// reset must stop it rather than fail "Resource is temporarily busy", then
+/// wipe the mailbox it served.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_and_reset_stops_a_running_server_holding_the_mailbox() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log)
+        .spawn()
+        .expect("start HTTP server");
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut serving = false;
+    while Instant::now() < deadline && matches!(server.try_wait(), Ok(None)) {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+            && env.db_path.exists()
+        {
+            serving = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !serving {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!(
+            "server never started serving:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+    }
+
+    let out = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["clear-and-reset-everything", "--force", "--no-archive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clear-and-reset-everything");
+
+    // Reap the server whatever the outcome, so a failure cannot leak it.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let mut server_exited = false;
+    while Instant::now() < exit_deadline {
+        if matches!(server.try_wait(), Ok(Some(_))) {
+            server_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !server_exited {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reset must stop the running server instead of failing busy\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Stopping Agent Mail process pid {}", server.id())),
+        "reset should name the server it stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        server_exited,
+        "the server holding the mailbox should have been stopped"
+    );
+    assert!(
+        !env.db_path.exists(),
+        "database should be removed after the reset\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ---- Archive commands ----
 
 #[test]
@@ -6373,6 +6950,31 @@ fn check_serve_http_client_config_setup(setup: bool) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // Liveness answers as soon as the listener serves, but `--setup` repairs
+    // client configs only after the server's own readiness self-probe, so
+    // stopping on the first 200 raced the repair. With setup, wait (bounded)
+    // for every client config to name this server; without it, give a wrong
+    // startup rewrite the same chance to land before asserting it did not.
+    if healthy {
+        if setup {
+            let expected = format!("http://127.0.0.1:{port}/mcp/");
+            let clients: Vec<_> = config_paths
+                .iter()
+                .filter(|path| **path != env.user_config_env_path())
+                .collect();
+            let settle_deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < settle_deadline
+                && matches!(child.try_wait(), Ok(None))
+                && !clients.iter().all(|path| {
+                    std::fs::read_to_string(path).is_ok_and(|content| content.contains(&expected))
+                })
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
     // Reap this test's own server before assertions, including startup failures.
     let _ = child.kill();
     let _ = child.wait();
@@ -6767,5 +7369,134 @@ fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
     assert!(
         daemon_reload < restart,
         "reload must precede restart: {calls}"
+    );
+}
+
+/// Hermetic env for one `am` run against a private HOME and mailbox. The
+/// listener port is one nothing listens on, so mutations take the local path
+/// instead of reaching a live daemon.
+fn user_env_guard_env(root: &Path, port: u16) -> Vec<(String, String)> {
+    let home = root.join("home");
+    let storage = root.join("storage");
+    [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.join(".config").display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME",
+            home.join(".local/share").display().to_string(),
+        ),
+        ("XDG_CACHE_HOME", home.join(".cache").display().to_string()),
+        ("STORAGE_ROOT", storage.display().to_string()),
+        (
+            "DATABASE_URL",
+            format!("sqlite:///{}/storage.sqlite3", storage.display()),
+        ),
+        ("AM_INTERFACE_MODE", "cli".to_string()),
+        ("AM_ATC_ENABLED", "false".to_string()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1".to_string()),
+        ("HTTP_HOST", "127.0.0.1".to_string()),
+        ("HTTP_PORT", port.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
+/// br-ww5js: through the real `execute` path, an unsafe (symlinked) user
+/// `config.env` makes config-consuming mutations fail closed before they open
+/// any mailbox state and without echoing the credential, while an exempt
+/// reflection verb still runs. The control arm, with a regular private
+/// `config.env`, shows the same registration does create the mailbox, so the
+/// missing storage in the unsafe arm is the guard's doing.
+#[cfg(unix)]
+#[test]
+fn unsafe_user_config_env_blocks_mutations_before_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let port = unused_loopback_port();
+    let unsafe_root = tmp.path().join("unsafe");
+    let control_root = tmp.path().join("control");
+    for root in [&unsafe_root, &control_root] {
+        std::fs::create_dir_all(root.join("home/.config/mcp-agent-mail")).expect("config dir");
+        std::fs::create_dir_all(root.join("project")).expect("project dir");
+    }
+    let elsewhere = tmp.path().join("elsewhere.env");
+    std::fs::write(&elsewhere, "HTTP_BEARER_TOKEN=elsewhere-secret\n").expect("target env");
+    std::os::unix::fs::symlink(
+        &elsewhere,
+        unsafe_root.join("home/.config/mcp-agent-mail/config.env"),
+    )
+    .expect("symlinked config.env");
+    let control_env = control_root.join("home/.config/mcp-agent-mail/config.env");
+    std::fs::write(&control_env, "HTTP_BEARER_TOKEN=control-secret\n").expect("control env");
+    std::fs::set_permissions(
+        &control_env,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod control env");
+
+    let project = unsafe_root.join("project");
+    let project_key = project.to_str().expect("utf-8 project path");
+    let env = user_env_guard_env(&unsafe_root, port);
+    // Temp paths contain no whitespace, so each command splits into its argv.
+    for command in [
+        format!("agents register --project {project_key} --program x --model y"),
+        format!(
+            "mail send --project {project_key} --from BlueLake --to RedStone --subject s --body b"
+        ),
+        format!("file_reservations reserve {project_key} BlueLake src/**"),
+        "doctor fix --yes".to_string(),
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let out = run_am_hermetic(&env, Some(&project), &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail closed: {stdout}");
+        assert!(
+            stderr.contains("refusing unsafe user configuration authority"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !format!("{stdout}{stderr}").contains("elsewhere-secret"),
+            "{args:?} disclosed the credential"
+        );
+        assert!(
+            !unsafe_root.join("storage").exists(),
+            "{args:?} created mailbox state despite the unsafe authority"
+        );
+    }
+    let reflection = run_am_hermetic(
+        &env,
+        Some(&project),
+        &["doctor", "capabilities", "--format", "json"],
+    );
+    assert!(
+        reflection.status.success(),
+        "exempt reflection must still run"
+    );
+    assert!(!unsafe_root.join("storage").exists());
+
+    let control_project = control_root.join("project");
+    let control_command = format!(
+        "agents register --project {} --program x --model y",
+        control_project.display()
+    );
+    let control_args: Vec<&str> = control_command.split_whitespace().collect();
+    let control = run_am_hermetic(
+        &user_env_guard_env(&control_root, port),
+        Some(&control_project),
+        &control_args,
+    );
+    assert!(
+        control.status.success(),
+        "control registration: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        control_root.join("storage").exists(),
+        "control must create the mailbox"
     );
 }

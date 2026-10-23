@@ -362,7 +362,9 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
     pool_config.run_migrations = false;
     pool_config.warmup_connections = 0;
 
-    mcp_agent_mail_db::create_query_only_pool(&pool_config)
+    // Shared across resource reads: a per-read pool leaked one live-mailbox
+    // descriptor per read wherever the engine cannot reuse it (GH#333).
+    mcp_agent_mail_db::get_or_create_live_query_only_pool(&pool_config)
         .map(ResourceReadPool::live)
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
@@ -2988,6 +2990,10 @@ pub struct InboxResourceMessage {
     pub from: String,
     pub created_ts: Option<String>,
     pub kind: String,
+    /// `"project"` when the message reached this inbox through the project's
+    /// shared mailbox (GH#282), exactly as `fetch_inbox` reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -3036,6 +3042,9 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_resource_agent(ctx, &pool, project_id, &agent_name).await?;
+    // GH#279 (opt-in): a session holding another identity here reads only
+    // its own inbox, as through `fetch_inbox`.
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     let agent_name = agent.name;
 
@@ -3087,6 +3096,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 from: row.sender_name.clone(),
                 created_ts: Some(micros_to_iso(msg.created_ts)),
                 kind: row.kind.clone(),
+                via: crate::messaging::inbox_via(&row.kind),
                 attachments: parse_attachment_metadata(&msg.attachments),
                 body_md: if include_bodies {
                     Some(msg.body_md.clone())
@@ -6709,6 +6719,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("fetch recipient inbox"),
@@ -6775,6 +6786,7 @@ mod resource_shape_tests {
                         None,
                         Some(10),
                         Some(true),
+                        None,
                         None,
                         None,
                         None,

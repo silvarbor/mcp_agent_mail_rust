@@ -313,4 +313,75 @@ else
     e2e_pass "validator rejects manifest artifact reference to missing file"
 fi
 
+e2e_case_banner "Wrapper seals late stderr and preserves delegate failures"
+WRAPPER_DELEGATE="${FIX_ROOT}/wrapper_delegate.sh"
+cat > "$WRAPPER_DELEGATE" <<'SH'
+source "$1/scripts/e2e_lib.sh"
+E2E_RUN_STARTED_AT="2026-10-23T01:00:00Z"
+E2E_RUN_ENDED_AT="2026-10-23T01:00:01Z"
+e2e_write_bundle_manifest "$2"
+cp "$2/bundle.json" "$2.original-manifest.json"
+echo "stderr after delegate manifest" >&2
+if [ "$3" = "tamper" ]; then
+    echo "changed after sealing" >> "$2/transcript/summary.txt"
+fi
+exit "$4"
+SH
+
+for wrapper_case in success failure tamper; do
+    WRAPPED_DIR="${FIX_ROOT}/wrapped-${wrapper_case}"
+    cp -R "$GOOD_DIR" "$WRAPPED_DIR"
+    delegate_exit=0
+    if [ "$wrapper_case" = failure ]; then
+        delegate_exit=7
+    fi
+    wrapper_exit=0
+    E2E_SUITE="$E2E_SUITE" E2E_TIMESTAMP="$E2E_TIMESTAMP" WRAPPER_SUITE="$E2E_SUITE" \
+        bash -c '
+            source "$1/tests/e2e/test_helpers.sh"
+            _WRAPPER_ARTIFACT_DIR="$2"
+            wrapper_exec "$3" "$1" "$2" "$4" "$5"
+        ' _ "$E2E_PROJECT_ROOT" "$WRAPPED_DIR" "$WRAPPER_DELEGATE" \
+        "$wrapper_case" "$delegate_exit" || wrapper_exit=$?
+
+    if [ "$wrapper_case" = tamper ]; then
+        if [ "$wrapper_exit" -ne 0 ] && ! e2e_validate_bundle_manifest "$WRAPPED_DIR"; then
+            e2e_pass "wrapper rejects changed delegate artifacts without resealing them"
+        else
+            e2e_fail "wrapper accepted or concealed changed delegate artifacts"
+        fi
+    elif [ "$wrapper_exit" -eq "$delegate_exit" ] \
+        && grep -q 'stderr after delegate manifest' "$WRAPPED_DIR/wrapper/stderr_capture.txt" \
+        && grep -Fq '"path": "wrapper/stderr_capture.txt"' "$WRAPPED_DIR/bundle.json" \
+        && grep -Fq '"path": "wrapper/exit_code.txt"' "$WRAPPED_DIR/bundle.json" \
+        && grep -Fq '"path": "wrapper/timing.txt"' "$WRAPPED_DIR/bundle.json" \
+        && grep -Fq '"path": "wrapper/wrapper_meta.json"' "$WRAPPED_DIR/bundle.json" \
+        && e2e_validate_bundle_manifest "$WRAPPED_DIR"; then
+        e2e_pass "wrapper seals complete stderr and preserves ${wrapper_case} exit"
+    else
+        e2e_fail "wrapper failed final artifact/exit contract for ${wrapper_case}"
+    fi
+done
+
+for wrapper_case in success failure; do
+    WRAPPED_DIR="${FIX_ROOT}/wrapped-${wrapper_case}"
+    if python3 - "$WRAPPED_DIR.original-manifest.json" "$WRAPPED_DIR/bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+original = json.loads(Path(sys.argv[1]).read_text())
+completed = json.loads(Path(sys.argv[2]).read_text())
+original_files = original.pop("files")
+completed_files = completed.pop("files")
+assert completed == original, "wrapper changed delegate metadata"
+assert all(entry in completed_files for entry in original_files), "wrapper changed sealed entries"
+PY
+    then
+        e2e_pass "wrapper preserves ${wrapper_case} delegate metadata and sealed entries"
+    else
+        e2e_fail "wrapper changed ${wrapper_case} delegate metadata or sealed entries"
+    fi
+done
+
 e2e_summary

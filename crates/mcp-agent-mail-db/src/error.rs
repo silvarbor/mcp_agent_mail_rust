@@ -217,7 +217,7 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
-                recommended_command: "am doctor --json",
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::WalSidecarCorruption => Self {
                 class,
@@ -235,7 +235,10 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
-                recommended_command: "am doctor migrate --check",
+                // `doctor check` verifies the required tables; `am migrate
+                // --check` only inspects timestamp format and would report
+                // "No migration needed" for a missing table.
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::EngineProbeLimitation => Self {
                 class,
@@ -253,7 +256,7 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: true,
                 blocks_edits: true,
-                recommended_command: "am doctor --json",
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::FtsIndexCorruption => Self {
                 class,
@@ -1183,6 +1186,7 @@ fn contains_lock_or_busy(msg: &str) -> bool {
         || lower.contains("database table is locked")
         || lower.contains("database schema is locked")
         || lower.contains("database is busy")
+        || lower.contains("write coordinator service start timed out while another launcher remained in starting state")
         || lower.contains("resource temporarily busy")
         || lower.contains("sqlite_busy")
         || lower.contains("locked by another process")
@@ -1447,6 +1451,16 @@ mod tests {
         classification
     }
 
+    #[test]
+    fn write_coordinator_start_timeout_is_busy_not_engine_damage() {
+        let message = "internal error: write coordinator service start timed out while another launcher remained in Starting state";
+        let classification = assert_class(message, DbErrorClass::BusyRetryable);
+        assert!(classification.safe_to_retry);
+        assert!(!classification.repairable);
+        assert!(is_lock_error(message));
+        assert!(!is_corruption_error(message));
+    }
+
     /// GH#312: a multi-form integrity probe joins every form's error into one
     /// message. On current SQLite the table-valued `pragma_integrity_check(N)`
     /// form fails first with "no such table: N" (the argument is quoted and
@@ -1709,7 +1723,8 @@ mod tests {
         );
         assert!(!schema.safe_to_retry);
         assert!(schema.blocks_edits);
-        assert_eq!(schema.recommended_command, "am doctor migrate --check");
+        // A read-only check that actually looks for missing tables.
+        assert_eq!(schema.recommended_command, "am doctor check --json");
     }
 
     #[test]

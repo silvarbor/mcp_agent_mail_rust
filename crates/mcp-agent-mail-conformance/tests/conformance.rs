@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 ///
@@ -49,8 +49,7 @@ const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
 /// `Config::from_env()` calls to avoid flakey cross-test races.
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 fn crate_root() -> PathBuf {
@@ -598,6 +597,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
+        crate::settle_shared_storage();
         let mut previous = Vec::new();
         for (key, value) in vars {
             let old = std::env::var(*key).ok();
@@ -643,6 +643,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(v) => unsafe {
@@ -1199,6 +1200,15 @@ struct FixtureEnv {
     tokens: BTreeMap<String, String>,
 }
 
+impl Drop for FixtureEnv {
+    // Fields drop in declaration order, so `tmp` would be removed before
+    // `_env_guard` drains; drain first so queued archive writes still find
+    // their directory (br-odkc4).
+    fn drop(&mut self) {
+        crate::drain_shared_storage();
+    }
+}
+
 fn init_fixture_repo(repo_dir: &Path) {
     std::fs::create_dir_all(repo_dir)
         .unwrap_or_else(|e| panic!("create fixture repo dir {}: {e}", repo_dir.display()));
@@ -1361,6 +1371,8 @@ fn insert_test_message(
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
 fn setup_fixture_env() -> FixtureEnv {
     let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let default_config = mcp_agent_mail_core::Config::default();
+    let default_http_port = default_config.http_port.to_string();
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
@@ -1374,13 +1386,20 @@ fn setup_fixture_env() -> FixtureEnv {
     // Also explicitly disable tool filtering (otherwise tools may not be registered).
     let env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
+        ("HTTP_HOST", &default_config.http_host),
+        ("HTTP_PORT", &default_http_port),
         ("WORKTREES_ENABLED", "1"),
+        // The captured identity fixtures use directory routing, independently
+        // of the operator's project identity configuration.
+        ("PROJECT_IDENTITY_MODE", "dir"),
         ("STORAGE_ROOT", storage_root_str),
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
         ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        // The fixture switch is honored only inside a declared test harness.
+        ("AM_TEST_MODE", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
@@ -4084,7 +4103,7 @@ fn toon_format_resolution_json_fallback() {
     assert_eq!(
         json.get("status").and_then(|v| v.as_str()),
         Some("ok"),
-        "health_check must return status=ok"
+        "health_check must return status=ok: {json}"
     );
 }
 

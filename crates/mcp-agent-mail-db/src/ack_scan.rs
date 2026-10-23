@@ -7,9 +7,18 @@
 //!
 //! Metadata and deliveries come from one SQL statement. A different mailbox or
 //! stamped database generation restarts the lap; no old page is replayed into
-//! a new generation. Unstamped legacy databases remain readable, but cannot
-//! provide the same generation-change detection. This is a bounded observation,
-//! not a transaction authorizing a later mutation or a query execution deadline.
+//! a new generation. A missing generation row remains readable, but cannot
+//! provide the same generation-change detection. Workers run after schema
+//! migration; missing delivery/receipt tables are errors, not empty queues.
+//! Direct and visible project-mailbox obligations share one ordered stream.
+//! A shared obligation is observed, never materialized as a per-agent delivery
+//! or receipt; direct deliveries take precedence even when already ACKed.
+//! Only active recipients in the message's project enter the automatic work
+//! queue. Retirement and permanent deregistration suspend scanning, not erase
+//! delivery history. Lifecycle is observed afresh on every page; escalation
+//! still revalidates it transactionally before granting a reservation.
+//! This is a bounded observation, not a transaction authorizing a later mutation
+//! or a query execution deadline.
 
 #[path = "ack_escalation.rs"]
 mod escalation;
@@ -28,7 +37,8 @@ pub const MAX_ACK_SCAN_PAGE_SIZE: usize = 128;
 // its bound parameters (see the September 22 bridge integration receipt). Only
 // the validated internal integer limit is appended below; every data value
 // remains a binding with an explicit, statement-wide index.
-const PAGE_SQL_PREFIX: &str = "\
+const PAGE_SQL_PREFIX: &str = concat!(
+    "\
 WITH input AS (\
     SELECT ?1 AS resume, ?2 AS expected_generation, ?3 AS previous_upper_id, \
            ?4 AS previous_before_ts, ?5 AS current_before_ts, \
@@ -51,11 +61,30 @@ SELECT 0 AS row_kind, generation_id, upper_id, before_ts, after_message, after_a
        0 AS message_id, 0 AS project_id, 0 AS created_ts, 0 AS agent_id FROM bounds \
 UNION ALL \
 SELECT 1, NULL, NULL, NULL, NULL, NULL, m.id, m.project_id, m.created_ts, mr.agent_id \
-FROM messages m JOIN message_recipients mr ON mr.message_id = m.id CROSS JOIN bounds b \
+FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
+JOIN agents recipient ON recipient.id = mr.agent_id AND recipient.project_id = m.project_id \
+CROSS JOIN bounds b \
 WHERE m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts <= b.before_ts \
+  AND recipient.retired_at IS NULL \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = recipient.id) \
+  AND substr(recipient.task_description, 1, length(?8)) <> ?8 COLLATE BINARY \
   AND m.id <= b.upper_id \
   AND (m.id > b.after_message OR (m.id = b.after_message AND mr.agent_id > b.after_agent)) \
-ORDER BY row_kind, message_id, agent_id LIMIT ";
+UNION ALL \
+SELECT 1, NULL, NULL, NULL, NULL, NULL, m.id, m.project_id, m.created_ts, viewer.id \
+FROM project_mailbox_deliveries d JOIN messages m ON m.id = d.message_id \
+JOIN agents viewer ON viewer.project_id = d.project_id \
+LEFT JOIN project_mailbox_receipts pr \
+  ON pr.message_id = d.message_id AND pr.agent_id = viewer.id CROSS JOIN bounds b \
+WHERE m.ack_required = 1 AND pr.ack_ts IS NULL AND m.created_ts <= b.before_ts \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = viewer.id) \
+  AND substr(viewer.task_description, 1, length(?8)) <> ?8 COLLATE BINARY \
+  AND m.id <= b.upper_id \
+  AND (m.id > b.after_message OR (m.id = b.after_message AND viewer.id > b.after_agent)) \
+  AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    " ORDER BY row_kind, message_id, agent_id LIMIT "
+);
 
 /// Opaque process-local continuation. It represents consumed deliveries, not a
 /// message delivery cursor and not proof that an escalation succeeded.
@@ -149,6 +178,7 @@ fn page_query(
         overdue_before_ts.into(),
         cursor.map_or(0, |cursor| cursor.after_message).into(),
         cursor.map_or(0, |cursor| cursor.after_agent).into(),
+        crate::models::DEREGISTERED_TASK_PREFIX.into(),
     ];
     Ok((sql, params))
 }
@@ -272,8 +302,12 @@ mod tests {
             "ack scan fixture",
         );
         for sql in [
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, ack_required INTEGER NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, ack_required INTEGER NOT NULL, sender_id INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, ack_ts INTEGER, PRIMARY KEY (message_id, agent_id))",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, inception_ts INTEGER NOT NULL DEFAULT 1, retired_at INTEGER, contact_policy TEXT DEFAULT 'auto', task_description TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "CREATE TABLE project_mailbox_receipts (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL)",
             "INSERT INTO db_identity VALUES (0, 'generation-one')",
         ] {
@@ -284,11 +318,19 @@ mod tests {
 
     fn seed(conn: &crate::DbConn, message: i64, recipients: &[i64], created: i64) {
         conn.execute_sync(
-            "INSERT INTO messages VALUES (?, 1, ?, 1)",
+            "INSERT INTO messages(id, project_id, created_ts, ack_required) VALUES (?, 1, ?, 1)",
             &[message.into(), created.into()],
         )
         .unwrap();
         for recipient in recipients {
+            // Direct-delivery fixtures need a real recipient just as the
+            // migrated runtime schema does. Never reactivate an existing one.
+            conn.execute_sync(
+                "INSERT INTO agents(id, project_id) SELECT ?1, 1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+                &[(*recipient).into()],
+            )
+            .unwrap();
             conn.execute_sync(
                 "INSERT INTO message_recipients VALUES (?, ?, NULL)",
                 &[message.into(), (*recipient).into()],
@@ -314,6 +356,287 @@ mod tests {
             .iter()
             .map(|row| (row.message_id, row.agent_id))
             .collect()
+    }
+
+    fn viewers(conn: &crate::DbConn, ids: &[i64]) {
+        for id in ids {
+            conn.execute_sync(
+                "INSERT INTO agents(id, project_id) VALUES (?, 1)",
+                &[(*id).into()],
+            )
+            .unwrap();
+        }
+    }
+
+    fn shared(conn: &crate::DbConn, message: i64, created: i64) {
+        seed(conn, message, &[], created);
+        conn.execute_sync(
+            "UPDATE messages SET sender_id = 1 WHERE id = ?",
+            &[message.into()],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO project_mailbox_deliveries VALUES (?, 1, 'to', ?)",
+            &[message.into(), created.into()],
+        )
+        .unwrap();
+    }
+
+    fn count(conn: &crate::DbConn, sql: &str) -> i64 {
+        conn.query_sync(sql, &[]).unwrap()[0].get_as(0).unwrap()
+    }
+
+    #[test]
+    fn shared_visibility_and_direct_precedence_are_observed_without_writes() {
+        fixture(|conn| {
+            viewers(conn, &(1..=9).collect::<Vec<_>>());
+            shared(conn, 10, 100);
+            for sql in [
+                "UPDATE agents SET inception_ts = 100 WHERE id = 2",
+                "UPDATE agents SET inception_ts = 101 WHERE id = 3",
+                "UPDATE agents SET retired_at = 2 WHERE id = 4",
+                "UPDATE agents SET contact_policy = 'BLOCK_ALL' WHERE id = 5",
+                "UPDATE agents SET project_id = 2 WHERE id = 9",
+                "INSERT INTO message_recipients VALUES (10, 6, NULL), (10, 7, 1000)",
+                "INSERT INTO project_mailbox_receipts VALUES (10, 2, 44, NULL), (10, 6, 100, 200), (10, 7, 100, NULL), (10, 8, 100, 300)",
+                "PRAGMA query_only = ON",
+            ] {
+                conn.execute_raw(sql).unwrap();
+            }
+            let observed = page(conn, "db", None, 100, 128);
+            assert_eq!(keys(&observed), vec![(10, 2), (10, 6)]);
+            assert!(observed.continuation_after(2).unwrap().is_none());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 2);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                4
+            );
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
+            assert_eq!(
+                count(
+                    conn,
+                    "SELECT read_ts FROM project_mailbox_receipts WHERE agent_id = 2"
+                ),
+                44
+            );
+            assert!(
+                conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES(10, 5, 1, 1)")
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn shared_pages_keep_one_witness_at_every_size_without_fanout() {
+        fixture(|conn| {
+            viewers(conn, &(1..=131).collect::<Vec<_>>());
+            shared(conn, 7, 19);
+            for size in 1..=MAX_ACK_SCAN_PAGE_SIZE {
+                let (sql, params) = page_query("db", None, 19, size).unwrap();
+                let rows = conn.query_sync(&sql, &params).unwrap();
+                assert_eq!(rows.len(), size + 2);
+                let first = decode_page("db".into(), rows, size).unwrap();
+                assert_eq!(first.rows.len(), size);
+                assert!(first.has_more);
+                assert!(first.continuation_after(size + 1).is_err());
+                let cursor = first.continuation_after(size).unwrap().unwrap();
+                let next = page(conn, "db", Some(&cursor), 999, size);
+                assert_eq!(next.rows[0].agent_id, i64::try_from(size + 2).unwrap());
+                assert_eq!(next.overdue_before_ts(), 19);
+            }
+            let mut cursor = None;
+            let mut seen = Vec::new();
+            loop {
+                let observed = page(conn, "db", cursor.as_ref(), 19, 17);
+                seen.extend(keys(&observed));
+                cursor = observed.continuation_after(observed.rows.len()).unwrap();
+                if cursor.is_none() {
+                    break;
+                }
+                assert!(seen.len() <= 130, "the finite shared lap did not progress");
+            }
+            assert_eq!(seen, (2..=131).map(|agent| (7, agent)).collect::<Vec<_>>());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 0);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn shared_ack_and_opt_out_between_pages_preserve_the_frozen_lap() {
+        fixture(|conn| {
+            viewers(conn, &[1, 2, 3, 4, 5]);
+            shared(conn, 1, 10);
+            seed(conn, 2, &[5], 10);
+            seed(conn, 3, &[5], 11);
+            let first = page(conn, "db", None, 10, 2);
+            assert_eq!(keys(&first), vec![(1, 2), (1, 3)]);
+            let zero = first.continuation_after(0).unwrap().unwrap();
+            assert_eq!(keys(&page(conn, "db", Some(&zero), 999, 2)), keys(&first));
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES(1, 3, 50, 50)")
+                .unwrap();
+            conn.execute_raw("UPDATE agents SET contact_policy = 'block_all' WHERE id = 4")
+                .unwrap();
+            shared(conn, 4, 10);
+            let last = page(conn, "db", Some(&cursor), 999, 2);
+            assert_eq!(keys(&last), vec![(1, 5), (2, 5)]);
+            assert_eq!(last.overdue_before_ts(), 10);
+            assert!(last.continuation_after(2).unwrap().is_none());
+            assert_eq!(
+                keys(&page(conn, "db", None, 999, 128)),
+                vec![(1, 2), (1, 5), (2, 5), (3, 5), (4, 2), (4, 3), (4, 5)]
+            );
+        });
+    }
+
+    #[test]
+    fn shared_generation_restart_and_maximum_ids_do_not_skip_viewers() {
+        fixture(|conn| {
+            viewers(conn, &[1, 2, i64::MAX]);
+            shared(conn, i64::MAX, 10);
+            let first = page(conn, "db", None, 10, 1);
+            assert_eq!(keys(&first), vec![(i64::MAX, 2)]);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            let last = page(conn, "db", Some(&cursor), 20, 1);
+            assert_eq!(keys(&last), vec![(i64::MAX, i64::MAX)]);
+            assert!(last.continuation_after(1).unwrap().is_none());
+            conn.execute_raw("UPDATE db_identity SET generation_id = 'replacement'")
+                .unwrap();
+            let restarted = page(conn, "db", Some(&cursor), 20, 1);
+            assert_eq!(keys(&restarted), keys(&first));
+            assert_eq!(restarted.generation_id(), Some("replacement"));
+            assert_eq!(restarted.overdue_before_ts(), 20);
+            let cursor = restarted.continuation_after(1).unwrap().unwrap();
+            assert_eq!(
+                keys(&page(conn, "other-db", Some(&cursor), 30, 1)),
+                keys(&first)
+            );
+        });
+    }
+
+    #[test]
+    fn broken_shared_schema_cannot_return_a_direct_only_page() {
+        fixture(|conn| {
+            viewers(conn, &[1, 2]);
+            shared(conn, 1, 10);
+            seed(conn, 2, &[2], 10);
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO unavailable_receipts")
+                .unwrap();
+            let (sql, params) = page_query("db", None, 10, 128).unwrap();
+            assert!(conn.query_sync(&sql, &params).is_err());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 1);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
+        });
+    }
+
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn shared_pool(test: impl FnOnce(&DbPool, &Cx)) {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let root = tempfile::tempdir().unwrap();
+            let pool = crate::create_pool(&crate::DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &root.path().join("mail.sqlite3"),
+                ),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let conn = run(pool.acquire(&cx)).into_result().unwrap();
+            for sql in [
+                "INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'project', '/project', 1)",
+                "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(101, 101, 'RedFox', 'test', 'test', 1, 1), (102, 101, 'BlueBear', 'test', 'test', 1, 1), (103, 101, 'GreenHill', 'test', 'test', 1, 1)",
+                "INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts, ack_required) VALUES(901, 101, 101, 'Shared obligation', 'Body', 1000000, 1)",
+                "INSERT INTO project_mailbox_deliveries VALUES(901, 101, 'to', 1000000)",
+            ] {
+                conn.execute_raw(sql).unwrap();
+            }
+            drop(conn);
+            test(&pool, &cx);
+        });
+    }
+
+    #[test]
+    fn runtime_shared_page_revalidates_ack_before_granting_the_next_viewer() {
+        shared_pool(|pool, cx| {
+            let first = run(overdue_ack_page(cx, pool, None, 1_000_000, 1))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&first), vec![(901, 102)]);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            run(crate::queries::acknowledge_message(cx, pool, 102, 901))
+                .into_result()
+                .unwrap();
+            let request = AckEscalationRequest {
+                observed: &first.rows[0],
+                overdue_before_ts: first.overdue_before_ts(),
+                generation_id: first.generation_id(),
+                project_slug: "project",
+                project_key: "/project",
+                recipient_name: "BlueBear",
+                holder_id: 102,
+                holder_name: "BlueBear",
+                ttl_seconds: 3600,
+                exclusive: true,
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::NoLongerOverdue)
+            ));
+            let second = run(overdue_ack_page(cx, pool, Some(&cursor), i64::MAX, 1))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&second), vec![(901, 103)]);
+            assert_eq!(second.overdue_before_ts(), 1_000_000);
+            let request = AckEscalationRequest {
+                observed: &second.rows[0],
+                overdue_before_ts: second.overdue_before_ts(),
+                generation_id: second.generation_id(),
+                recipient_name: "GreenHill",
+                holder_id: 103,
+                holder_name: "GreenHill",
+                ..request
+            };
+            let result = run(grant_ack_escalation(cx, pool, &request));
+            assert!(matches!(
+                result,
+                Outcome::Ok(AckEscalationOutcome::Granted(_))
+            ));
+            assert!(second.continuation_after(1).unwrap().is_none());
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 103);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                1
+            );
+            assert_eq!(
+                count(&conn, "SELECT agent_id FROM project_mailbox_receipts"),
+                102
+            );
+            assert!(count(&conn, "SELECT ack_ts FROM project_mailbox_receipts") > 0);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM message_recipients"), 0);
+        });
     }
 
     #[test]
@@ -393,6 +716,7 @@ mod tests {
         fixture(|conn| {
             seed(conn, 1, &[1, 2, 3], 10);
             let first = page(conn, "db", None, 10, 1);
+            assert_eq!(keys(&first), vec![(1, 1)]);
             let cursor = first.continuation_after(1).unwrap().unwrap();
             conn.execute_sync(
                 "UPDATE db_identity SET generation_id = 'generation-two' WHERE singleton = 0",
@@ -469,7 +793,11 @@ mod tests {
     fn compound_limit_is_internal_and_all_data_bindings_are_explicit() {
         for size in 1..=MAX_ACK_SCAN_PAGE_SIZE {
             let (sql, params) = page_query("db", None, i64::MIN, size).unwrap();
-            assert_eq!(params.len(), 7);
+            assert_eq!(params.len(), 8);
+            assert_eq!(
+                params[7],
+                Value::Text(crate::models::DEREGISTERED_TASK_PREFIX.into())
+            );
             assert_eq!(
                 sql.strip_prefix(PAGE_SQL_PREFIX),
                 Some((size + 2).to_string().as_str())
@@ -516,13 +844,245 @@ mod tests {
             let cursor = first.continuation_after(1).unwrap().unwrap();
             let (sql, params) = page_query("mailbox", Some(&cursor), 29, 1).unwrap();
             assert!(!sql.contains(generation));
-            assert_eq!(params.len(), 7);
+            assert_eq!(params.len(), 8);
             let next =
                 decode_page("mailbox".into(), conn.query_sync(&sql, &params).unwrap(), 1).unwrap();
             assert_eq!(keys(&next), vec![(7, 13)]);
             assert_eq!(next.generation_id(), Some(generation));
             assert_eq!(next.overdue_before_ts(), 23);
             assert_eq!(next.window.upper_id, 7);
+        });
+    }
+
+    #[test]
+    fn inactive_direct_and_shared_recipients_keep_history_not_automatic_work() {
+        for mutation in [
+            "UPDATE agents SET retired_at = 0 WHERE id = 2",
+            "UPDATE agents SET retired_at = 42 WHERE id = 2",
+            "INSERT INTO agent_deregistrations VALUES(2, 0)",
+            "INSERT INTO agent_deregistrations VALUES(2, 42)",
+            "UPDATE agents SET task_description = '[DEREGISTERED 2026-01-01T00:00:00Z] old' WHERE id = 2",
+            "UPDATE agents SET task_description = '[DEREGISTERED at 2026-01-01 00:00:00] old' WHERE id = 2",
+            "UPDATE agents SET task_description = '[DEREGISTERED malformed] old' WHERE id = 2",
+        ] {
+            fixture(|conn| {
+                viewers(conn, &[1, 2, 3]);
+                shared(conn, 10, 100);
+                seed(conn, 11, &[2, 3], 100);
+                conn.execute_raw(mutation).unwrap();
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                let observed = page(conn, "db", None, 100, 128);
+                assert_eq!(keys(&observed), vec![(10, 3), (11, 3)], "{mutation}");
+                assert!(observed.continuation_after(2).unwrap().is_none());
+                assert_eq!(count(conn, "SELECT COUNT(*) FROM messages"), 2);
+                assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 2);
+                assert_eq!(
+                    count(
+                        conn,
+                        "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                    ),
+                    2
+                );
+                assert_eq!(
+                    count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                    0
+                );
+                assert_eq!(
+                    count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                    1
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn direct_scope_is_required_without_reapplying_shared_subscription_rules() {
+        fixture(|conn| {
+            viewers(conn, &[1, 2, 3, 4, 5]);
+            shared(conn, 10, 100);
+            seed(conn, 11, &[2, 3, 4, 5], 100);
+            for sql in [
+                "UPDATE agents SET project_id = 2 WHERE id = 3",
+                "UPDATE agents SET id = 99 WHERE id = 4",
+                "UPDATE agents SET contact_policy = 'BLOCK_ALL', inception_ts = 101 WHERE id = 2",
+                "UPDATE agents SET task_description = 'mentions [DEREGISTERED old] in ordinary text' WHERE id = 2",
+                "UPDATE agents SET task_description = '[deregistered lowercase is not reserved]' WHERE id = 5",
+                // A direct ACK wins over a still-unacknowledged shared receipt.
+                "INSERT INTO message_recipients VALUES(10, 5, 42)",
+            ] {
+                conn.execute_raw(sql).unwrap();
+            }
+            assert_eq!(
+                keys(&page(conn, "db", None, 100, 128)),
+                vec![(10, 99), (11, 2), (11, 5)]
+            );
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 5);
+            assert_eq!(
+                count(
+                    conn,
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = 10"
+                ),
+                42
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_changes_between_pages_preserve_the_cursor_and_reactivate_next_lap() {
+        fixture(|conn| {
+            seed(conn, 1, &[1, 2, 3, 4, 5], 10);
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 1")
+                .unwrap();
+            let first = page(conn, "db", None, 10, 1);
+            assert_eq!(keys(&first), vec![(1, 2)]);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 1")
+                .unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 3")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations VALUES(4, 42)")
+                .unwrap();
+            seed(conn, 2, &[5], 10);
+            let next = page(conn, "db", Some(&cursor), 999, 1);
+            assert_eq!(keys(&next), vec![(1, 5)]);
+            assert_eq!(next.overdue_before_ts(), 10);
+            assert!(next.continuation_after(1).unwrap().is_none());
+            assert_eq!(
+                keys(&page(conn, "db", None, 999, 128)),
+                vec![(1, 1), (1, 2), (1, 5), (2, 5)]
+            );
+            assert_eq!(
+                count(
+                    conn,
+                    "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                ),
+                6
+            );
+        });
+    }
+
+    #[test]
+    fn retired_backlog_does_not_consume_the_active_recipients_page() {
+        fixture(|conn| {
+            viewers(conn, &(1..=941).collect::<Vec<_>>());
+            shared(conn, 1, 10);
+            seed(conn, 2, &(2..=941).collect::<Vec<_>>(), 10);
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id <= 940")
+                .unwrap();
+            let observed = page(conn, "db", None, 10, MAX_ACK_SCAN_PAGE_SIZE);
+            assert_eq!(keys(&observed), vec![(1, 941), (2, 941)]);
+            assert!(!observed.has_more);
+            assert!(observed.continuation_after(2).unwrap().is_none());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 940);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn missing_lifecycle_authority_refuses_the_page_and_recovers_without_cursor_loss() {
+        fixture(|conn| {
+            seed(conn, 1, &[1, 2, 3], 10);
+            let first = page(conn, "db", None, 10, 1);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            conn.execute_raw("ALTER TABLE agent_deregistrations RENAME TO unavailable_lifecycle")
+                .unwrap();
+            let (sql, params) = page_query("db", Some(&cursor), 999, 128).unwrap();
+            assert!(conn.query_sync(&sql, &params).is_err());
+            conn.execute_raw("ALTER TABLE unavailable_lifecycle RENAME TO agent_deregistrations")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations VALUES(2, 42)")
+                .unwrap();
+            assert_eq!(
+                keys(&page(conn, "db", Some(&cursor), 999, 128)),
+                vec![(1, 3)]
+            );
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 3);
+        });
+    }
+
+    #[test]
+    fn runtime_lifecycle_scan_and_grant_revalidation_agree_without_erasing_obligations() {
+        shared_pool(|pool, cx| {
+            // The production startup stamps this identity; retain one stable
+            // generation across all observations and the grant transaction.
+            let generation = run(crate::queries::db_generation_id(cx, pool))
+                .into_result()
+                .unwrap();
+            assert!(generation.is_some());
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 102")
+                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')",
+            )
+            .unwrap();
+            drop(conn);
+            let observed = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&observed), vec![(901, 103)]);
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 102")
+                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(103, 42)",
+            )
+            .unwrap();
+            drop(conn);
+            let request = AckEscalationRequest {
+                observed: &observed.rows[0],
+                overdue_before_ts: observed.overdue_before_ts(),
+                generation_id: observed.generation_id(),
+                project_slug: "project",
+                project_key: "/project",
+                recipient_name: "GreenHill",
+                holder_id: 103,
+                holder_name: "GreenHill",
+                ttl_seconds: 3600,
+                exclusive: true,
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::NoLongerOverdue)
+            ));
+            let fresh = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&fresh), vec![(901, 102)]);
+            let request = AckEscalationRequest {
+                observed: &fresh.rows[0],
+                overdue_before_ts: fresh.overdue_before_ts(),
+                generation_id: fresh.generation_id(),
+                recipient_name: "BlueBear",
+                holder_id: 102,
+                holder_name: "BlueBear",
+                ..request
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::Granted(_))
+            ));
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 102);
+            assert_eq!(
+                count(
+                    &conn,
+                    "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                ),
+                1
+            );
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
         });
     }
 }

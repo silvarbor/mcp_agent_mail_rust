@@ -138,6 +138,68 @@ fn make_message(
     })
 }
 
+/// Regression for same-device mount boundaries reported by the staging audit.
+/// The matrix script owns the bind mount's setup and teardown.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires the matrix script's Linux bind mount fixture"]
+fn archive_same_device_bind_mount_probe() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = required_path("AM_FSYNC_BIND_ROOT");
+    let source = root.join("inbox-source");
+    let inbox = root.join("projects/fsync-bind/agents/RecipientAgent/inbox");
+    assert_eq!(
+        fs::metadata(&source).unwrap().dev(),
+        fs::metadata(&inbox).unwrap().dev()
+    );
+    fs::write(source.join("mount-witness"), b"mount boundary").unwrap();
+    assert_eq!(
+        fs::rename(
+            source.join("mount-witness"),
+            inbox.join("relocated-witness")
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::CrossesDevices,
+        "fixture must exercise distinct mounts on the same device"
+    );
+
+    let config = test_config(&root);
+    let archive = ensure_archive(&config, "fsync-bind").expect("ensure bind-mount archive");
+    let message = make_message(1, "fsync-bind", "FSYNC-BIND", "Bind mount probe");
+    let recipients = vec!["RecipientAgent".to_string()];
+    write_message_bundle(
+        &archive,
+        &config,
+        &message,
+        "Bind mount probe payload.",
+        "SenderAgent",
+        &recipients,
+        &[],
+        None,
+    )
+    .expect("publish message across same-device mount boundaries");
+    flush_async_commits();
+    let paths = mcp_agent_mail_storage::message_paths(
+        &archive,
+        "SenderAgent",
+        &recipients,
+        &chrono::DateTime::parse_from_rfc3339(message["created_ts"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        message["subject"].as_str().unwrap(),
+        message["id"].as_i64().unwrap(),
+    )
+    .unwrap();
+    let canonical = fs::read_to_string(&paths.canonical).unwrap();
+    assert!(canonical.ends_with("Bind mount probe payload."));
+    assert_eq!(fs::read_to_string(&paths.outbox).unwrap(), canonical);
+    for path in paths.inbox {
+        assert_eq!(fs::read_to_string(path).unwrap(), canonical);
+    }
+}
+
 fn measure_single_message(storage_root: &Path) -> PercentileSummary {
     let root = storage_root.join("single_message");
     fs::create_dir_all(&root).expect("create single_message root");
@@ -217,10 +279,19 @@ fn measure_batch_message(storage_root: &Path) -> PercentileSummary {
         let started = Instant::now();
         write_message_batch_bundle(&archive, &config, &entries, None)
             .expect("write batch message bundle");
+        let write_elapsed = started.elapsed();
         flush_async_commits();
+        let total_elapsed = started.elapsed();
         if run_idx > 0 {
-            samples.push(duration_to_micros(started.elapsed()));
+            samples.push(duration_to_micros(total_elapsed));
         }
+        // Log after measuring so diagnostics do not enter the latency sample.
+        eprintln!(
+            "batch sample {run_idx}: write_ms={:.3}, flush_ms={:.3}, total_ms={:.3}",
+            write_elapsed.as_secs_f64() * 1000.0,
+            total_elapsed.saturating_sub(write_elapsed).as_secs_f64() * 1000.0,
+            total_elapsed.as_secs_f64() * 1000.0,
+        );
     }
 
     PercentileSummary::from_micros(samples)

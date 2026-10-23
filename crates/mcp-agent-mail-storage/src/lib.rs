@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 // (lines ~1290); removed the bare `use` after bead C5 deleted the
 // read-tree shell-out.
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -555,6 +555,55 @@ fn fence_contention_report(
     })
 }
 
+/// Contended fence waits in progress: wait sequence number to the wait's start
+/// in µs since the epoch. The oldest start is published as
+/// `storage.archive_fence_wait_since_us`, so a timeout that is still waiting
+/// behind the fence names it instead of reporting an unattributed stall
+/// (br-9bwnb).
+static FENCE_WAITS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+static FENCE_WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One contended fence wait, registered until it drops.
+struct FenceWait {
+    seq: u64,
+}
+
+impl FenceWait {
+    fn begin() -> Self {
+        let seq = FENCE_WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.insert(seq, now_micros_u64());
+        publish_oldest_fence_wait(&waits);
+        Self { seq }
+    }
+}
+
+impl Drop for FenceWait {
+    fn drop(&mut self) {
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.remove(&self.seq);
+        publish_oldest_fence_wait(&waits);
+    }
+}
+
+/// The earliest start among `waits`, or zero when none. Sequence order need
+/// not match start order: a wait may take its number, then lose the race for
+/// the map to a later one.
+fn oldest_fence_wait_start(waits: &BTreeMap<u64, u64>) -> u64 {
+    waits.values().copied().min().unwrap_or(0)
+}
+
+fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_fence_wait_since_us
+        .set(oldest_fence_wait_start(waits));
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -571,9 +620,11 @@ impl FenceLease {
             Err(std::sync::TryLockError::WouldBlock) => {
                 let blocker = archive_publication_fence_holder();
                 let started = Instant::now();
+                let wait = FenceWait::begin();
                 let guard = ARCHIVE_PUBLICATION_FENCE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(wait);
                 if let Some(report) =
                     fence_contention_report(started.elapsed(), site, blocker.as_ref())
                 {
@@ -1474,8 +1525,10 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-#[must_use]
-pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+fn write_op_sync_direct_with_cancel(
+    op: &WriteOp,
+    mut cancelled: impl FnMut() -> bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
@@ -1487,6 +1540,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             .add(1);
         return DirectArchiveWrite::SkippedDiskCritical;
     }
+
+    // GH#351: direct request-path publication must never enter the blocking
+    // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
+    // mutation guard used by recovery: try_lock first, preserve the existing
+    // fence -> epoch -> filesystem ordering, and refuse contention before any
+    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
+    // this thread and therefore reuse this already-held publication window.
+    let _publication =
+        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
+            Ok(guard) => guard,
+            Err(error) => return DirectArchiveWrite::Failed(error),
+        };
+
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
     metrics.storage.archive_direct_writes_total.add(1);
@@ -1502,6 +1568,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             DirectArchiveWrite::Failed(error)
         }
     }
+}
+
+/// Cancellation-aware direct writer for request paths with an asupersync
+/// context. Cancellation racing fence admission exits before any archive
+/// mutation bookkeeping or filesystem publication begins.
+#[must_use]
+pub fn write_op_sync_direct_cancellable(cx: &asupersync::Cx, op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || cx.checkpoint().is_err())
+}
+
+#[must_use]
+pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2183,33 @@ static ARCHIVE_BACKLOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
     archive_storage_root(config).join(".archive_backlog")
+}
+
+/// Refuse offline retention while durable archive work could replay old messages.
+///
+/// # Errors
+/// Returns an error for pending journal records or an unreadable journal directory.
+pub fn require_drained_archive_backlog(config: &Config) -> Result<()> {
+    let directory = archive_backlog_journal_dir_for(config);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            return Err(StorageError::InvalidPath(format!(
+                "Archive work is pending at {}. Drain it through the service before pruning.",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
@@ -3066,7 +3172,7 @@ fn wbq_circuit_breaker_escalate(storage_root: &Path, project_slug: &str, consecu
             storage_root = %storage_root.display(),
             "[wbq-circuit-breaker] boot-check found no repairable git-shape issue; the failure \
              cause is elsewhere (disk full / permissions / DB corruption) — run \
-             `am robot health --include-host` then `am doctor --json`",
+             `am robot health --include-host` then `am doctor check --json`",
         );
     }
 }
@@ -3601,7 +3707,17 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     // documented (and debug-asserted) not to initiate archive writes. Keep it
     // that way: never acquire the fence from code already holding a
     // per-project archive lock.
-    let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
+    //
+    // A reservation op takes no outer window (br-9bwnb): it stages and syncs
+    // its artifacts outside the fence and holds it only to rename them into
+    // place, and it takes no per-project archive lock. Holding the fence
+    // across its fsyncs serialized every agent's reservation behind every
+    // other's, the swarm-scale p99 of ~25 s.
+    let _mutation = if matches!(op, WriteOp::FileReservation { .. }) {
+        None
+    } else {
+        Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+    };
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -7419,11 +7535,10 @@ where
     tx.set_target(&refname, commit_oid, Some(sig), &final_message)?;
     tx.commit()?;
     // The archive commit is durable even when an operator or an interrupted
-    // writer owns staged evidence. Index maintenance must never discard it or
-    // turn an already-committed operation into a retryable commit failure.
-    if let Err(error) = sync_clean_index_after_commit(repo, parent.as_ref(), &tree) {
-        tracing::warn!("failed to synchronize clean archive index: {error}");
-    }
+    // writer owns staged evidence. The shared index catches up later, off the
+    // commit path and outside the archive fence; it can never turn an
+    // already-committed operation into a retryable failure (br-0i0g4).
+    note_archive_commit_for_index_sync(repo.path());
     Ok(())
 }
 fn commit_paths_lockfree(
@@ -8067,8 +8182,16 @@ fn archive_storage_root(config: &Config) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const ARCHIVE_GITIGNORE_HEADER: &str = "# Agent Mail runtime artifacts";
-const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
-    &[".mailbox.activity.lock", "diagnostics/", "search_index/"];
+/// `.tmp-*` covers atomic-write temp files (`atomic_write_tmp_path`): staged
+/// reservation artifacts exist outside the publication fence (br-9bwnb), so a
+/// concurrent `commit_all` must never publish one. No archive name can match
+/// it: thread ids and project slugs never start with a dot.
+const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".mailbox.activity.lock",
+    "diagnostics/",
+    "search_index/",
+    ".tmp-*",
+];
 
 /// Ensure the global archive root directory exists and is a git repository.
 ///
@@ -8266,6 +8389,12 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    // A cached repo is no mutation: like `ensure_dir`, it must not wait for
+    // the global publication fence (br-9bwnb: every reservation write opens
+    // its archive here before staging outside the fence).
+    if repo_cache_contains(root) {
+        return Ok(false);
+    }
     let _mutation = ArchiveMutationGuard::begin_at(root);
     if repo_cache_contains(root) {
         return Ok(false);
@@ -8276,9 +8405,11 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         // Pre-existing archive: apply gc defaults once. `configure_archive_git_defaults`
         // is idempotent and respects operator-set values, so this is safe to run
         // every time a cold process first opens the archive.
-        if let Ok(existing) = Repository::open(root) {
-            configure_archive_git_defaults(&existing);
-        }
+        // A leftover .git directory is not proof that initialization succeeded.
+        // Propagate an invalid repository before changing its configuration or
+        // caching the path; otherwise subsequent writes silently trust it.
+        let existing = Repository::open(root)?;
+        configure_archive_git_defaults(&existing);
         if ensure_archive_gitignore(root)? {
             commit_paths_with_retry(
                 root,
@@ -8480,6 +8611,13 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
 }
 
 /// Write file reservation records to the archive and commit.
+///
+/// Every artifact is written and synced under a temp name before the archive
+/// publication fence is taken; the fence covers only the renames that publish
+/// them (br-9bwnb). The fence serializes every archive writer in the process,
+/// so syncing inside it queued each agent's reservation behind every other
+/// agent's. Durability on return is unchanged: the data is synced before the
+/// rename, exactly as `atomic_write_bytes` does it.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -8530,7 +8668,9 @@ pub fn write_file_reservation_records(
     let reservation_dir = project_root.join("file_reservations");
     ensure_dir(&reservation_dir)?;
 
+    let mut files = Vec::with_capacity(normalized_reservations.len() * 2);
     for (normalized, path_pattern, agent_name) in normalized_reservations {
+        let content = serde_json::to_string_pretty(&normalized)?.into_bytes();
         // Legacy path: sha1(path_pattern).json
         let digest = {
             let mut hasher = sha1::Sha1::new();
@@ -8538,8 +8678,8 @@ pub fn write_file_reservation_records(
             hex::encode(hasher.finalize())
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
-        write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
+        files.push((legacy_path, content.clone()));
 
         // Stable per-reservation artifact, keyed by (db_generation, id). The
         // generation token (br-n8qh6) makes the name unique across DB
@@ -8556,12 +8696,13 @@ pub fn write_file_reservation_records(
                     generation, id,
                 ),
             );
-            write_json(&id_path, &normalized, true)?;
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
+            files.push((id_path, content));
         }
 
         entries.push((agent_name, path_pattern));
     }
+    StagedArchiveWrites::stage(files)?.publish()?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -8760,12 +8901,13 @@ fn collect_canonical_message_paths_with_id(
     messages_root: &Path,
     message_id: i64,
     matches: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
     let wanted_ids = HashSet::from([message_id]);
-    let index = collect_canonical_message_id_index(messages_root, &wanted_ids);
+    let index = collect_canonical_message_id_index(messages_root, &wanted_ids)?;
     if let Some(paths) = index.get(&message_id) {
         matches.extend(paths.iter().cloned());
     }
+    Ok(())
 }
 
 /// Stat identity of a canonical message file; see [`CanonicalIdCache`].
@@ -8780,8 +8922,8 @@ struct MessageFileStamp {
 }
 
 #[cfg(unix)]
-fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
-    use std::os::unix::fs::MetadataExt as _;
+fn message_file_stamp(metadata: &cap_std::fs::Metadata) -> Option<MessageFileStamp> {
+    use cap_std::fs::MetadataExt as _;
 
     Some(MessageFileStamp {
         len: metadata.len(),
@@ -8796,7 +8938,7 @@ fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
 
 /// Without a change time a rewritten file cannot be told apart: never cache.
 #[cfg(not(unix))]
-const fn message_file_stamp(_metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+const fn message_file_stamp(_metadata: &cap_std::fs::Metadata) -> Option<MessageFileStamp> {
     None
 }
 
@@ -8835,6 +8977,178 @@ const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
 static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalIdCache>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Pins a month's directory chain for one collision scan. File opens cannot
+/// follow a substituted symlink; validating the retained chain before returning
+/// the scan prevents a replaced directory from yielding an accepted result.
+#[cfg(unix)]
+#[derive(Clone)]
+struct CanonicalScanDirectory {
+    chain: Vec<(PathBuf, Arc<CanonicalDirectoryHandle>)>,
+}
+
+#[cfg(unix)]
+struct CanonicalDirectoryHandle {
+    file: fs::File,
+    /// An open descriptor pins this identity even when its path is replaced.
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+impl CanonicalDirectoryHandle {
+    fn new(file: fs::File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        Ok(Self {
+            file,
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl CanonicalScanDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        Self::open_cached(path, &mut HashMap::new())
+    }
+
+    fn open_cached(
+        path: &Path,
+        handles: &mut HashMap<PathBuf, std::sync::Weak<CanonicalDirectoryHandle>>,
+    ) -> Result<Self> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        let path = std::path::absolute(path)?;
+        let mut current = PathBuf::from("/");
+        let root = if let Some(file) = handles.get(&current).and_then(std::sync::Weak::upgrade) {
+            file
+        } else {
+            let file = Arc::new(CanonicalDirectoryHandle::new(fs::File::open(&current)?)?);
+            handles.insert(current.clone(), Arc::downgrade(&file));
+            file
+        };
+        let mut chain = vec![(current.clone(), root)];
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(name) => name,
+                Component::ParentDir => std::ffi::OsStr::new(".."),
+                _ => {
+                    return Err(StorageError::InvalidPath(
+                        "invalid scan directory component".into(),
+                    ));
+                }
+            };
+            let parent = &chain.last().expect("root directory is retained").1;
+            current.push(name);
+            if let Some(file) = handles.get(&current).and_then(std::sync::Weak::upgrade) {
+                chain.push((current.clone(), file));
+                continue;
+            }
+            let fd = openat(
+                &parent.file,
+                name,
+                OFlag::O_RDONLY
+                    | OFlag::O_DIRECTORY
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let file = Arc::new(CanonicalDirectoryHandle::new(fs::File::from(fd))?);
+            handles.insert(current.clone(), Arc::downgrade(&file));
+            chain.push((current.clone(), file));
+        }
+        let directory = Self { chain };
+        directory.validate_binding()?;
+        Ok(directory)
+    }
+
+    fn file(&self) -> &fs::File {
+        &self
+            .chain
+            .last()
+            .expect("root directory is retained")
+            .1
+            .file
+    }
+
+    fn path(&self) -> &Path {
+        &self.chain.last().expect("root directory is retained").0
+    }
+
+    fn validate_binding(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for (path, file) in &self.chain {
+            let current = fs::symlink_metadata(path)?;
+            if !current.is_dir() || (current.dev(), current.ino()) != file.identity {
+                return Err(StorageError::InvalidPath(format!(
+                    "canonical scan directory was replaced: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn entries(&self) -> std::io::Result<cap_std::fs::ReadDir> {
+        let directory = &self.chain.last().expect("root directory is retained").1;
+        cap_std::fs::Dir::from_std_file(directory.file.try_clone()?).entries()
+    }
+
+    fn read_frontmatter(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> Result<(Option<MessageFileStamp>, serde_json::Value)> {
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::Mode;
+
+        let path = Path::new(name);
+        if !matches!(path.components().next(), Some(Component::Normal(_)))
+            || path.components().count() != 1
+        {
+            return Err(StorageError::InvalidPath(
+                "invalid scan file component".into(),
+            ));
+        }
+        let parent = &self.chain.last().expect("root directory is retained").1;
+        let fd = openat(
+            &parent.file,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut file = fs::File::from(fd);
+        let before = cap_std::fs::Metadata::from_file(&file)?;
+        if !before.is_file() || before.len() > MAX_MESSAGE_FILE_BYTES {
+            return Err(StorageError::InvalidPath(
+                "scan entry is not a bounded regular message file".into(),
+            ));
+        }
+        let mut content = String::new();
+        (&mut file)
+            .take(MAX_MESSAGE_FILE_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > MAX_MESSAGE_FILE_BYTES {
+            return Err(StorageError::InvalidPath(
+                "message grew beyond scan size limit".into(),
+            ));
+        }
+        let before = message_file_stamp(&before);
+        let after = message_file_stamp(&cap_std::fs::Metadata::from_file(&file)?);
+        if before != after {
+            return Err(StorageError::InvalidPath(
+                "canonical message changed while being scanned".into(),
+            ));
+        }
+        Ok((after, parse_message_content(content)?.0))
+    }
+}
+
 fn unix_time_ns(time: SystemTime) -> i128 {
     time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
         i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX)
@@ -8844,8 +9158,13 @@ fn unix_time_ns(time: SystemTime) -> i128 {
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
-) -> HashMap<i64, Vec<PathBuf>> {
-    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    Ok(collect_canonical_message_id_index_with_window(
+        messages_root,
+        wanted_ids,
+        RACY_STAMP_WINDOW,
+    )?
+    .0)
 }
 
 /// The id index for `wanted_ids`, and how many files had to be parsed.
@@ -8853,23 +9172,34 @@ fn collect_canonical_message_id_index_with_window(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
     racy_window: Duration,
-) -> (HashMap<i64, Vec<PathBuf>>, usize) {
+) -> Result<(HashMap<i64, Vec<PathBuf>>, usize)> {
     let mut index = HashMap::new();
     let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return (index, parsed);
+        return Ok((index, parsed));
     }
-    if !path_is_nonsymlink_dir(messages_root) {
-        return (index, parsed);
+    if path_existing_prefix_has_symlink(messages_root)? {
+        return Err(StorageError::InvalidPath(
+            "symlinked canonical scan root".into(),
+        ));
     }
-    // `read_message_file` refuses every file under a symlinked prefix, so no
-    // file can match; cached ids must not be served through one either.
-    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
-        return (index, parsed);
-    }
-
-    let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return (index, parsed);
+    #[cfg(unix)]
+    let root_directory = match CanonicalScanDirectory::open(messages_root) {
+        Ok(directory) => directory,
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((index, parsed));
+        }
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    let year_entries = root_directory.entries();
+    #[cfg(not(unix))]
+    let year_entries = fs::read_dir(messages_root);
+    let year_entries = match year_entries {
+        Ok(entries) => entries,
+        #[cfg(not(unix))]
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((index, parsed)),
+        Err(error) => return Err(error.into()),
     };
     let cache = {
         let mut caches = CANONICAL_ID_CACHES
@@ -8882,11 +9212,10 @@ fn collect_canonical_message_id_index_with_window(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
     let mut seen = HashSet::with_capacity(cache.files.len());
-    for year_entry in year_entries.flatten() {
-        let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
-            continue;
-        };
+    for year_entry in year_entries {
+        let year_entry = year_entry?;
+        let year_path = messages_root.join(year_entry.file_name());
+        let year_type = year_entry.file_type()?;
         if !year_type.is_dir() || year_type.is_symlink() {
             continue;
         }
@@ -8897,14 +9226,16 @@ fn collect_canonical_message_id_index_with_window(
             continue;
         }
 
-        let Ok(month_entries) = fs::read_dir(&year_path) else {
-            continue;
-        };
-        for month_entry in month_entries.flatten() {
-            let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
-                continue;
-            };
+        #[cfg(unix)]
+        let year_directory = CanonicalScanDirectory::open(&year_path)?;
+        #[cfg(unix)]
+        let month_entries = year_directory.entries()?;
+        #[cfg(not(unix))]
+        let month_entries = fs::read_dir(&year_path)?;
+        for month_entry in month_entries {
+            let month_entry = month_entry?;
+            let month_path = year_path.join(month_entry.file_name());
+            let month_type = month_entry.file_type()?;
             if !month_type.is_dir() || month_type.is_symlink() {
                 continue;
             }
@@ -8915,14 +9246,16 @@ fn collect_canonical_message_id_index_with_window(
                 continue;
             }
 
-            let Ok(file_entries) = fs::read_dir(&month_path) else {
-                continue;
-            };
-            for file_entry in file_entries.flatten() {
-                let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
-                    continue;
-                };
+            #[cfg(unix)]
+            let scan_directory = CanonicalScanDirectory::open(&month_path)?;
+            #[cfg(unix)]
+            let file_entries = scan_directory.entries()?;
+            #[cfg(not(unix))]
+            let file_entries = fs::read_dir(&month_path)?;
+            for file_entry in file_entries {
+                let file_entry = file_entry?;
+                let file_path = month_path.join(file_entry.file_name());
+                let file_type = file_entry.file_type()?;
                 if !file_type.is_file()
                     || file_type.is_symlink()
                     || file_path.extension().is_none_or(|ext| ext != "md")
@@ -8930,11 +9263,10 @@ fn collect_canonical_message_id_index_with_window(
                     continue;
                 }
 
-                let stamp = file_entry
-                    .metadata()
-                    .ok()
-                    .as_ref()
-                    .and_then(message_file_stamp);
+                let metadata = file_entry.metadata().ok();
+                #[cfg(not(unix))]
+                let metadata = metadata.map(cap_std::fs::Metadata::from_just_metadata);
+                let stamp = metadata.as_ref().and_then(message_file_stamp);
                 seen.insert(file_path.clone());
                 let cached = stamp.and_then(|stamp| {
                     cache
@@ -8948,10 +9280,22 @@ fn collect_canonical_message_id_index_with_window(
                 } else {
                     parsed += 1;
                     let parsed_at_ns = unix_time_ns(SystemTime::now());
-                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                        // Never cache a failed read: it may be transient.
-                        cache.files.remove(&file_path);
-                        continue;
+                    #[cfg(unix)]
+                    let read = scan_directory.read_frontmatter(&file_entry.file_name());
+                    #[cfg(not(unix))]
+                    let read =
+                        read_message_file(&file_path).map(|(frontmatter, _)| (stamp, frontmatter));
+                    let (stamp, frontmatter) = match read {
+                        Ok(value) => value,
+                        Err(StorageError::Json(_)) => {
+                            // Never cache a failed read: it may be transient.
+                            cache.files.remove(&file_path);
+                            continue;
+                        }
+                        Err(error) => {
+                            cache.files.remove(&file_path);
+                            return Err(error);
+                        }
                     };
                     let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
                     if let Some(stamp) = stamp {
@@ -8963,6 +9307,8 @@ fn collect_canonical_message_id_index_with_window(
                                 id,
                             },
                         );
+                    } else {
+                        cache.files.remove(&file_path);
                     }
                     id
                 };
@@ -8976,10 +9322,16 @@ fn collect_canonical_message_id_index_with_window(
                         .push(file_path);
                 }
             }
+            #[cfg(unix)]
+            scan_directory.validate_binding()?;
         }
+        #[cfg(unix)]
+        year_directory.validate_binding()?;
     }
+    #[cfg(unix)]
+    root_directory.validate_binding()?;
     cache.files.retain(|path, _| seen.contains(path));
-    (index, parsed)
+    Ok((index, parsed))
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -9022,7 +9374,7 @@ fn reject_canonical_message_id_collision(
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
     let mut matches = Vec::new();
-    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches);
+    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches)?;
     reject_canonical_message_id_collision_against_matches(
         message_id,
         &matches,
@@ -9069,10 +9421,7 @@ fn collect_existing_batch_message_ids(
     }
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
-    Ok(collect_canonical_message_id_index(
-        &messages_root,
-        &wanted_ids,
-    ))
+    collect_canonical_message_id_index(&messages_root, &wanted_ids)
 }
 
 fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
@@ -9106,6 +9455,12 @@ fn redact_message_bcc_for_inbox(message: &serde_json::Value) -> serde_json::Valu
 struct MessageBundleCommitMeta {
     auto_commit_message: String,
     summary_line: String,
+}
+
+struct PreparedMessageBundle {
+    commit: MessageBundleCommitMeta,
+    canonical_path: PathBuf,
+    timestamp: String,
 }
 
 fn visible_recipient_label(visible_recipients: &[String]) -> String {
@@ -9185,31 +9540,13 @@ fn message_paths_for_bundle(
     Ok((paths, created, timestamp_str))
 }
 
-fn reject_message_bundle_archive_collision_from_index(
-    existing_ids: &HashMap<i64, Vec<PathBuf>>,
-    archive: &ProjectArchive,
-    message: &serde_json::Value,
-    body_md: &str,
-    sender: &str,
-    recipients: &[String],
-) -> Result<()> {
-    let (paths, _created, _timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
-    let full_content = render_message_bundle_content(message, body_md)?;
-    reject_canonical_message_id_collision_from_index(
-        existing_ids,
-        message,
-        &paths.canonical,
-        &full_content,
-    )
-}
-
 fn append_message_bundle_files(
     archive: &ProjectArchive,
     entry: MessageBundleBatchEntry<'_>,
     rel_paths: &mut Vec<String>,
     existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
-) -> Result<MessageBundleCommitMeta> {
+    writes: &mut StagedArchiveWrites,
+) -> Result<PreparedMessageBundle> {
     let message = entry.message;
     let body_md = entry.body_md;
     let sender = entry.sender;
@@ -9240,43 +9577,24 @@ fn append_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    write_text(&paths.canonical, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
+    rel_paths.push(writes.add_repo_file(
         &archive.canonical_repo_root,
         &paths.canonical,
+        full_content.as_bytes(),
     )?);
 
-    write_text(&paths.outbox, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
+    rel_paths.push(writes.add_repo_file(
         &archive.canonical_repo_root,
         &paths.outbox,
+        full_content.as_bytes(),
     )?);
 
     for inbox_path in &paths.inbox {
-        write_text(inbox_path, inbox_content_ref, true)?;
-        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
-    }
-
-    if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
-        let thread_id = thread_id.trim();
-        if !thread_id.is_empty() {
-            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
-            if let Ok(digest_rel) = update_thread_digest(
-                archive,
-                thread_id,
-                sender,
-                &visible_recipients,
-                message
-                    .get("subject")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-                &timestamp_str,
-                body_md,
-                &canonical_rel,
-            ) {
-                rel_paths.push(digest_rel);
-            }
-        }
+        rel_paths.push(writes.add_repo_file(
+            &archive.canonical_repo_root,
+            inbox_path,
+            inbox_content_ref.as_bytes(),
+        )?);
     }
 
     for p in extra_paths {
@@ -9284,12 +9602,56 @@ fn append_message_bundle_files(
         rel_paths.push(p.to_string());
     }
 
-    Ok(build_message_bundle_commit_meta(
-        message,
-        sender,
-        &visible_recipients,
-        &timestamp_str,
-    ))
+    Ok(PreparedMessageBundle {
+        commit: build_message_bundle_commit_meta(
+            message,
+            sender,
+            &visible_recipients,
+            &timestamp_str,
+        ),
+        canonical_path: paths.canonical,
+        timestamp: timestamp_str,
+    })
+}
+
+fn append_message_bundle_digest(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    prepared: &PreparedMessageBundle,
+    rel_paths: &mut Vec<String>,
+    pending: Option<&mut BTreeMap<String, (String, String)>>,
+) -> Result<()> {
+    let message = entry.message;
+    if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            let canonical_rel =
+                rel_path_cached(&archive.canonical_repo_root, &prepared.canonical_path)?;
+            let digest_entry = render_thread_digest_entry(
+                entry.sender,
+                &message_visible_recipients(message),
+                message
+                    .get("subject")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                &prepared.timestamp,
+                entry.body_md,
+                &canonical_rel,
+            );
+            if let Some(pending) = pending {
+                // Different thread spellings can share a sanitized filename.
+                // Preserve their original order and the first entry's header.
+                let (_, contents) = pending
+                    .entry(sanitize_thread_id(thread_id))
+                    .or_insert_with(|| (thread_id.to_string(), String::new()));
+                contents.push_str(&digest_entry);
+            } else if let Ok(digest_rel) = append_thread_digest(archive, thread_id, &digest_entry) {
+                rel_paths.push(digest_rel);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn dedup_repo_relative_paths(rel_paths: &mut Vec<String>) {
@@ -9425,23 +9787,17 @@ pub fn write_message_batch_bundle(
     with_project_lock(archive, || {
         let existing_message_ids = collect_existing_batch_message_ids(archive, entries)?;
 
+        // Preparation checks every collision before publication. A later
+        // rejection drops all staged files without exposing earlier entries.
+        let mut writes = StagedArchiveWrites::default();
+        let mut prepared = Vec::with_capacity(entries.len());
         for entry in entries {
-            reject_message_bundle_archive_collision_from_index(
-                &existing_message_ids,
-                archive,
-                entry.message,
-                entry.body_md,
-                entry.sender,
-                entry.recipients,
-            )?;
-        }
-
-        for entry in entries {
-            let commit_meta = match append_message_bundle_files(
+            let bundle = match append_message_bundle_files(
                 archive,
                 *entry,
                 &mut rel_paths,
                 Some(&existing_message_ids),
+                &mut writes,
             ) {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -9456,7 +9812,7 @@ pub fn write_message_batch_bundle(
                         outcome = "error",
                         git_version = git_version,
                         batch_id = %args_hash,
-                        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+                        files_written = 0u64,
                         total_bytes = total_bytes,
                         error_kind = %error_kind,
                         "disk_phase"
@@ -9479,10 +9835,27 @@ pub fn write_message_batch_bundle(
                     return Err(err);
                 }
             };
+            prepared.push(bundle);
+        }
+        writes.publish()?;
+        let mut digests = BTreeMap::new();
+        for (entry, bundle) in entries.iter().zip(prepared) {
+            append_message_bundle_digest(
+                archive,
+                *entry,
+                &bundle,
+                &mut rel_paths,
+                Some(&mut digests),
+            )?;
             if entries.len() == 1 {
-                single_auto_commit_message = Some(commit_meta.auto_commit_message);
+                single_auto_commit_message = Some(bundle.commit.auto_commit_message);
             }
-            summary_lines.push(commit_meta.summary_line);
+            summary_lines.push(bundle.commit.summary_line);
+        }
+        for (thread_id, contents) in digests.values() {
+            if let Ok(digest_rel) = append_thread_digest(archive, thread_id, contents) {
+                rel_paths.push(digest_rel);
+            }
         }
         Ok(())
     })?;
@@ -9579,10 +9952,14 @@ pub fn write_message_bundle(
             recipients,
             extra_paths,
         };
-        let commit_meta = append_message_bundle_files(archive, entry, &mut rel_paths, None)?;
+        let mut writes = StagedArchiveWrites::default();
+        let prepared =
+            append_message_bundle_files(archive, entry, &mut rel_paths, None, &mut writes)?;
+        writes.publish()?;
+        append_message_bundle_digest(archive, entry, &prepared, &mut rel_paths, None)?;
         let commit_message = commit_text
             .map(ToString::to_string)
-            .unwrap_or(commit_meta.auto_commit_message);
+            .unwrap_or(prepared.commit.auto_commit_message);
 
         enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
@@ -9647,25 +10024,14 @@ fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
     Utc::now()
 }
 
-/// Update (append to) a thread-level digest file.
-#[allow(clippy::too_many_arguments)]
-fn update_thread_digest(
-    archive: &ProjectArchive,
-    thread_id: &str,
+fn render_thread_digest_entry(
     sender: &str,
     recipients: &[String],
     subject: &str,
     timestamp: &str,
     body_md: &str,
     canonical_rel: &str,
-) -> Result<String> {
-    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
-    let project_root = archive_project_root_checked(archive)?;
-    let digest_dir = project_root.join("messages").join("threads");
-    ensure_dir(&digest_dir)?;
-
-    let safe_thread_id = sanitize_thread_id(thread_id);
-    let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
+) -> String {
     let recipients_str = if recipients.is_empty() {
         "(hidden recipients)".to_string()
     } else {
@@ -9689,17 +10055,28 @@ fn update_thread_digest(
         preview.to_string()
     };
 
-    let entry = format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n");
+    format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n")
+}
+
+/// Append ordered entries to one thread digest while holding the archive fence.
+fn append_thread_digest(
+    archive: &ProjectArchive,
+    thread_id: &str,
+    entries: &str,
+) -> Result<String> {
+    let _mutation = ArchiveMutationGuard::begin_at(&archive.repo_root);
+    let project_root = archive_project_root_checked(archive)?;
+    let digest_dir = project_root.join("messages").join("threads");
+    ensure_dir(&digest_dir)?;
+    let safe_thread_id = sanitize_thread_id(thread_id);
+    let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
 
     // Append to digest. Use create_new to atomically determine if this is
     // the first entry (eliminates TOCTOU race between exists() + create).
     //
-    // CORRECTNESS: Build the full payload in memory and write it with a
-    // single `write_all()` call. On most filesystems, writes under the
-    // `PIPE_BUF` limit (~4 KB on Linux) to an O_APPEND fd are atomic with
-    // respect to other appenders. Even for larger payloads, combining
-    // header + entry into one write avoids interleaving from concurrent
-    // writers between the two calls.
+    // Message writers hold the project lock through this append. Assemble the
+    // header and entries together; write_all may need multiple system calls,
+    // so serialization comes from the locks rather than a payload-size limit.
     let (mut file, is_new) = match create_new_archive_append_file(&digest_path) {
         Ok(f) => (f, true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -9709,11 +10086,11 @@ fn update_thread_digest(
         Err(e) => return Err(e.into()),
     };
 
-    // Single write: header (if new) + entry — no interleaving possible.
+    // Include the header only when this call created the digest.
     let payload = if is_new {
-        format!("# Thread {thread_id}\n\n{entry}")
+        format!("# Thread {thread_id}\n\n{entries}")
     } else {
-        entry
+        entries.to_string()
     };
     file.write_all(payload.as_bytes())?;
 
@@ -12068,7 +12445,7 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
             format!("message path is not a regular file: {}", path.display()),
         )));
     }
-    if meta.len() > 50 * 1024 * 1024 {
+    if meta.len() > MAX_MESSAGE_FILE_BYTES {
         // 50MB safety limit
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -12080,7 +12457,12 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
     }
 
     let content = fs::read_to_string(path)?;
+    parse_message_content(content)
+}
 
+const MAX_MESSAGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn parse_message_content(content: String) -> Result<(serde_json::Value, String)> {
     // Parse ---json frontmatter
     if let Some(rest) = content.strip_prefix("---json\n")
         && let Some(end_idx) = rest.find("\n---\n")
@@ -12427,19 +12809,381 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
     Ok(())
 }
 
-/// Update an unstaged index without consuming an interrupted writer's evidence.
+// ── Shared `.git/index` maintenance (br-0i0g4) ──────────────────────────────
+//
+// Commits build trees from private indexes and never read `.git/index`. It is
+// kept current so `git status` in the archive (and tooling that walks it) sees
+// a clean tree. Rewriting it is O(archive): about 0.5 s and 32 MB for a
+// 174k-file archive. Doing that after every commit, under the archive fence,
+// cost ~6 cpu-s and ~75 MB per message on a 352k-file archive (GH#337) and
+// stretched fence holds. Commits now only mark the repository pending; one
+// background thread brings the index up to HEAD outside the fence once commits
+// pause for `ARCHIVE_INDEX_SYNC_QUIET_PERIOD` (or the index has lagged for
+// `ARCHIVE_INDEX_SYNC_MAX_LAG` under unbroken traffic), and waits
+// `ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR` times as long as a rewrite took before
+// rewriting that index again. Rewriting between commits instead cost a
+// 350k-file archive 10-15% more CPU and 30-160% more bytes per message than
+// refusing the rewrite outright.
+
+/// Record, inside the archive's Git directory, of the tree the shared index
+/// was last synchronized to and the identity of the index file written then.
+const ARCHIVE_INDEX_SYNC_FILE_NAME: &str = "agent-mail-index-sync";
+const ARCHIVE_INDEX_SYNC_FORMAT_VERSION: &str = "1";
+/// Shortest interval between two rewrites of one archive's index.
+const ARCHIVE_INDEX_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// The next rewrite of an index waits this many times the previous rewrite,
+/// so rewriting stays near 3% of one core however large the index grows.
+const ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR: u32 = 30;
+/// Commits must pause this long before their index is rewritten.
+const ARCHIVE_INDEX_SYNC_QUIET_PERIOD: Duration = Duration::from_secs(2);
+/// An index behind HEAD this long is rewritten even if commits never pause.
+const ARCHIVE_INDEX_SYNC_MAX_LAG: Duration = Duration::from_secs(300);
+/// Without a matching record, an index equal to one of this many most recent
+/// first-parent commits is a sync that fell behind, not foreign state.
+const ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct ArchiveIndexSyncState {
+    /// Git directories with commits the shared index has not caught up with.
+    pending: BTreeMap<PathBuf, ArchiveIndexLag>,
+    /// Earliest next rewrite per Git directory.
+    next_due: HashMap<PathBuf, Instant>,
+    /// Git directories whose current run of failures was already logged.
+    warned: HashSet<PathBuf>,
+    worker_started: bool,
+    /// A sync is rewriting an index right now.
+    in_flight: bool,
+    /// Shutdown: start no further syncs.
+    stopping: bool,
+}
+
+/// When an index fell behind HEAD, and when its latest commit landed.
+#[derive(Debug, Clone, Copy)]
+struct ArchiveIndexLag {
+    since: Instant,
+    last_commit: Instant,
+}
+
+fn mark_archive_index_pending(state: &mut ArchiveIndexSyncState, git_dir: &Path, now: Instant) {
+    state
+        .pending
+        .entry(git_dir.to_path_buf())
+        .and_modify(|lag| lag.last_commit = now)
+        .or_insert(ArchiveIndexLag {
+            since: now,
+            last_commit: now,
+        });
+}
+
+static ARCHIVE_INDEX_SYNC: LazyLock<(Mutex<ArchiveIndexSyncState>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(ArchiveIndexSyncState::default()), Condvar::new()));
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests get the shared index synchronized at commit time, so archive
+    /// fixtures always find a current `.git/index`. Tests of the background
+    /// contract switch this off for their thread.
+    static ARCHIVE_INDEX_SYNC_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Mark `git_dir`'s shared index as behind HEAD and wake the sync worker.
+fn note_archive_commit_for_index_sync(git_dir: &Path) {
+    #[cfg(test)]
+    if ARCHIVE_INDEX_SYNC_INLINE.with(std::cell::Cell::get) {
+        let _ = sync_archive_index_to_head(git_dir);
+        return;
+    }
+    let (state, wake) = &*ARCHIVE_INDEX_SYNC;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mark_archive_index_pending(&mut state, git_dir, Instant::now());
+    // Unit tests drive `sync_archive_index_to_head` themselves so their index
+    // assertions are deterministic.
+    if !state.worker_started && !cfg!(test) {
+        match std::thread::Builder::new()
+            .name("archive-index-sync".to_string())
+            .spawn(archive_index_sync_worker)
+        {
+            Ok(_) => state.worker_started = true,
+            Err(error) => {
+                tracing::warn!("could not start the archive index sync worker: {error}");
+            }
+        }
+    }
+    drop(state);
+    wake.notify_one();
+}
+
+/// Stop the index sync worker for shutdown: start no further syncs and wait up
+/// to `timeout` for one in progress, so the process does not exit holding
+/// `.git/index.lock`. A sync still owed is left to the next process's commits.
+pub fn stop_archive_index_sync(timeout: Duration) {
+    let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+    let mut state = state_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopping = true;
+    wake.notify_all();
+    let deadline = Instant::now() + timeout;
+    while state.in_flight {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            tracing::warn!("archive index sync still running at shutdown; not waiting longer");
+            break;
+        }
+        state = wake
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// The pending Git directory to synchronize at `now`, or how long until the
+/// earliest pending one is due (`None` when nothing is pending).
+fn next_archive_index_sync(
+    state: &ArchiveIndexSyncState,
+    now: Instant,
+) -> std::result::Result<PathBuf, Option<Duration>> {
+    let mut wait: Option<Duration> = None;
+    for (git_dir, lag) in &state.pending {
+        // Due once commits pause, or once the lag bound is reached, and never
+        // before the backoff from the previous rewrite ends.
+        let wanted = (lag.last_commit + ARCHIVE_INDEX_SYNC_QUIET_PERIOD)
+            .min(lag.since + ARCHIVE_INDEX_SYNC_MAX_LAG);
+        let due = state
+            .next_due
+            .get(git_dir)
+            .map_or(wanted, |backoff| (*backoff).max(wanted));
+        if due <= now {
+            return Ok(git_dir.clone());
+        }
+        let left = due - now;
+        wait = Some(wait.map_or(left, |wait| wait.min(left)));
+    }
+    Err(wait)
+}
+
+/// How long after a rewrite that took `elapsed` the same index may be
+/// rewritten again.
+fn archive_index_sync_backoff(elapsed: Duration) -> Duration {
+    elapsed
+        .saturating_mul(ARCHIVE_INDEX_SYNC_BACKOFF_FACTOR)
+        .max(ARCHIVE_INDEX_SYNC_MIN_INTERVAL)
+}
+
+fn archive_index_sync_worker() {
+    let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+    loop {
+        let git_dir = {
+            let mut state = state_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if state.stopping {
+                    return;
+                }
+                match next_archive_index_sync(&state, Instant::now()) {
+                    Ok(git_dir) => {
+                        state.pending.remove(&git_dir);
+                        state.in_flight = true;
+                        break git_dir;
+                    }
+                    Err(Some(wait)) => {
+                        state = wake
+                            .wait_timeout(state, wait)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                    Err(None) => {
+                        state = wake
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            }
+        };
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(|| sync_archive_index_to_head(&git_dir))
+            .unwrap_or_else(|_| {
+                Err(StorageError::Io(std::io::Error::other(
+                    "archive index synchronization panicked",
+                )))
+            });
+        let mut state = state_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = false;
+        wake.notify_all();
+        state.next_due.insert(
+            git_dir.clone(),
+            Instant::now() + archive_index_sync_backoff(started.elapsed()),
+        );
+        match result {
+            Ok(ArchiveIndexSync::Settled) => {
+                state.warned.remove(&git_dir);
+            }
+            // Someone else holds the lock: this commit's sync is still owed.
+            Ok(ArchiveIndexSync::Locked) => {
+                mark_archive_index_pending(&mut state, &git_dir, Instant::now());
+            }
+            Err(error) if state.warned.insert(git_dir.clone()) => tracing::warn!(
+                git_dir = %git_dir.display(),
+                "could not bring the archive's .git/index up to HEAD: {error}; repeats are logged at debug level until it succeeds"
+            ),
+            Err(error) => tracing::debug!(
+                git_dir = %git_dir.display(),
+                "could not bring the archive's .git/index up to HEAD: {error}"
+            ),
+        }
+    }
+}
+
+/// Device, inode, length and modification time of an index file.
+fn archive_index_file_identity(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        format!(
+            "{}:{}:{}:{modified}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        format!("{}:{modified}", metadata.len())
+    }
+}
+
+/// The tree recorded by the last sync, if the record describes `identity`.
+/// The tree the last sync wrote and the identity of the index file it wrote.
+fn read_archive_index_sync_record(git_dir: &Path) -> Option<(git2::Oid, String)> {
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME),
+        512,
+    )
+    .ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != ARCHIVE_INDEX_SYNC_FORMAT_VERSION {
+        return None;
+    }
+    let tree = git2::Oid::from_str(lines.next()?).ok()?;
+    let identity = lines.next()?.to_string();
+    lines.next().is_none().then_some((tree, identity))
+}
+
+fn write_archive_index_sync_record(
+    git_dir: &Path,
+    tree: git2::Oid,
+    identity: &str,
+) -> std::io::Result<()> {
+    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = git_dir.join(format!(
+        "{ARCHIVE_INDEX_SYNC_FILE_NAME}.tmp-{}-{seq}",
+        std::process::id()
+    ));
+    let content = format!("{ARCHIVE_INDEX_SYNC_FORMAT_VERSION}\n{tree}\n{identity}\n");
+    fs::write(&tmp, content)
+        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME)))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+}
+
+/// Whether `tree` is the tree of `head` or of one of its recent first-parent
+/// ancestors.
+fn tree_on_recent_first_parent_chain(head: &git2::Commit<'_>, tree: git2::Oid) -> bool {
+    let mut commit = head.clone();
+    for _ in 0..ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT {
+        if commit.tree_id() == tree {
+            return true;
+        }
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Whether `tree` is the tree of `head` or of a recent first-parent ancestor
+/// committed after the newest commit whose tree is `since`.
+fn tree_committed_since(head: &git2::Commit<'_>, tree: git2::Oid, since: git2::Oid) -> bool {
+    let mut commit = head.clone();
+    for _ in 0..ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT {
+        let current = commit.tree_id();
+        if current == since {
+            return false;
+        }
+        if current == tree {
+            return true;
+        }
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// What one synchronization attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveIndexSync {
+    /// The index is current, was rewritten, or is foreign and left alone.
+    Settled,
+    /// Another writer holds `index.lock`: try again later.
+    Locked,
+}
+
+/// Age after which an `index.lock` whose owner is gone may be reclaimed: the
+/// rule commits apply on their first retry.
+const ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS: f64 = 30.0;
+
+fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Removes this process's `index.lock.owner` record when dropped.
+struct IndexLockOwner<'a>(Option<&'a Path>);
+
+impl Drop for IndexLockOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(repo_root) = self.0 {
+            remove_lock_owner(repo_root);
+        }
+    }
+}
+
+/// Bring the shared `.git/index` up to HEAD when it holds nothing but this
+/// maintenance's own earlier result.
 ///
-/// Hold Git's exclusive index lock from observation through atomic replacement.
-/// Dirty, conflicted, corrupt, oversized or locked indexes remain untouched.
-/// This maintenance is best-effort: the caller has already committed its tree.
-fn sync_clean_index_after_commit(
-    repo: &Repository,
-    parent: Option<&git2::Commit<'_>>,
-    committed: &git2::Tree<'_>,
-) -> Result<()> {
-    const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
-    let index_path = repo.path().join("index");
-    let lock_path = repo.path().join("index.lock");
+/// The index is ours when it is the exact file the last sync wrote (per
+/// [`ARCHIVE_INDEX_SYNC_FILE_NAME`]); when it was rewritten since but holds
+/// HEAD's tree, the tree that sync wrote (a `git status` stat refresh), or the
+/// tree of a commit made after it (a reset); when it is missing; or, without
+/// any record, when it is empty or equals HEAD or one of its recent
+/// first-parent ancestors (a sync that fell behind before the record
+/// existed). Git's exclusive index lock is held from observation through
+/// atomic replacement, with an owner record so a lock left by a process that
+/// exited mid-sync can be reclaimed. Staged, conflicted, corrupt, oversized,
+/// locked or otherwise foreign indexes stay untouched: they may hold an
+/// interrupted writer's only evidence.
+fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
+    const MAX_INDEX_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_INDEX_ENTRIES: u32 = 500_000;
+    let index_path = git_dir.join("index");
+    let lock_path = git_dir.join("index.lock");
     if path_existing_prefix_has_symlink(&index_path)?
         || path_existing_prefix_has_symlink(&lock_path)?
     {
@@ -12447,13 +13191,24 @@ fn sync_clean_index_after_commit(
             "archive index synchronization refuses symlinked paths".to_string(),
         ));
     }
-    let lock_file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
+    let repo = Repository::open(git_dir)?;
+    let repo_root = repo.workdir().map(Path::to_path_buf);
+    let lock_file = match create_index_lock(&lock_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A process that exited mid-sync never releases its lock, which
+            // would block every later sync and every archive read stamp.
+            let reclaimed = repo_root.as_deref().is_some_and(|root| {
+                try_clean_stale_git_lock(root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS)
+            });
+            match reclaimed.then(|| create_index_lock(&lock_path)) {
+                Some(Ok(file)) => file,
+                Some(Err(error)) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return Err(error.into());
+                }
+                _ => return Ok(ArchiveIndexSync::Locked),
+            }
+        }
         Err(error) => return Err(error.into()),
     };
     // Adopt only the lock we just created; dropping it never touches another
@@ -12462,8 +13217,23 @@ fn sync_clean_index_after_commit(
         lock_file,
         tempfile::TempPath::try_from_path(lock_path)?,
     );
+    // Written only once the lock is ours and declared after it, so it is
+    // removed before the lock is released on every path: it can never erase
+    // the record of whoever takes the lock next.
+    if let Some(root) = repo_root.as_deref() {
+        write_lock_owner(root);
+    }
+    let owner = IndexLockOwner(repo_root.as_deref());
+    // HEAD is read under the lock, so a slow sync cannot publish a tree older
+    // than one another writer synced while this one waited.
+    let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
+        return Ok(ArchiveIndexSync::Settled);
+    };
+    let head = repo.find_commit(head_oid)?;
+    let head_tree = head.tree_id();
     let scratch = tempfile::tempdir()?;
     let scratch_path = scratch.path().join("index");
+    let mut identity = None;
     match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &index_path,
         MAX_INDEX_BYTES,
@@ -12480,29 +13250,70 @@ fn sync_clean_index_after_commit(
                 StorageError::InvalidPath("archive index header is incomplete".to_string())
             })?;
             if &header[..4] != b"DIRC"
-                || u32::from_be_bytes([header[8], header[9], header[10], header[11]]) > 100_000
+                || u32::from_be_bytes([header[8], header[9], header[10], header[11]])
+                    > MAX_INDEX_ENTRIES
             {
                 return Err(StorageError::InvalidPath(
                     "archive index format or entry budget is invalid".to_string(),
                 ));
             }
+            identity = Some(archive_index_file_identity(&metadata));
             fs::write(&scratch_path, bytes)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     let mut index = git2::Index::open_ext(&scratch_path, repo.object_format())?;
-    let parent_tree = parent.map(git2::Commit::tree).transpose()?;
-    if index.has_conflicts()
-        || repo
-            .diff_tree_to_index(parent_tree.as_ref(), Some(&index), None)?
-            .deltas()
-            .len()
-            != 0
-    {
-        return Ok(());
+    if index.has_conflicts() {
+        return Ok(ArchiveIndexSync::Settled);
     }
-    index.read_tree(committed)?;
+    // A missing index file is simply rebuilt.
+    if let Some(identity) = identity.as_deref() {
+        // Records it as current, so later syncs skip the tree comparison.
+        let record_current = || {
+            if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, identity) {
+                tracing::debug!("could not record the archive index sync: {error}");
+            }
+        };
+        match read_archive_index_sync_record(git_dir) {
+            Some((tree, recorded)) if recorded == identity => {
+                if tree == head_tree {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            Some((tree, _)) => {
+                // Rewritten since the last sync. Git rewrites the file to
+                // refresh stat data (`git status`), keeping the tree we wrote,
+                // and a reset leaves the tree of a commit made since; both
+                // stage nothing, so the index is still ours. Any older tree is
+                // someone's staged change (`git rm --cached` of a recent file,
+                // `git revert --no-commit`).
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if index_tree != tree && !tree_committed_since(&head, index_tree, tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            None if index.is_empty() => {}
+            None => {
+                // No record yet (first sync after an upgrade, or a lost
+                // record). Cheap when the index carries Git's tree cache, as
+                // every index this function writes does.
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if !tree_on_recent_first_parent_chain(&head, index_tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+        }
+    }
+    index.read_tree(&head.tree()?)?;
     index.write()?;
     let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &scratch_path,
@@ -12510,9 +13321,16 @@ fn sync_clean_index_after_commit(
     )?;
     lock.write_all(&bytes)?;
     lock.as_file().sync_all()?;
+    // A rename keeps inode, length and mtime, so this is the identity the
+    // published index will have.
+    let written = archive_index_file_identity(&lock.as_file().metadata()?);
+    drop(owner);
     lock.persist(&index_path)
         .map_err(|error| StorageError::Io(error.error))?;
-    Ok(())
+    if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, &written) {
+        tracing::debug!("could not record the archive index sync: {error}");
+    }
+    Ok(ArchiveIndexSync::Settled)
 }
 
 /// Add files to the git index and create a commit.
@@ -12853,9 +13671,555 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin_at(path);
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    let (tmp_path, _file) = stage_atomic_write(path, data, sync)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+const ARCHIVE_SYNC_GROUP_FILES: usize = 64;
+const ARCHIVE_SYNC_WORKERS: usize = 4;
+const ARCHIVE_PARALLEL_SYNC_MIN_FILES: usize = 16;
+#[cfg(unix)]
+const ARCHIVE_PUBLICATION_DIRECTORY_CACHE: usize = 4;
+
+/// Keep blocking work inside the staging operation even while unwinding.
+struct ArchiveSyncTasks(Vec<asupersync::runtime::BlockingTaskHandle>);
+
+impl ArchiveSyncTasks {
+    fn wait(&self) {
+        for task in &self.0 {
+            task.wait();
+        }
+    }
+}
+
+impl Drop for ArchiveSyncTasks {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
+fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
+    for file in files {
+        // Apple fsync reaches the device; publication subsequently performs
+        // the full device-cache flush after every file has synchronized.
+        #[cfg(target_vendor = "apple")]
+        nix::unistd::fsync(file).map_err(std::io::Error::from)?;
+        #[cfg(not(target_vendor = "apple"))]
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+/// Destination identities consume memory, without retaining a descriptor per
+/// recipient. Publication reopens through no-follow directory handles.
+#[cfg(unix)]
+struct StagedDirectoryBinding {
+    chain: Vec<(PathBuf, fs::Metadata)>,
+}
+
+struct StagedArchiveFile {
+    temporary: PathBuf,
+    target: PathBuf,
+    #[cfg(unix)]
+    staging_index: usize,
+}
+
+#[cfg(unix)]
+impl StagedDirectoryBinding {
+    fn capture(directory: &CanonicalScanDirectory) -> Result<Self> {
+        let chain = directory
+            .chain
+            .iter()
+            .map(|(path, file)| Ok((path.clone(), file.file.metadata()?)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self { chain })
+    }
+
+    fn device(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+
+        self.chain
+            .last()
+            .expect("root directory is recorded")
+            .1
+            .dev()
+    }
+
+    fn matches(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        current.is_dir()
+            && current.dev() == expected.dev()
+            && current.ino() == expected.ino()
+            && current.created().ok() == expected.created().ok()
+    }
+
+    fn validate_binding(&self) -> Result<()> {
+        for (path, expected) in &self.chain {
+            if !Self::matches(expected, &fs::symlink_metadata(path)?) {
+                return Err(StorageError::InvalidPath(format!(
+                    "staged archive destination was replaced: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_directory(&self, directory: &CanonicalScanDirectory) -> Result<()> {
+        if directory.chain.len() != self.chain.len() {
+            return Err(StorageError::InvalidPath(
+                "staged archive destination chain changed".into(),
+            ));
+        }
+        for ((expected_path, expected), (current_path, file)) in
+            self.chain.iter().zip(&directory.chain)
+        {
+            if expected_path != current_path || !Self::matches(expected, &file.file.metadata()?) {
+                return Err(StorageError::InvalidPath(format!(
+                    "staged archive destination was replaced: {}",
+                    directory.path().display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Archive files staged under temp names on their target filesystems,
+/// then renamed into place together inside one archive mutation window
+/// (br-9bwnb). Staging needs no publication fence: readers only open named
+/// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
+/// Whatever is still staged when this drops is removed.
+#[derive(Default)]
+struct StagedArchiveWrites {
+    /// Owned temporary files not yet renamed into place.
+    staged: Vec<StagedArchiveFile>,
+    /// Destination identities do not hold open directory descriptors.
+    #[cfg(unix)]
+    directories: HashMap<PathBuf, StagedDirectoryBinding>,
+    /// One retained source per rename-compatible mount owns the staged names.
+    #[cfg(unix)]
+    staging_directories: Vec<CanonicalScanDirectory>,
+    /// Only the bounded cache and staging roots own strong handles.
+    #[cfg(unix)]
+    directory_handles: HashMap<PathBuf, std::sync::Weak<CanonicalDirectoryHandle>>,
+    #[cfg(unix)]
+    directory_cache: Vec<(PathBuf, CanonicalScanDirectory)>,
+    /// Bound open data descriptors while allowing a group of writes to reach the
+    /// filesystem before its first synchronization barrier.
+    pending_sync: Vec<fs::File>,
+    /// Owned blocking workers are created only for larger groups. Every submitted
+    /// task is waited before publication or dropping this staging operation.
+    sync_pool: Option<asupersync::runtime::BlockingPool>,
+    /// One open file per device keeps descriptor use independent of batch size.
+    #[cfg(target_vendor = "apple")]
+    devices: HashMap<u64, fs::File>,
+}
+
+impl StagedArchiveWrites {
+    fn add_repo_file(&mut self, canonical_base: &Path, path: &Path, data: &[u8]) -> Result<String> {
+        self.add(path, data)?;
+        // On Unix, add opened the parent chain without following symlinks and
+        // recorded its binding for publication. A missing leaf needs no further
+        // canonical walk when its absolute spelling is already below the base.
+        // Existing leaves retain canonical resolution, as do non-normal paths.
+        #[cfg(unix)]
+        if path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+            && fs::symlink_metadata(path)
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+            && let Ok(relative) = path.strip_prefix(canonical_base)
+        {
+            return Ok(relative.to_string_lossy().replace('\\', "/"));
+        }
+        rel_path_cached(canonical_base, path)
+    }
+
+    /// Stage every file; publication completes synchronization before renaming.
+    fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
+        let mut writes = Self::default();
+        writes.staged.reserve(files.len());
+        for (path, data) in files {
+            writes.add(&path, &data)?;
+        }
+        Ok(writes)
+    }
+
+    fn add(&mut self, path: &Path, data: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            #[cfg(unix)]
+            if !self.directories.contains_key(parent) {
+                ensure_dir(parent)?;
+            }
+            #[cfg(not(unix))]
+            ensure_dir(parent)?;
+        }
+        #[cfg(unix)]
+        let (tmp_path, file, staging_index) = {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            let index = self.destination_index(parent)?;
+            let destination = &self.directory_cache[index].1;
+            if !self.directories.contains_key(parent) {
+                let binding = StagedDirectoryBinding::capture(destination)?;
+                self.directories.insert(parent.to_path_buf(), binding);
+            }
+            let (tmp_path, file) = stage_archive_write_at(destination, path, data)?;
+            // Creation in the destination preserves inherited ACLs and group
+            // ownership. Relocation retains the inode and uses no-replace.
+            match retain_archive_temp_for_mount(
+                destination,
+                &mut self.staging_directories,
+                self.directories[parent].device(),
+                &tmp_path,
+                path,
+            ) {
+                Ok((retained_path, index)) => (retained_path, file, index),
+                Err(err) => {
+                    let _ = nix::unistd::unlinkat(
+                        destination.file(),
+                        tmp_path.file_name().expect("staged file has a name"),
+                        nix::unistd::UnlinkatFlags::NoRemoveDir,
+                    );
+                    return Err(err);
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let (tmp_path, file) = stage_atomic_write(path, data, false)?;
+        self.staged.push(StagedArchiveFile {
+            temporary: tmp_path,
+            target: path.to_path_buf(),
+            #[cfg(unix)]
+            staging_index,
+        });
+        self.pending_sync.push(file);
+        if self.pending_sync.len() >= ARCHIVE_SYNC_GROUP_FILES {
+            self.sync_pending()?;
+        }
+        Ok(())
+    }
+
+    fn sync_pending(&mut self) -> Result<()> {
+        if self.pending_sync.len() < ARCHIVE_PARALLEL_SYNC_MIN_FILES {
+            sync_archive_file_group(&self.pending_sync)?;
+        } else {
+            let pool = self.sync_pool.get_or_insert_with(|| {
+                asupersync::runtime::BlockingPool::new(0, ARCHIVE_SYNC_WORKERS)
+            });
+            let files = Arc::new(std::mem::take(&mut self.pending_sync));
+            let chunk_size = files.len().div_ceil(ARCHIVE_SYNC_WORKERS);
+            let mut tasks = ArchiveSyncTasks(Vec::with_capacity(ARCHIVE_SYNC_WORKERS));
+            let mut results = Vec::with_capacity(ARCHIVE_SYNC_WORKERS);
+            for start in (0..files.len()).step_by(chunk_size) {
+                let end = (start + chunk_size).min(files.len());
+                let chunk_files = Arc::clone(&files);
+                let result = Arc::new(asupersync::sync::OnceCell::new());
+                let completion = Arc::clone(&result);
+                let task = pool.spawn(move || {
+                    // This task is the cell's only writer.
+                    let _ = completion.set(sync_archive_file_group(&chunk_files[start..end]));
+                });
+                tasks.0.push(task);
+                results.push(result);
+            }
+            tasks.wait();
+            self.pending_sync = Arc::try_unwrap(files).map_err(|_| {
+                std::io::Error::other("archive synchronization retained file ownership")
+            })?;
+            for result in results {
+                Arc::try_unwrap(result)
+                    .map_err(|_| {
+                        std::io::Error::other("archive synchronization retained result ownership")
+                    })?
+                    .into_inner()
+                    .ok_or_else(|| {
+                        std::io::Error::other("archive synchronization task did not complete")
+                    })??;
+            }
+        }
+        // All workers have finished before descriptors are released or any
+        // device flush/publication can begin. A failed group remains unpublished.
+        #[cfg(target_vendor = "apple")]
+        for file in self.pending_sync.drain(..) {
+            use std::os::unix::fs::MetadataExt as _;
+
+            self.devices.entry(file.metadata()?.dev()).or_insert(file);
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        self.pending_sync.clear();
+        Ok(())
+    }
+
+    /// Rename every staged file into place inside one archive mutation window.
+    fn publish(mut self) -> Result<()> {
+        self.sync_pending()?;
+        #[cfg(target_vendor = "apple")]
+        for file in self.devices.values() {
+            file.sync_data()?;
+        }
+        let Some(anchor) = self.staged.first().map(|file| file.target.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        #[cfg(unix)]
+        for directory in self.directories.values() {
+            directory.validate_binding()?;
+        }
+        #[cfg(unix)]
+        for directory in &self.staging_directories {
+            directory.validate_binding()?;
+        }
+        let mut pending = std::mem::take(&mut self.staged).into_iter();
+        while let Some(staged) = pending.next() {
+            #[cfg(unix)]
+            let result = self.publish_at(&staged);
+            #[cfg(not(unix))]
+            let result = fs::rename(&staged.temporary, &staged.target).map_err(StorageError::from);
+            if let Err(err) = result {
+                self.staged.push(staged);
+                self.staged.extend(pending);
+                return Err(err);
+            }
+        }
+        #[cfg(unix)]
+        for (_, directory) in &self.directory_cache {
+            directory.validate_binding()?;
+        }
+        #[cfg(unix)]
+        for directory in &self.staging_directories {
+            directory.validate_binding()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn destination_index(&mut self, parent: &Path) -> Result<usize> {
+        let index = if let Some(index) = self
+            .directory_cache
+            .iter()
+            .position(|(key, _)| key == parent)
+        {
+            index
+        } else {
+            if self.directory_cache.len() == ARCHIVE_PUBLICATION_DIRECTORY_CACHE {
+                let (_, evicted) = self.directory_cache.remove(0);
+                evicted.validate_binding()?;
+            }
+            let directory =
+                CanonicalScanDirectory::open_cached(parent, &mut self.directory_handles)?;
+            if let Some(binding) = self.directories.get(parent) {
+                binding.validate_directory(&directory)?;
+            }
+            self.directory_cache.push((parent.to_path_buf(), directory));
+            self.directory_cache.len() - 1
+        };
+        self.directory_cache[index].1.validate_binding()?;
+        Ok(index)
+    }
+
+    #[cfg(unix)]
+    fn publish_at(&mut self, staged: &StagedArchiveFile) -> Result<()> {
+        let parent = staged.target.parent().unwrap_or(Path::new("."));
+        let index = self.destination_index(parent)?;
+        let destination = &self.directory_cache[index].1;
+        let source = &self.staging_directories[staged.staging_index];
+        nix::fcntl::renameat(
+            source.file(),
+            staged
+                .temporary
+                .file_name()
+                .expect("staged file has a name"),
+            destination.file(),
+            staged.target.file_name().expect("target file has a name"),
+        )
+        .map_err(std::io::Error::from)?;
+        destination.validate_binding()?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedArchiveWrites {
+    fn drop(&mut self) {
+        for staged in &self.staged {
+            let tmp_path = &staged.temporary;
+            #[cfg(unix)]
+            {
+                let directory = &self.staging_directories[staged.staging_index];
+                let _ = nix::unistd::unlinkat(
+                    directory.file(),
+                    tmp_path.file_name().expect("staged file has a name"),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn retain_archive_temp_for_mount(
+    destination: &CanonicalScanDirectory,
+    staging: &mut Vec<CanonicalScanDirectory>,
+    device: u64,
+    tmp_path: &Path,
+    target: &Path,
+) -> Result<(PathBuf, usize)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for (index, directory) in staging.iter().enumerate() {
+        if directory.file().metadata()?.dev() != device {
+            continue;
+        }
+        match retain_archive_temp(destination, directory, tmp_path, target) {
+            Ok(path) => return Ok((path, index)),
+            // Bind mounts can share a device ID but reject cross-mount moves.
+            // EXDEV leaves the owned file in its destination directory.
+            Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(err) => return Err(err),
+        }
+    }
+    staging.push(destination.clone());
+    Ok((tmp_path.to_path_buf(), staging.len() - 1))
+}
+
+#[cfg(unix)]
+fn retain_archive_temp(
+    destination: &CanonicalScanDirectory,
+    staging: &CanonicalScanDirectory,
+    tmp_path: &Path,
+    target: &Path,
+) -> Result<PathBuf> {
+    if std::ptr::eq(destination.file(), staging.file()) {
+        return Ok(tmp_path.to_path_buf());
+    }
+    let old_name = tmp_path.file_name().expect("staged file has a name");
+    for _ in 0..64 {
+        let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let retained_path = atomic_write_tmp_path(staging.path(), target, seq);
+        let new_name = retained_path.file_name().expect("staged file has a name");
+        match relocate_archive_temp(destination.file(), old_name, staging.file(), new_name) {
+            Ok(()) => return Ok(retained_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate a retained archive temporary name",
+    )
+    .into())
+}
+
+/// Never replace another writer's temporary file while consolidating staging.
+#[cfg(unix)]
+fn relocate_archive_temp(
+    from: &fs::File,
+    old_name: &std::ffi::OsStr,
+    to: &fs::File,
+    new_name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    match rustix::fs::renameat_with(
+        from,
+        old_name,
+        to,
+        new_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    // Filesystems without no-replace rename can link the same inode without
+    // overwriting the new name, then release its original directory entry.
+    rustix::fs::linkat(from, old_name, to, new_name, rustix::fs::AtFlags::empty())?;
+    if let Err(err) = rustix::fs::unlinkat(from, old_name, rustix::fs::AtFlags::empty()) {
+        let _ = rustix::fs::unlinkat(to, new_name, rustix::fs::AtFlags::empty());
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Create and fill a new temporary file through the retained parent handle.
+#[cfg(unix)]
+fn stage_archive_write_at(
+    directory: &CanonicalScanDirectory,
+    path: &Path,
+    data: &[u8],
+) -> Result<(PathBuf, fs::File)> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
     use std::io::Write as _;
 
-    let _mutation = ArchiveMutationGuard::begin_at(path);
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    if path.file_name().is_none() {
+        return Err(StorageError::InvalidPath(
+            "archive target has no file name".into(),
+        ));
+    }
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to write through symlink: {}",
+            path.display()
+        )));
+    }
+    let parent = directory.path();
+    for _ in 0..64 {
+        let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = atomic_write_tmp_path(parent, path, seq);
+        let name = tmp_path.file_name().expect("temporary file has a name");
+        let fd = match openat(
+            directory.file(),
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::from_bits_truncate(0o666),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(err) => return Err(std::io::Error::from(err).into()),
+        };
+        let mut file = fs::File::from(fd);
+        if let Err(err) = file.write_all(data) {
+            let _ = nix::unistd::unlinkat(
+                directory.file(),
+                name,
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            );
+            return Err(err.into());
+        }
+        return Ok((tmp_path, file));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique temp file in {}",
+            parent.display()
+        ),
+    )
+    .into())
+}
+
+/// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
+/// return the temp path and open file for the caller to sync and publish. `create_new`
+/// means a pre-existing file or symlink at a temp name is never clobbered.
+fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<(PathBuf, fs::File)> {
+    use std::io::Write as _;
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -12887,7 +14251,7 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = atomic_write_tmp_path(parent, path, seq);
 
-        let result: std::io::Result<()> = (|| {
+        let result: std::io::Result<fs::File> = (|| {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -12896,12 +14260,11 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
             if sync {
                 f.sync_data()?;
             }
-            fs::rename(&tmp_path, path)?;
-            Ok(())
+            Ok(f)
         })();
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(file) => return Ok((tmp_path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -13819,6 +15182,49 @@ mod tests {
     /// publication fence that a draining write-behind batch holds (observed:
     /// inbox reads waiting 25-30 s); a real archive mutation still waits.
     #[test]
+    fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
+        assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
+        // Wait 7 took its number first but registered after wait 8.
+        let waits = BTreeMap::from([(7, 2_000), (8, 1_000), (9, 3_000)]);
+        assert_eq!(oldest_fence_wait_start(&waits), 1_000);
+    }
+
+    /// br-9bwnb: a thread blocked on the held fence is visible to timeout
+    /// diagnostics while it waits. Without the registration the live wait age
+    /// stays zero and a timed-out reservation reads as unattributed.
+    #[test]
+    fn a_contended_fence_wait_is_visible_to_timeout_diagnostics() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let waiter = std::thread::spawn(|| drop(ArchiveMutationGuard::begin()));
+
+        let gauge = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gauge.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waiting = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(30_000_000);
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        waiter.join().expect("waiter thread");
+
+        assert!(
+            waiting.archive_fence_wait_us >= 20_000,
+            "a blocked fence wait must have a live age: {waiting:?}"
+        );
+    }
+
+    #[test]
     fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
         let cached_dir = tmp.path().join("cached");
@@ -14587,6 +15993,441 @@ mod tests {
         }
     }
 
+    fn staged_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(".tmp-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// br-9bwnb: a reservation write syncs its artifacts outside the archive
+    /// publication fence and takes the fence only to rename them into place.
+    /// While another writer holds the fence the artifacts are staged but not
+    /// visible; once it is released they publish and no temp file remains.
+    #[test]
+    fn reservation_writes_stage_outside_the_fence_and_publish_inside_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        // A cached archive and directory are no mutation; warm both first.
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 7,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let writer = std::thread::spawn(move || wbq_execute_op(&op, "br-9bwnb-test"));
+
+        // The legacy and id artifacts both stage while the fence is held.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        let id_artifact = reservation_dir.join("id-7.json");
+        let published_while_held = id_artifact.exists();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("reservation write");
+
+        assert_eq!(
+            staged.len(),
+            2,
+            "both artifacts must sync outside the held fence: {staged:?}"
+        );
+        assert!(
+            !published_while_held,
+            "publication must wait for the held fence"
+        );
+        let id_json = fs::read_to_string(&id_artifact).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&id_json).unwrap();
+        assert_eq!(written["path_pattern"], "src/**");
+        let legacy = reservation_dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(b"src/**"))
+        ));
+        assert_eq!(fs::read_to_string(legacy).unwrap(), id_json);
+        assert!(
+            staged_temp_files(&reservation_dir).is_empty(),
+            "publication leaves no temp file"
+        );
+    }
+
+    /// br-9bwnb: a staged temp file is no archive state. The overload
+    /// `commit_all` adds the whole worktree; it must never publish a temp file
+    /// another writer staged outside the fence, while the artifact beside it
+    /// is committed. Dropping an unpublished stage removes its temp file.
+    #[test]
+    fn commit_all_never_publishes_a_staged_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let staged =
+            StagedArchiveWrites::stage(vec![(reservation_dir.join("id-1.json"), b"{}".to_vec())])
+                .unwrap();
+        fs::write(reservation_dir.join("id-2.json"), "{}").unwrap();
+        assert_eq!(staged_temp_files(&reservation_dir).len(), 1);
+
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_all(&repo, &config, "overload snapshot").unwrap();
+
+        let committed = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new("projects/proj/file_reservations"))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.name().ok().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(committed, ["id-2.json"]);
+        drop(staged);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    /// A failed publication stops at the failing rename and removes every
+    /// temp file it still owns.
+    #[test]
+    fn staged_archive_writes_clean_up_after_a_failed_publication() {
+        let tmp = TempDir::new().unwrap();
+        // A file cannot be renamed over a non-empty directory.
+        let blocked = tmp.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "keep").unwrap();
+        let later = tmp.path().join("later.json");
+        let staged = StagedArchiveWrites::stage(vec![
+            (blocked.clone(), b"{}".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(staged_temp_files(tmp.path()).len(), 2);
+
+        staged
+            .publish()
+            .expect_err("a rename over a non-empty directory fails");
+
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        assert_eq!(fs::read_to_string(blocked.join("keep")).unwrap(), "keep");
+        assert!(!later.exists(), "publication stops at the failed rename");
+    }
+
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_staging_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let blocked_parent = tmp.path().join("not-a-directory");
+        fs::write(&blocked_parent, "keep").unwrap();
+
+        let result = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (blocked_parent.join("child.json"), b"{}".to_vec()),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert_eq!(fs::read_to_string(blocked_parent).unwrap(), "keep");
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_reject_replaced_parent_and_keep_foreign_temp() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let retained = tmp.path().join("retained");
+        fs::create_dir(&parent).unwrap();
+        let staged = StagedArchiveWrites::stage(vec![(
+            parent.join("message.md"),
+            b"intended message".to_vec(),
+        )])
+        .unwrap();
+        let temp_name = staged_temp_files(&parent).pop().unwrap();
+        fs::rename(&parent, &retained).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join(&temp_name), b"foreign staged content").unwrap();
+        fs::write(parent.join("message.md"), b"foreign target").unwrap();
+
+        let result = staged.publish();
+
+        assert!(
+            result.is_err(),
+            "a replaced parent cannot authorize publication"
+        );
+        assert_eq!(
+            fs::read(parent.join("message.md")).unwrap(),
+            b"foreign target"
+        );
+        assert_eq!(
+            fs::read(parent.join(temp_name)).unwrap(),
+            b"foreign staged content"
+        );
+        assert!(staged_temp_files(&retained).is_empty());
+        assert!(!retained.join("message.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_reject_replaced_destination_and_clean_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        let retained = tmp.path().join("retained");
+        let staged = StagedArchiveWrites::stage(vec![
+            (source.join("first.md"), b"first".to_vec()),
+            (destination.join("second.md"), b"second".to_vec()),
+        ])
+        .unwrap();
+        fs::rename(&destination, &retained).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("second.md"), b"foreign target").unwrap();
+
+        assert!(staged.publish().is_err());
+
+        assert_eq!(
+            fs::read(destination.join("second.md")).unwrap(),
+            b"foreign target"
+        );
+        assert!(!source.join("first.md").exists());
+        assert!(!retained.join("second.md").exists());
+        assert!(staged_temp_files(&source).is_empty());
+        assert!(staged_temp_files(&destination).is_empty());
+        assert!(staged_temp_files(&retained).is_empty());
+    }
+
+    #[test]
+    fn staged_archive_writes_bound_pending_files_and_publish_complete_contents() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        for index in 0..=ARCHIVE_SYNC_GROUP_FILES {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+            assert!(staged.pending_sync.len() < ARCHIVE_SYNC_GROUP_FILES);
+            assert!(!tmp.path().join(index.to_string()).exists());
+        }
+
+        staged.publish().unwrap();
+
+        for index in 0..=ARCHIVE_SYNC_GROUP_FILES {
+            assert_eq!(
+                fs::read(tmp.path().join(index.to_string())).unwrap(),
+                index.to_le_bytes()
+            );
+        }
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    /// Also run with a 128-descriptor process limit: recipient fanout must not
+    /// retain one descriptor per destination directory until publication.
+    #[test]
+    fn staged_archive_writes_publish_many_distinct_parents() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        for index in 0..ARCHIVE_SYNC_GROUP_FILES * 4 {
+            staged
+                .add(
+                    &tmp.path().join(index.to_string()).join("message.md"),
+                    &index.to_le_bytes(),
+                )
+                .unwrap();
+        }
+
+        staged.publish().unwrap();
+
+        for index in 0..ARCHIVE_SYNC_GROUP_FILES * 4 {
+            assert_eq!(
+                fs::read(tmp.path().join(index.to_string()).join("message.md")).unwrap(),
+                index.to_le_bytes()
+            );
+            assert!(staged_temp_files(&tmp.path().join(index.to_string())).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_temp_relocation_preserves_foreign_destination() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("from")).unwrap();
+        fs::create_dir(tmp.path().join("to")).unwrap();
+        fs::write(tmp.path().join("from/temp"), b"owned").unwrap();
+        fs::write(tmp.path().join("to/temp"), b"foreign").unwrap();
+
+        let result = relocate_archive_temp(
+            &fs::File::open(tmp.path().join("from")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+            &fs::File::open(tmp.path().join("to")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+        );
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(tmp.path().join("from/temp")).unwrap(), b"owned");
+        assert_eq!(fs::read(tmp.path().join("to/temp")).unwrap(), b"foreign");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_temp_relocation_preserves_created_inode_and_permissions() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("from")).unwrap();
+        fs::create_dir(tmp.path().join("to")).unwrap();
+        fs::write(tmp.path().join("from/temp"), b"owned").unwrap();
+        fs::set_permissions(
+            tmp.path().join("from/temp"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let before = fs::metadata(tmp.path().join("from/temp")).unwrap();
+
+        relocate_archive_temp(
+            &fs::File::open(tmp.path().join("from")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+            &fs::File::open(tmp.path().join("to")).unwrap(),
+            std::ffi::OsStr::new("temp"),
+        )
+        .unwrap();
+
+        let after = fs::metadata(tmp.path().join("to/temp")).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(fs::read(tmp.path().join("to/temp")).unwrap(), b"owned");
+        assert!(!tmp.path().join("from/temp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_pending_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let later = tmp.path().join("later.json");
+        let mut staged = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        // The real filesystem refuses synchronization of a pipe.
+        // The publication boundary must propagate that failure before any rename.
+        staged.pending_sync[1] = nix::unistd::pipe().unwrap().0.into();
+
+        assert!(staged.publish().is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert!(!later.exists());
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_clean_up_when_a_full_sync_group_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        staged.add(&tmp.path().join("first"), b"first").unwrap();
+        staged.pending_sync[0] = nix::unistd::pipe().unwrap().0.into();
+        for index in 1..ARCHIVE_SYNC_GROUP_FILES - 1 {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+        }
+
+        assert!(staged.add(&tmp.path().join("last"), b"last").is_err());
+        assert!(!tmp.path().join("first").exists());
+        assert!(!tmp.path().join("last").exists());
+        drop(staged);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_late_group_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("existing"), b"original").unwrap();
+        let mut staged = StagedArchiveWrites::default();
+        staged
+            .add(&tmp.path().join("existing"), b"replacement")
+            .unwrap();
+        for index in 1..ARCHIVE_SYNC_GROUP_FILES - 1 {
+            staged
+                .add(&tmp.path().join(index.to_string()), &index.to_le_bytes())
+                .unwrap();
+        }
+        // A real failing descriptor near the end must prevent publication even
+        // when earlier files in the same group synchronized successfully.
+        staged.pending_sync[ARCHIVE_SYNC_GROUP_FILES - 2] = nix::unistd::pipe().unwrap().0.into();
+
+        assert!(staged.add(&tmp.path().join("last"), b"last").is_err());
+        assert_eq!(fs::read(tmp.path().join("existing")).unwrap(), b"original");
+        assert!(!tmp.path().join("last").exists());
+        drop(staged);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn staged_archive_writes_preserve_targets_when_device_sync_fails() {
+        let tmp = TempDir::new().unwrap();
+        let existing = tmp.path().join("existing.json");
+        fs::write(&existing, "original").unwrap();
+        let later = tmp.path().join("later.json");
+        let mut staged = StagedArchiveWrites::stage(vec![
+            (existing.clone(), b"replacement".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        // Exercise a real failing full-sync syscall at the device boundary.
+        // No file may be published even if every preceding file fsync passed.
+        staged.sync_pending().unwrap();
+        for device in staged.devices.values_mut() {
+            *device = fs::File::open("/dev/null").unwrap();
+        }
+
+        let result = staged.publish();
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
+        assert!(!later.exists());
+        assert!(staged_temp_files(tmp.path()).is_empty());
+    }
+
     #[test]
     fn test_write_message_bundle() {
         let tmp = TempDir::new().unwrap();
@@ -14714,11 +16555,11 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 9]);
 
         let (first, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 3);
         assert_eq!(names(&first, 2), ["b__2.md"]);
         let (second, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0, "unchanged files must be served from the cache");
         assert_eq!(second, first);
 
@@ -14726,14 +16567,14 @@ mod tests {
         // keep reporting id 2 and miss a collision on id 9.
         write("b__2.md", 9, "b, rewritten under another id");
         let (rewritten, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 1);
         assert!(names(&rewritten, 2).is_empty());
         assert_eq!(names(&rewritten, 9), ["b__2.md"]);
 
         fs::remove_file(month.join("c__3.md")).unwrap();
         let (deleted, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0);
         assert!(names(&deleted, 3).is_empty());
 
@@ -14742,8 +16583,133 @@ mod tests {
             &root,
             &wanted,
             Duration::from_secs(3600),
-        );
+        )
+        .unwrap();
         assert_eq!(parsed, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_id_scan_rejects_symlinked_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), tmp.path().join("messages"))
+            .unwrap();
+        assert!(
+            collect_canonical_message_id_index(&tmp.path().join("messages"), &HashSet::from([1]),)
+                .is_err(),
+            "a symlinked archive must not produce a successful empty collision scan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_retains_reads_and_rejects_replacement() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("month/message.md"),
+            "---json\n{\"id\":1}\n---\nbody",
+        )
+        .unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("retained")).unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("month/message.md"),
+            "---json\n{\"id\":2}\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("message.md"))
+                .unwrap()
+                .1["id"],
+            1
+        );
+        assert!(directory.validate_binding().is_err());
+        assert_eq!(
+            read_message_file(&tmp.path().join("month/message.md"))
+                .unwrap()
+                .0["id"],
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_enumerates_retained_entries_across_temporary_replacement() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(tmp.path().join("month/message.md"), "existing message").unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("retained")).unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        let entries = directory
+            .entries()
+            .unwrap()
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        fs::rename(tmp.path().join("month"), tmp.path().join("replacement")).unwrap();
+        fs::rename(tmp.path().join("retained"), tmp.path().join("month")).unwrap();
+        assert!(directory.validate_binding().is_ok());
+        assert_eq!(
+            entries,
+            [OsString::from("message.md")],
+            "temporary pathname replacement must not hide the retained directory's entries"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_refuses_symlink_and_nonregular_entries() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("month")).unwrap();
+        fs::write(
+            tmp.path().join("outside.md"),
+            "---json\n{\"id\":1}\n---\nbody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("outside.md"),
+            tmp.path().join("month/link.md"),
+        )
+        .unwrap();
+        nix::unistd::mkfifo(
+            &tmp.path().join("month/pipe.md"),
+            nix::sys::stat::Mode::S_IRUSR,
+        )
+        .unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("month")).unwrap();
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("link.md"))
+                .is_err()
+        );
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("pipe.md"))
+                .is_err()
+        );
+        assert!(
+            directory
+                .read_frontmatter(std::ffi::OsStr::new("../outside.md"))
+                .is_err()
+        );
+        assert!(directory.validate_binding().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_scan_directory_rejects_symlinked_ancestor_after_open() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("year/month")).unwrap();
+        let directory = CanonicalScanDirectory::open(&tmp.path().join("year/month")).unwrap();
+        fs::rename(tmp.path().join("year"), tmp.path().join("retained")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("retained"), tmp.path().join("year")).unwrap();
+        assert!(directory.validate_binding().is_err());
+        assert!(CanonicalScanDirectory::open(&tmp.path().join("year/month")).is_err());
     }
 
     #[test]
@@ -15282,6 +17248,20 @@ mod tests {
                 "thread_id": "TKT-BATCH",
                 "project": "proj",
             }),
+            serde_json::json!({
+                "id": 3,
+                "subject": "Separate Thread",
+                "created_ts": "2026-01-15T10:02:00Z",
+                "thread_id": "TKT-OTHER",
+                "project": "proj",
+            }),
+            serde_json::json!({
+                "id": 4,
+                "subject": "Same Digest Different Spelling",
+                "created_ts": "2026-01-15T10:03:00Z",
+                "thread_id": "tkt-batch",
+                "project": "proj",
+            }),
         ];
         let recipients = vec!["RecipientAgent".to_string()];
 
@@ -15317,6 +17297,13 @@ mod tests {
             snapshot_archive_files(&archive_single.root),
             snapshot_archive_files(&archive_batch.root)
         );
+        let digest =
+            fs::read_to_string(archive_batch.root.join("messages/threads/tkt-batch.md")).unwrap();
+        assert_eq!(digest.matches("# Thread TKT-BATCH\n").count(), 1);
+        assert_eq!(digest.matches("\n---\n").count(), 3);
+        assert!(digest.find("Batch Layout One") < digest.find("Batch Layout Two"));
+        assert!(digest.find("Batch Layout Two") < digest.find("Same Digest Different Spelling"));
+        assert!(!digest.contains("Separate Thread"));
     }
 
     #[test]
@@ -15462,6 +17449,76 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn staged_repo_file_preserves_missing_target_path_and_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert_eq!(
+            writes
+                .add_repo_file(&root, &root.join("messages/new.md"), b"message body")
+                .unwrap(),
+            "messages/new.md"
+        );
+        assert!(!root.join("messages/new.md").exists());
+        writes.publish().unwrap();
+        assert_eq!(
+            fs::read(root.join("messages/new.md")).unwrap(),
+            b"message body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_repo_file_rejects_target_outside_base() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("archive")).unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert!(matches!(
+            writes.add_repo_file(&root.join("archive"), &root.join("outside.md"), b"body"),
+            Err(StorageError::InvalidPath(_))
+        ));
+        drop(writes);
+        assert!(!root.join("outside.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_repo_file_rejects_existing_leaf_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir(root.join("archive")).unwrap();
+        fs::write(root.join("archive/existing.md"), b"existing").unwrap();
+        fs::write(root.join("outside.md"), b"outside").unwrap();
+        std::os::unix::fs::symlink("existing.md", root.join("archive/inside-link.md")).unwrap();
+        std::os::unix::fs::symlink("../outside.md", root.join("archive/outside-link.md")).unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        assert!(matches!(
+            writes.add_repo_file(
+                &root.join("archive"),
+                &root.join("archive/inside-link.md"),
+                b"replacement",
+            ),
+            Err(StorageError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            writes.add_repo_file(
+                &root.join("archive"),
+                &root.join("archive/outside-link.md"),
+                b"replacement",
+            ),
+            Err(StorageError::InvalidPath(_))
+        ));
+        drop(writes);
+        assert_eq!(
+            fs::read(root.join("archive/existing.md")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(fs::read(root.join("outside.md")).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rel_path_cached_rejects_missing_target_under_symlinked_parent() {
         use std::os::unix::fs::symlink;
 
@@ -15517,6 +17574,10 @@ mod tests {
         let outside = outside_tmp.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
 
+        // Production order: the fence before the test lock. Holding only the
+        // test lock here while `write_text` waits on the fence would deadlock
+        // against a concurrent atomic write that holds the fence.
+        let _mutation = ArchiveMutationGuard::begin();
         let _guard = atomic_write_test_guard();
         ATOMIC_WRITE_TMP_COUNTER.store(0, Ordering::Relaxed);
         for seq in 0..8 {
@@ -21322,15 +23383,10 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, &digest_path).unwrap();
 
-        let err = update_thread_digest(
+        let err = append_thread_digest(
             &archive,
             "T-1",
-            "SenderAgent",
-            &["ReceiverAgent".to_string()],
-            "Subject",
-            "2026-05-05T12:00:00Z",
-            "body",
-            "messages/2026/05/message.md",
+            "digest entry must not reach the outside file",
         )
         .unwrap_err();
 
@@ -22170,6 +24226,7 @@ mod tests {
 
     #[test]
     fn archive_commit_strategies_preserve_staged_locked_and_corrupt_indexes() {
+        let _background = BackgroundIndexSync::enter();
         for strategy in 0..3 {
             for state in ["clean", "staged", "locked", "corrupt"] {
                 let tmp = TempDir::new().unwrap();
@@ -22219,6 +24276,11 @@ mod tests {
                 )
                 .unwrap();
                 assert!(tree.get_path(Path::new(&staged_relative)).is_err());
+                // What the background worker would do next (br-0i0g4). Only
+                // the corrupt index is an error; the others succeed, with a
+                // staged or locked index left untouched.
+                let synced = sync_archive_index_to_head(repo.path());
+                assert_eq!(synced.is_err(), state == "corrupt", "{synced:?}");
                 if state == "clean" {
                     let reopened = Repository::open(&archive.repo_root).unwrap();
                     assert_eq!(
@@ -22253,6 +24315,320 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The tree the shared `.git/index` currently describes.
+    fn shared_index_tree(repo: &Repository) -> git2::Oid {
+        let mut index =
+            git2::Index::open_ext(&repo.path().join("index"), repo.object_format()).unwrap();
+        index.write_tree_to(repo).unwrap()
+    }
+
+    /// For the rest of a test, commits leave `.git/index` to the background
+    /// sync, as in production, instead of the inline sync unit tests get.
+    struct BackgroundIndexSync;
+
+    impl BackgroundIndexSync {
+        fn enter() -> Self {
+            ARCHIVE_INDEX_SYNC_INLINE.with(|inline| inline.set(false));
+            Self
+        }
+    }
+
+    impl Drop for BackgroundIndexSync {
+        fn drop(&mut self) {
+            ARCHIVE_INDEX_SYNC_INLINE.with(|inline| inline.set(true));
+        }
+    }
+
+    #[test]
+    fn archive_index_sync_catches_up_but_never_overwrites_foreign_state() {
+        // br-0i0g4: commits no longer rewrite .git/index; a later sync brings
+        // it up to HEAD however many commits it is behind, across restarts,
+        // and leaves an index holding someone else's staged state alone.
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-sync").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let commit = |name: &str| {
+            let path = archive.root.join(name);
+            fs::write(&path, name).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            commit_paths_lockfree(&repo, &config, name, &[rel.as_str()]).unwrap();
+        };
+        let head_tree = || repo.head().unwrap().peel_to_tree().unwrap().id();
+        let record = git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME);
+
+        commit("a.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+        assert!(record.exists(), "a sync records what it wrote");
+
+        // Three commits behind: the record identifies the index as ours.
+        let behind = shared_index_tree(&repo);
+        for name in ["b.txt", "c.txt", "d.txt"] {
+            commit(name);
+        }
+        assert_eq!(
+            shared_index_tree(&repo),
+            behind,
+            "commits leave .git/index alone"
+        );
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Without the record (an upgrade or a lost record) an index equal to
+        // a recent ancestor of HEAD is still a sync that fell behind.
+        let moved = tmp.path().join("moved-record");
+        fs::rename(&record, &moved).unwrap();
+        commit("e.txt");
+        commit("f.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Negative control: a staged foreign entry makes the index someone
+        // else's evidence, with or without a record.
+        let mut index = repo.index().unwrap();
+        let staged = archive.root.join("staged-only.txt");
+        fs::write(&staged, "irreplaceable staged evidence").unwrap();
+        let staged_rel = rel_path_cached(&archive.canonical_repo_root, &staged).unwrap();
+        index.add_path(Path::new(&staged_rel)).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let before = fs::read(git_dir.join("index")).unwrap();
+        commit("g.txt");
+        sync_archive_index_to_head(&git_dir).unwrap();
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), before);
+        assert!(!git_dir.join("index.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_reclaims_dead_locks_and_keeps_staged_changes() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-sync-locks").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let rel = |name: &str| {
+            let path = archive.root.join(name);
+            rel_path_cached(&archive.canonical_repo_root, &path).unwrap()
+        };
+        let commit = |name: &str| {
+            fs::write(archive.root.join(name), name).unwrap();
+            commit_paths_lockfree(&repo, &config, name, &[rel(name).as_str()]).unwrap();
+        };
+        let head_tree = || repo.head().unwrap().peel_to_tree().unwrap().id();
+        let index_bytes = || fs::read(git_dir.join("index")).unwrap();
+        let lock = git_dir.join("index.lock");
+        let owner = git_dir.join("index.lock.owner");
+        let sync = || sync_archive_index_to_head(&git_dir).unwrap();
+
+        // A lock whose recorded owner is alive belongs to that writer: wait,
+        // and keep the sync owed.
+        commit("a.txt");
+        fs::write(&lock, "live writer").unwrap();
+        let me = std::process::id();
+        let ticks = process_start_ticks(me).unwrap_or(0);
+        fs::write(&owner, format!("{me}\n0\n{ticks}\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Locked);
+        assert_eq!(fs::read(&lock).unwrap(), b"live writer");
+
+        // A lock left by a process that exited mid-sync is reclaimed, so the
+        // index is not stuck behind HEAD (and reads are not stuck) forever.
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        fs::write(&owner, format!("{dead}\n0\n0\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+        assert!(!lock.exists() && !owner.exists());
+
+        // A staged change whose tree equals an ancestor (`git rm --cached` of
+        // the file the last commit added) is someone's, not a lagging sync.
+        // Git reloads the index file before changing it; so do these steps.
+        let shared_index = || {
+            let mut index = repo.index().unwrap();
+            index.read(true).unwrap();
+            index
+        };
+        let tree_a = head_tree();
+        commit("b.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        let mut index = shared_index();
+        index.remove_path(Path::new(&rel("b.txt"))).unwrap();
+        index.write().unwrap();
+        drop(index);
+        assert_eq!(shared_index_tree(&repo), tree_a);
+        let staged = index_bytes();
+        commit("c.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(index_bytes(), staged);
+
+        // An index reset to HEAD stages nothing: it is adopted and followed
+        // after the next commit.
+        let mut index = shared_index();
+        index
+            .read_tree(&repo.head().unwrap().peel_to_tree().unwrap())
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit("d.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Git rewriting the file without changing its tree (a `git status`
+        // stat refresh) leaves it ours.
+        let mut index = shared_index();
+        index.write().unwrap();
+        drop(index);
+        commit("e.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+    }
+
+    #[test]
+    fn archive_index_sync_waits_for_a_pause_bounds_the_lag_and_backs_off() {
+        let quiet = ARCHIVE_INDEX_SYNC_QUIET_PERIOD;
+        let now = Instant::now();
+        let mut state = ArchiveIndexSyncState::default();
+        assert_eq!(next_archive_index_sync(&state, now), Err(None));
+
+        // A commit makes the index due once commits pause for the quiet period.
+        let repo = PathBuf::from("/archives/busy/.git");
+        mark_archive_index_pending(&mut state, &repo, now);
+        assert_eq!(next_archive_index_sync(&state, now), Err(Some(quiet)));
+        assert_eq!(
+            next_archive_index_sync(&state, now + quiet),
+            Ok(repo.clone())
+        );
+
+        // Each further commit pushes the rewrite out (no rewrite between two
+        // commits of a busy archive)...
+        let mut at = now;
+        for _ in 0..10 {
+            at += quiet / 2;
+            mark_archive_index_pending(&mut state, &repo, at);
+            assert_eq!(next_archive_index_sync(&state, at), Err(Some(quiet)));
+        }
+        // ...but unbroken traffic cannot hold the index behind HEAD for longer
+        // than the lag bound.
+        while at < now + ARCHIVE_INDEX_SYNC_MAX_LAG {
+            at += quiet / 2;
+            mark_archive_index_pending(&mut state, &repo, at);
+        }
+        assert_eq!(next_archive_index_sync(&state, at), Ok(repo.clone()));
+
+        // The backoff after a slow rewrite holds even a quiet repository.
+        state.pending.clear();
+        mark_archive_index_pending(&mut state, &repo, now);
+        state
+            .next_due
+            .insert(repo.clone(), now + Duration::from_secs(40));
+        assert_eq!(
+            next_archive_index_sync(&state, now + quiet),
+            Err(Some(Duration::from_secs(40) - quiet))
+        );
+        assert_eq!(
+            next_archive_index_sync(&state, now + Duration::from_secs(40)),
+            Ok(repo)
+        );
+
+        assert_eq!(
+            archive_index_sync_backoff(Duration::from_millis(10)),
+            ARCHIVE_INDEX_SYNC_MIN_INTERVAL
+        );
+        assert_eq!(
+            archive_index_sync_backoff(Duration::from_millis(500)),
+            Duration::from_millis(15_000)
+        );
+    }
+
+    #[test]
+    fn tree_updates_preserve_bases_deletions_and_update_order() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let left_blob = repo.blob(b"left retained content").unwrap();
+        let right_blob = repo.blob(b"right retained content").unwrap();
+        let first_blob = repo.blob(b"first replacement").unwrap();
+        let last_blob = repo.blob(b"last replacement").unwrap();
+        let mut left = repo.treebuilder(None).unwrap();
+        left.insert("kept", left_blob, 0o100_644).unwrap();
+        left.insert("old", first_blob, 0o100_644).unwrap();
+        let left = left.write().unwrap();
+        let mut right = repo.treebuilder(None).unwrap();
+        right.insert("kept", right_blob, 0o100_644).unwrap();
+        right.insert("old", first_blob, 0o100_644).unwrap();
+        let right = right.write().unwrap();
+        let mut base = repo.treebuilder(None).unwrap();
+        base.insert("left", left, 0o040_000).unwrap();
+        base.insert("mirror", left, 0o040_000).unwrap();
+        base.insert("right", right, 0o040_000).unwrap();
+        let base = repo.find_tree(base.write().unwrap()).unwrap();
+        let mut updates = Vec::new();
+        for prefix in ["left", "mirror", "right"] {
+            updates.push((format!("{prefix}/new"), Some(first_blob)));
+            updates.push((format!("{prefix}/old"), None));
+            updates.push((format!("{prefix}/new"), Some(last_blob)));
+        }
+        updates.push(("other/new".to_string(), Some(last_blob)));
+        updates.push(("other/new".to_string(), Some(first_blob)));
+        let tree = repo
+            .find_tree(build_tree_with_updates(&repo, Some(&base), &updates).unwrap())
+            .unwrap();
+        assert_eq!(
+            tree.get_path(Path::new("left/kept")).unwrap().id(),
+            left_blob
+        );
+        assert_eq!(
+            tree.get_path(Path::new("right/kept")).unwrap().id(),
+            right_blob
+        );
+        assert_eq!(
+            tree.get_name("left").unwrap().id(),
+            tree.get_name("mirror").unwrap().id()
+        );
+        for prefix in ["left", "mirror", "right"] {
+            assert_eq!(
+                tree.get_path(Path::new(&format!("{prefix}/new")))
+                    .unwrap()
+                    .id(),
+                last_blob
+            );
+            assert!(tree.get_path(Path::new(&format!("{prefix}/old"))).is_err());
+        }
+        assert_eq!(
+            tree.get_path(Path::new("other/new")).unwrap().id(),
+            first_blob
+        );
+        assert!(tree.get_path(Path::new("other/kept")).is_err());
+
+        // A subsequent commit must use its own base and updates.
+        let next = repo
+            .find_tree(
+                build_tree_with_updates(
+                    &repo,
+                    Some(&tree),
+                    &[("left/new".to_string(), Some(first_blob))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            next.get_path(Path::new("left/new")).unwrap().id(),
+            first_blob
+        );
+        assert_eq!(
+            next.get_path(Path::new("mirror/new")).unwrap().id(),
+            last_blob
+        );
+        assert_eq!(
+            next.get_path(Path::new("left/kept")).unwrap().id(),
+            left_blob
+        );
     }
 
     #[test]
@@ -23039,8 +25415,10 @@ mod tests {
         fs::write(&lock_path, "fake lock").unwrap();
         write_lock_owner(&archive.repo_root);
 
-        // Stale lock cleanup should NOT remove the lock (PID is alive)
-        let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
+        // Exercise a fresh live-owner lock with the archive's actual expiry.
+        // A zero threshold explicitly expires unknown-start-time owners on macOS.
+        let removed =
+            try_clean_stale_git_lock(&archive.repo_root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS);
         assert!(!removed, "should not remove lock owned by alive PID");
         assert!(lock_path.exists(), "lock file should still exist");
 
@@ -24704,5 +27082,60 @@ Test body.
             Some("256"),
             "pre-existing archive must have gc.auto=256 migrated in"
         );
+    }
+
+    #[test]
+    fn ensure_repo_rejects_missing_head_without_caching_or_rewriting_history() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let config = test_config(root);
+        let repo = Repository::init(root).expect("init real archive");
+        let sig = git2::Signature::now("archive-test", "archive@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let original_tip = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "preserve this history",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let head_path = root.join(".git/HEAD");
+        let saved_head = root.join("saved-HEAD");
+        let head_bytes = fs::read(&head_path).unwrap();
+        let config_bytes = fs::read(root.join(".git/config")).unwrap();
+        drop(tree);
+        drop(repo);
+        // Preserve the real HEAD, rather than deleting it to plant the fault.
+        fs::rename(&head_path, &saved_head).unwrap();
+        // Already-correct .gitignore reproduces the old silent Ok/cache path.
+        ensure_archive_gitignore(root).unwrap();
+        let ignore_bytes = fs::read(root.join(".gitignore")).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                ensure_repo(root, &config),
+                Err(StorageError::Git(_))
+            ));
+            assert!(
+                !repo_cache_contains(root),
+                "invalid root must not be cached"
+            );
+            assert!(!head_path.exists(), "must not guess a replacement HEAD");
+            assert_eq!(fs::read(&saved_head).unwrap(), head_bytes);
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), config_bytes);
+            assert_eq!(fs::read(root.join(".gitignore")).unwrap(), ignore_bytes);
+        }
+
+        // An operator can restore the known HEAD; the failed opens must not
+        // poison later archive initialization or replace the existing history.
+        fs::rename(&saved_head, &head_path).unwrap();
+        assert!(!ensure_repo(root, &config).expect("open restored archive"));
+        let restored = Repository::open(root).unwrap();
+        assert_eq!(restored.head().unwrap().target(), Some(original_tip));
+        assert!(restored.find_commit(original_tip).is_ok());
     }
 }

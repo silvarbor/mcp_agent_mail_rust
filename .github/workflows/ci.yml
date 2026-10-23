@@ -18,6 +18,10 @@ jobs:
     name: Dashboard WASM + Exporter Matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Use the toolchain receiving this job's WASM target, rather than the
+      # native workspace's rust-toolchain.toml override.
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +81,9 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold dependency build exceeded 30 minutes during Clippy, before tests.
+    # Keep all validation steps; this is a job deadline, not a latency budget.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -135,6 +141,21 @@ jobs:
 
       - name: Build workspace
         run: cargo build --workspace
+
+      - name: Install pinned Beads CLI for real-command tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_tools="${RUNNER_TEMP}/beads-0.6.0-fixture-tools"
+          mkdir -p "$fixture_tools"
+          cd "$fixture_tools"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output br-0.6.0-linux_amd64.tar.gz \
+            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.6.0/br-0.6.0-linux_amd64.tar.gz
+          echo 'f6f9a1663bae31e94d2dcfec62163f15b17f822711c486e860183a654784829b  br-0.6.0-linux_amd64.tar.gz' | sha256sum --check --strict
+          tar -xzf br-0.6.0-linux_amd64.tar.gz br
+          ./br --version
+          echo "$fixture_tools" >> "$GITHUB_PATH"
 
       - name: Unit + integration tests
         run: cargo test --workspace
@@ -195,7 +216,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Mode matrix harness (Rust)
-        run: cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -360,7 +382,9 @@ jobs:
         shell: bash
         env:
           AM_E2E_KEEP_TMP: "1"
-        run: bash tests/installer/test_install_artifact_fallback.sh
+        run: |
+          bash tests/installer/test_install_artifact_fallback.sh
+          bash tests/installer/test_install_transaction_history_prune.sh
 
       - name: Run PowerShell installer transaction suite
         if: runner.os == 'Windows'
@@ -412,7 +436,8 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Semantic conformance suite
-        run: cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -470,7 +495,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Perf + security regression suite
-        run: cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -999,7 +1025,8 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Verify help snapshots
-        run: cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
         env:
           COLUMNS: "120"
           DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
@@ -1306,7 +1333,8 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Fault injection integration tests
-        run: cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"

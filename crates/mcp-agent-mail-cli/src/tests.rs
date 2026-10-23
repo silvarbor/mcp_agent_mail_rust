@@ -103,9 +103,9 @@ fn user_env_authority_exemptions_are_narrow_and_explicit() {
             dry_run: false,
             yes: true,
             token: Some("operator-token".to_string()),
-            port: 8765,
-            host: "127.0.0.1".to_string(),
-            path: "/mcp/".to_string(),
+            port: Some(8765),
+            host: Some("127.0.0.1".to_string()),
+            path: Some("/mcp/".to_string()),
             project_dir: None,
             format: None,
             json: false,
@@ -119,9 +119,9 @@ fn user_env_authority_exemptions_are_narrow_and_explicit() {
             json: false,
             agent: None,
             token: None,
-            port: 8765,
-            host: "127.0.0.1".to_string(),
-            path: "/mcp/".to_string(),
+            port: Some(8765),
+            host: Some("127.0.0.1".to_string()),
+            path: Some("/mcp/".to_string()),
             project_dir: None,
             no_user_config: false,
             no_hooks: false,
@@ -2200,6 +2200,7 @@ fn resolve_check_inbox_rpc_config_prefers_agent_mail_url_over_host_port() {
         "127.0.0.1",
         9999,
         "/mcp/",
+        Some("from-config-env".to_string()),
     );
     assert_eq!(cfg.project_key, "/tmp/proj");
     assert_eq!(cfg.agent_name, "BlueLake");
@@ -2211,7 +2212,101 @@ fn resolve_check_inbox_rpc_config_prefers_agent_mail_url_over_host_port() {
             "http://10.0.0.5:8123/mcp/".to_string(),
         ]
     );
+    // A process variable outranks the configured token.
     assert_eq!(cfg.bearer_token.as_deref(), Some("token-xyz"));
+}
+
+#[test]
+fn resolve_check_inbox_rpc_config_falls_back_to_the_configured_token() {
+    // After `am setup run` the token lives in config.env, not the process
+    // environment; the hook commands must still authenticate with it.
+    let cfg = resolve_check_inbox_rpc_config_reader(
+        |_| None,
+        "/tmp/proj",
+        "BlueLake",
+        "127.0.0.1",
+        9000,
+        "/mcp/",
+        Some("from-config-env".to_string()),
+    );
+    assert_eq!(cfg.server_url, "http://127.0.0.1:9000/mcp/");
+    assert_eq!(cfg.bearer_token.as_deref(), Some("from-config-env"));
+
+    let none = resolve_check_inbox_rpc_config_reader(
+        |_| None,
+        "/tmp/proj",
+        "BlueLake",
+        "127.0.0.1",
+        9000,
+        "/mcp/",
+        None,
+    );
+    assert_eq!(none.bearer_token, None);
+}
+
+#[test]
+fn service_listens_on_the_configured_port_unless_overridden() {
+    // After `am config set-port 9000` the CLI calls :9000, so the managed
+    // service must listen there too.
+    let config = Config {
+        http_port: 9000,
+        ..Config::default()
+    };
+    assert_eq!(
+        service_listen_addr(&config, None, None),
+        (Config::default().http_host, 9000)
+    );
+    assert_eq!(
+        service_listen_addr(&config, Some("0.0.0.0"), Some(9100)),
+        ("0.0.0.0".to_string(), 9100)
+    );
+    let defaults = Config::default();
+    assert_eq!(
+        service_listen_addr(&defaults, None, None),
+        (defaults.http_host.clone(), defaults.http_port)
+    );
+
+    // `am setup run` writes the same configured endpoint into clients.
+    let api = Config {
+        http_port: 9000,
+        http_path: "/api/".to_string(),
+        ..Config::default()
+    };
+    assert_eq!(
+        setup_endpoint_from(&api, None, None, None),
+        (Config::default().http_host, 9000, "/api/".to_string())
+    );
+    assert_eq!(
+        setup_endpoint_from(
+            &api,
+            Some("10.0.0.2".into()),
+            Some(8765),
+            Some("/mcp/".into())
+        ),
+        ("10.0.0.2".to_string(), 8765, "/mcp/".to_string())
+    );
+}
+
+#[test]
+fn hook_server_host_port_prefers_flags_then_configuration() {
+    let config = Config {
+        http_host: "10.1.2.3".to_string(),
+        http_port: 9000,
+        ..Config::default()
+    };
+    assert_eq!(
+        hook_server_host_port(&config, Some("127.0.0.2".to_string()), None),
+        ("127.0.0.2".to_string(), 9000)
+    );
+    assert_eq!(
+        hook_server_host_port(&config, None, Some(9100)),
+        ("10.1.2.3".to_string(), 9100)
+    );
+    // No flags: a non-default configured endpoint is used as-is.
+    assert_eq!(
+        hook_server_host_port(&config, None, None),
+        ("10.1.2.3".to_string(), 9000)
+    );
 }
 
 #[test]
@@ -2746,6 +2841,27 @@ fn validate_mail_inbox_limit_accepts_positive_values() {
 }
 
 #[test]
+fn mail_inbox_server_arguments_never_consume_unread_state() {
+    let args = mail_inbox_server_arguments("/tmp/demo", "BlueLake", true, None, 20, false);
+    // Listing must not mark rows read on the server path; the local
+    // fallback never does (GH#229 / GH#207).
+    assert_eq!(args["mark_read"], false);
+    assert_eq!(args["urgent_only"], true);
+    assert_eq!(args["limit"], 20);
+    assert!(args.get("since_ts").is_none());
+    let since = mail_inbox_server_arguments(
+        "/tmp/demo",
+        "BlueLake",
+        false,
+        Some("2026-10-05T00:00:00Z"),
+        5,
+        true,
+    );
+    assert_eq!(since["since_ts"], "2026-10-05T00:00:00Z");
+    assert_eq!(since["mark_read"], false);
+}
+
+#[test]
 fn validate_mail_inbox_limit_rejects_non_positive_values() {
     let error = validate_mail_inbox_limit(0).expect_err("limit=0 should be rejected");
     assert!(matches!(error, CliError::InvalidArgument(_)));
@@ -2795,7 +2911,7 @@ fn check_inbox_direct_uses_actual_opened_sqlite_path_for_native_reads() {
                 mcp_agent_mail_db::DbConn::open_file(&absolute_db_str).expect("open absolute db");
             for stmt in [
                 "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                 "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]', topic TEXT)",
                 "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -2867,7 +2983,7 @@ fn check_inbox_daemon_and_direct_paths_agree_on_unread_count() {
             let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
             for stmt in [
                 "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                 "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, topic TEXT, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
                 "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -2970,8 +3086,9 @@ fn clap_parses_mark_all_read_defaults_and_flags() {
             assert_eq!(limit, 500);
             assert!(!direct);
             assert!(!json);
-            assert_eq!(host, "127.0.0.1");
-            assert_eq!(port, 8765);
+            // Unset: the configured endpoint is resolved at run time.
+            assert_eq!(host, None);
+            assert_eq!(port, None);
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -3021,6 +3138,31 @@ fn mark_all_read_is_write_classified() {
         !command_is_read_only(&command),
         "mark-all-read mutates read state and must not bypass the ownership guard"
     );
+}
+
+#[test]
+fn mail_read_is_write_classified_and_acks_remind_is_read_only() {
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(args)
+            .expect("parse")
+            .command
+            .expect("expected command")
+    };
+    assert!(
+        !command_is_read_only(&parse(&[
+            "am", "mail", "read", "-p", "proj", "-a", "BlueLake", "7"
+        ])),
+        "mail read marks a message read and must not bypass the ownership guard"
+    );
+    assert!(!command_is_read_only(&parse(&[
+        "am", "mail", "ack", "-p", "proj", "-a", "BlueLake", "7"
+    ])));
+    assert!(command_is_read_only(&parse(&[
+        "am", "acks", "remind", "proj", "BlueLake"
+    ])));
+    assert!(command_is_read_only(&parse(&[
+        "am", "mail", "inbox", "-p", "proj", "-a", "BlueLake"
+    ])));
 }
 
 /// GH#273: the JSON-RPC request the CLI sends to the daemon must name the
@@ -3344,6 +3486,99 @@ fn agents_reap_dry_run_then_retire_is_idempotent_and_respects_exemptions() {
             ]
         );
     });
+}
+
+/// GH#348: one deregistered stale agent must not abort the sweep. The
+/// planted control is the same seed without the deregistration, where
+/// both agents are ordinary candidates.
+#[test]
+fn agents_reap_skips_a_deregistered_agent_and_still_retires_the_rest() {
+    use asupersync::runtime::RuntimeBuilder;
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+
+    for deregister_one in [true, false] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-reap-deregistered.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        init_schema_sqlite_canonical(&db_path_str).expect("init canonical schema");
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        let idle_40d = now_us - 40 * 86_400_000_000;
+
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'reap-proj', '/tmp/reap-proj', ?)",
+            &[Value::BigInt(now_us)],
+        )
+        .expect("seed project");
+        for (id, name) in [(1i64, "GoneAgent"), (2, "StaleAgent")] {
+            conn.execute_sync(
+                "INSERT INTO agents (\
+                    id, project_id, name, program, model, task_description, \
+                    inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                    reaper_exempt, retired_at\
+                ) VALUES (?, 1, ?, 'test', 'test', '', ?, ?, 'auto', 'auto', 0, NULL)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(name.to_string()),
+                    Value::BigInt(idle_40d),
+                    Value::BigInt(idle_40d),
+                ],
+            )
+            .expect("seed agent");
+        }
+        if deregister_one {
+            conn.execute_sync(
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (1, ?)",
+                &[Value::BigInt(now_us)],
+            )
+            .expect("deregister GoneAgent");
+        }
+        drop(conn);
+
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_str}"),
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::get_or_create_pool(&cfg).expect("pool");
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let (candidates, reaped, skipped): (i64, i64, i64) =
+            if deregister_one { (1, 1, 1) } else { (2, 2, 0) };
+        rt.block_on(async {
+            let dry = agents_reap_payload(&cx, &pool, 30, None, true)
+                .await
+                .expect("dry run");
+            assert_eq!(dry["candidate_count"], candidates);
+            assert_eq!(dry["reaped_count"], 0);
+            assert_eq!(dry["skipped_deregistered_count"], skipped);
+
+            let real = agents_reap_payload(&cx, &pool, 30, None, false)
+                .await
+                .expect("a deregistered agent must not abort the sweep");
+            assert_eq!(real["candidate_count"], candidates);
+            assert_eq!(real["reaped_count"], reaped);
+            assert_eq!(real["skipped_deregistered_count"], skipped);
+
+            let mut agents =
+                outcome_to_result(mcp_agent_mail_db::queries::list_agents(&cx, &pool, 1).await)
+                    .expect("list agents for verification");
+            agents.sort_by_key(|agent| agent.id);
+            let retired: Vec<(String, bool)> = agents
+                .into_iter()
+                .map(|agent| (agent.name, agent.retired_at.is_some()))
+                .collect();
+            // The deregistered row is left exactly as it was.
+            assert_eq!(
+                retired,
+                vec![
+                    ("GoneAgent".to_string(), !deregister_one),
+                    ("StaleAgent".to_string(), true),
+                ]
+            );
+        });
+    }
 }
 
 #[test]
@@ -3807,9 +4042,9 @@ fn setup_self_heal_command_uses_runtime_http_values() {
             no_hooks,
             ..
         } => {
-            assert_eq!(host, "0.0.0.0");
-            assert_eq!(port, 9001);
-            assert_eq!(path, "/api/v2/");
+            assert_eq!(host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(port, Some(9001));
+            assert_eq!(path.as_deref(), Some("/api/v2/"));
             assert!(yes);
             assert!(!dry_run);
             assert!(!no_user_config);
@@ -3831,7 +4066,7 @@ fn setup_self_heal_command_uses_normalized_http_path() {
     );
 
     match build_setup_run_command_for_http_server(&config) {
-        SetupCommand::Run { path, .. } => assert_eq!(path, "/mcp/"),
+        SetupCommand::Run { path, .. } => assert_eq!(path.as_deref(), Some("/mcp/")),
         other => panic!("unexpected command: {other:?}"),
     }
 }
@@ -4583,8 +4818,9 @@ fn clap_parses_check_inbox_defaults() {
             assert!(!direct);
             assert!(format.is_none());
             assert!(!json);
-            assert_eq!(host, "127.0.0.1");
-            assert_eq!(port, 8765);
+            // Unset: the configured endpoint is resolved at run time.
+            assert_eq!(host, None);
+            assert_eq!(port, None);
             assert!(project.is_none());
         }
         other => panic!("unexpected command: {other:?}"),
@@ -4626,8 +4862,8 @@ fn clap_parses_check_inbox_all_flags() {
             assert!(direct);
             assert!(format.is_none());
             assert!(json);
-            assert_eq!(host, "0.0.0.0");
-            assert_eq!(port, 9999);
+            assert_eq!(host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(port, Some(9999));
             assert_eq!(project.as_deref(), Some("/tmp/proj"));
         }
         other => panic!("unexpected command: {other:?}"),
@@ -5750,6 +5986,62 @@ fn am_run_local_backend_sets_env_and_releases_lease() {
     assert!(
         lease.released_ts.is_some(),
         "expected released_ts to be set, got: {lease_json}"
+    );
+}
+
+#[test]
+fn am_run_with_build_slots_disabled_leaves_no_lease_and_says_so() {
+    use ftui_runtime::stdio_capture::StdioCapture;
+
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _capture_lock = stdio_capture_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config {
+        worktrees_enabled: false,
+        storage_root: temp.path().join("storage_root"),
+        ..Config::default()
+    };
+    let args = AmRunArgs {
+        slot: "frontend-build".to_string(),
+        cmd: vec!["true".to_string()],
+        path: PathBuf::from("/tmp/am-run-fixture"),
+        agent: Some("TestAgent".to_string()),
+        ttl_seconds: 3600,
+        shared: false,
+        exclusive: false,
+        block_on_conflicts: true,
+        no_block_on_conflicts: false,
+        artifact_dir: None,
+    };
+
+    let capture = StdioCapture::install().unwrap();
+    handle_am_run_with(&config, None, None, args).expect("the command still runs");
+    let mut sink = Vec::new();
+    capture.drain(&mut sink).unwrap();
+    drop(capture);
+    let output = String::from_utf8_lossy(&sink).to_string();
+    assert!(
+        output.contains("build slots are disabled"),
+        "expected the disabled-slots warning: {output}"
+    );
+
+    // No lease is written, so none lingers as an active exclusive hold.
+    let identity = resolve_project_identity("/tmp/am-run-fixture");
+    let lease_path = config
+        .storage_root
+        .join("projects")
+        .join(&identity.slug)
+        .join("build_slots")
+        .join("frontend-build");
+    assert!(
+        !lease_path.exists(),
+        "no slot directory or lease may be created: {}",
+        lease_path.display()
     );
 }
 
@@ -9019,6 +9311,7 @@ fn archive_save_list_restore_roundtrip_smoke() {
         &restore_storage,
         false,
         false,
+        || Ok(()),
     )
     .unwrap_err();
     let msg = match err {
@@ -9044,6 +9337,7 @@ fn archive_save_list_restore_roundtrip_smoke() {
             &restore_storage,
             false,
             true,
+            || -> CliResult<()> { panic!("a dry run must not take the mailbox") },
         )
         .unwrap();
         let mut sink = Vec::new();
@@ -9063,7 +9357,15 @@ fn archive_save_list_restore_roundtrip_smoke() {
 
     // Actual restore with --force should preserve the prior state and
     // restore the snapshot + storage.
-    archive_restore_state(archive_arg, &restore_db, &restore_storage, true, false).unwrap();
+    archive_restore_state(
+        archive_arg,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || Ok(()),
+    )
+    .unwrap();
 
     let db_quarantine = find_backup_entry(&restore_dir, "mailbox.sqlite3.corrupt-")
         .expect("prior database generation preserved");
@@ -9141,6 +9443,7 @@ fn archive_restore_state_backs_up_broken_sqlite_sidecar_symlink() {
         &restore_storage,
         true,
         false,
+        || Ok(()),
     )
     .expect("archive restore should back up broken sidecar symlink");
 
@@ -9216,8 +9519,15 @@ fn archive_restore_state_keeps_live_state_when_archive_snapshot_is_invalid() {
         zip.finish().unwrap();
     }
 
-    let err = archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-        .expect_err("invalid archive snapshot should fail before mutating live state");
+    let err = archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || Ok(()),
+    )
+    .expect_err("invalid archive snapshot should fail before mutating live state");
 
     assert!(
         format!("{err}").contains("did not pass health check"),
@@ -9275,8 +9585,15 @@ fn archive_restore_state_handles_database_embedded_in_storage_root() {
     std::fs::create_dir_all(restore_storage.join(".git")).unwrap();
     std::fs::write(restore_storage.join(".git/HEAD"), b"old-head\n").unwrap();
 
-    archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-        .expect("restore into embedded sqlite layout");
+    archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || Ok(()),
+    )
+    .expect("restore into embedded sqlite layout");
 
     assert!(
         find_backup_entry(root.path(), "storage.sqlite3.backup-").is_none(),
@@ -9316,6 +9633,127 @@ fn archive_restore_state_handles_database_embedded_in_storage_root() {
 }
 
 #[test]
+fn archive_restore_state_stops_the_running_service_and_starts_it_after_restoring() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+    let _cwd = CwdGuard::chdir(root.path());
+
+    let source_storage = root.path().join("source-storage");
+    let source_db = root.path().join("source.sqlite3");
+    seed_storage_root(&source_storage);
+    seed_mailbox_db(&source_db);
+    let archive_path = archive_save_state(
+        &source_db,
+        &source_storage,
+        vec!["proj-alpha".to_string()],
+        "archive".to_string(),
+        Some("restore-under-service".to_string()),
+    )
+    .expect("archive save");
+
+    let restore_storage = root.path().join("restore-root");
+    let restore_db = root.path().join("restore.sqlite3");
+    std::fs::create_dir_all(&restore_storage).unwrap();
+    std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+    // A running service holds the live mailbox; taking it stops the
+    // service, and the service comes back only after the restore.
+    let unit = user_unit(SYSTEMD_UNIT_NAME);
+    let host = ScriptedQuiesceHost::new(
+        &restore_storage,
+        scripted_holder(4242, Some(unit.clone())),
+        ScriptedRelease::Stop,
+    );
+    archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || {
+            let locks = acquire_mailbox_locks_quiescing_owners(
+                &host,
+                &restore_storage,
+                Some(&restore_db),
+                "the restore",
+                fast_quiesce_timing(),
+            )?;
+            host.events.borrow_mut().push("mailbox taken".to_string());
+            Ok(locks)
+        },
+    )
+    .expect("restore stops the running service instead of failing busy");
+
+    assert_eq!(
+        std::fs::read(restore_storage.join("nested/dir/file.txt")).unwrap(),
+        b"hello\n"
+    );
+    assert_eq!(
+        host.events(),
+        vec![
+            format!("stop {}", unit.display_name()),
+            "mailbox taken".to_string(),
+            format!("start {} lock_free=true", unit.display_name()),
+        ]
+    );
+}
+
+#[test]
+fn archive_restore_state_leaves_live_state_when_the_mailbox_cannot_be_taken() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+    let _cwd = CwdGuard::chdir(root.path());
+
+    let source_storage = root.path().join("source-storage");
+    let source_db = root.path().join("source.sqlite3");
+    seed_storage_root(&source_storage);
+    seed_mailbox_db(&source_db);
+    let archive_path = archive_save_state(
+        &source_db,
+        &source_storage,
+        vec!["proj-alpha".to_string()],
+        "archive".to_string(),
+        Some("restore-busy".to_string()),
+    )
+    .expect("archive save");
+
+    let restore_storage = root.path().join("restore-root");
+    let restore_db = root.path().join("restore.sqlite3");
+    std::fs::create_dir_all(&restore_storage).unwrap();
+    std::fs::write(&restore_db, b"old-db").unwrap();
+    std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+    let error = archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || {
+            Err::<(), _>(CliError::Other(
+                "Resource is temporarily busy. mailbox activity lock is busy".to_string(),
+            ))
+        },
+    )
+    .expect_err("a mailbox that cannot be taken fails the restore");
+    assert!(is_resource_busy_cli_error(&error), "{error}");
+    assert_eq!(std::fs::read(&restore_db).unwrap(), b"old-db");
+    assert_eq!(
+        std::fs::read(restore_storage.join("old.txt")).unwrap(),
+        b"old-storage"
+    );
+    assert!(!restore_storage.join("nested").exists());
+}
+
+#[test]
 fn archive_restore_state_embedded_layout_missing_target_creates_no_backup() {
     let _lock = ARCHIVE_TEST_LOCK
         .lock()
@@ -9346,8 +9784,15 @@ fn archive_restore_state_embedded_layout_missing_target_creates_no_backup() {
         "test requires a missing restore root"
     );
 
-    archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-        .expect("restore into previously missing embedded sqlite layout");
+    archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || Ok(()),
+    )
+    .expect("restore into previously missing embedded sqlite layout");
 
     assert!(
         find_backup_entry(root.path(), "missing-restore-root.backup-").is_none(),
@@ -9447,8 +9892,15 @@ fn archive_restore_state_embedded_layout_ignores_storage_payload_sqlite_artifact
 
     let restore_storage = root.path().join("restore-root");
     let restore_db = restore_storage.join("storage.sqlite3");
-    archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-        .expect("restore should ignore embedded sqlite artifacts from storage payload");
+    archive_restore_state(
+        archive_path,
+        &restore_db,
+        &restore_storage,
+        true,
+        false,
+        || Ok(()),
+    )
+    .expect("restore should ignore embedded sqlite artifacts from storage payload");
 
     let restored_conn =
         mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
@@ -9873,6 +10325,7 @@ fn clear_and_reset_force_archive_creates_archive_and_wipes() {
     let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
     let outcome = clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
         true,
         Some(true),
         Some(&db_path),
@@ -9940,6 +10393,7 @@ fn clear_and_reset_force_no_archive_wipes_without_archive() {
     let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
     clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
         true,
         Some(false),
         Some(&db_path),
@@ -9981,9 +10435,15 @@ fn clear_and_reset_refuses_without_force_on_non_interactive_stdin() {
     std::fs::write(&shm_path, b"shm").unwrap();
     let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
-    let err =
-        clear_and_reset_everything(false, None, Some(&db_path), &database_files, &storage_root)
-            .unwrap_err();
+    let err = clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
+        false,
+        None,
+        Some(&db_path),
+        &database_files,
+        &storage_root,
+    )
+    .unwrap_err();
     let msg = match err {
         CliError::Other(m) => m,
         other => format!("{other}"),
@@ -10028,7 +10488,10 @@ fn clear_and_reset_reports_busy_before_wiping_mailbox() {
     )
     .expect("acquire shared storage-root lock");
 
+    // The holder is this very process, which the reset never stops, so the
+    // live host finds nothing it may quiesce and reports the busy mailbox.
     let error = clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
         true,
         Some(false),
         Some(&db_path),
@@ -10080,6 +10543,7 @@ fn clear_and_reset_removes_symlinked_storage_entries_without_touching_targets() 
     let database_files = vec![db_path.clone()];
 
     clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
         true,
         Some(false),
         Some(&db_path),
@@ -10110,6 +10574,416 @@ fn clear_and_reset_removes_symlinked_storage_entries_without_touching_targets() 
         std::fs::read(outside_dir.join("keep.txt")).unwrap(),
         b"keep",
         "outside target contents must remain untouched"
+    );
+}
+
+// -----------------------------------------------------------------------
+// clear-and-reset-everything: quiescing the running mailbox owner
+// -----------------------------------------------------------------------
+
+/// What a scripted holder lets go of the mailbox in response to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptedRelease {
+    Stop,
+    Terminate,
+    Kill,
+    Never,
+}
+
+/// A reset host whose single "holder" is an in-process activity lock that
+/// is released when the reset applies the scripted action to it.
+struct ScriptedQuiesceHost {
+    holder: MailboxHolder,
+    release_on: ScriptedRelease,
+    storage_root: PathBuf,
+    held: std::cell::RefCell<Option<mcp_agent_mail_server::MailboxActivityLockGuard>>,
+    events: std::cell::RefCell<Vec<String>>,
+}
+
+impl ScriptedQuiesceHost {
+    fn new(storage_root: &Path, holder: MailboxHolder, release_on: ScriptedRelease) -> Self {
+        let held = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("scripted holder takes the storage-root lock");
+        Self {
+            holder,
+            release_on,
+            storage_root: storage_root.to_path_buf(),
+            held: std::cell::RefCell::new(held),
+            events: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn apply(&self, action: ScriptedRelease, event: String) {
+        self.events.borrow_mut().push(event);
+        if action == self.release_on {
+            self.held.borrow_mut().take();
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.borrow().clone()
+    }
+}
+
+impl MailboxQuiesceHost for ScriptedQuiesceHost {
+    fn mailbox_holders(
+        &self,
+        _storage_root: &Path,
+        _sqlite_path: Option<&Path>,
+    ) -> Vec<MailboxHolder> {
+        if self.held.borrow().is_some() {
+            vec![self.holder.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn stop_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+        self.apply(
+            ScriptedRelease::Stop,
+            format!("stop {}", supervisor.display_name()),
+        );
+        Ok(())
+    }
+
+    fn start_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+        // A restarted server must find the mailbox free: the reset has to
+        // release both locks before it starts anything again.
+        let free = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+            &self.storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .is_ok();
+        self.events.borrow_mut().push(format!(
+            "start {} lock_free={free}",
+            supervisor.display_name()
+        ));
+        Ok(())
+    }
+
+    fn terminate(&self, pid: u32) {
+        self.apply(ScriptedRelease::Terminate, format!("terminate {pid}"));
+    }
+
+    fn force_kill(&self, pid: u32) {
+        self.apply(ScriptedRelease::Kill, format!("kill {pid}"));
+    }
+}
+
+fn fast_quiesce_timing() -> MailboxQuiesceTiming {
+    MailboxQuiesceTiming {
+        term_grace: std::time::Duration::from_millis(50),
+        kill_grace: std::time::Duration::from_millis(50),
+        poll: std::time::Duration::from_millis(5),
+    }
+}
+
+fn user_unit(unit: &str) -> MailboxSupervisor {
+    MailboxSupervisor::Systemd {
+        unit: unit.to_string(),
+        user: true,
+    }
+}
+
+fn scripted_holder(pid: u32, supervisor: Option<MailboxSupervisor>) -> MailboxHolder {
+    MailboxHolder {
+        pid,
+        command: Some(format!("/opt/am/mcp-agent-mail serve-http --pid-{pid}")),
+        supervisor,
+    }
+}
+
+#[test]
+fn systemd_unit_from_cgroup_finds_user_and_system_services() {
+    assert_eq!(
+        parse_systemd_unit_from_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-mail.service\n"
+        ),
+        Some(("agent-mail.service".to_string(), true))
+    );
+    assert_eq!(
+        parse_systemd_unit_from_cgroup("0::/system.slice/mcp-agent-mail.service\n"),
+        Some(("mcp-agent-mail.service".to_string(), false))
+    );
+    // A delegated sub-cgroup still belongs to its unit.
+    assert_eq!(
+        parse_systemd_unit_from_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-mail.service/payload\n"
+        ),
+        Some(("agent-mail.service".to_string(), true))
+    );
+    // cgroup v1 exposes the systemd hierarchy as `name=systemd`.
+    assert_eq!(
+        parse_systemd_unit_from_cgroup(
+            "12:cpu,cpuacct:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/user@1000.service/agent-mail.service\n"
+        ),
+        Some(("agent-mail.service".to_string(), true))
+    );
+}
+
+#[test]
+fn systemd_unit_from_cgroup_ignores_scopes_and_the_user_manager() {
+    for content in [
+        "0::/user.slice/user-1000.slice/session-3.scope\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-1f2e.scope\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n",
+        "0::/\n",
+        "",
+    ] {
+        assert_eq!(
+            parse_systemd_unit_from_cgroup(content),
+            None,
+            "no supervising service in {content:?}"
+        );
+    }
+}
+
+#[test]
+fn systemd_supervisor_requires_our_unit_or_the_units_main_pid() {
+    assert_eq!(
+        mailbox_supervisor_for_systemd_unit(SYSTEMD_UNIT_NAME, true, 4242, Some(17)),
+        Some(user_unit(SYSTEMD_UNIT_NAME)),
+        "our own unit owns its holder even behind a wrapper ExecStart"
+    );
+    assert_eq!(
+        mailbox_supervisor_for_systemd_unit("custom-mail.service", true, 4242, Some(4242)),
+        Some(user_unit("custom-mail.service")),
+        "any unit whose main process is the holder supervises it"
+    );
+    assert_eq!(
+        mailbox_supervisor_for_systemd_unit("agent-harness.service", true, 4242, Some(17)),
+        None,
+        "a stdio server spawned by an unrelated service must not stop that service"
+    );
+    assert_eq!(
+        mailbox_supervisor_for_systemd_unit(SYSTEMD_UNIT_NAME, false, 4242, None),
+        None,
+        "a system unit that merely shares our name needs the main-pid proof"
+    );
+}
+
+#[test]
+fn launchctl_print_pid_is_parsed() {
+    let text = "gui/501/com.agent-mail = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/com.agent-mail.plist\n\tstate = running\n\n\tpid = 8123\n\timmediate reason = speculative\n}\n";
+    assert_eq!(parse_launchctl_print_pid(text), Some(8123));
+    assert_eq!(parse_launchctl_print_pid("\tstate = not running\n"), None);
+}
+
+#[test]
+fn reset_quiesce_plan_groups_supervisors_and_never_targets_self_or_init() {
+    let unit = user_unit(SYSTEMD_UNIT_NAME);
+    let holders = vec![
+        scripted_holder(100, Some(unit.clone())),
+        scripted_holder(101, Some(unit.clone())),
+        scripted_holder(200, None),
+        scripted_holder(200, None),
+        scripted_holder(777, None),
+        scripted_holder(1, None),
+        scripted_holder(0, None),
+    ];
+    let plan = plan_mailbox_quiesce(&holders, 777, &[]);
+    assert_eq!(plan.supervisors.len(), 1);
+    assert_eq!(plan.supervisors[0].0, unit);
+    assert_eq!(
+        plan.supervisors[0]
+            .1
+            .iter()
+            .map(|holder| holder.pid)
+            .collect::<Vec<_>>(),
+        vec![100, 101]
+    );
+    assert_eq!(
+        plan.unmanaged
+            .iter()
+            .map(|holder| holder.pid)
+            .collect::<Vec<_>>(),
+        vec![200]
+    );
+
+    // A holder that outlived its already-stopped unit is terminated directly.
+    let plan = plan_mailbox_quiesce(&holders[..1], 777, std::slice::from_ref(&unit));
+    assert!(plan.supervisors.is_empty());
+    assert_eq!(plan.unmanaged.len(), 1);
+    assert_eq!(plan.unmanaged[0].pid, 100);
+
+    assert!(plan_mailbox_quiesce(&[scripted_holder(777, None)], 777, &[]).is_empty());
+}
+
+#[test]
+fn reset_lock_quiesce_stops_the_service_and_restarts_it_after_releasing_locks() {
+    let root = tempfile::tempdir().unwrap();
+    let storage_root = root.path().join("storage_repo");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let unit = user_unit(SYSTEMD_UNIT_NAME);
+    let host = ScriptedQuiesceHost::new(
+        &storage_root,
+        scripted_holder(4242, Some(unit.clone())),
+        ScriptedRelease::Stop,
+    );
+
+    let locks = acquire_mailbox_locks_quiescing_owners(
+        &host,
+        &storage_root,
+        None,
+        "the reset",
+        fast_quiesce_timing(),
+    )
+    .expect("the reset takes the mailbox once the service is stopped");
+    assert_eq!(host.events(), vec![format!("stop {}", unit.display_name())]);
+    drop(locks);
+    assert_eq!(
+        host.events(),
+        vec![
+            format!("stop {}", unit.display_name()),
+            format!("start {} lock_free=true", unit.display_name()),
+        ]
+    );
+}
+
+#[test]
+fn reset_lock_quiesce_escalates_to_sigkill_for_a_holder_ignoring_sigterm() {
+    let root = tempfile::tempdir().unwrap();
+    let storage_root = root.path().join("storage_repo");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let host = ScriptedQuiesceHost::new(
+        &storage_root,
+        scripted_holder(5150, None),
+        ScriptedRelease::Kill,
+    );
+
+    let locks = acquire_mailbox_locks_quiescing_owners(
+        &host,
+        &storage_root,
+        None,
+        "the reset",
+        fast_quiesce_timing(),
+    )
+    .expect("SIGKILL frees the mailbox");
+    drop(locks);
+    assert_eq!(
+        host.events(),
+        vec!["terminate 5150".to_string(), "kill 5150".to_string()],
+        "an unsupervised holder is never restarted"
+    );
+}
+
+#[test]
+fn reset_lock_quiesce_reports_a_holder_it_cannot_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let storage_root = root.path().join("storage_repo");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let host = ScriptedQuiesceHost::new(
+        &storage_root,
+        scripted_holder(6060, None),
+        ScriptedRelease::Never,
+    );
+
+    let Err(error) = acquire_mailbox_locks_quiescing_owners(
+        &host,
+        &storage_root,
+        None,
+        "the reset",
+        fast_quiesce_timing(),
+    ) else {
+        panic!("a holder that survives SIGKILL keeps the mailbox busy");
+    };
+    assert!(is_resource_busy_cli_error(&error), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("pid 6060"), "{message}");
+    assert!(
+        message.contains("Could not stop the mailbox owner"),
+        "{message}"
+    );
+    let terminations = host
+        .events()
+        .iter()
+        .filter(|event| event.as_str() == "terminate 6060")
+        .count();
+    assert_eq!(terminations, MAILBOX_QUIESCE_MAX_ROUNDS);
+}
+
+#[test]
+fn clear_and_reset_restarts_the_stopped_service_and_wipes() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+    let _cwd = CwdGuard::chdir(root.path());
+
+    let storage_root = root.path().join("storage_repo");
+    seed_storage_root(&storage_root);
+    let db_path = root.path().join("mailbox.sqlite3");
+    seed_mailbox_db(&db_path);
+    let database_files = vec![db_path.clone()];
+
+    let unit = user_unit(SYSTEMD_UNIT_NAME);
+    let host = ScriptedQuiesceHost::new(
+        &storage_root,
+        scripted_holder(4242, Some(unit.clone())),
+        ScriptedRelease::Stop,
+    );
+    clear_and_reset_everything(
+        &host,
+        true,
+        Some(false),
+        Some(&db_path),
+        &database_files,
+        &storage_root,
+    )
+    .expect("the reset stops the running service instead of failing busy");
+
+    assert!(!db_path.exists(), "database file should be removed");
+    // The restarted service may already have re-created its lock file, so
+    // check the seeded content rather than an empty directory.
+    assert!(!storage_root.join("nested").exists());
+    assert!(!storage_root.join(".git").exists());
+    assert_eq!(
+        host.events(),
+        vec![
+            format!("stop {}", unit.display_name()),
+            format!("start {} lock_free=true", unit.display_name()),
+        ]
+    );
+}
+
+#[test]
+fn clear_and_reset_restarts_the_stopped_service_when_the_reset_fails() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+    let _cwd = CwdGuard::chdir(root.path());
+
+    let storage_root = root.path().join("storage_repo");
+    seed_storage_root(&storage_root);
+
+    let unit = user_unit(SYSTEMD_UNIT_NAME);
+    let host = ScriptedQuiesceHost::new(
+        &storage_root,
+        scripted_holder(4242, Some(unit.clone())),
+        ScriptedRelease::Stop,
+    );
+    // A mandatory archive with no SQLite source fails after the service
+    // was stopped; the service must still come back and nothing is wiped.
+    let error = clear_and_reset_everything(&host, true, Some(true), None, &[], &storage_root)
+        .expect_err("a mandatory archive without a database fails the reset");
+    assert!(matches!(error, CliError::ExitCode(1)), "{error}");
+
+    assert!(storage_root.join("nested/dir/file.txt").exists());
+    assert!(storage_root.join(".git/HEAD").exists());
+    assert_eq!(
+        host.events(),
+        vec![
+            format!("stop {}", unit.display_name()),
+            format!("start {} lock_free=true", unit.display_name()),
+        ]
     );
 }
 
@@ -12024,7 +12898,9 @@ fn doctor_locks_owner_state_classifies_stale_unowned_locks() {
     );
 
     assert_eq!(state.class, DoctorLockOwnerClass::Stale);
-    assert_eq!(state.safe_next_command, "am doctor --dry-run --fix");
+    assert_eq!(state.safe_next_command, "am doctor fix --dry-run");
+    // The advertised command must be one clap accepts.
+    assert!(Cli::try_parse_from(state.safe_next_command.split_whitespace()).is_ok());
     assert!(state.reason.contains("activity lock artifact"));
 }
 
@@ -12129,6 +13005,82 @@ fn doctor_locks_owner_state_ignores_read_only_cli_reader() {
     assert!(doctor_mutation_blocked_by_owner(state.class, false));
     assert_ne!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
     assert_ne!(state.class, DoctorLockOwnerClass::Wedged);
+}
+
+#[test]
+fn doctor_locks_owner_state_held_activity_lock_beats_reader_classification() {
+    // GH#336: the ownership scan saw the interactive `am` server only as a
+    // database reader (disposition Unowned), but the lock report shows it
+    // holding the storage-root activity lock exclusively. locks/drain must
+    // call that a live owner, not a stale mailbox that is safe to mutate.
+    let mut ownership = doctor_locks_test_ownership(
+        mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+        Vec::new(),
+    );
+    ownership.readers = vec![4242];
+    let storage_lock = doctor_locks_test_lock("storage_root", true, vec![4242]);
+    let sqlite_lock = doctor_locks_test_lock("sqlite", true, Vec::new());
+    let mut server = doctor_locks_test_process(4242, true, false, true);
+    server.command = Some("am".to_string());
+
+    let state = doctor_locks_owner_state(
+        &ownership,
+        &storage_lock,
+        &sqlite_lock,
+        &[server],
+        &[],
+        &DoctorReclaimContext::inert(),
+    );
+
+    assert_eq!(state.class, DoctorLockOwnerClass::Live, "{}", state.reason);
+    assert!(
+        state
+            .reason
+            .contains("storage_root activity lock is held by PID 4242 (mode exclusive)"),
+        "{}",
+        state.reason
+    );
+    assert_eq!(
+        state.safe_next_command,
+        "ps -p 4242 -o pid,ppid,stat,lstart,cmd"
+    );
+    assert!(doctor_mutation_blocked_by_owner(state.class, false));
+    let protocol =
+        supervised_drain_protocol_steps(!doctor_mutation_blocked_by_owner(state.class, false));
+    assert!(
+        protocol
+            .iter()
+            .any(|step| step.contains("Gracefully stop it via your supervisor")),
+        "{protocol:?}"
+    );
+}
+
+#[test]
+fn doctor_locks_owner_state_reader_without_lock_stays_stale() {
+    // Negative control for GH#336: a reader that holds no activity lock
+    // (and a lock "held" only by this doctor process) must not turn an
+    // unowned mailbox into a live one.
+    let mut ownership = doctor_locks_test_ownership(
+        mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+        Vec::new(),
+    );
+    ownership.readers = vec![17];
+    let storage_lock = doctor_locks_test_lock("storage_root", true, vec![std::process::id()]);
+    let sqlite_lock = doctor_locks_test_lock("sqlite", true, Vec::new());
+    let mut reader = doctor_locks_test_process(17, false, false, true);
+    reader.command = Some("am robot handoff".to_string());
+
+    let state = doctor_locks_owner_state(
+        &ownership,
+        &storage_lock,
+        &sqlite_lock,
+        &[reader],
+        &[],
+        &DoctorReclaimContext::inert(),
+    );
+
+    assert_eq!(state.class, DoctorLockOwnerClass::Stale, "{}", state.reason);
+    assert!(!doctor_mutation_blocked_by_owner(state.class, false));
 }
 
 // ─── br-z41ij: reclaimable-owner classification + supervised takeover ────
@@ -12527,8 +13479,8 @@ fn doctor_drain_report_serializes_verdict_and_protocol() {
         storage_root: "/data/storage".to_string(),
         database_path: "/data/storage/storage.sqlite3".to_string(),
         detail: "unowned".to_string(),
-        recommended_next_action: "am doctor --dry-run --fix".to_string(),
-        safe_next_command: "am doctor --dry-run --fix".to_string(),
+        recommended_next_action: "am doctor fix --dry-run".to_string(),
+        safe_next_command: "am doctor fix --dry-run".to_string(),
         supervised_protocol: supervised_drain_protocol_steps(true),
         read_only: true,
     };
@@ -14434,7 +15386,8 @@ fn inventory_failure_strategy_prefers_reconstruct_with_archive_state() {
             .to_string(),
     );
 
-    let strategy = doctor_database_inventory_failure_strategy(&error, true, &archive_root);
+    let strategy = doctor_database_inventory_failure_strategy(&error, true, &archive_root)
+        .expect("corrupt inventory remains recoverable");
     match strategy {
         DoctorDatabaseFixStrategy::Reconstruct(detail) => {
             assert!(detail.contains("Database inventory probe failed"));
@@ -14443,13 +15396,219 @@ fn inventory_failure_strategy_prefers_reconstruct_with_archive_state() {
         other => panic!("archive-backed inventory failure should reconstruct: {other:?}"),
     }
 
-    let strategy = doctor_database_inventory_failure_strategy(&error, false, &archive_root);
+    let strategy = doctor_database_inventory_failure_strategy(&error, false, &archive_root)
+        .expect("corrupt inventory remains repairable without an archive");
     match strategy {
         DoctorDatabaseFixStrategy::Repair(detail) => {
             assert!(detail.contains("Database inventory probe failed"));
             assert!(detail.contains("no authoritative archive data"));
         }
         other => panic!("inventory failure without archive data should repair: {other:?}"),
+    }
+}
+
+#[test]
+fn doctor_probe_failures_do_not_authorize_recovery_without_damage_evidence() {
+    let archive_root = Path::new("/archive/projects");
+    for detail in [
+        "Disk quota exceeded (os error 122)",
+        "No space left on device (os error 28)",
+        "Read-only file system (os error 30)",
+        "Permission denied (os error 13)",
+        "database is busy",
+        "Operation cancelled",
+        "unrecognized engine probe error",
+    ] {
+        let error = CliError::Other(detail.to_string());
+        for archive_available in [false, true] {
+            for result in [
+                doctor_database_inventory_failure_strategy(&error, archive_available, archive_root),
+                doctor_database_probe_failure_strategy(
+                    "Required-table probe",
+                    &error,
+                    archive_available,
+                    archive_root,
+                ),
+            ] {
+                let refusal = result.expect_err("a failed probe is not damage evidence");
+                assert!(refusal.to_string().contains(detail));
+                assert!(
+                    refusal.to_string().contains("not authorized")
+                        || refusal.to_string().contains("not mailbox damage"),
+                    "{refusal}"
+                );
+            }
+        }
+    }
+
+    // R3 boundary forcing: a staging path/error can contain a corruption
+    // signature. Typed I/O must win over its text. The real filesystem
+    // refusal and startup/breaker path are exercised in the test below.
+    let io = CliError::Io(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        "database disk image is malformed/TMPDIR: quota exceeded",
+    ));
+    assert!(doctor_require_recoverable_probe_error(&io).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_unusable_tmpdir_preserves_mailbox_and_recovery_authority() {
+    const FIXTURE: &str = "AM_TEST_STARTUP_TMPDIR_FIXTURE";
+    const PRIME_CACHE: &str = "AM_TEST_STARTUP_TMPDIR_PRIME_CACHE";
+    const TEST: &str = "tests::startup_unusable_tmpdir_preserves_mailbox_and_recovery_authority";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = PathBuf::from(root);
+        let db_path = root.join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let bad_tmp = std::env::temp_dir();
+        assert!(
+            bad_tmp.is_file() || !bad_tmp.exists(),
+            "TMPDIR must be a real unusable path"
+        );
+
+        if std::env::var_os(PRIME_CACHE).is_some() {
+            let good_tmp = root.join("usable-temp");
+            // The DB staging helper honors the config test override;
+            // std::env::temp_dir still points at the bad directory. This
+            // primes only the healthy-verdict cache before the real
+            // canonical source selector encounters the unusable TMPDIR.
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("TMPDIR", good_tmp.to_str().expect("UTF-8 fixture"))],
+                || {
+                    assert!(
+                        sqlite_file_is_healthy(&db_path)
+                            .expect("prime unchanged-family healthy verdict")
+                    );
+                },
+            );
+        }
+
+        let repairs = std::cell::Cell::new(0);
+        let reconstructs = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            let error = run_startup_database_self_heal_with(
+                &db_url,
+                &root,
+                || {
+                    repairs.set(repairs.get() + 1);
+                    Err(CliError::Other("unexpected repair callback".to_string()))
+                },
+                |_| {
+                    reconstructs.set(reconstructs.get() + 1);
+                    Err(CliError::Other(
+                        "unexpected reconstruct callback".to_string(),
+                    ))
+                },
+            )
+            .expect_err("startup must refuse an unavailable health probe");
+            let detail = error.to_string();
+            assert!(detail.contains("TMPDIR"), "{detail}");
+            assert!(detail.contains(&bad_tmp.display().to_string()), "{detail}");
+        }
+        assert_eq!(repairs.get(), 0, "refusal must precede repair admission");
+        assert_eq!(reconstructs.get(), 0, "refusal must precede reconstruction");
+        println!("STARTUP_TMPDIR_REFUSAL_CHILD_RAN");
+        return;
+    }
+
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let bad_tmp_file = fixture.path().join("not-a-directory");
+    std::fs::write(&bad_tmp_file, b"unusable temporary directory witness")
+        .expect("create deterministic ENOTDIR fixture");
+    for case in [
+        "cold",
+        "cached",
+        "truncated-wal",
+        "cached-truncated-wal",
+        "missing-temp",
+        "cached-missing-temp",
+    ] {
+        // Exhausting the staging helper's NotFound retries must retain
+        // its I/O classification even with damage words in the path.
+        let bad_tmp = if case.ends_with("missing-temp") {
+            fixture
+                .path()
+                .join("database disk image is malformed")
+                .join("missing-temp")
+        } else {
+            bad_tmp_file.clone()
+        };
+        for existing_history in [false, true] {
+            let root = fixture.path().join(format!("{case}-{existing_history}"));
+            std::fs::create_dir_all(root.join("usable-temp")).expect("create fixture");
+            let db_path = root.join("storage.sqlite3");
+            seed_matching_archive_project(&root, "tmpdir-health");
+            let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, "tmpdir-health");
+            mcp_agent_mail_db::close_db_conn(writer, "finish startup TMPDIR fixture");
+            if matches!(case, "truncated-wal" | "cached-truncated-wal") {
+                std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                    .expect("plant repairable WAL without touching the database");
+            }
+            if existing_history {
+                let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path);
+                let prior = mcp_agent_mail_db::recovery_breaker::record_failure(
+                    None,
+                    &fingerprint,
+                    "prior independent recovery failure",
+                    mcp_agent_mail_db::recovery_breaker::RecoveryBreakerConfig {
+                        max_consecutive_failures: 3,
+                        cooldown_secs: 21_600,
+                    },
+                    chrono::Utc::now().timestamp(),
+                );
+                mcp_agent_mail_db::recovery_breaker::store(&db_path, &prior)
+                    .expect("retain existing recovery history");
+            }
+            let breaker = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+            let breaker_before = std::fs::read(&breaker).ok();
+            let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+            let identity_before = live_family_identity(&db_path);
+            let entries_before = directory_entry_names_for_cli_open_test(&root);
+
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(FIXTURE, &root)
+                .env("TMPDIR", &bad_tmp)
+                .env("TEMP", &bad_tmp)
+                .env("TMP", &bad_tmp)
+                .env("STORAGE_ROOT", &root)
+                .env("AM_HEALTH_VERDICT_REUSE_SECS", "600");
+            if matches!(
+                case,
+                "cached" | "cached-truncated-wal" | "cached-missing-temp"
+            ) {
+                child.env(PRIME_CACHE, "1");
+            } else {
+                child.env_remove(PRIME_CACHE);
+            }
+            let output = child
+                .output()
+                .expect("run real startup refusal in fresh process");
+            assert!(
+                output.status.success(),
+                "{case}/{existing_history}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("STARTUP_TMPDIR_REFUSAL_CHILD_RAN"),
+                "the selected child test must actually run"
+            );
+            assert_eq!(
+                sqlite_family_bytes_for_cli_open_test(&db_path),
+                family_before
+            );
+            assert_eq!(live_family_identity(&db_path), identity_before);
+            assert_eq!(std::fs::read(&breaker).ok(), breaker_before);
+            assert_eq!(
+                directory_entry_names_for_cli_open_test(&root),
+                entries_before,
+                "refused probes must not publish breaker locks, forensics, or reconstruction candidates"
+            );
+        }
     }
 }
 
@@ -14466,7 +15625,8 @@ fn relational_probe_failure_strategy_prefers_reconstruct_with_archive_state() {
         &error,
         true,
         &archive_root,
-    );
+    )
+    .expect("corrupt relational probe remains recoverable");
     match strategy {
         DoctorDatabaseFixStrategy::Reconstruct(detail) => {
             assert!(detail.contains("Foreign-key consistency probe failed"));
@@ -14483,7 +15643,8 @@ fn relational_probe_failure_strategy_prefers_reconstruct_with_archive_state() {
         &error,
         false,
         &archive_root,
-    );
+    )
+    .expect("corrupt relational probe remains repairable without an archive");
     match strategy {
         DoctorDatabaseFixStrategy::Repair(detail) => {
             assert!(detail.contains("Foreign-key consistency probe failed"));
@@ -14565,6 +15726,42 @@ fn doctor_database_fix_strategy_cleans_header_only_wal_before_open_probe() {
         1,
         "doctor strategy should preserve the healthy main database"
     );
+}
+
+/// br-txx8u: the exact staging failures from the yto incident become a
+/// clear host-storage error, never a repair or reconstruct verdict;
+/// real database failures still reach the verdict logic.
+#[test]
+fn doctor_probe_failures_from_host_storage_are_not_mailbox_damage() {
+    for detail in [
+        "database health probe failed for /m/storage.sqlite3: failed to stage source-byte-neutral SQLite health probe for /m/storage.sqlite3: Quota exceeded (os error 122)",
+        "canonical double-probe snapshot tempdir failed: No space left on device (os error 28)",
+        "staged family copy of /m/storage.sqlite3 failed: Read-only file system (os error 30)",
+    ] {
+        let error = doctor_refuse_host_storage_fault(
+            "Database sanity probe",
+            &CliError::Other(detail.to_string()),
+        )
+        .expect_err("host storage failure must be refused as a verdict");
+        let text = error.to_string();
+        assert!(
+            text.contains("not mailbox damage")
+                && text.contains("no repair or archive reconstruction was attempted")
+                && text.contains("TMPDIR"),
+            "{text}"
+        );
+    }
+    for detail in [
+        "database disk image is malformed",
+        "PRAGMA integrity_check failed: wrong # of entries in index",
+        "Permission denied (os error 13)",
+    ] {
+        doctor_refuse_host_storage_fault(
+            "Database sanity probe",
+            &CliError::Other(detail.to_string()),
+        )
+        .expect("database failures keep flowing to the repair/reconstruct verdict");
+    }
 }
 
 #[test]
@@ -14944,8 +16141,9 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
         "an unopenable main file must still reconstruct: {strategy:?}"
     );
 
-    // The open-probe layer reports the composite cause with every branch
-    // readable instead of truncating it down to the first clause.
+    // The open-probe layer cannot establish damage independently while the
+    // live-owner guard refuses access. Preserve that refusal and all branch
+    // diagnostics even though the outer strategy proved main-file damage.
     let archive_root = dir.path().join("projects");
     let probe = doctor_database_fix_strategy_read_only_probes(
         &db_url,
@@ -14956,11 +16154,11 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
         None,
         true,
     )
-    .expect("open-probe strategy");
+    .expect_err("live-owner refusal must not authorize automatic reconstruction");
     match probe {
-        DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+        CliError::Other(detail) => {
             assert!(
-                detail.starts_with("Database open probe failed: "),
+                detail.starts_with("Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: "),
                 "{detail}"
             );
             for clause in [
@@ -14978,20 +16176,16 @@ fn doctor_read_only_probe_still_fails_on_unopenable_file() {
                 "the offline clause must carry the real guard refusal: {detail}"
             );
             assert!(
-                detail.contains("archive recovery is available under"),
-                "{detail}"
-            );
-            assert!(
                 detail.chars().count()
                     <= DOCTOR_OPEN_PROBE_DETAIL_LIMIT
-                        + "Database open probe failed: ".len()
-                        + "; archive recovery is available under ".len()
-                        + archive_root.display().to_string().len(),
+                        + "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: ".len(),
                 "open-probe detail must stay bounded ({} chars): {detail}",
                 detail.chars().count()
             );
         }
-        other => panic!("truncated main file must report an open-probe failure: {other:?}"),
+        other => {
+            panic!("live-owner refusal must report the composite open-probe failure: {other:?}")
+        }
     }
     drop(writer);
 }
@@ -21483,7 +22677,34 @@ fn resolve_guard_archive_root_prefers_real_project_archive() {
     .expect("write project metadata");
 
     let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-    assert_eq!(resolved, candidate);
+    assert_eq!(resolved, Some(candidate));
+}
+
+#[test]
+fn resolve_guard_archive_root_uses_an_unlabelled_slug_archive_and_reports_none() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let repo_path = td.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+    let config = Config {
+        storage_root: td.path().join("storage"),
+        ..Config::default()
+    };
+
+    // No archive at all: nothing to check, not "no conflicts".
+    assert_eq!(
+        resolve_guard_archive_root_for_check(&repo_path, &config),
+        None
+    );
+
+    // This project's slug with no project.json proves no collision, so its
+    // reservations are read (as the installed hook does).
+    let identity = resolve_project_identity(&repo_path.to_string_lossy());
+    let candidate = config.storage_root.join("projects").join(&identity.slug);
+    std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+    assert_eq!(
+        resolve_guard_archive_root_for_check(&repo_path, &config),
+        Some(candidate)
+    );
 }
 
 #[cfg(unix)]
@@ -21521,7 +22742,7 @@ fn resolve_guard_archive_root_ignores_symlinked_repo_reservations_dir() {
     .expect("write project metadata");
 
     let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-    assert_eq!(resolved, candidate);
+    assert_eq!(resolved, Some(candidate));
 }
 
 #[test]
@@ -21557,7 +22778,10 @@ fn resolve_guard_archive_root_rejects_slug_collision_without_matching_metadata()
     .expect("write colliding metadata");
 
     let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-    assert_eq!(resolved, repo_path);
+    assert_eq!(
+        resolved, None,
+        "an archive naming another project is not ours"
+    );
 }
 
 #[test]
@@ -22216,6 +23440,18 @@ fn clap_parses_projects_adopt_apply() {
         } => assert!(apply),
         other => panic!("expected Projects Adopt, got {other:?}"),
     }
+
+    // --dry-run never rides along with --apply into a mutation.
+    let both = Cli::try_parse_from([
+        "am",
+        "projects",
+        "adopt",
+        "/tmp/src",
+        "/tmp/dst",
+        "--dry-run",
+        "--apply",
+    ]);
+    assert!(both.is_err(), "--dry-run --apply must be refused");
 }
 
 #[test]
@@ -25756,7 +26992,7 @@ fn integration_file_reservations_reserve_rejects_orphaned_project_placeholder() 
     let output = capture.drain_to_string();
     assert!(
         result.is_err(),
-        "a missing project cannot authorize a reservation"
+        "a missing project cannot authorize a reservation: {result:?} {output}"
     );
     assert!(
         !output.contains("\"granted\""),
@@ -26653,6 +27889,10 @@ fn integration_file_reservations_conflicts_no_overlap() {
         output.contains("No conflicts"),
         "expected no conflicts, got: {output}"
     );
+    assert!(
+        !output.contains("is not registered"),
+        "a registered project gets no warning, got: {output}"
+    );
 }
 
 #[test]
@@ -26677,6 +27917,11 @@ fn integration_file_reservations_conflicts_unknown_project_is_empty() {
     assert!(
         output.contains("No conflicts"),
         "expected empty conflicts result, got: {output}"
+    );
+    // A misspelled project must not read as a clear field.
+    assert!(
+        output.contains("project `missing-proj` is not registered"),
+        "expected an unregistered-project warning, got: {output}"
     );
 }
 
@@ -28768,6 +30013,110 @@ fn integration_contacts_respond_reject() {
         .unwrap();
     let status: String = rows[0].get_named("status").unwrap();
     assert_eq!(status, "blocked");
+
+    // Asking again does not lift the block, as with the tool.
+    drop(capture);
+    let capture = ftui_runtime::StdioCapture::install().unwrap();
+    let again = handle_contacts_with_conn(&conn, contact_request("RedFox", "BlueLake"));
+    let output = capture.drain_to_string();
+    assert!(again.is_ok(), "repeat request failed: {again:?}");
+    assert!(output.contains("blocked"), "{output}");
+    let rows = conn
+        .query_sync(
+            "SELECT status FROM agent_links WHERE a_agent_id = 2 AND b_agent_id = 1",
+            &[],
+        )
+        .unwrap();
+    let status: String = rows[0].get_named("status").unwrap();
+    assert_eq!(
+        status, "blocked",
+        "a block stands until the target lifts it"
+    );
+}
+
+fn contact_request(from: &str, to: &str) -> ContactsCommand {
+    ContactsCommand::Request {
+        project_key: "test-proj".to_string(),
+        from_agent: from.to_string(),
+        to_agent: to.to_string(),
+        reason: "again".to_string(),
+        ttl_seconds: i64::MAX,
+        format: None,
+        json: true,
+    }
+}
+
+#[test]
+fn integration_contacts_respond_without_a_request_is_an_error() {
+    let _guard = stdio_capture_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.sqlite3");
+    let conn = seed_acks_and_reservations_db(&db_path);
+
+    let capture = ftui_runtime::StdioCapture::install().unwrap();
+    let result = handle_contacts_with_conn(
+        &conn,
+        ContactsCommand::Respond {
+            project_key: "test-proj".to_string(),
+            agent_name: "RedFox".to_string(),
+            from_agent: "BlueLake".to_string(),
+            accept: true,
+            reject: false,
+            ttl_seconds: 86400,
+            format: None,
+            json: true,
+        },
+    );
+    let output = capture.drain_to_string();
+    let err = result.expect_err("no request means nothing was approved");
+    assert!(err.to_string().contains("no contact request"), "{err}");
+    assert!(!output.contains("\"updated\""), "{output}");
+
+    // An approved link stays approved when asked again, and an absurd TTL
+    // is clamped to a year rather than pinning the link forever.
+    drop(capture);
+    let capture = ftui_runtime::StdioCapture::install().unwrap();
+    handle_contacts_with_conn(&conn, contact_request("BlueLake", "RedFox")).expect("request");
+    let expires: i64 = conn
+        .query_sync(
+            "SELECT expires_ts FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+            &[],
+        )
+        .unwrap()[0]
+        .get_named("expires_ts")
+        .unwrap();
+    let year_and_a_day = 366 * 24 * 3600 * 1_000_000_i64;
+    assert!(
+        expires <= mcp_agent_mail_db::timestamps::now_micros() + year_and_a_day,
+        "TTL must be clamped to a year, got expires_ts={expires}"
+    );
+    handle_contacts_with_conn(
+        &conn,
+        ContactsCommand::Respond {
+            project_key: "test-proj".to_string(),
+            agent_name: "RedFox".to_string(),
+            from_agent: "BlueLake".to_string(),
+            accept: true,
+            reject: false,
+            ttl_seconds: 86400,
+            format: None,
+            json: true,
+        },
+    )
+    .expect("approve");
+    handle_contacts_with_conn(&conn, contact_request("BlueLake", "RedFox"))
+        .expect("repeat request");
+    let _ = capture.drain_to_string();
+    let rows = conn
+        .query_sync(
+            "SELECT status FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+            &[],
+        )
+        .unwrap();
+    let status: String = rows[0].get_named("status").unwrap();
+    assert_eq!(status, "approved");
 }
 
 #[test]
@@ -32456,6 +33805,67 @@ fn sqlite_conn_requires_canonical_init_for_empty_db() {
 }
 
 #[test]
+fn canonical_schema_initializer_records_rebuild_once_and_preserves_later_indexes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("canonical-migration-ledger.sqlite3");
+    let path = db_path.to_string_lossy().into_owned();
+    let read_ledger = |conn: &mcp_agent_mail_db::CanonicalDbConn| {
+        conn.query_sync(
+            &format!(
+                "SELECT id, checksum, applied_at FROM {} ORDER BY id",
+                mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+            ),
+            &[],
+        )
+        .expect("read canonical migration ledger")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get_named::<String>("id").expect("migration id"),
+                row.get_named::<String>("checksum").expect("checksum"),
+                row.get_named::<i64>("applied_at")
+                    .expect("applied timestamp"),
+            )
+        })
+        .collect::<Vec<_>>()
+    };
+
+    init_schema_sqlite_canonical(&path).expect("initialize fresh canonical database");
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path).expect("open initialized DB");
+    let ledger_before = read_ledger(&conn);
+    let rebuild = mcp_agent_mail_db::schema::schema_migrations_base()
+        .into_iter()
+        .find(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+        .expect("project-scoped delivery migration is registered");
+    assert!(
+        ledger_before
+            .iter()
+            .any(|(id, checksum, _)| { id == &rebuild.id && checksum == &rebuild.checksum() }),
+        "canonical bootstrap must record the checked migration checksum"
+    );
+    conn.execute_raw(
+        "CREATE INDEX operator_delivery_kind ON inbox_delivery_events(kind, delivered_ts)",
+    )
+    .expect("add an operator index after the rebuild has committed");
+    drop(conn);
+
+    init_schema_sqlite_canonical(&path).expect("reopen without repeating applied rebuilds");
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path).expect("reopen initialized DB");
+    assert_eq!(read_ledger(&conn), ledger_before);
+    let indexes = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'operator_delivery_kind'",
+            &[],
+        )
+        .expect("read retained custom index");
+    assert_eq!(
+        indexes.len(),
+        1,
+        "an already-applied table rebuild must neither remove nor refuse a later operator index"
+    );
+}
+
+#[test]
 fn sqlite_conn_requires_canonical_init_false_for_initialized_db() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("initialized.sqlite3");
@@ -33007,6 +34417,104 @@ fn robot_reads_never_migrate_an_existing_older_schema_mailbox() {
         schema_of(&db_path),
         before,
         "a robot read changed the mailbox schema or migration ledger"
+    );
+}
+
+/// br-2hpuk: pool-backed read verbs (`agents list`/`show` fallback,
+/// `agents resolve-pane`, `agents reap --dry-run`) used a pool on the live
+/// mailbox, whose first use runs the full schema init and migrations. They
+/// now read a private snapshot: the live mailbox keeps its older schema
+/// and migration ledger byte-for-byte, and the read still answers.
+#[test]
+fn pool_backed_read_verbs_never_migrate_the_live_mailbox() {
+    use sqlmodel_core::Value;
+    const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage_root = dir.path().join("archive");
+    std::fs::create_dir_all(&storage_root).expect("storage root");
+    let db_path = dir.path().join("storage.sqlite3");
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    let db_url = format!("sqlite:///{db_path_str}");
+    drop(open_db_sync_with_database_url(&db_url).expect("create a mailbox"));
+
+    // Simulate a mailbox last migrated by an older binary, with one
+    // stale agent for the dry-run reap to find.
+    let idle_40d = mcp_agent_mail_db::timestamps::now_micros() - 40 * 86_400_000_000;
+    {
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str).expect("open canonical");
+        conn.execute_raw(&format!(
+            "DELETE FROM {} WHERE id = '{V31}'",
+            mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+        ))
+        .expect("drop the v31 ledger row");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'old-proj', '/tmp/old-proj', ?)",
+            &[Value::BigInt(idle_40d)],
+        )
+        .expect("seed project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+             retired_at) VALUES (1, 1, 'StaleAgent', 'test', 'test', '', ?, ?, 'auto', 'auto', 0, NULL)",
+            &[Value::BigInt(idle_40d), Value::BigInt(idle_40d)],
+        )
+        .expect("seed agent");
+        drop(conn);
+    }
+    let live_state = |path: &str| {
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path).expect("open for inspection");
+        let mut state = conn
+            .query_sync(
+                &format!(
+                    "SELECT id AS item FROM {} UNION ALL \
+                     SELECT type || ':' || name || ':' || COALESCE(sql, '') FROM sqlite_master \
+                     ORDER BY 1",
+                    mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+                ),
+                &[],
+            )
+            .expect("read ledger and schema")
+            .iter()
+            .map(|row| row.get_as::<String>(0).unwrap())
+            .collect::<Vec<_>>();
+        state.push(format!(
+            "user_version={}",
+            conn.query_sync("PRAGMA user_version", &[])
+                .expect("user_version")[0]
+                .get_as::<i64>(0)
+                .unwrap()
+        ));
+        drop(conn);
+        state
+    };
+    let before = live_state(&db_path_str);
+    assert!(!before.iter().any(|item| item == V31));
+
+    let config = mcp_agent_mail_core::Config {
+        storage_root: storage_root.clone(),
+        ..mcp_agent_mail_core::Config::default()
+    };
+    let ctx =
+        context::AsyncCliContext::open_for_read_with(config, &db_url, "agents reap --dry-run")
+            .expect("a read verb opens an older-schema mailbox through a snapshot");
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    let cx = asupersync::Cx::for_testing();
+    let dry = rt
+        .block_on(async { agents_reap_payload(&cx, &ctx.pool, 30, None, true).await })
+        .expect("dry-run reap reads the snapshot");
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["candidate_count"], 1, "{dry}");
+    assert_eq!(dry["reaped_count"], 0);
+    drop(ctx);
+
+    assert_eq!(
+        live_state(&db_path_str),
+        before,
+        "a read verb migrated or changed the live mailbox"
     );
 }
 

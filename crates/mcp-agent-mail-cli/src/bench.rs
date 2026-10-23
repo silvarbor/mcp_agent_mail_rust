@@ -313,9 +313,6 @@ const BENCH_ENV_ATC_LIVE: &[(&str, &str)] = &[("AM_ATC_WRITE_MODE", "live")];
 const CMD_HELP: &[&str] = &["--help"];
 const CMD_LINT: &[&str] = &["lint"];
 const CMD_TYPECHECK: &[&str] = &["typecheck"];
-const CMD_STUB_ENCODE_1K: &[&str] = &["stub-encode", "--size", "1024"];
-const CMD_STUB_ENCODE_10K: &[&str] = &["stub-encode", "--size", "10240"];
-const CMD_STUB_ENCODE_100K: &[&str] = &["stub-encode", "--size", "102400"];
 const CMD_MAIL_INBOX: &[&str] = &[
     "mail",
     "inbox",
@@ -360,13 +357,6 @@ const CMD_ROBOT_STATUS: &[&str] = &[
     "json",
 ];
 const CMD_DOCTOR_CHECK: &[&str] = &["doctor", "check", "--json"];
-const CMD_MESSAGE_COUNT: &[&str] = &[
-    "mail",
-    "count",
-    "--project",
-    BENCH_PROJECT_HUMAN_KEY,
-    "--json",
-];
 const CMD_AGENTS_LIST: &[&str] = &[
     "agents",
     "list",
@@ -843,36 +833,6 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
-        name: "stub_encode_1k",
-        command: CMD_STUB_ENCODE_1K,
-        category: BenchCategory::StubEncoder,
-        default_runs: DEFAULT_RUNS,
-        requires_seeded_db: false,
-        conditional: true,
-        condition: BenchCondition::StubEncoderScriptPresent,
-        env: BENCH_ENV_NONE,
-    },
-    BenchmarkDef {
-        name: "stub_encode_10k",
-        command: CMD_STUB_ENCODE_10K,
-        category: BenchCategory::StubEncoder,
-        default_runs: DEFAULT_RUNS,
-        requires_seeded_db: false,
-        conditional: true,
-        condition: BenchCondition::StubEncoderScriptPresent,
-        env: BENCH_ENV_NONE,
-    },
-    BenchmarkDef {
-        name: "stub_encode_100k",
-        command: CMD_STUB_ENCODE_100K,
-        category: BenchCategory::StubEncoder,
-        default_runs: DEFAULT_RUNS,
-        requires_seeded_db: false,
-        conditional: true,
-        condition: BenchCondition::StubEncoderScriptPresent,
-        env: BENCH_ENV_NONE,
-    },
-    BenchmarkDef {
         name: "mail_inbox",
         command: CMD_MAIL_INBOX,
         category: BenchCategory::Operational,
@@ -945,16 +905,6 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
     BenchmarkDef {
         name: "doctor_check",
         command: CMD_DOCTOR_CHECK,
-        category: BenchCategory::Operational,
-        default_runs: DEFAULT_RUNS,
-        requires_seeded_db: true,
-        conditional: true,
-        condition: BenchCondition::SeededDatabaseReady,
-        env: BENCH_ENV_NONE,
-    },
-    BenchmarkDef {
-        name: "message_count",
-        command: CMD_MESSAGE_COUNT,
         category: BenchCategory::Operational,
         default_runs: DEFAULT_RUNS,
         requires_seeded_db: true,
@@ -1506,6 +1456,10 @@ pub(super) fn handle_bench(
         let report = seed_bench_database(&conn, false)
             .map_err(|err| CliError::Other(format!("benchmark seed failed: {err}")))?;
         bench_env.insert("DATABASE_URL".to_string(), database_url);
+        // These commands measure the isolated fixture, including local fallback.
+        // Never discover or send requests to the operator's running mailbox.
+        bench_env.insert("HTTP_HOST".to_string(), "127.0.0.1".to_string());
+        bench_env.insert("HTTP_PORT".to_string(), "1".to_string());
         bench_env.insert(
             "STORAGE_ROOT".to_string(),
             storage_root.to_string_lossy().into_owned(),
@@ -1752,8 +1706,22 @@ mod tests {
     }
 
     #[test]
-    fn default_benchmark_catalog_has_expected_size() {
-        assert_eq!(DEFAULT_BENCHMARKS.len(), 16);
+    fn default_benchmark_catalog_uses_supported_cli_commands() {
+        use clap::CommandFactory as _;
+
+        for definition in DEFAULT_BENCHMARKS {
+            let parsed = crate::Cli::command()
+                .no_binary_name(true)
+                .try_get_matches_from(definition.command);
+            assert!(
+                parsed.is_ok()
+                    || parsed
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == clap::error::ErrorKind::DisplayHelp),
+                "{} is not a supported command: {parsed:?}",
+                definition.name
+            );
+        }
     }
 
     #[test]

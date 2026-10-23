@@ -18,8 +18,7 @@ those signals.
 - Field names are `snake_case`.
 - Units are encoded in field names: `duration_ms`, `wait_seconds`,
   `size_bytes`. Do not use a bare field such as `duration`.
-- Raw git arguments are never logged by default. Use `args_hash`; raw args are
-  only allowed when `AM_LOG_GIT_ARGS=1`.
+- Raw git arguments are never logged. Use `args_hash`.
 - Use stable, tokenized identifiers such as `repo_slug` in operator-facing
   events instead of high-cardinality absolute paths when possible.
 
@@ -31,7 +30,7 @@ Every `run_git_locked`-adjacent event must carry these fields:
 |---|---|---|
 | `repo_slug` | string | Tokenized project or repository identifier. |
 | `caller` | string | Static call-site name, populated by the wrapper or macro. |
-| `args_hash` | string | SHA-256 of the joined argv. Raw argv requires `AM_LOG_GIT_ARGS=1`. |
+| `args_hash` | string | SHA-256 of the joined argv. Raw argv is never logged. |
 | `duration_ms` | number | End-to-end duration in milliseconds. |
 | `outcome` | enum | One of `success`, `retrying`, `succeeded_after_retry`, `exhausted`, `error`. |
 | `git_version` | string | Cached resolved git version, or `unknown`. |
@@ -74,7 +73,7 @@ Draft 2020-12, has a stable `$id` under
 
 | schema | covers |
 |---|---|
-| `run_git_locked.schema.json` | `run_git_locked_*`, `git_locked_exit_*`, `git_spawn_failed`, `flock_acquire_failed`, and `git_binary_*` resolution/catalog events |
+| `run_git_locked.schema.json` | `git_locked_exit_*`, git retry attempts and successes, and git binary resolution/catalog events |
 | `git_segfault_retry.schema.json` | `git_segfault_retry_*`, `guard_git_segfault_retry*` |
 | `git_repo_lock.schema.json` | Per-process repo mutex events and metrics. |
 | `git_flock.schema.json` | `flock_*` events from cooperative repo flocking. |

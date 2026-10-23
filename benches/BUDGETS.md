@@ -62,7 +62,7 @@ Current blocker on `2026-04-18`:
 - Treat `<= 10%` p95 drift on the same host as noise.
 - Investigate `> 10%` drift; escalate at `>= 20%` or after three consecutive `> 10%` runs.
 - Cross-host comparisons are advisory only; NVMe model, filesystem, mount options, and kernel materially affect `fsync`-heavy workloads.
-- If a same-host rerun breaches the envelope after an archive-path change, follow [docs/OPERATOR_RUNBOOK.md](/data/projects/mcp_agent_mail_rust/docs/OPERATOR_RUNBOOK.md#emergency-roll-back-archive-batch-write-optimization).
+- If a same-host rerun breaches the envelope after an archive-path change, preserve the failing measurements and verify the previous qualified build on that host before choosing a rollback.
 
 ### Cross-Filesystem Fsync Matrix (br-8qdh0.11)
 
@@ -86,7 +86,7 @@ CI-covered budgets:
 | ext4 (`data=journal`) | Linux loopback | `normal` | < 40ms | < 350ms | Higher journal cost; use when durability policy is stricter than latency policy |
 | xfs | Linux loopback | `normal` | < 25ms | < 250ms | Recommended for low-variance Linux server writes |
 | btrfs | Linux loopback | `normal` | < 50ms | < 500ms | Supported but slower under CoW + metadata pressure |
-| APFS | macOS runner | `barrier_only` | < 35ms | < 300ms | Durable rename + barrier semantics differ from Linux flush semantics |
+| APFS | macOS runner | `full_flush` | < 35ms | < 300ms | Rust file synchronization uses `F_FULLFSYNC` to flush the device cache |
 | tmpfs | Linux tmpfs | `buffered` | < 15ms | < 150ms | Canary only; not durable and still pays Git/process overhead, so treat it as a logic floor rather than a near-zero write budget |
 
 Documented but not yet CI-gated:

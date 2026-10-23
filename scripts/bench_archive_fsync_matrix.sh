@@ -8,10 +8,13 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_DIR="${PROJECT_ROOT}/tests/artifacts/perf/archive_fsync_matrix/${RUN_ID}"
 FILESYSTEM=""
 TARGET_DIR="${TMPDIR:-/tmp}/target-$(whoami)-am"
+TRACE_SYSCALLS=0
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>]
+Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>] [--trace-syscalls]
+
+--trace-syscalls records Linux diagnostic timing; use a separate output directory.
 
 Supported filesystems:
   Linux:  ext4-ordered, ext4-journal, xfs, btrfs, tmpfs
@@ -29,8 +32,11 @@ require_cmd() {
 
 cleanup() {
     set +e
+    if [ -n "${BIND_MOUNT_POINT:-}" ]; then
+        sudo umount "${BIND_MOUNT_POINT}" >/dev/null 2>&1 || return
+    fi
     if [ -n "${MOUNT_POINT:-}" ] && mount | grep -q " on ${MOUNT_POINT} "; then
-        sudo umount "${MOUNT_POINT}" >/dev/null 2>&1 || true
+        sudo umount "${MOUNT_POINT}" >/dev/null 2>&1 || return
     fi
     if [ -n "${MOUNT_POINT:-}" ] && [ -d "${MOUNT_POINT}" ]; then
         rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true
@@ -53,6 +59,10 @@ while [ $# -gt 0 ]; do
         --target-dir)
             TARGET_DIR="${2:-}"
             shift 2
+            ;;
+        --trace-syscalls)
+            TRACE_SYSCALLS=1
+            shift
             ;;
         -h|--help)
             usage
@@ -78,8 +88,45 @@ require_cmd cargo
 require_cmd python3
 
 mkdir -p "${OUTPUT_DIR}"
+OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
 
 OS_NAME="$(uname -s)"
+PROBE_RUNNER=(cargo test -p mcp-agent-mail-storage --test it
+    fsync_matrix::archive_fsync_matrix_probe --)
+if [ "${TRACE_SYSCALLS}" -eq 1 ]; then
+    if [ "${OS_NAME}" != "Linux" ]; then
+        printf 'error: --trace-syscalls requires Linux\n' >&2
+        exit 1
+    fi
+    require_cmd strace
+    (
+        cd "${PROJECT_ROOT}"
+        CARGO_TARGET_DIR="${TARGET_DIR}" cargo test --locked \
+            -p mcp-agent-mail-storage --test it --no-run --message-format=json
+    ) > "${OUTPUT_DIR}/compiler-artifacts.jsonl"
+    PROBE_BINARY="$(python3 - "${OUTPUT_DIR}/compiler-artifacts.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+artifacts = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+executables = {
+    artifact["executable"]
+    for artifact in artifacts
+    if artifact.get("reason") == "compiler-artifact"
+    and artifact.get("target", {}).get("name") == "it"
+    and artifact.get("executable")
+}
+if len(executables) != 1:
+    raise SystemExit(f"expected one archive test executable, found {len(executables)}")
+print(executables.pop())
+PY
+)"
+    PROBE_RUNNER=(strace -f -c -w -o "${OUTPUT_DIR}/syscalls.txt"
+        "${PROBE_BINARY}" fsync_matrix::archive_fsync_matrix_probe)
+    printf 'Diagnostic syscall tracing enabled; these timings are not qualification evidence.\n' \
+        | tee "${OUTPUT_DIR}/diagnostic.txt"
+fi
 STORAGE_ROOT=""
 FS_LABEL=""
 MOUNT_OPTIONS=""
@@ -93,6 +140,8 @@ linux_mount_loopback() {
     local image_size="$1"
     local filesystem_kind="$2"
     local mount_opts="$3"
+    local -a mount_args
+    read -r -a mount_args <<< "${mount_opts}"
 
     require_cmd sudo
     MOUNT_POINT="$(mktemp -d "/tmp/archive-fsync-${FILESYSTEM}.XXXXXX")"
@@ -113,7 +162,7 @@ linux_mount_loopback() {
             exit 1
             ;;
     esac
-    sudo mount ${mount_opts} "${IMAGE_PATH}" "${MOUNT_POINT}"
+    sudo mount "${mount_args[@]}" "${IMAGE_PATH}" "${MOUNT_POINT}"
     sudo chown "$(id -u):$(id -g)" "${MOUNT_POINT}"
     STORAGE_ROOT="${MOUNT_POINT}/storage"
     mkdir -p "${STORAGE_ROOT}"
@@ -180,9 +229,10 @@ case "${OS_NAME}" in
         fi
         STORAGE_ROOT="${TMPDIR%/}/archive-fsync-apfs-${RUN_ID}/storage"
         mkdir -p "${STORAGE_ROOT}"
+        STORAGE_ROOT="$(cd "${STORAGE_ROOT}" && pwd -P)"
         FS_LABEL="apfs"
         MOUNT_OPTIONS="runner-managed"
-        FSYNC_MODE="barrier_only"
+        FSYNC_MODE="full_flush"
         SINGLE_BUDGET_MS="35"
         BATCH_BUDGET_MS="300"
         ;;
@@ -224,6 +274,21 @@ PY
 printf '==> archive fsync matrix on %s (%s)\n' "${FS_LABEL}" "${FSYNC_MODE}"
 
 cd "${PROJECT_ROOT}"
+if [ "${OS_NAME}" = "Linux" ]; then
+    BIND_ROOT="${STORAGE_ROOT}/bind_mount_probe"
+    BIND_SOURCE="${BIND_ROOT}/inbox-source"
+    BIND_TARGET="${BIND_ROOT}/projects/fsync-bind/agents/RecipientAgent/inbox"
+    mkdir -p "${BIND_SOURCE}" "${BIND_TARGET}"
+    sudo mount --bind "${BIND_SOURCE}" "${BIND_TARGET}"
+    BIND_MOUNT_POINT="${BIND_TARGET}"
+    AM_FSYNC_BIND_ROOT="${BIND_ROOT}" CARGO_TARGET_DIR="${TARGET_DIR}" \
+        cargo test --locked -p mcp-agent-mail-storage --test it \
+        fsync_matrix::archive_same_device_bind_mount_probe -- --ignored --exact --nocapture \
+        2>&1 | tee "${OUTPUT_DIR}/bind-mount-probe.log"
+    sudo umount "${BIND_MOUNT_POINT}"
+    BIND_MOUNT_POINT=""
+fi
+
 AM_FSYNC_MATRIX_FS_LABEL="${FS_LABEL}" \
 AM_FSYNC_MATRIX_MOUNT_OPTIONS="${MOUNT_OPTIONS}" \
 AM_FSYNC_MATRIX_FSYNC_MODE="${FSYNC_MODE}" \
@@ -232,6 +297,6 @@ AM_FSYNC_MATRIX_ARTIFACT_DIR="${OUTPUT_DIR}" \
 AM_FSYNC_MATRIX_SINGLE_P95_BUDGET_MS="${SINGLE_BUDGET_MS}" \
 AM_FSYNC_MATRIX_BATCH_100_P95_BUDGET_MS="${BATCH_BUDGET_MS}" \
 CARGO_TARGET_DIR="${TARGET_DIR}" \
-cargo test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
+"${PROBE_RUNNER[@]}" --ignored --exact --nocapture
 
 printf 'artifact summary: %s\n' "${OUTPUT_DIR}/summary.json"

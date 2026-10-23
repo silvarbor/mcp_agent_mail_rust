@@ -8,9 +8,11 @@
     "importance": "normal",
     "kind": "to",
     "project_id": 2,
+    "sender_display_name": null,
     "sender_id": 4,
     "subject": "Beta ping",
     "thread_id": null,
+    "to_display_names": {},
     "topic": null
   },
   {
@@ -22,9 +24,11 @@
     "importance": "high",
     "kind": "to",
     "project_id": 1,
+    "sender_display_name": null,
     "sender_id": 3,
     "subject": "Unicorn alpha",
     "thread_id": null,
+    "to_display_names": {},
     "topic": null
   }
 ]

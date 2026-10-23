@@ -76,9 +76,22 @@ run_bench_case() {
 }
 
 WORKDIR="$(e2e_mktemp bench-e2e)"
+export ATC_GATE_TMPDIR_ROOT="${WORKDIR}/atc-tmp"
 ATC_CANARY_STATE_DIR="${E2E_ARTIFACT_DIR}/atc_canary_state"
 mkdir -p "${ATC_CANARY_STATE_DIR}"
 export AM_ATC_CANARY_REPORT_DIR="${ATC_CANARY_STATE_DIR}"
+# The lint/typecheck benchmarks need a real Cargo project. Keep their input
+# small and isolated while running the actual installed compiler commands.
+mkdir -p "${WORKDIR}/src"
+cat >"${WORKDIR}/Cargo.toml" <<'TOML'
+[package]
+name = "bench-e2e-fixture"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+TOML
+printf '%s\n' 'fn main() {}' >"${WORKDIR}/src/main.rs"
 pushd "${WORKDIR}" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -196,12 +209,22 @@ else
     e2e_fail "bench --save-baseline failed"
 fi
 
-if run_bench_case "bench_compare_saved_baseline" --json --filter help --baseline "${BASELINE_PATH}"; then
+set +e
+run_bench_case "bench_compare_saved_baseline" --json --filter help --baseline "${BASELINE_PATH}"
+compare_rc=$?
+set -e
+if [ "${compare_rc}" -eq 0 ] || [ "${compare_rc}" -eq 3 ]; then
     out_file="${E2E_ARTIFACT_DIR}/bench_compare_saved_baseline/stdout.json"
     baseline_present="$(jq -r '(.summary.benchmarks.help.baseline.baseline_p95_ms // .summary.benchmarks.help.baseline_p95_ms) != null' "${out_file}")"
     delta_present="$(jq -r '(.summary.benchmarks.help.baseline.delta_p95_ms // .summary.benchmarks.help.delta_p95_ms) != null' "${out_file}")"
     e2e_assert_eq "baseline compare populates baseline_p95_ms" "true" "${baseline_present}"
     e2e_assert_eq "baseline compare populates delta_p95_ms" "true" "${delta_present}"
+    comparison_regression="$(jq -r '.summary.benchmarks.help.regression' "${out_file}")"
+    if [ "${comparison_regression}" = true ]; then
+        e2e_assert_eq "baseline regression has regression exit code" 3 "${compare_rc}"
+    else
+        e2e_assert_eq "baseline without regression has success exit code" 0 "${compare_rc}"
+    fi
 else
     e2e_fail "bench --baseline compare failed"
 fi
@@ -353,6 +376,39 @@ e2e_assert_eq \
     "$(jq -r '.fallback_decision.verdict' "${ATC_GATE_ZERO_OUT}/canary_report.json")"
 
 # ---------------------------------------------------------------------------
+# Case 6c: Runtime telemetry is read from the separate ATC database.
+# ---------------------------------------------------------------------------
+e2e_case_banner "atc_perf_gate_reads_sidecar"
+ATC_SIDECAR_DIR="${WORKDIR}/atc-sidecar"
+mkdir -p "${ATC_SIDECAR_DIR}"
+python3 - "${ATC_SIDECAR_DIR}" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+root = pathlib.Path(sys.argv[1])
+conn = sqlite3.connect(root / "mailbox.sqlite3")
+conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+conn.commit()
+conn.close()
+conn = sqlite3.connect(root / "atc.sqlite3")
+conn.execute("CREATE TABLE atc_experiences (experience_id INTEGER PRIMARY KEY)")
+conn.execute("INSERT INTO atc_experiences DEFAULT VALUES")
+conn.commit()
+conn.close()
+PY
+bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+    --skip-bench --bench-report "${ATC_GATE_PASS_REPORT}" \
+    --canary-db "${ATC_SIDECAR_DIR}/mailbox.sqlite3" \
+    --output-dir "${E2E_ARTIFACT_DIR}/atc_sidecar"
+e2e_assert_eq "ATC gate counts durable sidecar observations" 1 \
+    "$(jq -r '.db_health.atc_rows' "${E2E_ARTIFACT_DIR}/atc_sidecar/summary.json")"
+e2e_assert_eq "ATC gate identifies its telemetry source" "${ATC_SIDECAR_DIR}/atc.sqlite3" \
+    "$(jq -r '.db_health.atc_path' "${E2E_ARTIFACT_DIR}/atc_sidecar/summary.json")"
+e2e_assert_eq "ATC sidecar and primary both pass integrity checks" ok \
+    "$(jq -r '.db_health.quick_check' "${E2E_ARTIFACT_DIR}/atc_sidecar/summary.json")"
+
+# ---------------------------------------------------------------------------
 # Case 7: ATC perf gate fails when relative overhead breaches the budget
 # ---------------------------------------------------------------------------
 e2e_case_banner "atc_perf_gate_overhead_regression_exit_code"
@@ -420,6 +476,136 @@ e2e_assert_eq \
     "ATC latest canary report tracks most recent fallback verdict" \
     "disable_live" \
     "$(jq -r '.fallback_decision.verdict' "${ATC_CANARY_STATE_DIR}/latest_canary_report.json")"
+
+e2e_case_banner "atc_canary_protocol_responses"
+ATC_PROTOCOL_DIR="${E2E_ARTIFACT_DIR}/atc_canary_protocol"
+mkdir -p "${ATC_PROTOCOL_DIR}"
+for protocol_case in completed rpc_error tool_error missing duplicate malformed; do
+    # Raw protocol bytes include deliberately malformed input; the adjacent
+    # JSON verdict records whether parsing and protocol validation rejected it.
+    protocol_stdout="${ATC_PROTOCOL_DIR}/${protocol_case}.stdout.txt"
+    for request_id in 1 2 3 4; do
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "${request_id}"
+    done >"${protocol_stdout}"
+    case "${protocol_case}" in
+        completed|duplicate)
+            printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[]}}' >>"${protocol_stdout}"
+            if [ "${protocol_case}" = duplicate ]; then
+                printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{}}' >>"${protocol_stdout}"
+            fi
+            ;;
+        rpc_error)
+            printf '%s\n' '{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"notifications/initialized is required before operating requests"}}' >>"${protocol_stdout}"
+            ;;
+        tool_error)
+            printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"isError":true,"content":[]}}' >>"${protocol_stdout}"
+            ;;
+        missing) ;;
+        malformed) printf '%s\n' '{' >>"${protocol_stdout}" ;;
+    esac
+    # Keep the gate's global configuration in its own shell process.
+    bash -c 'source "$1"; write_server_canary_status "$2" completed "server exited" "$3" "$4" /tmp/am-atc-perf-canary' \
+        _ "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+        "${ATC_PROTOCOL_DIR}/${protocol_case}.json" "${protocol_stdout}" "${ATC_PROTOCOL_DIR}/stderr.log"
+    if [ "${protocol_case}" = completed ]; then
+        e2e_assert_eq "successful canary responses are accepted" completed \
+            "$(jq -r '.status' "${ATC_PROTOCOL_DIR}/${protocol_case}.json")"
+    else
+        e2e_assert_eq "canary rejects ${protocol_case} responses" protocol_failed \
+            "$(jq -r '.status' "${ATC_PROTOCOL_DIR}/${protocol_case}.json")"
+    fi
+done
+
+e2e_case_banner "atc_benchmark_protocol_failure_blocks_gate"
+cat >"${ATC_PROTOCOL_DIR}/rejected-server" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+    serve-stdio)
+        read -r _request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"protocol rejected"}}'
+        cat >/dev/null
+        ;;
+    *) exit 2 ;;
+esac
+SH
+chmod +x "${ATC_PROTOCOL_DIR}/rejected-server"
+set +e
+AM_BENCH_BIN="${ATC_PROTOCOL_DIR}/rejected-server" \
+ATC_GATE_TMPDIR_ROOT="${ATC_PROTOCOL_DIR}/tmp" \
+bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+    --output-dir "${ATC_PROTOCOL_DIR}/rejected-gate"
+atc_protocol_rc=$?
+set -e
+e2e_assert_eq "benchmark protocol failure fails the whole gate" 1 "${atc_protocol_rc}"
+e2e_assert_eq "gate cannot pass a failed transport benchmark" runtime_error \
+    "$(jq -r '.status' "${ATC_PROTOCOL_DIR}/rejected-gate/summary.json")"
+e2e_assert_contains "benchmark retains the protocol error" \
+    "$(jq -r '.failures[0].error' "${ATC_PROTOCOL_DIR}/rejected-gate/bench_report.json")" \
+    "protocol rejected"
+
+e2e_case_banner "atc_transport_requires_durable_messages"
+cat >"${ATC_PROTOCOL_DIR}/acknowledging-server" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = serve-stdio
+while IFS= read -r request; do
+    request_id="$(printf '%s' "$request" | jq -r '.id // empty')"
+    if [ -n "$request_id" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$request_id"
+    fi
+done
+SH
+chmod +x "${ATC_PROTOCOL_DIR}/acknowledging-server"
+set +e
+python3 "${PROJECT_ROOT}/scripts/bench_atc_transport.py" \
+    --binary "${ATC_PROTOCOL_DIR}/acknowledging-server" \
+    --store-root "${ATC_PROTOCOL_DIR}/missing-durable-store" \
+    >"${ATC_PROTOCOL_DIR}/missing-durable-report.json"
+atc_durable_rc=$?
+set -e
+e2e_assert_eq "successful replies without a database fail measurement" 1 "${atc_durable_rc}"
+e2e_assert_eq "unpersisted sends produce no accepted timing entry" 0 \
+    "$(jq '.summary.benchmarks | length' "${ATC_PROTOCOL_DIR}/missing-durable-report.json")"
+e2e_assert_eq "missing persistence retains a diagnostic failure" 1 \
+    "$(jq '.failures | length' "${ATC_PROTOCOL_DIR}/missing-durable-report.json")"
+
+e2e_case_banner "atc_transport_requires_live_observations"
+# Exercise the real server while injecting a disabled ATC path after the driver
+# supplies its environment. Fast successful sends must still fail this gate.
+printf '#!/usr/bin/env bash\nexport ATC_LEARNING_DISABLED=1\nexec %q "$@"\n' \
+    "${AM_BIN}" >"${ATC_PROTOCOL_DIR}/disabled-atc-server"
+chmod +x "${ATC_PROTOCOL_DIR}/disabled-atc-server"
+set +e
+python3 "${PROJECT_ROOT}/scripts/bench_atc_transport.py" \
+    --binary "${ATC_PROTOCOL_DIR}/disabled-atc-server" \
+    --store-root "${ATC_PROTOCOL_DIR}/disabled-atc-store" \
+    >"${ATC_PROTOCOL_DIR}/disabled-atc-report.json"
+atc_disabled_rc=$?
+set -e
+e2e_assert_eq "real sends with disabled ATC fail live measurement" 1 "${atc_disabled_rc}"
+e2e_assert_eq "disabled ATC produces no accepted live timing" true \
+    "$(jq '.summary.benchmarks.mail_send_atc_live == null' "${ATC_PROTOCOL_DIR}/disabled-atc-report.json")"
+e2e_assert_contains "missing live observations retain their diagnostic" \
+    "$(jq -r '.failures[0].error' "${ATC_PROTOCOL_DIR}/disabled-atc-report.json")" \
+    "live: unexpected durable ATC row count: 0"
+
+e2e_case_banner "atc_transport_all_off_control"
+python3 "${PROJECT_ROOT}/scripts/bench_atc_transport.py" \
+    --binary "${AM_BIN}" \
+    --store-root "${ATC_PROTOCOL_DIR}/all-off-store" \
+    --diagnostic-all-off \
+    >"${ATC_PROTOCOL_DIR}/all-off-report.json"
+e2e_assert_eq "all-off measurements are marked diagnostic" diagnostic_all_off \
+    "$(jq -r '.measurement.purpose' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "all-off control reports three measurements" 3 \
+    "$(jq '.summary.benchmarks | length' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "all-off control retains three independent stores" 3 \
+    "$(jq '[.summary.benchmarks[].store] | unique | length' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "control runs preserve messages without ATC writes" true \
+    "$(jq '[.summary.benchmarks[] | .mode == "off" and .atc_rows == 0 and .messages > 0 and .integrity == "ok"] | all' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
+e2e_assert_eq "diagnostic results cannot replace qualification measurements" false \
+    "$(jq '.summary.benchmarks | has("mail_send_atc_live") or has("mail_send_atc_shadow") or has("mail_send_no_atc")' "${ATC_PROTOCOL_DIR}/all-off-report.json")"
 
 popd >/dev/null
 

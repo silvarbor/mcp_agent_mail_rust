@@ -19,18 +19,57 @@ jobs:
   archive-perf-gate:
     name: Archive Perf Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 125
     env:
       GATE_OUTPUT_DIR: tests/artifacts/perf/archive_perf_gate/${{ github.run_id }}-${{ github.run_attempt }}
+      # The two-job build reached 3 GiB of swap before termination.
+      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build archive benchmark and startup probe
+        # Serialized cold compilation reached the final crates at minute 60.
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GATE_OUTPUT_DIR}"
+          (
+            vmstat 15 &
+            resource_monitor_pid=$!
+            trap '
+              build_exit=$?
+              trap - EXIT
+              set +e
+              kill "$resource_monitor_pid" 2>/dev/null
+              wait "$resource_monitor_pid" 2>/dev/null
+              printf "Archive build exited with status %s at " "$build_exit"
+              date -u "+%Y-%m-%dT%H:%M:%SZ"
+              free -m
+              df -h .
+              if [[ -r /sys/fs/cgroup/memory.events ]]; then
+                cat /sys/fs/cgroup/memory.events
+              fi
+              ps -eo pid,ppid,stat,rss,comm --sort=-rss | head -20
+              exit "$build_exit"
+            ' EXIT
+            trap 'echo "Archive build received SIGTERM"; exit 143' TERM
+            trap 'echo "Archive build received SIGINT"; exit 130' INT
+            cargo bench --locked -p mcp-agent-mail --bench benchmarks --no-run
+            cargo build --locked --release -p mcp-agent-mail-cli --bin am
+          ) 2>&1 | tee "${GATE_OUTPUT_DIR}/build.log"
 
       - name: Run archive perf gate
         id: gate
+        timeout-minutes: 30
         continue-on-error: true
         shell: bash
         run: |
@@ -48,7 +87,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upsert PR comment
-        if: always() && github.event_name == 'pull_request'
+        if: always() && steps.gate.outcome != 'skipped' && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           COMMENT_PATH: ${{ env.GATE_OUTPUT_DIR }}/comment.md
@@ -97,7 +136,11 @@ jobs:
           import pathlib
           import sys
 
-          summary = json.loads(pathlib.Path(os.environ["SUMMARY_PATH"]).read_text(encoding="utf-8"))
+          summary_path = pathlib.Path(os.environ["SUMMARY_PATH"])
+          if not summary_path.is_file():
+              print("Archive perf gate failed: compilation or execution produced no summary.")
+              sys.exit(1)
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
           event = json.loads(pathlib.Path(os.environ["EVENT_PATH"]).read_text(encoding="utf-8"))
           labels = {
               label["name"]
