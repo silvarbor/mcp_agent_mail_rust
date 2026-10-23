@@ -1,5 +1,47 @@
 # Resume — local Agent Mail fork
 
+## Discarded trial: relative directory-binding validation
+
+Local HEAD9b1d049932dd551086b2d3def8dc4b155983218c restores the exact
+published storage source after trialabe8eeccca6beeec280c90dc0ba81fe6a32dfd6d.
+Published HEAD remains6a07d839. The trial used rustix statat through retained
+parents for every binding edge and cached native Stat identities. Baseline
+4scan+9staging tests passeddb0208; postchange1965 passed those13tests and
+built the integration probe. Paired APFS81801 passed unchanged35/300ms limits
+but LOST: baseline single25.071/batch247.004ms; candidate28.769/257.252ms.
+Both took2.95s. No speedup claim; do not publish or retry this trial unchanged.
+Manual inverse patch was committed9b1d0499; git diff35c501b8 for lib.rs is empty.
+
+Evidence: relative-binding-comparison-20261023/ and preserved binary in
+relative-binding-candidate-20261023/storage-tests under the preservation root.
+Binary SHA256fc3197d79bafaabd898091b27af12430044f7df01024a80c7bf5399dac97e259.
+Trial validation22435 completed exit0: all-targets48.89s, production30.13s,
+strict Clippy59.65s, fmtpass,713unit tests passed/1skipped82.403s. The source
+was restored while only the immutable test binary was still running; these
+results describe the discarded trial. Published-source qualification above
+remains the applicable evidence. No local command handle is active.
+Audit2026-10-23_14-57-50-277-6853fb1d3ca8 was withdrawn once the trial lost;
+auditor returned BLOCKED for caller-withdrawn continuation, not a source finding.
+
+Downloaded current XFS artifact12509345289 tofsync-xfs-6a07d839-20261023.zip
+and matching directory. Trace reports159064statx,126335readlink,3336fdatasync;
+overlapping traced times are diagnostic, not wall-time attribution.
+
+Next concrete experiment: bounded concurrent synchronization of pending files
+in StagedArchiveWrites::sync_pending. Current64-file groups synchronize serially.
+Use at most4scoped workers for sufficiently large groups, retain serial handling
+for small/single-message groups, join every worker before any publication, and
+propagate every synchronization or worker-spawn failure. Apple still requires
+fsync for EVERY file then one full device flush before publication; other
+platforms retain every file's sync_data. Keep128FD bound. Existing tests cover
+first-slot pipe sync failure, small-group failure and Apple device failure;
+add real pipe failure near the end of a full group to exercise a later worker,
+with no published files and complete temporary cleanup. Establish baseline,
+then test and compare against missing-staged-path-candidate-20261023/storage-tests.
+No concurrency implementation or new test has been written yet. Existing scoped
+thread patterns in lib.rs10643 provide prior art; no new dependency needed.
+ATC overhead remains unresolved; do not assume storage changes fix that gate.
+
 ## Published staged-path repair: fresh CI still fails performance
 
 Published head6a07d839a5c973c4bcf796fa26a5a31e69389bb3 includes source
