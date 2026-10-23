@@ -2,6 +2,37 @@
 
 ## Recovery on 2026-10-23
 
+CURRENT: committed implementation audit
+2026-10-23_08-14-12-558-05b0a2e930a5 approved the exact range
+88026bb2...a6dbf200 with zero findings; supported journal projection consumed.
+Candidate build 47872 exited 0 in 6m09s. Frozen development binary is
+atc-reuse-candidate-20261023/am, SHA-256
+d444f91690268cc351362428e7296604373b5d47c76867f7c132ad4279c0a5b0;
+source-commit.txt records a6dbf200e0828dbceecf0b488149cfe703970cb8.
+Paired diagnostic 66580 completed exit 0 after a 600s host-load wait. It compared
+both binaries in one invocation with 300 samples per store and all-off controls.
+Baseline live overhead was 14.889%; candidate live overhead was 5.043634%, still
+above the unchanged 5% budget. Candidate live p95 was 42.025375ms versus baseline
+46.686875ms (9.9846% lower); candidate off was 40.007541ms. Candidate shadow was
+-0.412837%. Null controls were baseline shadow/live 1.217469%/1.025839% and
+candidate -2.282126%/-3.923666%. All twelve stores had 363 messages and passed
+integrity, with 363 ATC rows only in each treatment/live store. Output root/log:
+atc-reuse-paired-20261023{,.log}. Qualification remains false.
+
+Next candidate is committed as faea8b49f13dbea6080cc3a96b2b4d10c750e2cd:
+retain a completed schema inspection
+against SQLite's read-only main.schema_version cookie on the retained connection.
+Every call reads the cookie; changed versions trigger the full required-column
+inspection. Before/after cookies must agree before an inspection is retained.
+Replacement connections start without a cached inspection. The DDL regression
+now creates a valid index, verifies append still works, then drops the experience
+table and requires the migration result. Authoritative semantics were checked at
+https://www.sqlite.org/pragma.html#pragma_schema_version. Command 63152 completed
+exit 0: nine append tests, both workspace checks, strict Clippy, fmt and diffcheck.
+This schema-cache candidate still needs its committed audit and binary comparison;
+the previous approval covers 62229216/a6dbf200 only. No heavy command is active.
+No push, merge, live installation or restart has occurred in this continuation.
+
 Connection-reuse candidate is committed as
 622292162537767e5b78349a46d4c9577e18f1ff in pool.rs, queries.rs and the
 atc_queries.rs test helper. A real
