@@ -1,5 +1,164 @@
 # Resume — local Agent Mail fork
 
+Operator instruction: run all future tests with `nice -19` (equivalently
+`nice -n 19`, low CPU priority). Apply this to test runners in addition to
+bounded Cargo jobs and the required load guard.
+
+Compiler batch 50945 COMPLETED exit 0 on candidate `82d515bf`:
+workspace all-target check 5m52s; production lib/bins check 2m27s; strict
+all-target Clippy 1m21s; formatting passed. Older waiting notes below are
+historical. Runtime correctness and acceptance remain pending.
+
+Active correctness batch: exec session **33295**, queued behind the same
+wait-for-load workflow as a new test invocation (compiler session is terminal).
+Command uses `nice -19 cargo nextest run --locked --workspace --test-threads 2
+--no-fail-fast`, Cargo jobs two, shared upstream-integration target. Filter
+selects labels/display, receipts, session identity, retention/reconstruction,
+ID floors, startup-page audit, shared mailbox/robot inbox ordering, direct and
+daemon inbox fixtures, portable recovery fixtures, conformance, isolated guard/
+JSON fixtures and WAL/authority/maintenance lock regressions. This is a focused
+correctness suite; do not describe it as an unfiltered workspace pass.
+Log: preservation root `functional-correctness-82d515bf.log`. Initial collection
+returned no admission result yet. Collect 33295; do not launch a duplicate.
+
+## October 27: functional release candidate
+
+Authority: operator goal attachment
+`/Users/shz/.local/state/codex/accounts/outcomeeng/attachments/c0b126b6-be33-4b88-9ee7-c972dcfe0b2a/pasted-text-1.txt`.
+This checkpoint supersedes the historical next steps below.
+
+Candidate worktree: `/Users/shz/Code/silvarbor/agent-mail/functional-release`.
+Branch: `work/functional-release-20261027`, based on `a91eead5`.
+Current implementation checkpoint: `82d515bf3dbaa5a51510fac534dfae333a0a51be`.
+Carried installer repair `e6ed9b1d` as `be588245`, dashboard lock alignment
+`0e0af4df` as `50f78e86`, and label rendering repair `8ecd60e2` as `1337cf8b`.
+All applied cleanly; diff whitespace check passed. Additional selected repairs:
+`cefa81c5` -> `d46abb92`, `de6f142a` -> `fc19b0bc`,
+`c4ee59fe` -> `3034c2ec`, `29971c31` -> `7fba3ab6`,
+`6a03d2b8` -> `3b199000`, `9e24c807` -> `79ef3cbf`.
+These repair label/recovery fixtures, environment isolation, macOS ref fixtures
+and child-test selectors. Confirmed the base already declares `pool_impl`, so
+the selector repair is required independently of optional performance changes.
+CI and evidence repairs: `c48d05fa` -> `c9e304e1`,
+`0b148f41` -> `cb2e1711`, `7477ecc0` -> `fceab518`,
+`4975bb71` -> `29a70a4f`, `fe99e8d9` -> `d76610da`,
+`8d5f6635` -> `92880e6b`. Inspected the actual patches before selection.
+
+Passing on this candidate: observability drift scanner (49 events, 10 schemas,
+zero findings), all six scanner unit tests, artifact-schema E2E (14 assertions,
+zero failures/skips, including tamper rejection and delegate-exit preservation),
+and diff whitespace. Artifact evidence:
+`/Users/shz/.local/state/mcp-agent-mail/integration/20261015-preservation/functional-release-artifacts-20261027`.
+E2E session 81830 completed exit 0. No active process remains from those checks.
+Compiler batch started in exec session **50945** behind wait-for-load; initial
+collection returned no output, so admission/build status is not yet known.
+Collect that same handle; do not start a duplicate. The sequential batch is
+`cargo check --locked --workspace --all-targets`, production lib/bins check,
+strict workspace Clippy, then formatting. Cargo jobs are bounded at two and
+target directory is the existing `upstream-integration/target` cache.
+Latest collection of 50945: handle remains live, no waiter terminal record or
+compiler output. Continue collecting it; no second guard/build was launched.
+
+Acceptance coverage inspection: tools `messaging.rs` has
+`display_labels_follow_current_profiles_without_changing_mail_identity` and
+`fetch_inbox_live_read_receipts_preserve_peek_and_ack_state`; DB `sync.rs` has
+`agent_display_names_keep_duplicate_labels_historical_profiles_and_canonical_addresses`;
+CLI `retention.rs` has
+`retention_preserves_boundary_relationships_receipts_and_allocator`.
+These are targets for the batched correctness run, not fresh passing evidence.
+The existing external `qualification/runtime_workload.py` already starts real
+servers, performs two restarts and audits exact message/receipt continuity via
+isolated cold copies. It does not assert relabeling, peek-state preservation or
+label persistence across restart. Extend that existing qualification before
+claiming the requested complete functional acceptance; do not rerun its old
+hour-long load test as a substitute. The stdio identity shell suite likewise
+does not supply the requested label/restart acceptance.
+
+October 27 functional qualification extension is now implemented in the existing
+external `qualification/runtime_workload.py` via `--functional`. It registers
+two distinct labeled identities, sends three messages, verifies repeated peeks
+leave receipts empty, explicitly reads two and acknowledges one, relabels the
+sender before restart and the recipient between restarts, and compares exact
+identity IDs, message IDs, bodies and receipt timestamps across both restarts.
+Cold-copy canonical integrity/foreign-key/message checks remain; functional mode
+also compares stored identity labels and the archived profile labels. The normal
+load mode remains available, while functional mode schedules no polling traffic.
+Ruff, strict mypy and CLI argument parsing pass. Real behavior is NOT RUN;
+use the final candidate binaries, an unused isolated run root and `--functional`.
+Qualification code still requires independent review before release claims.
+Compiler batch 50945 remains live with no admission record at latest collection.
+
+Recovery-test repair committed as `82d515bf`: `startup_page_leak.rs` now audits
+private physical copies through the existing staging API. Seeding, startup and
+restart run in separate processes, using the existing `libtest_path!` helper
+and completion witnesses to reject zero-test child runs. The parent retains
+the original in-place canonical VACUUM on the same database file after the seed
+process exits, rather than the earlier uncommitted fresh-inode proposal.
+Message and recipient counts are checked through compaction, first write and
+restart. The governing scenario is GH#291; subject is create_pool plus startup
+integrity and first pooled write; independent oracle is canonical SQLite on
+physical family copies. A leaked page fails integrity; a lost insert fails
+the row-count predicates. This is real-engine scenario evidence with no doubles.
+Formatting and whitespace pass; compiler and runtime results are NOT RUN.
+The compiler batch still had no admission output after this edit, so no build
+result is being reused across a source change. Run the focused test under
+nextest's process-group timeout before the wider correctness batch.
+
+Installer unit exit regressions pass on the candidate: 52/52 under Bash 5.3.20
+(session 15672, exit 0), and 52/52 under macOS stock /bin/bash 3.2.57
+(session 46430, exit 0). These cover file/stdin entry, empty/completed/rolled-back
+history, explicit failures, signal exits, recovery failure and required-client
+failure. Artifacts are `functional-installer-20261027` and
+`functional-installer-stock-bash-20261027` under the preservation root. This is
+focused installer-handler evidence, not a completed candidate installation.
+Retention coverage inspection confirms the existing CLI retention scenario
+exercises interrupted archive moves, startup/reconstruction refusal during an
+incomplete prune, idempotent resumption and the retained message-ID floor.
+
+Observation preparation: external `qualification/observe_service.py` now reports
+`release_observation_passed` only after at least 24 hours with no probe errors,
+critical samples or binary change. Samples explicitly classify nonzero dispatch
+timeouts, integrity failures, unavailable/ambiguous owner, PID changes and changed
+binary targets as functional failures. CPU/latency numbers remain measurements.
+Ruff and strict mypy pass. Real unreachable-service preflight completed in
+1.025 seconds with 2 samples, 8 probe errors, 2 critical samples and
+`release_observation_passed: false`; evidence directory is
+`qualification/functional-observer-unreachable-20261027`. This tests failure
+reporting only, not the candidate's stability. No live-service call was made.
+Current external qualification SHA-256 identities:
+- runtime_workload.py: `0a6eb661e498ac4ba1590578d301921d277734ca256bcf7e5fa7dca0caeea81b`
+- observe_service.py: `6477eda9e6f9dd6518238bfdbd8f335725983dcff2e2fb364599fc7f69751054`
+The observer remains read-only. Cutover must arrange removal of its exact rollback
+material before eight hours; do not wait for the 24-hour observation to clean it.
+Compiler session 50945 was admitted after 1,644.174 seconds (six wait cycles).
+Waiter terminal status `ready`, 12 CPUs, final normalized loads
+`[0.69397, 0.71301, 0.90670]`. Workspace all-target checking has started on
+candidate `82d515bf`; output confirms FrankenSQLite revision `3659c270`.
+Collect session 50945 through all sequential checks; do not duplicate it.
+Compiler/lint, functional acceptance and retention/recovery verification remain
+NOT RUN on the assembled candidate. No installation, restart or mail mutation.
+
+Keep display labels throughout registration, persistence, read surfaces and
+recovery; stable identity/receipt state; qualified WAL repairs; retention and
+message-ID preservation; inbox ordering and delivery authority. Keep necessary
+installer and test-harness repairs. Assemble remaining correctness carry-forwards
+before running a batched validation. Inspect actual patches, including fixture
+changes, before selecting them.
+
+Optional Apple flush batching, grouped/parallel synchronization, staging/path
+caches, ATC connection/schema caching and performance diagnostics remain on
+`work/upstream-integration-20261015`; that worktree's dirty changes are preserved.
+No broad rollback or deletion is needed to assemble this candidate.
+
+Next: inspect later functional test/CI fixes and the child-process test selector
+repair, establish release checks separately from performance reporting, then
+implement/run real label/send/peek/read/ack/restart and retention/recovery
+acceptance. Compiler, lint and correctness checks are required. Corruption,
+lost messages, hangs and timeouts remain blockers; missed speed targets do not.
+After review and supervised installation of the exact candidate, observe normal
+use for 24 hours. Rollback retention maximum is eight hours. Reuse existing build
+artifacts where compatible and keep compilation bounded; no active build handle.
+
 READY FOR SECOND REVIEW (2026-10-18). All repair source is committed through
 84b7ff8a60b495c2e3955f6d81f89ded980e97de. Session 72503 completed exit 0:
 13 session-identity integration tests, two registration regressions, strict
