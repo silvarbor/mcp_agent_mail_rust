@@ -1693,8 +1693,10 @@ mod tests {
         if admission_case_ran_in_child() {
             return;
         }
+        // Seeding owns an environment-override scope; finish it before opening
+        // the non-reentrant scope that isolates the scan's default mailbox.
+        let (tmp, pool, cx, original) = seed_unacked_message();
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
-            let (tmp, pool, cx, original) = seed_unacked_message();
             seed_more_overdue(&cx, &pool, &original, 1..=2);
             let mut config = escalation_config(&tmp);
             config.ack_escalation_enabled = false;
@@ -1769,8 +1771,8 @@ mod tests {
         if admission_case_ran_in_child() {
             return;
         }
+        let (tmp, pool, cx, original) = seed_unacked_message();
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
-            let (tmp, pool, cx, original) = seed_unacked_message();
             let mut config = escalation_config(&tmp);
             config.ack_escalation_enabled = false;
             let mut state = AckScanState::default();
@@ -1796,8 +1798,8 @@ mod tests {
         if admission_case_ran_in_child() {
             return;
         }
+        let (tmp, pool, cx, original) = seed_unacked_message();
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
-            let (tmp, pool, cx, original) = seed_unacked_message();
             let config = escalation_config(&tmp);
             let mut state = AckScanState::default();
             let mut checks = 0;
