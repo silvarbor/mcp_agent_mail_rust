@@ -6747,7 +6747,13 @@ mod tests {
             ..Default::default()
         })
         .expect("snapshot pool")
-        .with_search_identity_path(live_pool.sqlite_path());
+        .with_search_identity_path(
+            root.path()
+                .join(".")
+                .join("storage.sqlite3")
+                .to_str()
+                .expect("mailbox alias"),
+        );
         write_backfill_health_state_with_generation(
             root.path(),
             live_pool.sqlite_path(),

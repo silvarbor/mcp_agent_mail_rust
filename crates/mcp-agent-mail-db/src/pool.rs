@@ -3566,7 +3566,11 @@ impl DbPool {
     /// snapshot's path, degrading every later server search (GH#297).
     #[must_use]
     pub fn with_search_identity_path(mut self, path: &str) -> Self {
-        self.search_identity_path = Some(path.to_string());
+        self.search_identity_path = Some(
+            normalize_sqlite_identity_path_lossless(Path::new(path))
+                .to_string_lossy()
+                .into_owned(),
+        );
         self
     }
 
@@ -5781,13 +5785,10 @@ fn normalize_sqlite_identity_path_lossless(path: &Path) -> PathBuf {
     if path == Path::new(":memory:") {
         return path.to_path_buf();
     }
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-        }
-    })
+    // Recovery commonly starts with a missing primary. Resolve its existing
+    // parent prefix so admission and promotion agree through directory aliases
+    // even before the database itself can be canonicalized.
+    normalize_sqlite_identity_path_buf_uncached(path)
 }
 
 #[cfg(test)]
@@ -29512,6 +29513,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn recovery_identity_distinguishes_missing_lossy_colliding_unix_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x80.sqlite3".to_vec()));
+        let second = dir
+            .path()
+            .join(OsString::from_vec(b"authority-\x81.sqlite3".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(
+            normalize_sqlite_identity_path_lossless(&first),
+            normalize_sqlite_identity_path_lossless(&second)
+        );
+        assert_eq!(
+            normalize_sqlite_identity_path_lossless(&first).parent(),
+            Some(dir.path().canonicalize().unwrap().as_path())
+        );
+    }
+
+    // macOS filesystems reject invalid UTF-8 names before recovery can open
+    // them. The missing-path identity test above still runs on every Unix host.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
     fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir
@@ -31804,8 +31828,9 @@ mod tests {
     #[test]
     fn proactive_backup_refreshes_unknown_fresh_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("unknown-backup.db");
-        let backup = dir.path().join("unknown-backup.db.bak");
+        let root = dir.path().canonicalize().unwrap();
+        let db_path = root.join("unknown-backup.db");
+        let backup = root.join("unknown-backup.db.bak");
         write_marker_db(&db_path, "healthy-primary");
         std::fs::write(&backup, b"unverified fresh bytes").unwrap();
         let pool = DbPool::new(&DbPoolConfig {
@@ -32202,8 +32227,9 @@ mod tests {
     #[test]
     fn proactive_backup_refreshes_corruption_with_unchanged_mtime_and_length() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test_refresh_bad_bak.db");
-        let bak_path = dir.path().join("test_refresh_bad_bak.db.bak");
+        let root = dir.path().canonicalize().unwrap();
+        let db_path = root.join("test_refresh_bad_bak.db");
+        let bak_path = root.join("test_refresh_bad_bak.db.bak");
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             ..Default::default()

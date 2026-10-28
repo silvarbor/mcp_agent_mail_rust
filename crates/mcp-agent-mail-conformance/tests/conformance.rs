@@ -2245,10 +2245,14 @@ fn run_fixtures_against_rust_server_router() {
 
     // --- Notification signal assertions (tool flow) ---
     let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
-    let notif_db_path = notif_tmp.path().join("db.sqlite3");
+    let notif_root = notif_tmp
+        .path()
+        .canonicalize()
+        .expect("canonical notification root");
+    let notif_db_path = notif_root.join("db.sqlite3");
     let notif_db_url = format!("sqlite://{}", notif_db_path.display());
-    let notif_storage_root = notif_tmp.path().join("archive");
-    let notif_signals_dir = notif_tmp.path().join("signals");
+    let notif_storage_root = notif_root.join("archive");
+    let notif_signals_dir = notif_root.join("signals");
     let _env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", notif_db_url.as_str()),
         (
@@ -2273,8 +2277,10 @@ fn run_fixtures_against_rust_server_router() {
 
     let project_dir = notif_tmp.path().join("project");
     std::fs::create_dir_all(&project_dir).expect("create notification project dir");
+    let project_dir = project_dir
+        .canonicalize()
+        .expect("canonical notification project dir");
     let project_key = project_dir.to_string_lossy().to_string();
-    let project_slug = mcp_agent_mail_core::compute_project_slug(&project_key);
 
     let ensure_params = CallToolParams {
         name: "ensure_project".to_string(),
@@ -2291,6 +2297,12 @@ fn run_fixtures_against_rust_server_router() {
     .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
     req_id += 1;
     assert!(!ensure_result.is_error, "ensure_project returned error");
+
+    let project_response = decode_json_from_tool_content(&ensure_result.content)
+        .expect("decode ensured notification project");
+    let project_slug = project_response["slug"]
+        .as_str()
+        .expect("ensured notification project slug");
 
     for name in ["BoldCastle", "CalmRiver", "QuietMeadow", "SilverPeak"] {
         let register_params = CallToolParams {

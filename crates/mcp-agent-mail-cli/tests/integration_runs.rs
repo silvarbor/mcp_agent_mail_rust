@@ -1444,6 +1444,9 @@ fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
 fn seed_startup_recovery_archive_only(env: &TestEnv) {
     let project_path = env.tmp.path().join("reconstructed-project");
     std::fs::create_dir_all(&project_path).expect("create reconstruct project path");
+    let project_path = project_path
+        .canonicalize()
+        .expect("canonical reconstruct project path");
     let project_human_key = project_path.display().to_string();
     let project_slug = mcp_agent_mail_db::queries::generate_slug(&project_human_key);
     let project_dir = env.storage_root.join("projects").join(&project_slug);

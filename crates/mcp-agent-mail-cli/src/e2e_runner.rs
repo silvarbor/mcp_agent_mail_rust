@@ -4228,7 +4228,9 @@ exit 1
             .prefix("run-")
             .tempdir_in(root)
             .expect("run directory")
-            .keep();
+            .keep()
+            .canonicalize()
+            .expect("canonical run directory");
         let run = ReleaseRunEvidence {
             run_id: directory.file_name().unwrap().to_str().unwrap().to_string(),
             directory: directory.clone(),
@@ -4512,7 +4514,8 @@ exit 1
     #[cfg(unix)]
     #[test]
     fn release_scorecard_rejects_symlink_and_outside_run_paths() {
-        let root = TempDir::new().unwrap().keep();
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().canonicalize().unwrap();
         for symlink in [false, true] {
             let mut report = scorecard_report(
                 vec![scorecard_suite_result(INCIDENT_CORPUS_SUITE, true)],
