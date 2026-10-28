@@ -462,6 +462,9 @@ fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
     // Real guard plugin: checks active file reservations against staged changes (pre-commit)
     // or pushed commits (pre-push).
     let project_json = serde_json::to_string(project).unwrap_or_else(|_| "\"\"".to_string());
+    let project_slug_json =
+        serde_json::to_string(&mcp_agent_mail_core::resolve_project_identity(project).slug)
+            .unwrap_or_else(|_| "\"\"".to_string());
     let hook_name_json = serde_json::to_string(hook_name).unwrap_or_else(|_| "\"\"".to_string());
     let template = r##"#!/usr/bin/env python3
 # mcp-agent-mail guard plugin (__HOOK_NAME_TEXT__)
@@ -477,6 +480,7 @@ import subprocess
 import sys
 
 PROJECT = __PROJECT_JSON__
+INSTALLED_PROJECT_SLUG = __PROJECT_SLUG_JSON__
 HOOK_NAME = __HOOK_NAME_JSON__
 # STORAGE_ROOT configured when the guard was installed (environment or the
 # user config.env); a commit shell's own STORAGE_ROOT still takes precedence.
@@ -1147,7 +1151,7 @@ def resolve_archive_root():
     - (path, None, [...]) when a matching archive is found;
     - (None, name, [...]) when an archive whose directory name collides with
       this project's slug exists but provably belongs to a different project
-      (slug collision -- the guard must stay fail-closed, GH#224 note);
+      (slug collision -- warn that protection is unavailable for this repo);
     - (None, None, []) when nothing in the storage root relates to this repo
       at all (nothing to guard -- callers may fail open);
     - (None, *, [error, ...]) when resolution hit inspection errors
@@ -1214,6 +1218,8 @@ def resolve_archive_root():
         return None, None, errors
 
     slug_candidates = set(explicit_names)
+    if INSTALLED_PROJECT_SLUG:
+        slug_candidates.add(INSTALLED_PROJECT_SLUG)
     if project_slug:
         slug_candidates.add(project_slug)
     if repo_slug:
@@ -1823,6 +1829,7 @@ if __name__ == "__main__":
         .replace("__HOOK_NAME_TEXT__", hook_name)
         .replace("__PROJECT_TEXT__", &project.replace(['\n', '\r'], " "))
         .replace("__PROJECT_JSON__", &project_json)
+        .replace("__PROJECT_SLUG_JSON__", &project_slug_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
         .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
 }
@@ -6243,20 +6250,15 @@ mod tests {
 
         let repo_identity =
             mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
-        let colliding_identity =
-            mcp_agent_mail_core::resolve_project_identity(&colliding_project.to_string_lossy());
-        assert_eq!(
-            repo_identity.slug, colliding_identity.slug,
-            "test setup needs slug collision"
-        );
-
+        // Put foreign metadata under this project's actual slug. Git identity
+        // can hash paths, so punctuation alone need not create a collision.
         let archive_root = storage_root.join("projects").join(&repo_identity.slug);
         let reservations_dir = archive_root.join("file_reservations");
         std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
         std::fs::write(
             archive_root.join("project.json"),
             serde_json::json!({
-                "slug": colliding_identity.slug,
+                "slug": repo_identity.slug,
                 "human_key": colliding_project.to_string_lossy(),
             })
             .to_string(),
