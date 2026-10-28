@@ -2369,7 +2369,7 @@ fn run_fixtures_against_rust_server_router() {
 
     let signal_root = notif_signals_dir
         .join("projects")
-        .join(&project_slug)
+        .join(project_slug)
         .join("agents");
     let to_signal = signal_root.join("CalmRiver.signal");
     let cc_signal = signal_root.join("QuietMeadow.signal");
