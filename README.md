@@ -1,5 +1,52 @@
 # MCP Agent Mail (Rust)
 
+## Maintaining the Silvarbor fork
+
+We maintain this fork on `main` and preserve shared history with
+[upstream](https://github.com/Dicklesworthstone/mcp_agent_mail_rust).
+`origin` identifies `silvarbor/mcp_agent_mail_rust`; `upstream` identifies the original repository.
+The functional release candidate requires qualification before publication.
+The quick-install commands elsewhere in this README download upstream releases.
+They do not install this fork's display-name and retention changes.
+
+### Deliberate differences
+
+| Area | Behavior retained in this fork | Evidence required after an upstream merge |
+| --- | --- | --- |
+| Display names | Current profile labels in agent directories, mail, and interfaces; stable identities for routing | Registration, relabeling, delivery, restart, and checks of labels and stable message identities |
+| Mailbox correctness | Shared delivery authority, ordered inbox results, explicit read and acknowledgement receipts | Non-consuming peeks, explicit reads, acknowledgements, and receipt checks after restart |
+| Retention | Offline pruning with durable recovery state and preserved message-identifier floors | Interrupted pruning, resumed pruning, reconstruction, deletion persistence, and monotonic message identifiers |
+| Database repairs | Pinned FrankenSQLite write-ahead log and macOS repairs in [Cargo.toml](Cargo.toml) and [Cargo.lock](Cargo.lock) | Recovery, restart, read-only access, and database-integrity tests on the supported platforms |
+| Build and qualification | Bounded compiler jobs, portable fixtures, installer and continuous-integration repairs | Workspace checks, production-feature checks, strict Clippy, formatting, and relevant acceptance tests |
+
+Optional synchronization, cache, and flush optimizations stay separate from functional qualification.
+The repair for inbox processor use also receives its own reviewable change.
+Before you remove a fork patch, verify that upstream satisfies its behavior and acceptance tests.
+For example, upstream label support must preserve routing identities across a relabel and restart.
+
+### Upstream synchronization
+
+1. Fetch `upstream/main` and `origin/main`.
+2. Select the upstream commit for the update.
+3. Create a temporary integration branch from the fork's current `main`.
+4. Merge the selected upstream commit into that branch. Preserve both histories.
+5. Review each difference in the inventory above against upstream's implementation.
+6. Resolve conflicts.
+7. Run the required checks and fork acceptance tests.
+8. Merge the qualified integration branch through a pull request to the fork's `main`.
+9. After you account for their commits and uncommitted files, retire the integration branch and worktree.
+
+Keep published fork history intact during synchronization.
+For example, merge a selected upstream commit into `work/upstream-update-YYYYMMDD`.
+
+### Release identity
+
+Install fork releases only from a clean, qualified source commit with a published tag.
+Use a fork-specific tag, such as `silvarbor-v0.3.39.1`, for that exact commit.
+Record the full commit, tag, dependency lockfile, binary hashes, and validation results in the installation manifest.
+Verify the installed binary hashes against that manifest after deployment.
+Retain rollback material for at most eight hours under the operator's retention policy.
+
 <div align="center">
   <img src="docs/assets/am_illustration.webp" alt="MCP Agent Mail - A mail-like coordination layer for AI coding agents">
 </div>
@@ -33,6 +80,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 
 ## Table of Contents
 
+- [Maintaining the Silvarbor fork](#maintaining-the-silvarbor-fork)
 - [TL;DR](#tldr)
 - [Why This Exists](#why-this-exists)
 - [What People Are Saying](#what-people-are-saying)
