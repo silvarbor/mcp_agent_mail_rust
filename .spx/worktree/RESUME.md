@@ -1,5 +1,145 @@
 # Resume — local Agent Mail fork
 
+## October 28: active fork consolidation
+
+Current source head: d7566cc72343113601abcab08fc4c86152afa201. The final
+notification edit removes only a redundant borrow. Formatting and whitespace
+checks pass. Compiler qualification is session 88847, orchestration run
+4ff06ffd-e868-445f-9aaa-750d6f8df3c2: sequential locked workspace all-target
+check, production lib/bins check and strict all-target Clippy, nice 19, two
+compiler jobs, unchanged shared target. Logs are in
+`/tmp/mail-fork-qualification.XTHjZ8kE/`. Collect this exact handle to terminal.
+Do not start another heavy command while it runs.
+
+Latest repair test state: session 25645 completed with child exit 100 and a
+matching orchestration terminal record. Compilation took 12m20s; 19 selected
+tests took 18.567s, with 15 passing and four failing. Both backup refresh repairs
+passed; crash replay passed database promotion and next failed project lookup.
+Scorecard outside-run fixture encountered the macOS parent symlink first;
+conformance still lacked the expected signal; macOS rejected creation of the
+invalid-byte filename in the admission fixture.
+
+Second repair batch: session 44635, orchestration run
+8cf5bd3a-5d3a-4c92-823e-231d5d4c7fb4. Same workspace/features/target, nice 19,
+two compiler jobs and two test workers. Terminal record matches the run ID,
+started=true, status=completed, childExitCode=100. Compilation took 12m47s;
+19 tests completed in 18.576s: 17 passed, two failed. Remaining safe-local-fix
+ledger entries under Rust correctness qualification: conformance.rs:2377 still
+lacks CalmRiver.signal; integration_runs.rs:4951 now reaches search backfill
+but reports stale instead of fresh. Inspect emitted artifacts and real paths
+before another build. The other selected path and recovery repairs passed.
+
+Third repair batch: session 17693, orchestration run
+a8c962f3-6c89-434b-8e69-f741dfbd5628; completed with matching terminal record,
+started=true, status=completed, childExitCode=0. Compilation took 12m39s;
+all 20 selected tests passed in 23.532s. Includes
+snapshot_pool_bound_to_mailbox_path and the prior 19-test selection. The
+notification root is now canonical before configuring signal writes: storage
+ensure_dir rejects symlinked parent prefixes. Search snapshot binding now
+normalizes the mailbox path once; the failing artifact showed `/var` compared
+against `/private/var` despite identical source/index counts and a real result.
+The existing snapshot identity test now binds through a dot-component alias.
+
+Archive staging content check: StagedArchiveWrites originates in upstream
+f01409e4, already included in selected upstream 92fd8025. Its presence is not
+evidence that the later fork optimization series was selected. Storage lib's
+delta from that upstream baseline is retention backlog admission, dead helper
+removal, formatting and a portable lock fixture. Optional later fork staging,
+flush and ATC reuse commits remain absent by ancestry and patch equivalence.
+
+Second-round edits: canonical scorecard foreign-root fixture; canonical project
+key in the archive-only crash-replay seed; notification test uses the slug
+returned by ensure_project. Invalid-byte physical-file admission stays enabled
+on non-macOS Unix, matching the existing backup-enumeration platform contract;
+new missing-path identity coverage runs on every Unix, including macOS. It
+asserts two lossy-colliding names remain distinct and retain the canonical parent.
+No production admission guard or scorecard rejection was weakened.
+
+README now contains the fork inventory, integration-PR workflow, exact-source
+tag/manifest policy and an explicit distinction from upstream quick-install.
+The README documentation finding below is addressed. Focused prose audit
+2026-10-28_15-08-25-190-06c835618c4c approved commit a30d2db6. The subsequent
+code checkpoint f23e7d1861cf307d8f8b97df1c34c7fdb921f7ef changes only the five
+path-identity implementation/test files. Its focused verification is pending.
+Formatting and whitespace checks pass after this round.
+
+Cleanup accounting: agent-mail, work/agent-display-names and
+work/automatic-position-labels have no commits missing from this candidate.
+Retire them after delivery. The upstream-integration worktree is still dirty:
+startup audit fixture work is superseded by candidate 82d515bf; its export
+comparison helper, benchmark, manifest constant and regression remain a separate
+unfinished concern. Preserve those files until their disposition is recorded.
+The optional ATC append reuse helper is absent from candidate queries.rs;
+server lib's upstream delta is retention shutdown/admission only.
+
+The operator replaced the paused goal with the six requirements in
+`/Users/shz/.local/state/codex/accounts/outcomeeng/attachments/24e2fcac-acb4-4ac0-8f8c-cfd6b471b09d/pasted-text-1.txt`.
+Maintain the stable fork on main; tag exact installed sources; preserve upstream
+ancestry through integration PRs; qualify this candidate and account for its 454
+commits; keep the CPU repair separate; inventory deliberate differences; retire
+accounted-for branches/worktrees. This supersedes the earlier stand-down note.
+
+GitHub confirms origin's parent is Dicklesworthstone/mcp_agent_mail_rust.
+Added that repository as upstream and fetched upstream/main without tags.
+No branch was merged, reset, published, or deleted.
+
+History accounting at candidate 52ce18eb and upstream 9c31bc19:
+`main..HEAD` contains 454 commits; excluding upstream/main leaves 46.
+Thus 408 are shared upstream ancestry. This is provenance accounting, not
+acceptance of every upstream behavior. Upstream currently has 397 commits
+absent from the candidate; the candidate has 70 absent from upstream, including
+fork commits already on main. Do not pull the additional 397 into this release
+without selecting and qualifying that synchronization separately.
+
+Fork-only additions since main fall into these groups:
+- Profile labels: 53bb3180, f1218033, and their fixture/acceptance follow-ups.
+- Retention and WAL correctness: 4f9fcd0c, 3996e7fc, a4d99300.
+- Shared mailbox and inbox ordering: 895554ca, 8f433743.
+- Identity creation/binding: 6f8a7d60 and 84b7ff8a.
+- Upstream integration: 3adb7338; inspect its conflict resolutions separately.
+- Installer, dashboard, CI, conformance, and recovery qualification repairs:
+  be588245 through 82d515bf as enumerated below.
+- Operational tracking and bounded build artifacts: remaining fork-only commits.
+
+The following optional optimization commits are confirmed absent from candidate
+ancestry: 6cf0a3b1, 4a63da7a, 27c1efd0, 5ada6dcd, a1420a14, 1303d39c,
+646a9345, 6bd2ab22, 8c7a0251, bc037791, abe8eecc, 9b1d0499, 04a33f8d,
+495447dd. Content review remains required to exclude equivalent patches.
+
+October 28 initial repair qualification: session 25645 and orchestration run
+4feb47f4-6cc9-4476-98c5-452b6c3d8d64 are terminal; see the result above.
+
+Repair design: existing scenario tests exercise real filesystem/SQLite and
+the real router, with no substitutes. Backup replacement uses the independently
+seeded primary marker as oracle; skipping replacement fails its content check.
+Scorecard consumer uses the exact receipt and a conflicting foreign artifact;
+selecting by timestamp fails readiness. Notification checks compare emitted
+signals to the registered recipient/project and sent message; suppressing signal
+emission fails file existence. Recovery crash replay already failed for missing
+primary aliases; the production repair reuses the existing lossless parent-prefix
+normalizer. Cross-database and non-UTF8 admission rejection tests remain selected.
+
+Correctness batch 33295 is no longer running: process inspection found no
+Cargo, rustc, or nextest process. Its log ends at 427/1134 with no terminal
+summary. It is incomplete evidence, not a passing suite.
+
+Current imperfection ledger (safe local fixes under Rust test/code and
+qualification workflows; investigate and repair before publication):
+- Conformance notification fixture redundant borrow at signal_root: fixed
+  after session 17693 completed; compiler/lint qualification remains.
+- CLI release scorecard temporary-path fixture: fixed; all selected scorecard
+  checks passed in session 44635.
+- Startup crash replay recovery admission and search identity: fixed; complete
+  crash-replay scenario passed in session 17693.
+- Conformance router notification fixture: fixed; complete router fixture
+  passed in session 17693.
+- Backup refresh temporary-path comparisons: fixed; selected backup checks
+  passed in session 44635.
+- The incomplete qualification run must be completed after these failures are
+  resolved; preserve completed compiler evidence and avoid duplicate builds.
+- README.md upstream/fork installation distinction: fixed, with tagged-source
+  installation and manifest policy; prose audit approved a30d2db6.
+
 Operator instruction: run all future tests with `nice -19` (equivalently
 `nice -n 19`, low CPU priority). Apply this to test runners in addition to
 bounded Cargo jobs and the required load guard.
@@ -9,8 +149,7 @@ workspace all-target check 5m52s; production lib/bins check 2m27s; strict
 all-target Clippy 1m21s; formatting passed. Older waiting notes below are
 historical. Runtime correctness and acceptance remain pending.
 
-Active correctness batch: exec session **33295**, queued behind the same
-wait-for-load workflow as a new test invocation (compiler session is terminal).
+Historical incomplete correctness batch: exec session **33295**.
 Command uses `nice -19 cargo nextest run --locked --workspace --test-threads 2
 --no-fail-fast`, Cargo jobs two, shared upstream-integration target. Filter
 selects labels/display, receipts, session identity, retention/reconstruction,
@@ -18,8 +157,8 @@ ID floors, startup-page audit, shared mailbox/robot inbox ordering, direct and
 daemon inbox fixtures, portable recovery fixtures, conformance, isolated guard/
 JSON fixtures and WAL/authority/maintenance lock regressions. This is a focused
 correctness suite; do not describe it as an unfiltered workspace pass.
-Log: preservation root `functional-correctness-82d515bf.log`. Initial collection
-returned no admission result yet. Collect 33295; do not launch a duplicate.
+Log: preservation root `functional-correctness-82d515bf.log`. The process ended
+without a captured terminal summary; see the incomplete-evidence record above.
 
 ## October 27: functional release candidate
 
