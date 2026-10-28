@@ -2337,9 +2337,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recovery_inventory_preserves_non_unicode_database_identity() {
+    fn recovery_inventory_preserves_database_identity() {
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::ffi::OsStringExt;
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        // Keep real filesystem coverage on macOS, which rejects invalid UTF8.
+        // The byte-only classification test covers lossy aliases on all Unix.
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("mail-λ.corrupt-live.db");
+        #[cfg(not(target_os = "macos"))]
         let name = std::ffi::OsString::from_vec(b"mail-\xff.corrupt-live.db".to_vec());
         let primary = root.join(&name);
         std::fs::write(&primary, b"live state").unwrap();
@@ -2603,12 +2610,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn proactive_staging_inventory_preserves_non_unicode_names_and_sparse_lengths() {
+    fn proactive_staging_inventory_preserves_raw_names_and_sparse_lengths() {
         use std::os::unix::ffi::OsStringExt;
-        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        #[cfg(target_os = "macos")]
+        let primary = root.join("mail-λ.db");
+        #[cfg(not(target_os = "macos"))]
         let primary = root.join(std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec()));
         std::fs::write(&primary, b"live").unwrap();
         let mut stage_name = PROACTIVE_STAGING_PREFIX.to_vec();
+        #[cfg(target_os = "macos")]
+        stage_name.extend_from_slice("λ".as_bytes());
+        #[cfg(not(target_os = "macos"))]
         stage_name.push(0xff);
         let stage = root.join(std::ffi::OsString::from_vec(stage_name));
         std::fs::create_dir(&stage).unwrap();
