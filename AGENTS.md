@@ -202,6 +202,21 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### Testing Policy
 
+Keep local verification at niceness 19, with at most two Cargo jobs and two
+nextest workers. Reuse the existing target directory, toolchain, and feature
+selection across checks and tests; finish diagnosing a failure batch before
+rebuilding it.
+
+On macOS, resolve `TMPDIR` before running filesystem tests. Storage fixtures
+reject symlinked ancestors, and the system's `/var` temporary-directory alias
+otherwise triggers that rejection during fixture setup. Keep the explicit
+symlink-rejection tests enabled:
+
+```bash
+env TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)" CARGO_BUILD_JOBS=2 \
+  nice -19 cargo nextest run --locked --workspace --test-threads 2
+```
+
 Every component crate includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
 - Happy path
 - Edge cases (empty input, max values, boundary conditions)

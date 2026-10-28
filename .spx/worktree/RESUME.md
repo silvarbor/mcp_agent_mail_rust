@@ -2,14 +2,178 @@
 
 ## October 28: active fork consolidation
 
+LOCAL QUALIFICATION PASSED. Final run
+a0d7c2b3-6860-4488-9f35-03f90cb83f17/session 47636 completed with matching
+started=true/status=completed/childExitCode=0. All-target check 45.19s,
+production check 26.23s, strict Clippy 51.13s; final test build 8m40s, selected
+worker recovery test passed in 0.361s. Aggregate scoped evidence: the 3252
+passing broad-regression cases plus the repaired three worker cases, with
+49/50 ACK cases passing in the preceding focused run and the last case now
+passing. No unaddressed test failure remains in the selected 3255-case scope.
+The earlier 20-case path/recovery/router run and real-process display-name,
+receipt, archive, integrity and two-restart acceptance remain valid for their
+unchanged implementation paths. Formatting/whitespace checks pass.
+
+All code/test imperfection entries below are repaired and verified. The
+macOS fixture environment is documented in AGENTS.md; explicit symlink
+rejection cases remain enabled and passed. Workflow validation also passes:
+actionlint on notify-acfs.yml and publish.yml. Publication guidance now matches
+the manifests' disabled crate publication and dependency overrides, and the
+reported SC2129 output-redirection style issue is fixed. No heavy command is
+running. Remaining work is commit/PR/merge, installed-source provenance and
+accounted-for cleanup; preserve the shared compilation cache.
+
+Run b243ecc0-3501-4b8d-b439-a14ec8ee797e, session 56815, completed with matching
+record started=true/status=completed/childExitCode=100. Compiler all-targets
+passed in 1m29s, production in 50.76s, Clippy in 1m45s. Test build took 17m29s;
+3255 tests ran in 439.834s: 3252 passed, three failed. All nine diagnostic
+failures and the other two formerly nested ACK fixtures passed. New failures
+are ACK worker recovery tests at worker.rs:204 (expected error stage) and :294
+(empty selected seed row), listed in repaired-functional-tests.log. Classify as
+safe local investigation/repair under Rust test/code workflow; trace all three
+before any next build. No guarded command remains running.
+The three failures are traced: worker seed() migrated the generation table
+without calling the lazy generation initializer, and the blocked-parent case
+expected a pool-construction error even though no connection opens until the
+first page read. The fixture now calls the real db_generation_id seeder after
+releasing its connection, and the error assertion checks the actual frozen
+database authority refusal. Production worker behavior is unchanged. Formatting
+and whitespace checks pass. Follow-up run
+8bd9bb57-53e0-413d-8c9e-9d6b41f6f458 keeps workspace build selection/features
+and the shared target, runs the required compiler/lint checks, then only the
+ACK test module. Other passing regression results remain valid. Logs use ack-*.
+Run 8bd9bb57-53e0-413d-8c9e-9d6b41f6f458/session 90404 completed with matching
+started=true/status=completed/childExitCode=100. Required compiler/lint checks
+passed (46.25s, 27.67s, 52.45s); test build took 8m48s; 49/50 ACK tests passed
+in 12.884s. Remaining failure: worker.rs:210 over-specific backend error text.
+After proper generation seeding, the same blocked-parent fixture reports
+"failed to read overdue ACK page: ... unable to open database file" rather than
+the earlier frozen-authority detail. The prior repair substituted a backend
+string without respecting lazy connection failure paths. Safe local test fix:
+assert the worker's page-read failure category and existing preservation/
+recovery observations; review the complete continuation before another build.
+No guarded command remains running.
+
+Final isolated worker assertion repair: match the worker-owned page-read
+failure prefix, which both observed backend errors share, while retaining all
+pool/state, preserved-file, normal retry cadence, restored delivery, stamped
+artifact, and duplicate-grant assertions. Reviewed the entire remaining test
+and the weak pool registry/direct archive publication paths. Formatting and
+whitespace checks pass. Run a0d7c2b3-6860-4488-9f35-03f90cb83f17 repeats required
+compiler/lint checks and executes only this changed test with unchanged
+workspace features/target/nice/job limits. The other 49 ACK passes remain valid.
+Logs use worker-final-* in the existing qualification directory.
+
+Installed-source provenance check: current still selects
+retention-thread-digests-3659c270-20261013. Its manifest.json explicitly records
+an uncommitted working tree plus preserved tracked diff/new modules, rather
+than a release tag. This is a non-blocking release-identity question under the
+operator's fork-consolidation plan. Inspect the preserved source evidence to
+determine whether an exact historical source tag can be recovered without a
+new build; do not label the current binary as the new candidate or redeploy it.
+All 11 recorded current-bundle source hashes match existing commit
+4f9fcd0c167de87e35cc3de71cd7984482a9c344. The preserved tracked diff matches
+the manifest's SHA-256 exactly. The current server is copied from the preceding
+retention-3659c270-20261013 bundle; that bundle's recorded source differs only
+in CLI retention.rs. Both bundles retain source/implementation.diff and the two
+then-new source modules. Do not infer one exact per-binary source tag for the
+mixed bundle without accounting for that difference.
+
+Cleanup observation: the October 13 retention evidence directories still
+contain old before/admission/after SQLite copies and an archive tree, and the
+preceding installed retention bundle still exists. These need exact inventory
+and live-path exclusion under the operator's eight-hour rollback limit. Keep
+the small manifests/source evidence needed for release provenance distinct
+from rollback databases, archive copies, and superseded binaries. Inspect and
+resolve this after the active compilation, avoiding competing disk work.
+
+Fork workflow repair: notify-acfs.yml had an unconditional job that runs on
+Cargo.toml pushes to main, then fails because this fork is not its hardcoded
+upstream source repository. Added a job-level upstream repository condition;
+the existing dispatch authorization checks remain intact. This is an
+upstream-only notification job, separate from functional CI. Safe local
+workflow fix under fork consolidation; validate YAML without a Rust rebuild.
+
+Reviewed follow-up batch (uncommitted): embed Rust's resolved project slug in
+the generated guard's metadata-checked candidates; construct the collision
+fixture under that actual slug; move ACK fixture seeding before the isolated
+default-root scope; distinguish current display labels from immutable message
+history after both renaming and clearing; use Unicode filesystem fixtures on
+macOS while retaining invalid-byte coverage elsewhere; keep both repaired
+retention TempDirs alive through assertions and then clean them automatically.
+The existing pure non-UTF8 identity classification still runs on all Unix.
+Updated nextest's stale claim that fixture hangs were impossible and the
+guard collision docstring to match its warning behavior. Formatting and
+whitespace checks pass. These repairs await compiler and regression evidence.
+
+Next qualification run: b243ecc0-3501-4b8d-b439-a14ec8ee797e, one guarded
+sequential batch using the unchanged target/toolchain/features, two Cargo jobs,
+two test workers and nice 19. Checks: all-target compiler, production compiler,
+strict all-target Clippy, broad functional nextest plus all ACK and symlink
+cases. Canonical TMPDIR selects a real temporary directory for fixtures that
+deliberately reject symlinked storage ancestors; explicit rejection tests stay
+selected. Logs use repaired-* in the existing qualification directory.
+
+Active broader functional regression run: session 50337, orchestration run
+96f7f394-a4b7-440d-8248-e9cbce702352. Locked workspace nextest, two workers,
+two Cargo jobs, nice 19, unchanged target and features; --no-fail-fast collects
+all selected failures before any repair. Log:
+`/tmp/mail-fork-qualification.XTHjZ8kE/functional-tests.log`.
+Selection covers labels/display, receipts, session identity/registration,
+retention/reconstruction/ID floors, startup-page checks, shared mailbox and
+inbox behavior, CLI JSON/conformance, recovery/authority/backup/snapshot,
+mail UI/compose and the guard package. Collect this same handle to terminal.
+Admission completed. Nextest selected 2882 tests; only the changed conformance
+target compiled, in 16.52s. The run has reported doctor_orphan_refs.rs:907
+successful_apply_keeps_a_complete_pre_repair_snapshot as failing. Record the
+complete terminal result before classifying or repairing the batch.
+
+Broader run terminal: matching run record, started=true/status=completed,
+childExitCode=100. In 518.796s: 2662 passed, 219 failed, one timed out
+(ack_ttl::tests::recovery_contention_preserves_ack_tail_and_resumes_real_escalation).
+No source edits were made during the run. Many errors explicitly reject /var
+symlink prefixes; several fail creating non-UTF8 filenames on macOS.
+
+Diagnostic session 22069, run 543a58fd-86eb-4f5d-af3f-31ec046ea45e, captures
+metadata from the unchanged cached build, then uses nextest --binaries-metadata
+and --cargo-metadata to rerun all 220 failed/timed-out names plus explicit
+symlink/path-identity checks with canonical TMPDIR. This is a cause-isolation
+experiment, not final qualification. Paths under the same /tmp qualification
+directory: binaries-metadata.json, cargo-metadata.json, failed-and-alias.filter,
+metadata-build.log and canonical-temp-diagnostic.log. Collect this same handle.
+Metadata capture finished from cache in 0.86s with no Rust compilation.
+Nextest selected 647 tests including explicit symlink/path checks.
+An isolated one-second sample of ACK child PID 95290 confirms the nested
+fixture mutex wait: isolated-root scope -> seed_unacked_message ->
+with_process_env_overrides_for_test -> Mutex::lock -> __psynch_mutexwait.
+Evidence: ack-fixture-lock.sample.txt in the same qualification directory.
+Sample command session 86072 completed successfully. The test remains owned
+by nextest's process-group watchdog; no process was signaled manually.
+Diagnostic terminal: matching run record started=true/status=completed,
+childExitCode=100; 647 tests in 256.090s, 638 passed, eight failed, one timeout.
+The temporary-root experiment resolves 211 of the previous 219 failures.
+Remaining failures: five physical non-UTF8 filename fixtures unsupported by
+macOS, two guard cases, display-name history equality, and the sampled ACK lock.
+Explicit symlink rejection remains covered by this diagnostic. No final
+qualification claim follows from this environment-isolation experiment.
+
 Current source head: d7566cc72343113601abcab08fc4c86152afa201. The final
 notification edit removes only a redundant borrow. Formatting and whitespace
 checks pass. Compiler qualification is session 88847, orchestration run
 4ff06ffd-e868-445f-9aaa-750d6f8df3c2: sequential locked workspace all-target
 check, production lib/bins check and strict all-target Clippy, nice 19, two
 compiler jobs, unchanged shared target. Logs are in
-`/tmp/mail-fork-qualification.XTHjZ8kE/`. Collect this exact handle to terminal.
-Do not start another heavy command while it runs.
+`/tmp/mail-fork-qualification.XTHjZ8kE/`. Session 88847 completed with matching
+terminal record and childExitCode=0. All-target check passed in 1m00s,
+production check in 39.93s, strict Clippy in 1m11s.
+
+Real-process functional acceptance session 50079 completed with matching run
+831c4baa-3060-48e8-a52c-a092b81ec45d and childExitCode=0. Three messages and
+both labeled profiles retained exact identity/content/receipt state across
+two restarts; cold database integrity/foreign-key and archive checks passed.
+Evidence: preservation qualification/functional-f23e7d18-20261028/result.json.
+The 0.0s active-duration figure is expected in functional-only mode: it runs
+the three scenario phases without the optional sustained-load workers.
 
 Latest repair test state: session 25645 completed with child exit 100 and a
 matching orchestration terminal record. Compilation took 12m20s; 19 selected
@@ -125,6 +289,45 @@ summary. It is incomplete evidence, not a passing suite.
 
 Current imperfection ledger (safe local fixes under Rust test/code and
 qualification workflows; investigate and repair before publication):
+- guard/src/lib.rs:1178-1221 derives only legacy path slugs in the generated
+  hook, while Rust identity can use hashed Git slugs. The installed-root test
+  at :6206 confirms a reservation is missed when project.json is absent.
+  Safe local correctness repair under Rust/Python code guidance: carry the
+  resolved install-time project slug into metadata-checked candidate matching.
+- guard/src/lib.rs:6248 assumes two paths still collide under Git identity;
+  construct foreign metadata under the actual candidate slug to exercise the
+  intended collision behavior. Safe local fixture repair under Rust tests.
+- tools/tests/auto_register_profile.rs:560 compares dynamic recipient labels
+  as immutable message history. Assert the current label separately and
+  compare the remaining message data. Safe local fixture repair under Rust
+  tests; production labels must continue updating after relabeling.
+- recovery_retention.rs:2342 and :2608 physical non-Unicode fixtures retain
+  temporary directories with TempDir::keep, including a sparse 24 GiB file.
+  Safe local fixture-lifetime repair under Rust test guidance: retain TempDir
+  handles through assertions so fixture data is cleaned up on scope exit.
+- ACK timeout has a concrete nested-lock path: ack_ttl.rs:1696 enters
+  with_isolated_default_storage_root_for_test, then seed_unacked_message calls
+  ensure_ephemeral_test_project at :554, which enters
+  with_process_env_overrides_for_test again. config.rs:3611 holds the
+  non-reentrant TEST_SERIALIZER throughout both closures. Safe local fixture
+  repair under Rust test guidance; include in the next reviewed repair batch.
+  Preserve source unchanged until the reusable-binary diagnostic completes.
+- Broader-run reported failure at doctor_orphan_refs.rs:907, test
+  successful_apply_keeps_a_complete_pre_repair_snapshot. Classification awaits
+  terminal run 96f7f394-a4b7-440d-8248-e9cbce702352; collect all failures and
+  trace their causes together before any further Rust edit/build.
+- The same in-progress log also reports failures in core agent_detect runtime
+  discovery, pool validated ATC paths, recovery_retention non-Unicode inventory,
+  guard hook/installed-root fixtures and server backup_rotation fixtures.
+  Exact test names and stderr are retained in functional-tests.log. Treat as
+  one pending diagnostic batch under Rust test/code qualification; inspect
+  canonical temporary-root handling and filesystem capabilities before edits.
+- External harness adapter path: fixed by a required --adapter input, resolved
+  before creating artifacts and recorded with its hash. Help, Ruff and mypy
+  passed; the real functional acceptance passed using installed 0.17.1.
+- External harness optional load-mode adapter grammar: fixed to operation
+  `list` and `allRecords`, matching installed 0.17.1. No sustained performance
+  load was run or claimed; functional mode does not execute this path.
 - Conformance notification fixture redundant borrow at signal_root: fixed
   after session 17693 completed; compiler/lint qualification remains.
 - CLI release scorecard temporary-path fixture: fixed; all selected scorecard
