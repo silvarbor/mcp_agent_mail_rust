@@ -556,7 +556,21 @@ fn display_name_demo_preserves_routing_and_history() {
             assert_eq!(renamed["name"], "BlueLake");
             assert_eq!(renamed["id"], first_id);
             assert_eq!(renamed["display_name"], "Officer Alpha");
-            let after_rename = peek_inbox(&ctx, &project, "BlueLake").await;
+            let mut after_rename = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_rename.len(), 1);
+            assert_eq!(
+                after_rename[0]["to_display_names"],
+                serde_json::json!({"BlueLake": "Officer Alpha"})
+            );
+            // Labels are a current profile projection; the stored message
+            // and its routing identity remain unchanged after a relabel.
+            let mut history = history;
+            for messages in [&mut after_rename, &mut history] {
+                messages[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("to_display_names");
+            }
             assert_eq!(after_rename, history);
             println!(
                 "Officer Alpha <BlueLake> (id={first_id}); history unchanged: message {}",
@@ -617,7 +631,17 @@ fn display_name_demo_preserves_routing_and_history() {
             assert!(cleared.get("display_name").is_none());
             assert_eq!(cleared["id"], first_id);
             assert_eq!(cleared["name"], "BlueLake");
-            assert_eq!(peek_inbox(&ctx, &project, "BlueLake").await, after_rename);
+            let mut after_clear = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_clear.len(), 1);
+            assert_eq!(
+                after_clear[0]["to_display_names"],
+                serde_json::json!({"BlueLake": null})
+            );
+            after_clear[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("to_display_names");
+            assert_eq!(after_clear, history);
             mcp_agent_mail_storage::wbq_flush();
             let archived: Value = serde_json::from_str(
                 &std::fs::read_to_string(&profiles[0]).expect("read cleared profile"),
