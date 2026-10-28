@@ -5,6 +5,7 @@
 We maintain this fork on `main`. We preserve shared history with
 [upstream](https://github.com/Dicklesworthstone/mcp_agent_mail_rust).
 Use `origin` for `silvarbor/mcp_agent_mail_rust`. Use `upstream` for the original repository.
+
 The functional release candidate requires qualification before publication.
 The quick-install commands elsewhere in this README download upstream releases.
 They do not install this fork's display-name and retention changes.
