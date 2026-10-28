@@ -44,7 +44,7 @@ For example, merge a selected upstream commit into `work/upstream-update-YYYYMMD
 Install fork releases only from a clean, qualified source commit with a published tag.
 Use a fork-specific tag, such as `silvarbor-v0.3.39.1`, for that exact commit.
 Record the full commit, tag, dependency lockfile, binary hashes, and validation results in the installation manifest.
-Verify the installed binary hashes against that manifest after deployment.
+After you deploy the binaries, verify their hashes against the manifest.
 Retain rollback material for at most eight hours under the operator's retention policy.
 
 <div align="center">
