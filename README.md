@@ -2,9 +2,9 @@
 
 ## Maintaining the Silvarbor fork
 
-We maintain this fork on `main` and preserve shared history with
+We maintain this fork on `main`. We preserve shared history with
 [upstream](https://github.com/Dicklesworthstone/mcp_agent_mail_rust).
-`origin` identifies `silvarbor/mcp_agent_mail_rust`; `upstream` identifies the original repository.
+Use `origin` for `silvarbor/mcp_agent_mail_rust`. Use `upstream` for the original repository.
 The functional release candidate requires qualification before publication.
 The quick-install commands elsewhere in this README download upstream releases.
 They do not install this fork's display-name and retention changes.
@@ -20,7 +20,7 @@ They do not install this fork's display-name and retention changes.
 | Build and qualification | Bounded compiler jobs, portable fixtures, installer and continuous-integration repairs | Workspace checks, production-feature checks, strict Clippy, formatting, and relevant acceptance tests |
 
 Optional synchronization, cache, and flush optimizations stay separate from functional qualification.
-The repair for inbox processor use also receives its own reviewable change.
+Review the repair for excessive inbox processor use in a separate change.
 Before you remove a fork patch, verify that upstream satisfies its behavior and acceptance tests.
 For example, upstream label support must preserve routing identities across a relabel and restart.
 
