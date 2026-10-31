@@ -19,6 +19,25 @@ Agent Mail was started on October 31 using the existing launchd configuration;
 it remains intentionally disabled at login. Do not change that setting or
 restart the live service as part of specification recording or PR inspection.
 
+CI reinspection: all October 28 jobs are terminal. Build & Test exceeded its
+90-minute job limit. Clippy completed in 18m34s, build in 21m42s, test compile
+in 20m12s; CLI unit tests passed (3032 cases), then CLI integration output
+stopped after http_surface_isolation at 19:11:42 UTC until cancellation at
+19:36:51. Investigate the stalled integration run before extending deadlines
+or recompiling. The macOS installer never acquired a hosted runner (capacity
+annotations); archive perf received a runner shutdown signal during compilation.
+APFS failed on the symlinked /var TMPDIR; workflow correction canonicalizes
+TMPDIR with pwd -P before the probe, preserving the storage safety check.
+Actionlint and whitespace checks pass for the two workflow corrections.
+Linux fsync timing failures: ext4-ordered batch p95 328.262ms / 250ms budget,
+ext4-journal 472.404ms / 350ms, xfs 355.677ms / 250ms. Btrfs and tmpfs passed.
+These timing failures remain under investigation; do not weaken budgets or
+silently fold optional optimizations into the functional candidate.
+CI logs: /tmp/mail-fork-ci.Y1ROsT. The old local qualification scratch directory
+/tmp/mail-fork-qualification.XTHjZ8kE no longer exists; durable summaries above
+remain, but raw logs at that path must not be claimed available. Recover any
+needed evidence from retained artifacts before deciding on additional tests.
+
 ## October 28: active fork consolidation
 
 LOCAL QUALIFICATION PASSED. Final run
