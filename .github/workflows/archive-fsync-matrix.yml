@@ -80,6 +80,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          TMPDIR="$(cd "${TMPDIR}" && pwd -P)"
+          export TMPDIR
           chmod +x scripts/bench_archive_fsync_matrix.sh
           scripts/bench_archive_fsync_matrix.sh \
             --filesystem apfs \
