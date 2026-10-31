@@ -1,5 +1,24 @@
 # Resume — local Agent Mail fork
 
+## October 31: recipient-addressing follow-up recorded
+
+The operator approved recording the explicit recipient-addressing contract in
+`docs/SPEC-recipient-addressing.md`, then returning to the five-step fork
+closeout. Recipient addressing is a separate follow-up after PR #4; do not add
+its implementation to this qualification effort. Existing string recipients
+retain their meaning; new objects explicitly select `name` or `display_name`.
+No namespace guessing or fallback is permitted. Remaining interface decisions
+and future acceptance criteria are recorded in the specification.
+
+Resume closeout with fresh PR #4 CI/review inspection. Last observed branch
+has local commit `0e0f96c5` ahead of the published head, fixing the ATC gate's
+temporary-directory permission failure. Reuse unchanged local Rust evidence
+and the shared build cache; this specification changes no runtime code.
+The five-step goal instructions are in the file referenced by the runtime goal.
+Agent Mail was started on October 31 using the existing launchd configuration;
+it remains intentionally disabled at login. Do not change that setting or
+restart the live service as part of specification recording or PR inspection.
+
 ## October 28: active fork consolidation
 
 LOCAL QUALIFICATION PASSED. Final run
