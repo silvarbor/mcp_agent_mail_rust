@@ -510,7 +510,7 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Soak harness perf trend suite (quick)
-        run: am e2e run --project . soak_harness
+        run: nice -n 19 target/debug/am e2e run --project . soak_harness
         env:
           SOAK_SEED: "42"
           SOAK_PROJECTS: "3"
@@ -526,7 +526,7 @@ jobs:
           echo "/tmp/am-tui-pyte/bin" >> "$GITHUB_PATH"
 
       - name: TUI traversal + flash + soak regression gate
-        run: am e2e run --project . tui_full_traversal
+        run: nice -n 19 target/debug/am e2e run --project . tui_full_traversal
         env:
           E2E_FIXTURE_PROFILE: "small"
           E2E_CAPTURE_BASELINE_PROFILE: "0"
@@ -668,22 +668,22 @@ jobs:
         # requires ok=true. This is the gate that would have caught GH#203 at
         # v0.3.22: a total read-path hang shipped twice because nothing in CI
         # ever ran the binary end-to-end over the MCP transport.
-        run: am e2e run --project . health_and_selftests
+        run: nice -n 19 target/debug/am e2e run --project . health_and_selftests
 
       - name: E2E dual-mode suite
-        run: am e2e run --project . dual_mode
+        run: nice -n 19 target/debug/am e2e run --project . dual_mode
 
       - name: E2E mode matrix suite
-        run: am e2e run --project . mode_matrix
+        run: nice -n 19 target/debug/am e2e run --project . mode_matrix
 
       - name: E2E web parity suite (HTTP wrapper, includes mail_ui)
-        run: am e2e run --project . http
+        run: nice -n 19 target/debug/am e2e run --project . http
 
       - name: E2E static export conformance suite
-        run: am e2e run --project . share
+        run: nice -n 19 target/debug/am e2e run --project . share
 
       - name: E2E cross-epic integration suite
-        run: am e2e run --project . cross_epic_integration
+        run: nice -n 19 target/debug/am e2e run --project . cross_epic_integration
 
       - name: Validate artifact bundles
         if: always()
@@ -740,7 +740,7 @@ jobs:
 
           # Native runner dispatches all 5 suites and reports results.
           # Environment variables pass through to underlying test scripts.
-          if am e2e run --project . \
+          if nice -n 19 target/debug/am e2e run --project . \
             search_v3_stdio \
             search_v3_http \
             search_v3_shadow_parity \
@@ -1202,7 +1202,7 @@ jobs:
       - name: E2E crash-restart recovery
         id: crash_restart
         if: always()
-        run: am e2e run --project . crash_restart
+        run: nice -n 19 target/debug/am e2e run --project . crash_restart
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1214,7 +1214,7 @@ jobs:
       - name: E2E database corruption handling
         id: db_corruption
         if: always()
-        run: am e2e run --project . db_corruption
+        run: nice -n 19 target/debug/am e2e run --project . db_corruption
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1226,7 +1226,7 @@ jobs:
       - name: E2E failure injection
         id: failure_injection
         if: always()
-        run: am e2e run --project . failure_injection
+        run: nice -n 19 target/debug/am e2e run --project . failure_injection
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1238,7 +1238,7 @@ jobs:
       - name: E2E fault injection
         id: fault_injection
         if: always()
-        run: am e2e run --project . fault_injection
+        run: nice -n 19 target/debug/am e2e run --project . fault_injection
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
