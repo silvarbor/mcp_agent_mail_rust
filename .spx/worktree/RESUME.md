@@ -1,5 +1,49 @@
 # Resume — local Agent Mail fork
 
+## November 1: published candidate and closeout progress
+
+PR #4 head `31d8a5b397ce8089629ffd1087baf290e392c021` contains the verified
+HTTP timeout and build-cache repairs. Current CI runs: main 41326066940,
+filesystem matrix 41326066807, ATC 41326066801, archive perf 41326066828.
+Both installer jobs, dashboard, and observability passed. Archive perf failed
+with exit 143 during compilation before producing a performance verdict.
+XFS batch p95 is 394.809ms and ext4-ordered is 374.177ms against 250ms budgets;
+both are repeated failures. Tmpfs passed. Other jobs were still active at the
+last inspection. Read current GitHub state before waiting or rerunning.
+
+The operator has been asked whether to compare upstream/fork on one Linux
+runner, separate performance under an explicit merge exception, or pause and
+inspect. No answer has been received. Do not infer approval or weaken budgets.
+No local compiler or PR watcher is running. The previous watcher exited on a
+GitHub connection error; subsequent direct reads succeeded.
+
+Installed-source provenance is complete: published annotated tags
+`source/installed-am-20261013` -> `4f9fcd0c167de87e35cc3de71cd7984482a9c344`
+and `source/installed-server-20261013` ->
+`15843af24514252e827a8e9c0a236bb9daa7d844`. All 11 source hashes for each
+recorded build match; remote peeled tag refs were verified. The server source
+snapshot restores the prior bundle's retention module verbatim. The temporary
+source branch was removed. No rebuild, deployment, or reproducibility claim.
+
+Under the operator's eight-hour rollback instruction, removed 36,771 old
+rollback files (359,045,952 logical bytes) and two unused superseded binaries
+(197,661,728 logical bytes). Preserved manifests/source and verification
+records. Cleanup audits, per-binary source evidence and continuation state:
+`~/.local/state/mcp-agent-mail/integration/20261015-preservation/qualification/closeout-20261101/`.
+Live storage, current installed binaries, dirty upstream-integration work and
+the shared build cache remain protected.
+
+Archive perf diagnostic repair: `set -e` previously exited before recording a
+failed benchmark's PIPESTATUS or writing summary.json/comment.md. The script
+now captures benchmark failure, still fails on log-capture errors, and avoids
+building the startup probe after benchmark failure. Real Cargo rejection of an
+empty temporary workspace reproduced exit 101 with no summary before the fix;
+the final code returns 1 with runtime_error and bench_exit_code 101 recorded,
+writes both artifacts, and creates no target directory. Evidence:
+`/tmp/mail-perf-failure.rg4N0g/{before,after,final}`. Bash syntax, shellcheck and
+whitespace checks pass. No performance threshold or successful path changed.
+This fixes error reporting; it does not explain or cure the hosted exit 143.
+
 ## November 1: HTTP integration timeout diagnosis
 
 Active objective remains the five-step PR #4 consolidation, provenance, cleanup,
