@@ -20,43 +20,6 @@ const SNAPSHOT: &str = "before.sqlite3";
 struct ArchiveFile {
     relative: PathBuf,
     sha256: String,
-    kind: ArchiveFileKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum ArchiveFileKind {
-    Message,
-    ThreadDigest,
-}
-
-fn archive_file_kind(relative: &Path) -> Option<ArchiveFileKind> {
-    if relative
-        .extension()
-        .is_none_or(|extension| extension != "md")
-    {
-        return None;
-    }
-    let parts = relative.iter().collect::<Vec<_>>();
-    if parts.len() == 3 && parts[0] == "messages" && parts[1] == "threads" {
-        return Some(ArchiveFileKind::ThreadDigest);
-    }
-    let date_offset = if parts.len() == 4 && parts[0] == "messages" {
-        1
-    } else if parts.len() == 6
-        && parts[0] == "agents"
-        && (parts[2] == "inbox" || parts[2] == "outbox")
-    {
-        3
-    } else {
-        return None;
-    };
-    let year = parts[date_offset].to_str()?;
-    let month = parts[date_offset + 1].to_str()?;
-    (year.len() == 4
-        && year.bytes().all(|byte| byte.is_ascii_digit())
-        && month.len() == 2
-        && month.bytes().all(|byte| byte.is_ascii_digit()))
-    .then_some(ArchiveFileKind::Message)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,27 +138,21 @@ fn collect_files(
             )));
         }
         let relative_project = entry.path().strip_prefix(&project_root).map_err(failure)?;
-        let Some(kind) = archive_file_kind(relative_project) else {
+        let parts = relative_project.iter().collect::<Vec<_>>();
+        let message_tree = parts.first().is_some_and(|part| *part == "messages")
+            || (parts.first().is_some_and(|part| *part == "agents")
+                && parts
+                    .get(2)
+                    .is_some_and(|part| *part == "inbox" || *part == "outbox"));
+        if !message_tree {
             continue;
-        };
+        }
         if !entry.file_type().is_file()
             || entry
                 .path()
                 .extension()
                 .is_none_or(|extension| extension != "md")
         {
-            continue;
-        }
-        if kind == ArchiveFileKind::ThreadDigest {
-            files.push(ArchiveFile {
-                relative: entry
-                    .path()
-                    .strip_prefix(root)
-                    .map_err(failure)?
-                    .to_path_buf(),
-                sha256: digest(entry.path())?,
-                kind,
-            });
             continue;
         }
         let (metadata, _) =
@@ -223,7 +180,6 @@ fn collect_files(
                     .map_err(failure)?
                     .to_path_buf(),
                 sha256: digest(entry.path())?,
-                kind,
             });
         }
     }
@@ -318,7 +274,7 @@ fn create_plan(
         .collect::<CliResult<BTreeSet<_>>>()?;
     let files = collect_files(root, &slug, &expired_ids, &known_ids)?;
     let plan = Plan {
-        version: 2,
+        version: 1,
         database: database.to_path_buf(),
         storage_root: root.to_path_buf(),
         project_id,
@@ -555,9 +511,20 @@ fn apply_plan(plan: &Plan, run_dir: &Path) -> CliResult<()> {
             .relative
             .strip_prefix(Path::new("projects").join(&plan.project_slug))
             .map_err(failure)?;
-        if archive_file_kind(project_relative) != Some(file.kind) {
+        let parts = project_relative.iter().collect::<Vec<_>>();
+        let message_tree = parts.first().is_some_and(|part| *part == "messages")
+            || (parts.first().is_some_and(|part| *part == "agents")
+                && parts
+                    .get(2)
+                    .is_some_and(|part| *part == "inbox" || *part == "outbox"));
+        if !message_tree
+            || file
+                .relative
+                .extension()
+                .is_none_or(|extension| extension != "md")
+        {
             return Err(failure(
-                "manifest must select dated message files or derived thread digests",
+                "manifest must select only canonical, inbox or outbox message files",
             ));
         }
         let source = plan.storage_root.join(&file.relative);
@@ -653,7 +620,6 @@ fn apply_plan(plan: &Plan, run_dir: &Path) -> CliResult<()> {
         &run_dir.join("result.json"),
         &serde_json::json!({
             "complete": true, "expired_messages": plan.expired_ids.len(), "archive_files_moved": plan.files.len(),
-        "thread_digests_invalidated": plan.files.iter().filter(|file| file.kind == ArchiveFileKind::ThreadDigest).count(),
             "message_id_floor": plan.message_id_floor, "integrity": "ok", "relationships": "unchanged",
             "snapshot": run_dir.join(SNAPSHOT), "checked_snapshot": after_path
         }),
@@ -760,7 +726,7 @@ pub(super) fn run(
             crate::doctor::platform::open_regular_file_no_follow(&run_dir.join(MANIFEST))?,
         )
         .map_err(failure)?;
-        if plan.version != 2 || plan.database != database || plan.storage_root != root {
+        if plan.version != 1 || plan.database != database || plan.storage_root != root {
             return Err(failure("retention manifest does not select this mailbox"));
         }
         if project.is_some() || before.is_some() {
@@ -960,20 +926,10 @@ mod tests {
             &initial_paths.iter().map(String::as_str).collect::<Vec<_>>(),
         )
         .unwrap();
-        let thread_digest = project_dir.join("messages/threads/digest.md");
-        std::fs::create_dir_all(thread_digest.parent().unwrap()).unwrap();
-        std::fs::write(&thread_digest, "old derived thread preview\n").unwrap();
         let run_dir = base.join("recovery");
         let plan = create_plan(&database, &root, "shared", 1000000, &run_dir).unwrap();
         assert_eq!(plan.expired_ids, BTreeSet::from([100, 101, 102, 103]));
-        assert_eq!(plan.files.len(), 13);
-        assert_eq!(
-            plan.files
-                .iter()
-                .filter(|file| file.kind == ArchiveFileKind::ThreadDigest)
-                .count(),
-            1
-        );
+        assert_eq!(plan.files.len(), 12);
         assert_eq!(plan.message_id_floor, 103);
         let backlog = root.join(".archive_backlog");
         std::fs::create_dir(&backlog).unwrap();
