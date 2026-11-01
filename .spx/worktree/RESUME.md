@@ -1,6 +1,102 @@
 # Resume — local Agent Mail fork
 
-## November 1: published candidate and closeout progress
+## November 1: active merge goal and current evidence
+
+Finish and merge PR #4, then hand over the functional fork with an upstream
+sync procedure and a separately prioritized performance backlog. The goal is
+active. Earlier blocked-goal counters and unanswered questions below are
+historical; the operator authorized the paired comparison and this closeout.
+
+Published head: `f41f756f251c29b3d7c44a6f6d0ce674516674bf`.
+Run 41338518976 is terminal: Build & Test and dashboard passed; downstream
+functional jobs were cancelled and Skip Guard failed. They are unqualified.
+Help Snapshots, Mode Matrix and native Linux logs show independent cache
+misses followed by cancellation during compilation. Search diagnostics passed
+70 tests, but its E2E command failed with `am: command not found`; its evidence
+verifier then raised IndexError on an empty Path.glob iterator.
+
+Local repairs after diagnostic head 44e9b6d8:
+
+- bff9cf78: empty artifact iterators return None, preserving missing-evidence
+  failures. Empty iterator/list and ordered selection probes pass.
+- eaec2985: all 13 native E2E dispatches use the built target/debug/am at
+  nice level 19 instead of assuming Cargo installs it on PATH.
+- 30c880a6: downstream native jobs share the main build's dependency cache,
+  retain cache on failure, and use one Cargo target directory. Dashboard
+  remains separate. Build jobs and test threads are bounded to two. Native
+  job deadlines allow 90 minutes for cold builds; assertion counts, test
+  deadlines and performance budgets are unchanged.
+
+Actionlint and whitespace validation pass. These workflow fixes still need
+hosted execution. No new local Rust compilation or service restart occurred.
+Raw CI logs are under /tmp/mail-fork-ci.Y1ROsT/*-f41.log. The two other relevant
+jobs remain unresolved: Archive Perf run 41338518970 exited 143 while building;
+ATC run 41338519023 was cancelled. Neither produced a passing performance result.
+
+### Performance disposition and priority
+
+1. APFS baseline comparison: unresolved. Run 41338519014 measured single-message
+   p95 197.933ms against 35ms and batch p95 700.189ms against 300ms. Obtain
+   alternating upstream/fork measurements on the same Mac before attributing
+   a regression. The operator explicitly keeps this separate from consolidation.
+2. Shared Linux fsync budget failures: separate performance work, non-blocking
+   for functional consolidation under the active operator goal. Keep their
+   red results visible and preserve all thresholds. Paired run 41347942563
+   tested four rounds on each filesystem using the same runner and compiler.
+   Both revisions failed all 12 batch budget checks. Median round p50 batch
+   times (upstream/fork ms): ext4-ordered 346.462/350.147, ext4-journal
+   370.338/372.301, XFS 329.446/327.701. Ordered p95 was noisy in both directions;
+   these measurements establish no consistent fork regression and do not prove
+   equivalence. All 24 crash probes retained 100 canonical messages and at least
+   one archive commit; they do not establish full payload integrity.
+3. Performance evidence infrastructure: diagnose Archive Perf's build exit 143
+   and ATC's cancellation before claiming benchmark results. Reuse artifacts
+   and dependency caches; never treat interrupted compilation as a latency test.
+
+The paired upstream baseline is 92fd8025bcfff616b1b517e4f480d2b47458b1dc with
+one recorded build-only repair removing its duplicate write_op_storage_root
+definition. Timed functions and benchmark source are unchanged. Artifact
+13100317483, fsync-paired-comparison, contains the patch, binaries and raw
+results. Durable summary: closeout-20261101/fsync-comparison-result.json under
+the external qualification directory recorded below. Diagnostic success means
+the comparison completed; it does not turn failed budgets green.
+
+### Remaining sequence
+
+Publish the batched workflow repairs, collect functional results, fix actual
+correctness failures, obtain a final-head review, and merge PR #4 with a merge
+commit. No review workflow or review submission currently exists. A review
+route decision has been requested while CI repair continues. Main has no GitHub
+branch protection; this does not supply review evidence or waive verification.
+
+After merge, verify origin/main contains the merged head. Preserve the dirty
+upstream-integration checkout and its shared target. Reinspect occupancy and
+cleanliness before removing accounted branches/worktrees. The canonical
+agent-mail checkout should finish on main. The diagnostic comparison branch
+can be removed after its commits are incorporated and its evidence is retained.
+The eight-hour cleanup instruction also removed 116 old rotated database
+backups, 2,371,780,608 logical bytes, with seven recent copies retained at the
+time of cleanup; audit: rotated-backup-cleanup.json. Recheck ages before any
+further cleanup. Live database, installed binaries and unfinished work remain
+protected. Display-name recipient implementation follows separately under
+docs/SPEC-recipient-addressing.md.
+
+### Upstream synchronization procedure
+
+Origin is silvarbor/mcp_agent_mail_rust; upstream is
+Dicklesworthstone/mcp_agent_mail_rust. Preserve published ancestry. From a
+clean, unoccupied checkout, fetch both remotes, fast-forward local main to
+origin/main, and create a work/upstream-sync-YYYYMMDD branch. Record the exact
+upstream/main SHA being integrated, then merge that SHA with a merge commit.
+Resolve against the fork's functional contracts and dependency pins. Run
+formatting, both workspace compiler checks, strict Clippy and the relevant
+functional suites with the pinned toolchain, shared target, nice 19 and two
+workers. Compare performance against the same selected baseline when a change
+affects runtime cost. Open a PR against origin/main and complete review and
+verification before merging. Never force-push published main or rebase its
+fork history; upstream contributions are separate PRs.
+
+## Historical November 1 closeout log
 
 PR #4 head `31d8a5b397ce8089629ffd1087baf290e392c021` contains the verified
 HTTP timeout and build-cache repairs. Current CI runs: main 41326066940,
