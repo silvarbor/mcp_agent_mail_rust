@@ -10,6 +10,15 @@ on:
       - "benches/BUDGETS.md"
       - "docs/OPERATOR_RUNBOOK.md"
   workflow_dispatch:
+    inputs:
+      compare_upstream:
+        description: Run a paired upstream/fork diagnostic on one Linux runner
+        type: boolean
+        default: false
+      upstream_sha:
+        description: Exact upstream commit for the paired diagnostic
+        type: string
+        default: "92fd8025bcfff616b1b517e4f480d2b47458b1dc"
   schedule:
     - cron: "0 15 * * 2"
 
@@ -22,6 +31,7 @@ permissions:
 
 jobs:
   linux-fsync:
+    if: ${{ !inputs.compare_upstream }}
     name: Archive Fsync (${{ matrix.fs }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -67,6 +77,7 @@ jobs:
           if-no-files-found: error
 
   macos-apfs:
+    if: ${{ !inputs.compare_upstream }}
     name: Archive Fsync (apfs)
     runs-on: macos-latest
     timeout-minutes: 35
@@ -100,4 +111,161 @@ jobs:
           name: archive-fsync-apfs
           path: ${{ env.MATRIX_OUTPUT_DIR }}/
           retention-days: 30
+          if-no-files-found: error
+
+  paired-comparison:
+    name: Paired upstream and fork diagnostic
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.compare_upstream }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+      COMPARISON_DIR: ${{ github.workspace }}/tests/artifacts/fsync-comparison
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@nightly-2026-08-31
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fsync-paired-comparison
+          cache-on-failure: true
+
+      - name: Prepare exact source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${UPSTREAM_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${UPSTREAM_SHA}^{commit}"
+          mkdir -p "${COMPARISON_DIR}/binaries"
+          git worktree add --detach "${RUNNER_TEMP}/fsync-upstream" "${UPSTREAM_SHA}"
+          git rev-parse HEAD > "${COMPARISON_DIR}/candidate-sha.txt"
+          git -C "${RUNNER_TEMP}/fsync-upstream" rev-parse HEAD > "${COMPARISON_DIR}/upstream-sha.txt"
+          rustc -vV > "${COMPARISON_DIR}/toolchain.txt"
+          uname -a > "${COMPARISON_DIR}/host.txt"
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs xfsprogs
+
+      - name: Build each probe once
+        shell: bash
+        run: |
+          set -euo pipefail
+          for revision in candidate upstream; do
+            source_root="${GITHUB_WORKSPACE}"
+            if [ "${revision}" = upstream ]; then
+              source_root="${RUNNER_TEMP}/fsync-upstream"
+            fi
+            nice -n 19 cargo test --locked --manifest-path "${source_root}/Cargo.toml" \
+              --target-dir "${GITHUB_WORKSPACE}/target" \
+              -p mcp-agent-mail-storage --test it --no-run --message-format=json \
+              > "${COMPARISON_DIR}/${revision}-build.jsonl" \
+              2> "${COMPARISON_DIR}/${revision}-build.log"
+            python3 - "${revision}" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          root = Path(os.environ['COMPARISON_DIR'])
+          revision = sys.argv[1]
+          artifacts = [json.loads(line) for line in (root / f'{revision}-build.jsonl').read_text().splitlines()]
+          executables = [item['executable'] for item in artifacts
+                         if item.get('reason') == 'compiler-artifact'
+                         and item.get('target', {}).get('name') == 'it'
+                         and item.get('profile', {}).get('test')
+                         and item.get('executable')]
+          if len(executables) != 1:
+              raise SystemExit(f'Expected one storage test executable, found {executables}')
+          shutil.copy2(executables[0], root / 'binaries' / revision)
+          PY
+          done
+          sha256sum "${COMPARISON_DIR}"/binaries/* > "${COMPARISON_DIR}/binary-sha256.txt"
+
+      - name: Alternate paired filesystem probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for filesystem in ext4-ordered ext4-journal xfs; do
+            for round in 1 2 3 4; do
+              order="upstream candidate"
+              if (( round % 2 == 0 )); then order="candidate upstream"; fi
+              for revision in ${order}; do
+                output="${COMPARISON_DIR}/${filesystem}/${round}/${revision}"
+                mkdir -p "${output}"
+                set +e
+                nice -n 19 bash scripts/bench_archive_fsync_matrix.sh \
+                  --filesystem "${filesystem}" --output-dir "${output}" \
+                  --probe-binary "${COMPARISON_DIR}/binaries/${revision}" \
+                  > "${output}/probe.log" 2>&1
+                probe_exit=$?
+                set -e
+                printf '%s\n' "${probe_exit}" > "${output}/exit-code.txt"
+                # Timing assertions may fail; retain their verdicts and require
+                # a complete summary and successful crash checks for comparison.
+                python3 - "${output}" "${probe_exit}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          result = json.loads((output / 'summary.json').read_text())
+          if int(sys.argv[2]) not in (0, 101):
+              raise SystemExit(f'Unexpected probe exit: {sys.argv[2]}')
+          if result['crash_probe']['canonical_messages'] != 100 or result['crash_probe']['git_commits'] < 1:
+              raise SystemExit('Crash probe failed')
+          PY
+              done
+            done
+          done
+
+      - name: Summarize paired measurements
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import statistics
+
+          root = Path(os.environ['COMPARISON_DIR'])
+          rows = []
+          lines = ['## Paired filesystem diagnostic', '',
+                   'Both revisions ran on this runner. Original budgets and per-probe exit codes are retained.',
+                   'This diagnostic reports ratios; it does not waive a performance gate.', '',
+                   '| Filesystem | Operation | Upstream median p95 (ms) | Fork median p95 (ms) | Fork/upstream |',
+                   '| --- | --- | ---: | ---: | ---: |']
+          for filesystem in ('ext4-ordered', 'ext4-journal', 'xfs'):
+              for operation in ('single_message', 'batch_100'):
+                  pairs = []
+                  for round_number in range(1, 5):
+                      values = {}
+                      for revision in ('upstream', 'candidate'):
+                          result = json.loads((root / filesystem / str(round_number) / revision / 'summary.json').read_text())
+                          values[revision] = result[operation]
+                      pairs.append(values)
+                  upstream = statistics.median(pair['upstream']['p95_ms'] for pair in pairs)
+                  candidate = statistics.median(pair['candidate']['p95_ms'] for pair in pairs)
+                  rows.append({'filesystem': filesystem, 'operation': operation, 'pairs': pairs,
+                               'median_p95_ratio': candidate / upstream})
+                  lines.append(f'| {filesystem} | {operation} | {upstream:.3f} | {candidate:.3f} | {candidate / upstream:.3f} |')
+          (root / 'comparison.json').write_text(json.dumps(rows, indent=2) + '\n')
+          (root / 'comparison.md').write_text('\n'.join(lines) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\n'.join(lines) + '\n')
+          PY
+
+      - name: Upload paired diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsync-paired-comparison
+          path: |
+            ${{ env.COMPARISON_DIR }}/**
+            !${{ env.COMPARISON_DIR }}/binaries/**
+          retention-days: 14
           if-no-files-found: error
