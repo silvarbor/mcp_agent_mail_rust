@@ -408,10 +408,14 @@ pub struct Runner {
 }
 
 #[derive(Debug)]
-struct SuiteExecution {
-    output: std::process::Output,
-    timed_out: bool,
-    capture_incomplete: bool,
+/// Captured command outcome, including failures beyond the child's exit status.
+pub struct SuiteExecution {
+    /// Child exit status and captured output.
+    pub output: std::process::Output,
+    /// Whether the configured execution deadline elapsed.
+    pub timed_out: bool,
+    /// Whether output exceeded its limit or descendants retained output pipes.
+    pub capture_incomplete: bool,
 }
 
 impl Runner {
@@ -758,7 +762,14 @@ impl Runner {
         self.execute_script(cmd)
     }
 
-    fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
+    /// Runs a prepared adapter command with bounded output capture and shutdown.
+    ///
+    /// Callers must reject timed-out or incomplete captures even if the child
+    /// exits successfully. On Unix the runner owns a new process group.
+    ///
+    /// # Errors
+    /// Returns an error when admission, spawning, capture, or reaping fails.
+    pub fn execute_script(&self, mut cmd: Command) -> std::io::Result<SuiteExecution> {
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
