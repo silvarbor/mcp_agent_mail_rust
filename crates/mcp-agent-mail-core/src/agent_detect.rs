@@ -288,6 +288,9 @@ mod runtime_tests {
                 "symlink",
                 "relative",
                 "empty_component",
+                "unicode",
+                // macOS rejects non-UTF8 directory names at creation time.
+                #[cfg(not(target_os = "macos"))]
                 "non_utf8",
                 "shadowed",
                 "absent",
@@ -562,6 +565,8 @@ mod runtime_tests {
 
         let bin = if case == "non_utf8" {
             project.join(std::ffi::OsString::from_vec(b"bin-\xff".to_vec()))
+        } else if case == "unicode" {
+            project.join("bin-λ")
         } else if case == "empty_component" {
             project.to_path_buf()
         } else {

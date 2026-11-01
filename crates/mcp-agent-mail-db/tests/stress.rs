@@ -937,6 +937,190 @@ fn stress_concurrent_inbox_and_send() {
 // Test: Concurrent mark_read + acknowledge (idempotent, no race corruption)
 // =============================================================================
 
+/// br-pcgj3: exercise the reported polling/send/ack workload while a peer
+/// resets the WAL. Canonical SQLite judges the final cold image independently.
+#[test]
+fn concurrent_mailbox_poll_send_ack_and_checkpoint_preserves_pages() {
+    use mcp_agent_mail_db::pool::SyncQuery;
+    use mcp_agent_mail_db::{CanonicalDbConn, DbConn, guard_db_conn};
+
+    let (pool, directory) = make_pool();
+    let (project_id, sender_id, receivers) = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let project = queries::ensure_project(&cx, &pool, "/incident/mailbox-polling")
+                .await
+                .into_result()
+                .expect("create isolated incident project");
+            let project_id = project.id.expect("project id");
+            let sender = queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let mut receivers = Vec::new();
+            for name in [
+                "AmberHarbor",
+                "ScarletGoose",
+                "PeachFrog",
+                "RusticOwl",
+                "BlueCrane",
+                "TealHeron",
+                "SilverHeron",
+                "SageMaple",
+                "BrightWillow",
+                "SnowyHeron",
+                "CopperWren",
+            ] {
+                let receiver = queries::register_agent(
+                    &cx, &pool, project_id, name, "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("register incident poller");
+                receivers.push(receiver.id.unwrap());
+            }
+            (project_id, sender.id.unwrap(), receivers)
+        }
+    });
+    let database_path = directory
+        .path()
+        .read_dir()
+        .expect("find isolated database")
+        .map(|entry| entry.expect("database entry").path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "db"))
+        .expect("isolated database path");
+    let barrier = Arc::new(Barrier::new(15));
+    let checkpoint_count = AtomicU64::new(0);
+
+    std::thread::scope(|scope| {
+        for sender in 0..3 {
+            let pool = &pool;
+            let barrier = &barrier;
+            let receivers = &receivers;
+            scope.spawn(move || {
+                barrier.wait();
+                for message in 0..30 {
+                    let receiver_id = receivers[message % receivers.len()];
+                    let created = block_on_with_retry(50, |cx| async move {
+                        queries::create_message_with_recipients(
+                            &cx,
+                            pool,
+                            project_id,
+                            sender_id,
+                            &format!("incident sender {sender} message {message}"),
+                            &"checkpoint-page-reuse".repeat(256),
+                            Some("incident-checkpoints"),
+                            "normal",
+                            true,
+                            "[]",
+                            &[(receiver_id, "to")],
+                        )
+                        .await
+                    });
+                    let message_id = created.id.expect("created message id");
+                    block_on_with_retry(50, |cx| async move {
+                        queries::mark_message_read(&cx, pool, receiver_id, message_id).await
+                    });
+                    block_on_with_retry(50, |cx| async move {
+                        queries::acknowledge_message(&cx, pool, receiver_id, message_id).await
+                    });
+                }
+            });
+        }
+        for &receiver_id in &receivers {
+            let path = &database_path;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..30 {
+                    let reader = guard_db_conn(
+                        DbConn::open_file(path.to_str().expect("database UTF-8"))
+                            .expect("open short-lived inbox reader"),
+                        "incident short-lived reader",
+                    );
+                    reader
+                        .execute_raw("PRAGMA busy_timeout = 5000")
+                        .expect("bound reader contention wait");
+                    let rows = reader
+                        .query_sync(
+                            "SELECT m.id, m.subject FROM message_recipients r \
+                             JOIN messages m ON m.id = r.message_id \
+                             WHERE r.agent_id = ? ORDER BY m.created_ts DESC LIMIT 30",
+                            &[sqlmodel_core::Value::BigInt(receiver_id)],
+                        )
+                        .expect("poll inbox through fresh engine connection");
+                    assert!(rows.len() <= 30);
+                    drop(reader);
+                }
+            });
+        }
+        let pool = &pool;
+        let barrier = &barrier;
+        let checkpoint_count = &checkpoint_count;
+        scope.spawn(move || {
+            barrier.wait();
+            for _ in 0..30 {
+                block_on_with_retry(50, |_cx| async {
+                    match pool.wal_checkpoint() {
+                        Ok(frames) => Outcome::Ok(frames),
+                        Err(error) => {
+                            assert_eq!(
+                                error.classification().class,
+                                mcp_agent_mail_db::DbErrorClass::BusyRetryable,
+                                "checkpoint may refuse contention, never corruption: {error:?}"
+                            );
+                            Outcome::Err(error)
+                        }
+                    }
+                });
+                checkpoint_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    });
+
+    assert!(
+        checkpoint_count.load(Ordering::Relaxed) > 0,
+        "the workload must exercise a successful WAL checkpoint"
+    );
+    pool.wal_checkpoint()
+        .expect("checkpoint after all workers exit");
+    drop(pool);
+    let canonical =
+        CanonicalDbConn::open_file(database_path.to_str().expect("cold database UTF-8"))
+            .expect("open cold isolated database with canonical SQLite");
+    let integrity = canonical
+        .query_sync("PRAGMA integrity_check", &[])
+        .expect("canonical integrity query");
+    assert_eq!(
+        mcp_agent_mail_db::integrity::extract_check_details(
+            &integrity,
+            mcp_agent_mail_db::CheckKind::Full,
+        ),
+        ["ok"],
+        "concurrent polling, sends, acknowledgements and checkpoints must preserve page ownership"
+    );
+    let rows = canonical
+        .query_sync("SELECT COUNT(*) AS count FROM messages NOT INDEXED", &[])
+        .expect("independent table count");
+    assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 90);
+    let rows = canonical
+        .query_sync(
+            "SELECT COUNT(*) AS count FROM message_recipients NOT INDEXED \
+             WHERE read_ts IS NOT NULL AND ack_ts IS NOT NULL",
+            &[],
+        )
+        .expect("independent persisted read/ack count");
+    assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 90);
+    assert!(
+        canonical
+            .query_sync("PRAGMA foreign_key_check", &[])
+            .expect("canonical relationship check")
+            .is_empty()
+    );
+}
+
 #[test]
 fn stress_concurrent_read_ack() {
     let (pool, _dir) = make_pool();

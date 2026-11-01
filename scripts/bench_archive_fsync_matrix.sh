@@ -8,10 +8,13 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_DIR="${PROJECT_ROOT}/tests/artifacts/perf/archive_fsync_matrix/${RUN_ID}"
 FILESYSTEM=""
 TARGET_DIR="${TMPDIR:-/tmp}/target-$(whoami)-am"
+PROBE_BINARY=""
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>]
+Usage: scripts/bench_archive_fsync_matrix.sh --filesystem <id> [--output-dir <path>] [--target-dir <path>] [--probe-binary <absolute-path>]
+
+--probe-binary runs an already-built storage integration-test executable.
 
 Supported filesystems:
   Linux:  ext4-ordered, ext4-journal, xfs, btrfs, tmpfs
@@ -54,6 +57,10 @@ while [ $# -gt 0 ]; do
             TARGET_DIR="${2:-}"
             shift 2
             ;;
+        --probe-binary)
+            PROBE_BINARY="${2:?--probe-binary requires an absolute executable path}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -74,7 +81,14 @@ fi
 
 trap cleanup EXIT
 
-require_cmd cargo
+if [ -n "${PROBE_BINARY}" ]; then
+    if [[ "${PROBE_BINARY}" != /* ]] || [ ! -f "${PROBE_BINARY}" ] || [ ! -x "${PROBE_BINARY}" ]; then
+        printf 'error: --probe-binary requires an absolute executable file path\n' >&2
+        exit 2
+    fi
+else
+    require_cmd cargo
+fi
 require_cmd python3
 
 mkdir -p "${OUTPUT_DIR}"
@@ -93,6 +107,8 @@ linux_mount_loopback() {
     local image_size="$1"
     local filesystem_kind="$2"
     local mount_opts="$3"
+    local mount_args
+    read -r -a mount_args <<< "${mount_opts}"
 
     require_cmd sudo
     MOUNT_POINT="$(mktemp -d "/tmp/archive-fsync-${FILESYSTEM}.XXXXXX")"
@@ -113,7 +129,7 @@ linux_mount_loopback() {
             exit 1
             ;;
     esac
-    sudo mount ${mount_opts} "${IMAGE_PATH}" "${MOUNT_POINT}"
+    sudo mount "${mount_args[@]}" "${IMAGE_PATH}" "${MOUNT_POINT}"
     sudo chown "$(id -u):$(id -g)" "${MOUNT_POINT}"
     STORAGE_ROOT="${MOUNT_POINT}/storage"
     mkdir -p "${STORAGE_ROOT}"
@@ -192,7 +208,7 @@ case "${OS_NAME}" in
         ;;
 esac
 
-export OUTPUT_DIR RUN_ID OS_NAME FILESYSTEM FS_LABEL MOUNT_OPTIONS FSYNC_MODE STORAGE_ROOT TARGET_DIR
+export OUTPUT_DIR RUN_ID OS_NAME FILESYSTEM FS_LABEL MOUNT_OPTIONS FSYNC_MODE STORAGE_ROOT TARGET_DIR PROBE_BINARY
 
 python3 <<'PY'
 import json
@@ -213,6 +229,7 @@ output.mkdir(parents=True, exist_ok=True)
             "fsync_mode": os.environ["FSYNC_MODE"],
             "storage_root": os.environ["STORAGE_ROOT"],
             "cargo_target_dir": os.environ["TARGET_DIR"],
+            "probe_binary": os.environ["PROBE_BINARY"] or None,
         },
         indent=2,
     )
@@ -224,6 +241,11 @@ PY
 printf '==> archive fsync matrix on %s (%s)\n' "${FS_LABEL}" "${FSYNC_MODE}"
 
 cd "${PROJECT_ROOT}"
+if [ -n "${PROBE_BINARY}" ]; then
+    probe_command=("${PROBE_BINARY}" fsync_matrix::archive_fsync_matrix_probe --ignored --exact --nocapture)
+else
+    probe_command=(cargo test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture)
+fi
 AM_FSYNC_MATRIX_FS_LABEL="${FS_LABEL}" \
 AM_FSYNC_MATRIX_MOUNT_OPTIONS="${MOUNT_OPTIONS}" \
 AM_FSYNC_MATRIX_FSYNC_MODE="${FSYNC_MODE}" \
@@ -232,6 +254,6 @@ AM_FSYNC_MATRIX_ARTIFACT_DIR="${OUTPUT_DIR}" \
 AM_FSYNC_MATRIX_SINGLE_P95_BUDGET_MS="${SINGLE_BUDGET_MS}" \
 AM_FSYNC_MATRIX_BATCH_100_P95_BUDGET_MS="${BATCH_BUDGET_MS}" \
 CARGO_TARGET_DIR="${TARGET_DIR}" \
-cargo test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
+"${probe_command[@]}"
 
 printf 'artifact summary: %s\n' "${OUTPUT_DIR}/summary.json"

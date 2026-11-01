@@ -9,6 +9,7 @@
   "x-event-names": [
     "reservation_activity_cli_fallback_enabled",
     "reservation_activity_result",
+    "reservation_activity_batch_result",
     "reservation_activity_open_failed",
     "reservation_activity_pathspec_invalid"
   ],

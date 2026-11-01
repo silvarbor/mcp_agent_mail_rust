@@ -17,6 +17,8 @@ use std::path::Path;
 struct PageAudit {
     page_count: i64,
     freelist_count: i64,
+    messages: i64,
+    recipients: i64,
     unused_pages: Vec<i64>,
     other_findings: Vec<String>,
 }
@@ -30,9 +32,13 @@ fn pragma_i64(conn: &CanonicalDbConn, sql: &str) -> i64 {
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
-/// Canonical-SQLite page audit of a quiesced database file.
+/// Audit a private physical copy so the oracle cannot mutate the live engine's WAL.
 fn audit(path: &Path) -> PageAudit {
-    let conn = CanonicalDbConn::open_file(path.display().to_string()).expect("open canonical");
+    let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(path)
+        .expect("stage physical audit copy")
+        .expect("database family exists");
+    let conn = CanonicalDbConn::open_file(staged.path().display().to_string())
+        .expect("open canonical audit copy");
     conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
         .expect("checkpoint");
     let page_count = pragma_i64(&conn, "PRAGMA page_count");
@@ -63,6 +69,8 @@ fn audit(path: &Path) -> PageAudit {
     PageAudit {
         page_count,
         freelist_count,
+        messages: pragma_i64(&conn, "SELECT COUNT(*) FROM messages"),
+        recipients: pragma_i64(&conn, "SELECT COUNT(*) FROM message_recipients"),
         unused_pages,
         other_findings,
     }
@@ -176,17 +184,62 @@ fn assert_no_new_orphans(stage: &str, baseline: &PageAudit, after: &PageAudit) {
 
 #[test]
 fn clean_compacted_mailbox_stays_clean_across_service_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let storage_root = dir.path().join("storage");
-    std::fs::create_dir_all(&storage_root).expect("storage root");
-    let db_path = dir.path().join("storage.sqlite3");
-
-    seed_mailbox(&db_path, &storage_root);
-    let seeded = audit(&db_path);
-    eprintln!("after seed: {seeded:?}");
-
-    let clean = compact_and_verify(&db_path);
-    eprintln!("after compaction: {clean:?}");
+    // Each runtime lifetime runs in its own process. Dropping a pool alone
+    // does not discard the embedded engine's process-local pager registries.
+    let Some(child_root) = std::env::var_os("AM_STARTUP_PAGE_AUDIT_CHILD_ROOT") else {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let db_path = dir.path().join("storage.sqlite3");
+        let test_name = mcp_agent_mail_test_helpers::libtest_path!(
+            "clean_compacted_mailbox_stays_clean_across_service_startup"
+        );
+        let run_child = |stage: &str| {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", &test_name, "--nocapture"])
+                    .env("AM_STARTUP_PAGE_AUDIT_CHILD_ROOT", dir.path())
+                    .env("AM_STARTUP_PAGE_AUDIT_CHILD_STAGE", stage)
+                    .status()
+                    .expect("run isolated database lifetime");
+            assert!(status.success(), "{stage} child failed: {status}");
+            assert!(
+                storage_root.join(format!("{stage}.complete")).is_file(),
+                "{stage} child did not execute the selected test"
+            );
+        };
+        run_child("seed");
+        let seeded = audit(&db_path);
+        eprintln!("after seed: {seeded:?}");
+        // Keep the reported in-place VACUUM scenario on the same file. No
+        // runtime-engine process is alive while canonical SQLite compacts it.
+        let clean = compact_and_verify(&db_path);
+        eprintln!("after compaction: {clean:?}");
+        assert_eq!(clean.messages, seeded.messages);
+        assert_eq!(clean.recipients, seeded.recipients);
+        run_child("startup");
+        let after_write = audit(&db_path);
+        assert_no_new_orphans("startup process exit", &clean, &after_write);
+        assert_eq!(after_write.messages, clean.messages + 1);
+        assert_eq!(after_write.recipients, clean.recipients + 1);
+        run_child("restart");
+        let after_restart = audit(&db_path);
+        assert_no_new_orphans("restart process exit", &clean, &after_restart);
+        assert_eq!(after_restart.messages, after_write.messages);
+        assert_eq!(after_restart.recipients, after_write.recipients);
+        return;
+    };
+    let child_root = std::path::PathBuf::from(child_root);
+    let storage_root = child_root.join("storage");
+    let db_path = child_root.join("storage.sqlite3");
+    let stage = std::env::var("AM_STARTUP_PAGE_AUDIT_CHILD_STAGE").expect("child stage");
+    if stage == "seed" {
+        seed_mailbox(&db_path, &storage_root);
+        std::fs::write(storage_root.join("seed.complete"), b"seeded").expect("seed witness");
+        return;
+    }
+    assert!(matches!(stage.as_str(), "startup" | "restart"));
+    let clean = audit(&db_path);
 
     // Stage 1: pool creation + init gate (schema-version refusal, migrations,
     // legacy ATC table drop, runtime pragmas, FTS cleanup, schema gate,
@@ -208,6 +261,14 @@ fn clean_compacted_mailbox_stays_clean_across_service_startup() {
     let after_probe = audit(&db_path);
     eprintln!("after startup integrity check: {after_probe:?}");
     assert_no_new_orphans("startup integrity check", &clean, &after_probe);
+    assert_eq!(after_probe.messages, clean.messages);
+    assert_eq!(after_probe.recipients, clean.recipients);
+    if stage == "restart" {
+        drop(pool);
+        std::fs::write(storage_root.join("restart.complete"), b"restarted")
+            .expect("restart witness");
+        return;
+    }
 
     // Stage 3: first ordinary write through the pool after startup.
     let conn = common::spin_poll(pool.acquire(&cx))
@@ -228,15 +289,7 @@ fn clean_compacted_mailbox_stays_clean_across_service_startup() {
     let after_write = audit(&db_path);
     eprintln!("after first write: {after_write:?}");
     assert_no_new_orphans("first write after startup", &clean, &after_write);
-
-    // Stage 4: a second cold start on the already-started file.
-    let pool = create_pool(&pool_config(&db_path, &storage_root)).expect("create second pool");
-    let conn = common::spin_poll(pool.acquire(&cx))
-        .into_result()
-        .expect("acquire second-start connection");
-    drop(conn);
-    drop(pool);
-    let after_restart = audit(&db_path);
-    eprintln!("after second start: {after_restart:?}");
-    assert_no_new_orphans("second start", &clean, &after_restart);
+    assert_eq!(after_write.messages, clean.messages + 1);
+    assert_eq!(after_write.recipients, clean.recipients + 1);
+    std::fs::write(storage_root.join("startup.complete"), b"started").expect("startup witness");
 }

@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Shell E2E adapters and Cargo must reuse the same build directory.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_BUILD_JOBS: "2"
+  RUST_TEST_THREADS: "2"
   RUSTFLAGS: "-D warnings"
   DASHBOARD_FRANKENTUI_REVISION: 8aeb72216c3a5e8b03029c9634e607adcc297402
 
@@ -18,6 +22,11 @@ jobs:
     name: Dashboard WASM + Exporter Matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Use the toolchain receiving this job's WASM target, rather than the
+      # native workspace's rust-toolchain.toml override.
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_DIR: ${{ github.workspace }}/crates/mcp-agent-mail-dashboard-wasm/target
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +86,9 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold dependency build exceeded 30 minutes during Clippy, before tests.
+    # Keep all validation steps; this is a job deadline, not a latency budget.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -136,6 +147,21 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace
 
+      - name: Install pinned Beads CLI for real-command tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_tools="${RUNNER_TEMP}/beads-0.6.0-fixture-tools"
+          mkdir -p "$fixture_tools"
+          cd "$fixture_tools"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output br-0.6.0-linux_amd64.tar.gz \
+            https://github.com/Dicklesworthstone/beads_rust/releases/download/v0.6.0/br-0.6.0-linux_amd64.tar.gz
+          echo 'f6f9a1663bae31e94d2dcfec62163f15b17f822711c486e860183a654784829b  br-0.6.0-linux_amd64.tar.gz' | sha256sum --check --strict
+          tar -xzf br-0.6.0-linux_amd64.tar.gz br
+          ./br --version
+          echo "$fixture_tools" >> "$GITHUB_PATH"
+
       - name: Unit + integration tests
         run: cargo test --workspace
         env:
@@ -163,10 +189,13 @@ jobs:
           if-no-files-found: ignore
 
   # ── Mode matrix harness (Rust integration) ──────────────────────────
+  # Downstream native jobs share the Build & Test dependency cache. Their
+  # deadlines include cold compilation; test and benchmark budgets stay in
+  # the harnesses. Failed jobs retain dependencies for the next attempt.
   mode-matrix:
     name: Mode Matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -188,6 +217,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -195,7 +227,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Mode matrix harness (Rust)
-        run: cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -224,7 +257,8 @@ jobs:
   native-command-matrix:
     name: Native Command Matrix (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # macOS and Windows cannot reuse the Linux dependency cache.
+    timeout-minutes: 90
     needs: test
     strategy:
       fail-fast: false
@@ -250,6 +284,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build CLI binary
         run: cargo build -p mcp-agent-mail-cli
@@ -360,7 +397,9 @@ jobs:
         shell: bash
         env:
           AM_E2E_KEEP_TMP: "1"
-        run: bash tests/installer/test_install_artifact_fallback.sh
+        run: |
+          bash tests/installer/test_install_artifact_fallback.sh
+          bash tests/installer/test_install_transaction_history_prune.sh
 
       - name: Run PowerShell installer transaction suite
         if: runner.os == 'Windows'
@@ -385,7 +424,7 @@ jobs:
   conformance:
     name: Semantic Conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -407,12 +446,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build CLI binary
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Semantic conformance suite
-        run: cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -441,7 +484,7 @@ jobs:
   perf-security:
     name: Perf & Security
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -463,6 +506,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -470,7 +516,8 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Perf + security regression suite
-        run: cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -480,7 +527,7 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Soak harness perf trend suite (quick)
-        run: am e2e run --project . soak_harness
+        run: nice -n 19 target/debug/am e2e run --project . soak_harness
         env:
           SOAK_SEED: "42"
           SOAK_PROJECTS: "3"
@@ -496,7 +543,7 @@ jobs:
           echo "/tmp/am-tui-pyte/bin" >> "$GITHUB_PATH"
 
       - name: TUI traversal + flash + soak regression gate
-        run: am e2e run --project . tui_full_traversal
+        run: nice -n 19 target/debug/am e2e run --project . tui_full_traversal
         env:
           E2E_FIXTURE_PROFILE: "small"
           E2E_CAPTURE_BASELINE_PROFILE: "0"
@@ -605,7 +652,7 @@ jobs:
   e2e-dual-mode:
     name: E2E Dual-Mode (Native)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -627,6 +674,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -638,22 +688,22 @@ jobs:
         # requires ok=true. This is the gate that would have caught GH#203 at
         # v0.3.22: a total read-path hang shipped twice because nothing in CI
         # ever ran the binary end-to-end over the MCP transport.
-        run: am e2e run --project . health_and_selftests
+        run: nice -n 19 target/debug/am e2e run --project . health_and_selftests
 
       - name: E2E dual-mode suite
-        run: am e2e run --project . dual_mode
+        run: nice -n 19 target/debug/am e2e run --project . dual_mode
 
       - name: E2E mode matrix suite
-        run: am e2e run --project . mode_matrix
+        run: nice -n 19 target/debug/am e2e run --project . mode_matrix
 
       - name: E2E web parity suite (HTTP wrapper, includes mail_ui)
-        run: am e2e run --project . http
+        run: nice -n 19 target/debug/am e2e run --project . http
 
       - name: E2E static export conformance suite
-        run: am e2e run --project . share
+        run: nice -n 19 target/debug/am e2e run --project . share
 
       - name: E2E cross-epic integration suite
-        run: am e2e run --project . cross_epic_integration
+        run: nice -n 19 target/debug/am e2e run --project . cross_epic_integration
 
       - name: Validate artifact bundles
         if: always()
@@ -675,7 +725,7 @@ jobs:
   search-v3-e2e:
     name: Search V3 E2E + Diagnostics
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -697,6 +747,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -710,7 +763,7 @@ jobs:
 
           # Native runner dispatches all 5 suites and reports results.
           # Environment variables pass through to underlying test scripts.
-          if am e2e run --project . \
+          if nice -n 19 target/debug/am e2e run --project . \
             search_v3_stdio \
             search_v3_http \
             search_v3_shadow_parity \
@@ -785,7 +838,7 @@ jobs:
           }
 
           def newest(paths):
-              return sorted(paths, key=lambda p: str(p))[-1] if paths else None
+              return max(paths, key=str, default=None)
 
           for suite, floor in floors.items():
               summary = newest((artifact_root / suite).glob("*/summary.json"))
@@ -889,7 +942,7 @@ jobs:
   incident-regression-gates:
     name: Incident Regression Gates
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -911,6 +964,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -972,7 +1028,7 @@ jobs:
   snapshots:
     name: Help Snapshots
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -994,12 +1050,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build CLI binary
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Verify help snapshots
-        run: cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
         env:
           COLUMNS: "120"
           DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
@@ -1031,7 +1091,7 @@ jobs:
   durability-unit:
     name: Durability Unit Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -1053,6 +1113,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Durability state machine tests (core)
         run: cargo test -p mcp-agent-mail-core --lib mailbox_durability -- --nocapture
@@ -1140,7 +1203,7 @@ jobs:
   durability-e2e:
     name: Durability E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -1162,6 +1225,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build both binaries
         run: |
@@ -1171,7 +1237,7 @@ jobs:
       - name: E2E crash-restart recovery
         id: crash_restart
         if: always()
-        run: am e2e run --project . crash_restart
+        run: nice -n 19 target/debug/am e2e run --project . crash_restart
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1183,7 +1249,7 @@ jobs:
       - name: E2E database corruption handling
         id: db_corruption
         if: always()
-        run: am e2e run --project . db_corruption
+        run: nice -n 19 target/debug/am e2e run --project . db_corruption
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1195,7 +1261,7 @@ jobs:
       - name: E2E failure injection
         id: failure_injection
         if: always()
-        run: am e2e run --project . failure_injection
+        run: nice -n 19 target/debug/am e2e run --project . failure_injection
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1207,7 +1273,7 @@ jobs:
       - name: E2E fault injection
         id: fault_injection
         if: always()
-        run: am e2e run --project . fault_injection
+        run: nice -n 19 target/debug/am e2e run --project . fault_injection
         env:
           DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
           STORAGE_ROOT: "/tmp/ci_dur_storage"
@@ -1269,7 +1335,7 @@ jobs:
   chaos:
     name: Chaos Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -1291,6 +1357,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
 
       - name: Build workspace
         run: cargo build --workspace
@@ -1306,7 +1375,8 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Fault injection integration tests
-        run: cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
+        run: |
+          cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"

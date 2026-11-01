@@ -920,9 +920,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rotation_matches_non_unicode_database_basename_without_aliasing() {
+    fn rotation_matches_database_basename_without_aliasing() {
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::ffi::OsStringExt;
         let tmp = TempDir::new().unwrap();
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("mail-λ.db");
+        #[cfg(not(target_os = "macos"))]
         let name = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
         let primary = tmp.path().join(&name);
         let mut old_name = name.clone();
@@ -1324,9 +1328,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staging_collision_suffix_preserves_raw_filename_bytes() {
+        #[cfg(not(target_os = "macos"))]
         use std::os::unix::ffi::OsStringExt;
         let root = TempDir::new().unwrap();
         let directory = RotationQuarantine::claim(&root.path().join("quarantine")).unwrap();
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("backup-λ");
+        #[cfg(not(target_os = "macos"))]
         let name = std::ffi::OsString::from_vec(b"backup-\xff".to_vec());
         let source = root.path().join(&name);
         fs::write(&source, b"source").unwrap();

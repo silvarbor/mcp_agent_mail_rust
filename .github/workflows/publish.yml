@@ -1,18 +1,14 @@
 name: Publish Crates
 
 # Manual-only. This workspace is distributed as binary-only via dist.yml +
-# install.sh; every member sets `publish = false` because the workspace
-# depends on unpublished sibling path crates (frankensqlite, fastmcp_rust,
-# asupersync, frankensearch, sqlmodel_rust). Auto-publishing on push/tag
-# was structurally broken — `cargo publish --dry-run` cannot resolve the
-# path deps from crates.io — so it has been removed. Keep workflow_dispatch
-# so the maintainer can manually preflight (and eventually publish) once
-# every sibling crate is on crates.io.
+# install.sh; workspace members set `publish = false`. Keep workflow_dispatch
+# for a manual preflight of manifests and dependency overrides before any
+# future crate publication.
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Preflight only (dry-run). Set to false to attempt real publish — currently expected to fail until sibling path deps are on crates.io."
+        description: "Run a publication preflight; set false to attempt publishing, which workspace manifests currently disable."
         required: false
         default: true
         type: boolean
@@ -87,7 +83,7 @@ jobs:
                 case "$pub" in
                   "null"|"true")
                     echo "$name" >> /tmp/publishable.txt
-                    echo "| \`$name\` | (default = publishable) | path deps to unpublished siblings will still fail \`cargo publish\` |" >> "$GITHUB_STEP_SUMMARY"
+                    echo "| \`$name\` | (default = publishable) | review dependency availability before publishing |" >> "$GITHUB_STEP_SUMMARY"
                     ;;
                   "[]"|"false")
                     echo "$name" >> /tmp/unpublishable.txt
@@ -102,9 +98,9 @@ jobs:
 
           {
             echo ""
-            echo "### Path-dep override summary"
+            echo "### Dependency overrides"
             echo ""
-            echo "Root \`Cargo.toml\` has the following \`[patch.crates-io]\` entries pointing at sibling repos. While any of these are path-only (no published version on crates.io), \`cargo publish\` cannot succeed for crates that transitively depend on them."
+            echo "Root \`Cargo.toml\` declares the overrides below in \`[patch.crates-io]\`. Review their registry availability when preparing crate publication."
             echo ""
             echo '```toml'
             awk '/^\[patch\.crates-io\]/{flag=1; next} /^\[/{flag=0} flag' Cargo.toml || true
@@ -147,13 +143,15 @@ jobs:
               echo "- \`$crate\`: dry-run **OK**" >> "$GITHUB_STEP_SUMMARY"
             else
               status=1
-              echo "- \`$crate\`: dry-run **FAILED** (rc=$rc)" >> "$GITHUB_STEP_SUMMARY"
-              echo '  <details><summary>last 5 lines</summary>' >> "$GITHUB_STEP_SUMMARY"
-              echo '' >> "$GITHUB_STEP_SUMMARY"
-              echo '  ```' >> "$GITHUB_STEP_SUMMARY"
-              echo "$out" | tail -5 | sed 's/^/  /' >> "$GITHUB_STEP_SUMMARY"
-              echo '  ```' >> "$GITHUB_STEP_SUMMARY"
-              echo '  </details>' >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo "- \`$crate\`: dry-run **FAILED** (rc=$rc)"
+                echo '  <details><summary>last 5 lines</summary>'
+                echo ''
+                echo '  ```'
+                echo "$out" | tail -5 | sed 's/^/  /'
+                echo '  ```'
+                echo '  </details>'
+              } >> "$GITHUB_STEP_SUMMARY"
             fi
           done < /tmp/publishable.txt
 

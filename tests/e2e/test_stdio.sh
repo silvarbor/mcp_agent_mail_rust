@@ -28,6 +28,8 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_stdio")"
 STDIO_DB="${WORK}/stdio_test.sqlite3"
+# Every subprocess must pair its test database with this isolated archive.
+export STORAGE_ROOT="${WORK}/storage_root"
 
 # Helper: write structured stdio request artifact(s) as JSON.
 write_stdio_request_artifact() {
