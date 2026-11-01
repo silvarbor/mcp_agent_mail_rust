@@ -8,14 +8,15 @@ filesystem matrix 41326066807, ATC 41326066801, archive perf 41326066828.
 Both installer jobs, dashboard, and observability passed. Archive perf failed
 with exit 143 during compilation before producing a performance verdict.
 XFS batch p95 is 394.809ms and ext4-ordered is 374.177ms against 250ms budgets;
-both are repeated failures. Tmpfs passed. Other jobs were still active at the
-last inspection. Read current GitHub state before waiting or rerunning.
+both are repeated failures. Tmpfs passed. All four runs are now terminal;
+the complete results and active local verification handle are recorded below.
 
 The operator has been asked whether to compare upstream/fork on one Linux
 runner, separate performance under an explicit merge exception, or pause and
 inspect. No answer has been received. Do not infer approval or weaken budgets.
-No local compiler or PR watcher is running. The previous watcher exited on a
-GitHub connection error; subsequent direct reads succeeded.
+Local verification is complete; no local compiler or PR watcher is running.
+The previous watcher exited on a GitHub connection error; subsequent
+direct reads succeeded.
 
 Installed-source provenance is complete: published annotated tags
 `source/installed-am-20261013` -> `4f9fcd0c167de87e35cc3de71cd7984482a9c344`
@@ -43,6 +44,78 @@ writes both artifacts, and creates no target directory. Evidence:
 `/tmp/mail-perf-failure.rg4N0g/{before,after,final}`. Bash syntax, shellcheck and
 whitespace checks pass. No performance threshold or successful path changed.
 This fixes error reporting; it does not explain or cure the hosted exit 143.
+
+Subsequent terminal CI results: main reached the server suite and reported
+5217 passing tests plus one failure, `opt_in_http_sessions_carry_identity_across_requests`.
+Its synthetic HTTP requests omitted the peer address, so production RBAC
+correctly assigned reader and rejected session_state_probe with HTTP 403.
+The fixture now supplies an explicit loopback peer for POST and DELETE; all
+identity binding, policy refusal/preservation, stateless and ended-session
+assertions remain. Production authorization is unchanged. This is scenario
+evidence through the HTTP handler; the local request provenance matches the
+existing fresh-loopback server contract. Removing the peer reproduces the
+CI denial. Formatting and whitespace checks pass; runtime verification follows.
+
+Completed verification: orchestration run `dc4563af-8c7d-4be5-bc47-93323252f93a`,
+exec session `24083`, log `/tmp/mail-fork-ci.Y1ROsT/session-fixture-validation.log`.
+Terminal record: started=true, status=completed, childExitCode=100. After
+14m26s compilation, 14 tests passed and the session test failed at ensure_project;
+six cases were skipped by fail-fast. Compiler/Clippy/format steps did not run.
+The loopback correction passed the earlier session probe; the next failure
+discarded its response in the test. Preserve the raw JSON-RPC response when
+there is no JSON tool text and print the ensure_project result on failure.
+Follow-up run `7d24e4f8-0063-47e8-910c-91692d41f00a`, exec session `35692`, completed
+with childExitCode=100: 20 passed, one failed after 7m25s compilation; log
+`/tmp/mail-fork-ci.Y1ROsT/session-fixture-diagnostic.log`.
+Sequence: workspace library nextest,
+filtered to the repaired session case and server RBAC/loopback cases; both
+compiler checks; strict Clippy; formatting. Same target, pinned toolchain,
+LLVM library path, nice 19, two build jobs and two test workers. Historical
+source reconstruction switched this checkout backward and forward, changing
+timestamps and causing avoidable library rebuilds. Preserve the active source
+checkout during qualification; isolate any future historical reconstruction.
+
+The diagnostic identified the DB registration guard: private test paths still
+need explicit `AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1`. Running the existing binary
+with that opt-in (no compilation) passed registration and messaging, then failed
+DELETE: 404 instead of 204. Repeated with explicit localhost bypass and a fixture
+bearer token; RED log `/tmp/mail-fork-ci.Y1ROsT/session-delete-red.log`.
+Root cause: base-path POST adaptation synthesizes Authorization before session
+principal hashing, while DELETE hashes the original header. The repair captures
+the caller's principal before adaptation and passes it to session resolution.
+It computes the hash only when sessions are enabled. The fixture now declares
+the ephemeral opt-in and localhost/token settings explicitly, and checks session
+continuity through `/api/` as well as `/api`, DELETE and ended-session rejection.
+All production authentication and RBAC checks remain in place.
+
+Completed run `91348130-3037-43cb-8db5-c8bbdf9190e3`, exec session `82445`, log
+`/tmp/mail-fork-ci.Y1ROsT/session-principal-validation.log`: same guarded nice-19,
+two-job workspace feature graph; focused session/RBAC/loopback/HTTP POST/base
+passthrough/registry tests without fail-fast, then both compiler checks, strict
+Clippy and formatting. Matching terminal record: started=true, status=completed,
+childExitCode=0. All 44 focused tests passed in 1.332s; all-target check passed
+in 1m18s, production check in 47.51s, strict Clippy in 1m37s, formatting passed.
+Implementation and regression coverage committed as
+`fe4fade5efc02aa69d85f0afcee0461938098ec4` (verification passing).
+Current ledger: session fixture/authorization-principal defect fixed and verified;
+CI compilation deadlines and filesystem performance decision remain open under
+the five-step goal. No service mutation or hosted rerun. This focused result
+does not establish a green hosted pipeline or merge readiness.
+
+The filesystem matrix is terminal: XFS 394.809/250ms, ordered 374.177/250ms,
+journal 398.125/350ms and btrfs 840.219/500ms batch p95 failures; tmpfs passed.
+All five completed crash probes retained 100 canonical messages and Git commits.
+Absolute artifact paths now capture summary.json correctly. APFS exceeded its
+35-minute job deadline while compiling, and ATC exceeded 30 minutes. No
+performance gate was weakened and no further hosted run has been requested.
+
+ATC job `124906138291` full log confirms compilation was still active at
+cancellation: cleanup terminated Cargo and rustc. Its missing summary.json and
+comment.md are downstream consequences of the deadline, with no benchmark
+verdict. Full evidence: `/tmp/mail-fork-ci.Y1ROsT/41326066801-job.log`.
+Archive job `124906137903` annotations add no cause beyond exit 143; its
+configured 45-minute deadline does not explain termination after 15 minutes.
+Do not report that run as a measured performance regression or a job timeout.
 
 ## November 1: HTTP integration timeout diagnosis
 
