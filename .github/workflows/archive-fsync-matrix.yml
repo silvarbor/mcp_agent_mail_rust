@@ -147,6 +147,34 @@ jobs:
           git worktree add --detach "${RUNNER_TEMP}/fsync-upstream" "${UPSTREAM_SHA}"
           git rev-parse HEAD > "${COMPARISON_DIR}/candidate-sha.txt"
           git -C "${RUNNER_TEMP}/fsync-upstream" rev-parse HEAD > "${COMPARISON_DIR}/upstream-sha.txt"
+          # The selected upstream snapshot contains duplicate equivalent helper
+          # definitions (E0428). Record the minimal build repair explicitly.
+          if [ "${UPSTREAM_SHA}" = 92fd8025bcfff616b1b517e4f480d2b47458b1dc ]; then
+            cat > "${COMPARISON_DIR}/upstream-build-fix.patch" <<'PATCH'
+          diff --git a/crates/mcp-agent-mail-storage/src/lib.rs b/crates/mcp-agent-mail-storage/src/lib.rs
+          --- a/crates/mcp-agent-mail-storage/src/lib.rs
+          +++ b/crates/mcp-agent-mail-storage/src/lib.rs
+          @@ -1525,16 +1525,6 @@
+           /// defers the git commit to the async commit coalescer, so a reservation grant
+           /// can never be coupled to another agent's archive-drain latency.
+          -fn write_op_storage_root(op: &WriteOp) -> &Path {
+          -    match op {
+          -        WriteOp::MessageBundle { config, .. }
+          -        | WriteOp::AgentProfile { config, .. }
+          -        | WriteOp::FileReservation { config, .. }
+          -        | WriteOp::NotificationSignal { config, .. }
+          -        | WriteOp::ClearSignal { config, .. } => &config.storage_root,
+          -    }
+          -}
+          -
+           fn write_op_sync_direct_with_cancel(
+               op: &WriteOp,
+               mut cancelled: impl FnMut() -> bool,
+           ) -> DirectArchiveWrite {
+          PATCH
+            git -C "${RUNNER_TEMP}/fsync-upstream" apply --check "${COMPARISON_DIR}/upstream-build-fix.patch"
+            git -C "${RUNNER_TEMP}/fsync-upstream" apply "${COMPARISON_DIR}/upstream-build-fix.patch"
+          fi
           rustc -vV > "${COMPARISON_DIR}/toolchain.txt"
           uname -a > "${COMPARISON_DIR}/host.txt"
           sudo apt-get update
@@ -238,6 +266,7 @@ jobs:
           rows = []
           lines = ['## Paired filesystem diagnostic', '',
                    'Both revisions ran on this runner. Original budgets and per-probe exit codes are retained.',
+                   'For upstream 92fd8025, the recorded patch removes a duplicate equivalent helper definition so the baseline compiles; timed writing functions are unchanged.',
                    'This diagnostic reports ratios; it does not waive a performance gate.', '',
                    '| Filesystem | Operation | Upstream median p95 (ms) | Fork median p95 (ms) | Fork/upstream |',
                    '| --- | --- | ---: | ---: | ---: |']
@@ -268,6 +297,5 @@ jobs:
           name: fsync-paired-comparison
           path: |
             ${{ env.COMPARISON_DIR }}/**
-            !${{ env.COMPARISON_DIR }}/binaries/**
           retention-days: 14
           if-no-files-found: error
