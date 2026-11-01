@@ -128,7 +128,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@nightly-2026-08-31
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
 
       - uses: Swatinem/rust-cache@v2
         with:
