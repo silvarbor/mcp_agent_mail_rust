@@ -815,7 +815,7 @@ jobs:
           }
 
           def newest(paths):
-              return sorted(paths, key=lambda p: str(p))[-1] if paths else None
+              return max(paths, key=str, default=None)
 
           for suite, floor in floors.items():
               summary = newest((artifact_root / suite).glob("*/summary.json"))
