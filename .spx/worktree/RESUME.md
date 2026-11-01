@@ -1,5 +1,97 @@
 # Resume — local Agent Mail fork
 
+## November 1: HTTP integration timeout diagnosis
+
+Active objective remains the five-step PR #4 consolidation, provenance, cleanup,
+and handover. The retirement assignment is complete and adds no implementation
+work to this goal. Candidate HEAD before this correction is `6848c845`.
+
+Downloaded run 40742018633 artifact 12845323312 (`test-artifacts`) under
+`/tmp/mail-fork-ci.Y1ROsT/test-artifacts`. Its HTTP trace records suite start
+at 19:11:42 UTC and first HTTP case at 19:36:43 UTC: 25m01s before requests.
+The environment records `CARGO_TARGET_DIR=/tmp/cargo-target`; shell binary
+resolution builds in that directory before considering the workspace fallback.
+CI had already built the workspace binaries in its normal target directory.
+The HTTP suite reached run 5 and successfully sent a message at 19:36:51,
+after the native harness's 1200-second timeout should have stopped it.
+
+Safe local CI correction: set the Build & Test job's `CARGO_TARGET_DIR` to
+`${{ github.workspace }}/target`, shared by build, test, and child adapters.
+Actionlint on ci.yml and `git diff --check` pass. No compiler was started.
+This does not establish a successful CI rerun or resolve filesystem budgets.
+
+Current investigation ledger under the CI/Rust test workflow:
+- Duplicate HTTP adapter compilation: workflow correction applied; CI proof
+  pending. No test assertion, timeout, or performance budget was weakened.
+- HTTP adapter timeout: `http_transport_harness.rs::run_with_timeout` kills
+  only the wrapper and then joins blocking pipe readers. Descendants continued
+  in the failed run. Repair bounded child ownership/capture before publication.
+  The native `e2e_runner.rs::execute_script` already has process-group ownership,
+  nonblocking capture, bounded shutdown, and an escaped-descendant regression;
+  inspect reuse before introducing another subprocess implementation.
+- Linux fsync timing failures remain under investigation as recorded below.
+
+HTTP timeout repair now reuses the native runner's `execute_script` boundary;
+its outcome exposes timeout and incomplete-capture flags alongside captured
+output. The HTTP adapter rejects incomplete capture with exit 125. Removed
+the adapter's separate blocking reader threads and parent-only kill loop.
+Regression design: scenario from the failed CI wrapper/delegate lifecycle;
+subject is the HTTP adapter's actual command execution; a real shell launches
+a five-second descendant holding the pipes; the deadline is 100ms. Independent
+oracle is bounded wall time below the descendant's natural lifetime plus the
+timeout flag, nonzero status and retained stdout. Restoring parent-only kill
+and blocking joins makes the duration assertion fail. Existing runner tests
+cover escaped process groups and output overflow. Focused rustfmt and whitespace
+checks pass; compiler, Clippy and runtime regression evidence are pending.
+
+Verification in progress: orchestration run
+`7408d479-cb5b-40c9-8ea8-5b51cb4561eb`, exec session `89461`, workspace nextest
+with the shared upstream-integration target, pinned nightly, nice 19, two
+build jobs and two workers. Selects the new adapter timeout case and the
+runner's ordinary/escaped descendant cases. Collect this handle to terminal;
+do not start another compiler. Compiler emitted a rust-objcopy/libLLVM lookup
+warning while stripping the search-core integration binary. The toolchain's
+`lib/libLLVM.dylib` exists: subsequent commands must set scoped
+`DYLD_LIBRARY_PATH=/Users/shz/.rustup/toolchains/nightly-2026-08-31-aarch64-apple-darwin/lib`.
+This warning affects artifact stripping, not a test verdict; runtime results
+are still pending.
+
+Filesystem artifact diagnosis: all six uploaded matrix archives contain only
+environment.json. The workflow passed a relative artifact directory; Cargo
+runs the probe from the storage crate directory, so summary.json is written
+outside the uploaded root. Both matrix jobs now pass an absolute workspace
+artifact path and `--target-dir "$GITHUB_WORKSPACE/target"` to reuse the Rust
+cache. Actionlint passes. Timing gates are unchanged. Failure-log medians also
+exceed budgets: ordered 309.821ms, journal 389.425ms, xfs 350.418ms. The probe,
+batch-write function and budget table are unchanged from selected upstream
+92fd8025; this does not establish whole-path equivalence or explain the loss.
+The budget document's absolute checkout link was repaired to a relative link
+and its target heading verified. No performance improvement is claimed.
+
+Timeout regression run is terminal: run
+`7408d479-cb5b-40c9-8ea8-5b51cb4561eb` reports started=true, completed,
+childExitCode=0. Compilation took 13m54s. Nextest run
+`deb943ec-5651-420f-a242-c6e093b4c0de`: all three selected cases passed in
+36.136s (HTTP adapter 0.166s, ordinary descendant 0.141s, escaped descendant
+36.076s); 19,346 cases skipped. This is focused evidence, not a full-suite pass.
+The LLVM stripping warnings did not prevent compilation or test execution.
+Matrix cache-on-failure is now enabled to preserve builds after timing losses.
+
+Required-check batch started as orchestration run
+`0be351e7-5baa-4e1c-9b59-d8174f83b646`, exec session `27241`: all-target check,
+production lib/bins check, strict all-target Clippy, and formatting, sequentially.
+Uses the same pinned toolchain/shared target/nice 19/two jobs, with LLVM library
+path exported inside the child shell. Collect this exact handle to terminal.
+
+Required-check batch is terminal: matching run record reports started=true,
+completed, childExitCode=0. All-target check passed in 1m08s; production
+lib/bins passed in 42.85s; strict all-target Clippy passed in 1m18s; workspace
+formatting passed. No heavy command remains running. Workflow actionlint and
+whitespace checks also pass. The HTTP regression and compiler evidence cover
+the current repair; full HTTP-suite and current-head hosted CI remain pending.
+The LLVM lookup correction is applied to the verified command environment;
+the earlier test binaries retain their reported stripping limitation.
+
 ## October 31: recipient-addressing follow-up recorded
 
 The operator approved recording the explicit recipient-addressing contract in
