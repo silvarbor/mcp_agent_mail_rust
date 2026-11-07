@@ -162,8 +162,19 @@ jobs:
           ./br --version
           echo "$fixture_tools" >> "$GITHUB_PATH"
 
-      - name: Unit + integration tests
-        run: cargo test --workspace
+      - name: Install pinned test runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.149
+          fallback: none
+
+      - name: Unit + integration tests and doctests
+        # Recovery admission deliberately uses process-wide state. Nextest
+        # isolates test cases while preserving each test's own concurrency.
+        # Doctests remain a separate Cargo invocation because nextest omits them.
+        run: |
+          nice -n 19 cargo nextest run --workspace --test-threads 2 --no-fail-fast
+          nice -n 19 cargo test --workspace --doc
         env:
           DATABASE_URL: "sqlite:///tmp/ci_test.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
