@@ -8,6 +8,7 @@ use crate::error::DbError;
 use crate::models::MessageRow;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
+use std::collections::BTreeMap;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -23,6 +24,8 @@ pub struct InboxDeliveryEvent {
     pub delivered_ts: i64,
     pub subject: String,
     pub sender_name: String,
+    pub sender_display_name: Option<String>,
+    pub recipients_json: String,
     pub importance: String,
     pub ack_required: bool,
 }
@@ -63,6 +66,9 @@ pub struct MessageDeliveryReceipt {
     pub project_id: i64,
     pub persisted_ts: i64,
     pub recipients: Vec<MessageDeliveryRecipientReceipt>,
+    /// The project shared-mailbox delivery (GH#282) and each visible agent's
+    /// read/ack state, when the message was addressed to the project.
+    pub project_mailbox: Option<crate::project_mailbox::ProjectMailboxDeliveryReceipt>,
 }
 
 /// A cursor condition is explicit so monitor clients never confuse retention
@@ -214,11 +220,15 @@ pub fn message_delivery_receipt_from_conn(
         }
     }
 
+    let project_mailbox =
+        crate::project_mailbox::project_mailbox_delivery_from_conn(conn, message_id)?;
+
     Ok(MessageDeliveryReceipt {
         message_id,
         project_id,
         persisted_ts,
         recipients,
+        project_mailbox,
     })
 }
 
@@ -289,6 +299,7 @@ pub fn fetch_inbox_rows_from_conn(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
 }
@@ -317,6 +328,7 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             ack_overdue_before: None,
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
 }
@@ -344,6 +356,7 @@ pub fn fetch_inbox_ack_overdue_rows_from_conn(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::Full,
+            priority_before: None,
         },
     )
 }
@@ -371,6 +384,7 @@ pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
             ack_overdue_before: Some(ack_overdue_before),
             topic: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            priority_before: None,
         },
     )
 }
@@ -391,6 +405,9 @@ pub struct InboxFetchOptions<'a> {
     pub ack_overdue_before: Option<i64>,
     pub topic: Option<&'a str>,
     pub body_policy: InboxBodyPolicy,
+    /// Order by operator priority before limiting, using this overdue cutoff.
+    /// `None` retains the ordinary newest-first inbox order.
+    pub priority_before: Option<i64>,
 }
 
 /// Fetch inbox rows with the complete filter set used by the MCP tool.
@@ -403,6 +420,35 @@ pub fn fetch_inbox_filtered_rows_from_conn(
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
     fetch_inbox_rows_from_conn_impl(conn, project_id, agent_id, since_ts, limit, options)
+}
+
+/// Read current labels by stable address, retaining historical identities.
+///
+/// Like agent routing, the first registered ID owns each case-insensitive
+/// address. Labels are values only and never participate in resolution.
+pub fn agent_display_names_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+) -> Result<BTreeMap<String, Option<String>>, DbError> {
+    let rows = conn
+        .query_sync(
+            "SELECT name, display_name FROM agents WHERE project_id = ? ORDER BY id ASC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let mut labels = BTreeMap::new();
+    for row in rows {
+        let name: String = row
+            .get_named("name")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let display_name: Option<String> = row
+            .get_named("display_name")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        labels
+            .entry(name.to_ascii_lowercase())
+            .or_insert(display_name);
+    }
+    Ok(labels)
 }
 
 fn fetch_inbox_rows_from_conn_impl(
@@ -422,7 +468,8 @@ fn fetch_inbox_rows_from_conn_impl(
     let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
+                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts, \
+                s.display_name AS sender_display_name \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
          LEFT JOIN agents s ON s.id = m.sender_id \
@@ -454,7 +501,13 @@ fn fetch_inbox_rows_from_conn_impl(
 
     let limit_i64 =
         i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
-    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
+    if let Some(cutoff) = options.priority_before {
+        sql.push_str(&crate::project_mailbox::priority_order_sql("r"));
+        params.push(Value::BigInt(cutoff));
+    } else {
+        sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC");
+    }
+    sql.push_str(" LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
     let rows = conn
@@ -505,6 +558,9 @@ fn fetch_inbox_rows_from_conn_impl(
         let sender_name: String = row
             .get_named("sender_name")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let sender_display_name: Option<String> = row
+            .get_named("sender_display_name")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
         let read_ts: Option<i64> = row
             .get_named("read_ts")
             .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -529,12 +585,30 @@ fn fetch_inbox_rows_from_conn_impl(
             },
             kind,
             sender_name,
+            sender_display_name,
             read_ts,
             ack_ts,
         });
     }
 
-    Ok(out)
+    // GH#282: the agent's view of its project's shared mailbox, under the same
+    // filters, merged into one window using the requested ordering.
+    let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+        conn, project_id, agent_id, since_ts, limit, options,
+    )?;
+    if let Some(cutoff) = options.priority_before {
+        out.extend(shared);
+        out.sort_by(|left, right| {
+            crate::project_mailbox::inbox_priority(left, cutoff)
+                .cmp(&crate::project_mailbox::inbox_priority(right, cutoff))
+                .then_with(|| right.message.created_ts.cmp(&left.message.created_ts))
+                .then_with(|| right.message.id.cmp(&left.message.id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    } else {
+        Ok(crate::project_mailbox::merge_inbox_rows(out, shared, limit))
+    }
 }
 
 /// Read an append-only, recipient-scoped inbox delivery page.
@@ -571,9 +645,12 @@ pub fn inbox_delivery_events_from_conn(
 
     let range_rows = conn
         .query_sync(
+            // GH#282: the project's shared-mailbox cursor events (no agent)
+            // share this recipient's cursor space.
             "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
                     (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
-             FROM inbox_delivery_events WHERE project_id = ? AND agent_id = ?",
+             FROM inbox_delivery_events WHERE project_id = ? \
+               AND (agent_id = ? OR (agent_id IS NULL AND kind = 'project'))",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
@@ -631,10 +708,11 @@ pub fn inbox_delivery_events_from_conn(
     }
 
     let cursor = after.unwrap_or(0);
-    let rows = conn
+    let mut rows = conn
         .query_sync(
             "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
-                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required, \
+                    sender.display_name AS sender_display_name, m.recipients_json \
              FROM inbox_delivery_events AS e \
              JOIN messages AS m ON m.id = e.message_id \
              LEFT JOIN agents AS sender ON sender.id = m.sender_id \
@@ -649,6 +727,47 @@ pub fn inbox_delivery_events_from_conn(
             ],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+    // GH#282: this agent's view of the project's shared-mailbox deliveries.
+    match conn.query_sync(
+        &crate::project_mailbox::visible_events_sql(),
+        &[
+            Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+            Value::BigInt(agent_id),
+            Value::BigInt(project_id),
+            Value::BigInt(cursor),
+            Value::BigInt(limit_i64),
+        ],
+    ) {
+        Ok(shared) => rows.extend(shared),
+        Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            crate::project_mailbox::allow_absent_shared_schema(conn, &error.to_string())
+                .map_err(InboxDeliveryEventError::Database)?;
+            let retained_shared_events = conn
+                .query_sync(
+                    "SELECT seq FROM inbox_delivery_events WHERE project_id = ? \
+                         AND agent_id IS NULL AND kind = 'project' LIMIT 1",
+                    &[Value::BigInt(project_id)],
+                )
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            if !retained_shared_events.is_empty() {
+                return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                    "incomplete project mailbox schema; shared events retain delivery authority"
+                        .to_string(),
+                )));
+            }
+        }
+        Err(error) => {
+            return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                error.to_string(),
+            )));
+        }
+    }
 
     let mut events = Vec::with_capacity(rows.len().min(limit));
     for row in rows {
@@ -671,6 +790,12 @@ pub fn inbox_delivery_events_from_conn(
             sender_name: row.get_named("sender_name").map_err(|error| {
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
+            sender_display_name: row.get_named("sender_display_name").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            recipients_json: row.get_named("recipients_json").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
             importance: row.get_named("importance").map_err(|error| {
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
@@ -679,6 +804,8 @@ pub fn inbox_delivery_events_from_conn(
             })? != 0,
         });
     }
+    events.sort_by_key(|event| event.seq);
+    events.truncate(limit_with_probe);
     let has_more = events.len() > limit;
     if has_more {
         events.pop();
@@ -1354,6 +1481,7 @@ mod tests {
             fetch_inbox_rows_from_conn(&conn, pid, recipient_id, false, false, false, None, 10)
                 .expect("full inbox fetch");
         assert_eq!(full_rows.len(), 1);
+        assert_eq!(full_rows[0].sender_display_name, None);
         assert!(
             full_rows[0]
                 .message
@@ -1379,6 +1507,83 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+
+        for label in [Some("Reviewer"), Some("Officer Alpha"), None] {
+            conn.execute_sync(
+                "UPDATE agents SET display_name = ? WHERE id = ?",
+                &[
+                    label.map_or(Value::Null, |label| Value::Text(label.to_string())),
+                    Value::BigInt(sender_id),
+                ],
+            )
+            .expect("change current sender label");
+            for rows in [
+                fetch_inbox_rows_from_conn(&conn, pid, recipient_id, false, false, false, None, 10)
+                    .expect("full labeled inbox"),
+                fetch_inbox_metadata_rows_from_conn(
+                    &conn,
+                    pid,
+                    recipient_id,
+                    false,
+                    false,
+                    false,
+                    None,
+                    10,
+                )
+                .expect("metadata labeled inbox"),
+            ] {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].message.id, Some(msg_id));
+                assert_eq!(rows[0].message.sender_id, sender_id);
+                assert_eq!(rows[0].sender_name, "Sender");
+                assert_eq!(rows[0].sender_display_name.as_deref(), label);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_display_names_keep_duplicate_labels_historical_profiles_and_canonical_addresses() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "BlueLake");
+        let recipient_id = insert_agent(&conn, project_id, "GreenLake");
+        let alias_id = insert_agent(&conn, project_id, "bluelake");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Reviewer' WHERE id IN (?, ?)",
+            &[Value::BigInt(sender_id), Value::BigInt(recipient_id)],
+        )
+        .expect("set duplicate labels");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Alias' WHERE id = ?",
+            &[Value::BigInt(alias_id)],
+        )
+        .expect("set case-variant label");
+        conn.execute_sync(
+            "UPDATE agents SET retired_at = 2000000 WHERE id = ?",
+            &[Value::BigInt(recipient_id)],
+        )
+        .expect("retire historical profile");
+
+        let labels = agent_display_names_from_conn(&conn, project_id).expect("project labels");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels["bluelake"].as_deref(), Some("Reviewer"));
+        assert_eq!(labels["greenlake"].as_deref(), Some("Reviewer"));
+        assert!(!labels.contains_key("Reviewer"));
+        assert!(
+            agent_display_names_from_conn(&conn, project_id + 1)
+                .expect("unrelated project labels")
+                .is_empty()
+        );
+
+        conn.execute_sync(
+            "UPDATE agents SET display_name = NULL WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("clear canonical label");
+        let cleared = agent_display_names_from_conn(&conn, project_id).expect("cleared labels");
+        assert_eq!(cleared.len(), 2);
+        assert_eq!(cleared["bluelake"], None);
+        assert_eq!(cleared["greenlake"].as_deref(), Some("Reviewer"));
     }
 
     #[test]
@@ -1416,7 +1621,38 @@ mod tests {
         );
         assert_eq!(first.events[0].subject, "test subject");
         assert_eq!(first.events[0].sender_name, "Sender");
+        assert_eq!(first.events[0].sender_display_name, None);
         assert_eq!(first.events[0].kind, "to");
+
+        for label in [Some("Reviewer"), Some("Officer Alpha"), None] {
+            conn.execute_sync(
+                "UPDATE agents SET display_name = ? WHERE id = ?",
+                &[
+                    label.map_or(Value::Null, |label| Value::Text(label.to_string())),
+                    Value::BigInt(sender_id),
+                ],
+            )
+            .expect("change current event sender label");
+            let relabeled =
+                inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 2)
+                    .expect("reread unchanged delivery facts with current labels");
+            assert_eq!(relabeled.next_cursor, first.next_cursor);
+            assert_eq!(relabeled.tail_cursor, first.tail_cursor);
+            assert_eq!(
+                relabeled.oldest_available_cursor,
+                first.oldest_available_cursor
+            );
+            assert_eq!(relabeled.has_more, first.has_more);
+            for (current, original) in relabeled.events.iter().zip(&first.events) {
+                assert_eq!(current.seq, original.seq);
+                assert_eq!(current.message_id, original.message_id);
+                assert_eq!(current.kind, original.kind);
+                assert_eq!(current.delivered_ts, original.delivered_ts);
+                assert_eq!(current.sender_name, original.sender_name);
+                assert_eq!(current.recipients_json, original.recipients_json);
+                assert_eq!(current.sender_display_name.as_deref(), label);
+            }
+        }
 
         // Draining unread state changes the snapshot but never rewrites or
         // hides a delivery event that a restart-safe monitor still needs.
@@ -1459,6 +1695,170 @@ mod tests {
             expired,
             InboxDeliveryEventError::CursorExpired { .. }
         ));
+    }
+
+    #[test]
+    fn inbox_delivery_events_keep_retired_and_orphaned_sender_history() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "BlueLake");
+        let recipient_id = insert_agent(&conn, project_id, "GreenLake");
+        let message_id = insert_message(&conn, project_id, sender_id, "historical-label");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+            &[Value::BigInt(message_id), Value::BigInt(recipient_id)],
+        )
+        .expect("persist historical delivery");
+        conn.execute_sync(
+            "UPDATE agents SET display_name = 'Reviewer', retired_at = 2000000 WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("retire labeled sender");
+
+        let retired = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 10)
+            .expect("read retired sender delivery");
+        assert_eq!(retired.events.len(), 1);
+        assert_eq!(retired.events[0].message_id, message_id);
+        assert_eq!(retired.events[0].sender_name, "BlueLake");
+        assert_eq!(
+            retired.events[0].sender_display_name.as_deref(),
+            Some("Reviewer")
+        );
+
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("allow orphan drift in isolated test store");
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[Value::BigInt(sender_id)],
+        )
+        .expect("simulate missing historical sender profile");
+        let orphaned = inbox_delivery_events_from_conn(&conn, project_id, recipient_id, None, 10)
+            .expect("read orphaned sender delivery");
+        assert_eq!(orphaned.events.len(), 1);
+        assert_eq!(orphaned.events[0].message_id, message_id);
+        assert_eq!(orphaned.events[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+        assert_eq!(orphaned.events[0].sender_display_name, None);
+        assert_eq!(orphaned.events[0].seq, retired.events[0].seq);
+        assert_eq!(
+            orphaned.events[0].delivered_ts,
+            retired.events[0].delivered_ts
+        );
+        assert_eq!(orphaned.next_cursor, retired.next_cursor);
+        assert_eq!(orphaned.tail_cursor, retired.tail_cursor);
+    }
+
+    #[test]
+    fn priority_inbox_keeps_old_urgent_mail_beyond_a_thousand_newer_rows() {
+        for shared in [false, true] {
+            let conn = test_conn();
+            let project_id = insert_project(&conn);
+            let sender_id = insert_agent(&conn, project_id, "Sender");
+            let viewer_id = insert_agent(&conn, project_id, "Viewer");
+            conn.execute_raw("UPDATE agents SET inception_ts = 0")
+                .unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            let urgent = insert_message(&conn, project_id, sender_id, "urgent");
+            let overdue_urgent = insert_message(&conn, project_id, sender_id, "overdue-urgent");
+            conn.execute_sync(
+                "UPDATE messages SET importance = 'urgent', created_ts = 999999 WHERE id = ?",
+                &[Value::BigInt(urgent)],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET importance = 'urgent', ack_required = 1, created_ts = 999998 WHERE id = ?",
+                &[Value::BigInt(overdue_urgent)],
+            ).unwrap();
+            let mut message_ids = vec![urgent, overdue_urgent];
+            for _ in 0..1000 {
+                message_ids.push(insert_message(&conn, project_id, sender_id, "newer-normal"));
+            }
+            conn.execute_raw("UPDATE messages SET ack_required = 1 WHERE importance = 'normal'")
+                .unwrap();
+            for id in message_ids {
+                if shared {
+                    conn.execute_sync(
+                        "INSERT INTO project_mailbox_deliveries (message_id, project_id, delivered_ts) VALUES (?, ?, 1000000)",
+                        &[Value::BigInt(id), Value::BigInt(project_id)],
+                    ).unwrap();
+                } else {
+                    conn.execute_sync(
+                        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')",
+                        &[Value::BigInt(id), Value::BigInt(viewer_id)],
+                    ).unwrap();
+                }
+            }
+            conn.execute_raw("COMMIT").unwrap();
+            for (unread_only, ack_overdue_before, expected) in [
+                (true, None, urgent),
+                (false, None, urgent),
+                (false, Some(2_000_000), overdue_urgent),
+            ] {
+                let rows = fetch_inbox_filtered_rows_from_conn(
+                    &conn,
+                    project_id,
+                    viewer_id,
+                    None,
+                    1,
+                    InboxFetchOptions {
+                        urgent_only: false,
+                        unread_only,
+                        ack_required_only: false,
+                        ack_overdue_before,
+                        topic: None,
+                        body_policy: InboxBodyPolicy::MetadataOnly,
+                        priority_before: Some(2_000_000),
+                    },
+                )
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].message.id, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_event_cursor_rejects_missing_delivery_authority_until_restored() {
+        let conn = test_conn();
+        let project_id = insert_project(&conn);
+        let sender_id = insert_agent(&conn, project_id, "Sender");
+        let viewer_id = insert_agent(&conn, project_id, "Viewer");
+        let message_id = insert_message(&conn, project_id, sender_id, "shared-cursor");
+        conn.execute_sync(
+            "INSERT INTO project_mailbox_deliveries \
+             (message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', 1000000)",
+            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO inbox_delivery_events \
+             (project_id, agent_id, message_id, kind, delivered_ts) \
+             VALUES (?, NULL, ?, 'project', 1000000)",
+            &[Value::BigInt(project_id), Value::BigInt(message_id)],
+        )
+        .unwrap();
+        let before =
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).unwrap();
+        assert_eq!(before.events.len(), 1);
+        assert_eq!(before.events[0].message_id, message_id);
+
+        conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+            .unwrap();
+        assert!(
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).is_err()
+        );
+        conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+            .unwrap();
+        assert!(
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).is_err()
+        );
+        conn.execute_raw("ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries")
+            .unwrap();
+        conn.execute_raw("ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts")
+            .unwrap();
+        let restored =
+            inbox_delivery_events_from_conn(&conn, project_id, viewer_id, Some(0), 10).unwrap();
+        assert_eq!(restored.events, before.events);
+        assert_eq!(restored.next_cursor, before.next_cursor);
     }
 
     #[test]

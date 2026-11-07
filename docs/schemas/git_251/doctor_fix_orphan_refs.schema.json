@@ -9,13 +9,12 @@
   "x-event-names": [
     "no_projects_to_scan",
     "fix_orphan_refs_started",
-    "flock_acquire_failed",
     "ref_pruned",
     "fix_orphan_refs_done",
     "packed_refs_backup_written",
     "packed_refs_rebuild_completed",
-    "backup_rotation_remove_failed",
-    "backup_pruned"
+    "backup_rotation_retire_failed",
+    "backup_retired"
   ],
   "x-drift-required-fields": [],
   "properties": {
@@ -49,6 +48,7 @@
         "src": { "type": "string" },
         "dst": { "type": "string" },
         "path": { "type": "string" },
+        "retired_path": { "type": "string" },
         "err": { "type": "string" },
         "error": { "type": "string" }
       }

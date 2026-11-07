@@ -301,6 +301,7 @@ async fn inbox_snapshot(ctx: &McpContext, project_key: &str) -> Value {
         None,
         None,
         Some(false),
+        None,
     )
     .await
     .expect("peek persisted inbox");

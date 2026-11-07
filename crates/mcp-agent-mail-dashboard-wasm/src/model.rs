@@ -832,7 +832,7 @@ mod tests {
 
     use super::{DashboardMessage, DashboardModel};
     use crate::demo_pack::{DemoAction, DemoOperation, curated_public_demo};
-    use crate::tui_screens::{MailScreen, MailScreenId};
+    use crate::tui_screens::MailScreenId;
 
     #[test]
     fn replay_reset_is_deterministic() {
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_slash_matches_native_global_search() {
+    fn dashboard_slash_opens_public_search() {
         let mut model = DashboardModel::new(curated_public_demo());
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
             '/',
@@ -1234,6 +1234,7 @@ mod tests {
     fn colon_remains_literal_inside_dashboard_text_entry() {
         let mut model = DashboardModel::new(curated_public_demo());
         model.screen.set_query_interaction("active query", true);
+        let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::End))));
 
         let _ = model.update(DashboardMessage(Event::Key(KeyEvent::new(KeyCode::Char(
             ':',

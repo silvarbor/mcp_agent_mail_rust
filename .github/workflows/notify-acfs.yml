@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   notify-acfs:
+    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust'
     runs-on: ubuntu-latest
     permissions:
       contents: read

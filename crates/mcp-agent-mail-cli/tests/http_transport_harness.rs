@@ -9,13 +9,12 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use mcp_agent_mail_cli::e2e_runner::{RunConfig, Runner};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -145,46 +144,21 @@ fn copy_directory_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> CommandOutcome {
+    cmd.stdin(Stdio::null());
     let start = Instant::now();
-    let mut child = cmd.spawn().expect("spawn command");
-    let mut stdout = child.stdout.take().expect("capture adapter stdout");
-    let mut stderr = child.stderr.take().expect("capture adapter stderr");
-    let stdout_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).expect("read adapter stdout");
-        buf
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        stderr.read_to_end(&mut buf).expect("read adapter stderr");
-        buf
-    });
-    let mut timed_out = false;
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    timed_out = true;
-                    let _ = child.kill();
-                    break child.wait().expect("wait after adapter timeout");
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => panic!("try_wait failed: {error}"),
-        }
-    };
-
-    let stdout = stdout_reader.join().expect("join adapter stdout reader");
-    let stderr = stderr_reader.join().expect("join adapter stderr reader");
-    let mut stderr = String::from_utf8_lossy(&stderr).to_string();
-    if timed_out {
+    let outcome = Runner::new(
+        repo_root(),
+        RunConfig {
+            timeout: Some(timeout),
+            ..RunConfig::default()
+        },
+    )
+    .expect("create adapter runner")
+    .execute_script(cmd)
+    .expect("execute adapter");
+    let mut stderr = String::from_utf8_lossy(&outcome.output.stderr).to_string();
+    if outcome.timed_out {
         if !stderr.is_empty() {
             stderr.push('\n');
         }
@@ -193,14 +167,38 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
             timeout.as_millis()
         ));
     }
+    if outcome.capture_incomplete {
+        stderr.push_str("\nadapter output capture incomplete");
+    }
 
     CommandOutcome {
-        exit_code: status.code(),
-        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        exit_code: if outcome.capture_incomplete {
+            Some(125)
+        } else {
+            outcome.output.status.code()
+        },
+        stdout: String::from_utf8_lossy(&outcome.output.stdout).to_string(),
         stderr,
         duration_ms: start.elapsed().as_millis() as u64,
-        timed_out,
+        timed_out: outcome.timed_out,
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn adapter_timeout_closes_descendant_output_pipes() {
+    // CI left the delegate alive after killing only its wrapper. The child
+    // below holds both capture pipes beyond the adapter's deadline.
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", "sleep 5 & echo ready; wait"]);
+    let outcome = run_with_timeout(cmd, Duration::from_millis(100));
+    assert!(outcome.timed_out);
+    assert_ne!(outcome.exit_code, Some(0));
+    assert_eq!(outcome.stdout.trim(), "ready");
+    assert!(
+        outcome.duration_ms < 4000,
+        "adapter waited for its surviving descendant: {outcome:?}"
+    );
 }
 
 #[test]
@@ -252,7 +250,7 @@ fn native_http_transport_gate() {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(1200);
-    let outcome = run_with_timeout(&mut cmd, Duration::from_secs(timeout_secs));
+    let outcome = run_with_timeout(cmd, Duration::from_secs(timeout_secs));
 
     let stdout_path = run_root.join("adapter.stdout.log");
     let stderr_path = run_root.join("adapter.stderr.log");

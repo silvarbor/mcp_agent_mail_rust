@@ -111,12 +111,19 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
         exit 2
     fi
 
+    set +e
     (
         cd "${BENCH_ROOT}"
         MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
             cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch
     ) 2>&1 | tee "${bench_log}"
-    bench_rc="${PIPESTATUS[0]}"
+    bench_pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+    bench_rc="${bench_pipeline_status[0]}"
+    if [ "${bench_pipeline_status[1]}" -ne 0 ]; then
+        printf 'error: could not capture benchmark output\n' >&2
+        exit "${bench_pipeline_status[1]}"
+    fi
 else
     printf 'skip-bench=1; reusing %s\n' "${SUMMARY_CSV_PATH}" | tee "${bench_log}"
     bench_rc=0
@@ -135,7 +142,10 @@ if [ -f "${SPANS_JSON_PATH}" ]; then
 fi
 
 startup_binary=""
-if [ -x "${BENCH_ROOT}/target/release/am" ]; then
+if [ "${bench_rc}" -ne 0 ]; then
+    # Preserve the benchmark failure without starting another expensive build.
+    startup_binary=""
+elif [ -x "${BENCH_ROOT}/target/release/am" ]; then
     startup_binary="${BENCH_ROOT}/target/release/am"
 elif [ -x "${BENCH_ROOT}/target/debug/am" ]; then
     startup_binary="${BENCH_ROOT}/target/debug/am"

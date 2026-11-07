@@ -40,7 +40,7 @@ for fn in info ok warn err error_support_hint init_verbose_log verbose \
     dump_verbose_tail on_error early_exit_dump installer_path_owner_uid \
     remove_installer_tmp_dir remove_installer_lock_dir cleanup \
     handle_binary_transaction_signal update_mcp_configs configure_mcp_clients \
-    configure_mcp_clients_for_install; do
+    configure_mcp_clients_for_install prune_binary_transaction_history; do
     extract_function "$fn" >> "$unit_library" \
         || { echo "Cannot extract installer function: $fn" >&2; exit 2; }
 done
@@ -90,6 +90,20 @@ case "$mode" in
     nounset) printf '%s' "$MISSING_INSTALLER_VARIABLE" ;;
     early-nounset) trap early_exit_dump EXIT; printf '%s' "$MISSING_INSTALLER_VARIABLE" ;;
     guarded) if fail_required_step; then exit 99; fi ;;
+    history-empty|history-committed|history-rolled-back|history-both)
+        mkdir "$root/history"
+        if [ "$mode" = history-committed ] || [ "$mode" = history-both ]; then
+            mkdir "$root/history/.mcp-agent-mail-install-transaction.committed.fixture"
+        fi
+        if [ "$mode" = history-rolled-back ] || [ "$mode" = history-both ]; then
+            mkdir "$root/history/.mcp-agent-mail-install-transaction.rolled-back.fixture"
+        fi
+        # The ERR handler's stdout can be swallowed by command substitution.
+        # Observe its invocation as the full installer regression does.
+        set -x
+        prune_binary_transaction_history "$root/history" 2> "$root/history.trace"
+        set +x
+        ;;
     cleanup-fails-success|cleanup-fails-23)
         remove_installer_tmp_dir() { printf 'temp\n' >> "$root/cleanup.calls"; return 71; }
         remove_installer_lock_dir() { printf 'lock\n' >> "$root/cleanup.calls"; return 72; }
@@ -175,6 +189,9 @@ while read -r name expected_rc expected_errs; do
         *) [ ! -e "$case_root/recovery.calls" ] || case_failed=1 ;;
     esac
     case "$name" in
+        history-*)
+            [ -s "$case_root/history.trace" ] || case_failed=1
+            if grep -q 'on_error ' "$case_root/history.trace"; then case_failed=1; fi ;;
         cleanup-fails-*)
             [ "$(cat "$case_root/cleanup.calls")" = "$(printf 'temp\nlock')" ] || case_failed=1 ;;
         unexpected|pipefail)
@@ -212,6 +229,10 @@ pipefail 37 1
 nounset 1 0
 early-nounset 1 0
 guarded 0 0
+history-empty 0 0
+history-committed 0 0
+history-rolled-back 0 0
+history-both 0 0
 cleanup-fails-success 0 0
 cleanup-fails-23 23 0
 recovery-fails-success 1 0

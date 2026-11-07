@@ -10,13 +10,10 @@
 # binary keeps running and holding RAM for days. The 2026-05-08 fleet sweep found
 # 8-day-old `mcp_agent_mail_tools` orphans across two hosts.
 #
-# This repo's test code is provably free of *unbounded* hangs: every tool-layer
-# retry loop is bounded (<=4 attempts), the DB MVCC retry budget is bounded
-# (~30s of backoff), the pool busy_timeout is bounded (20s runtime / 60s
-# maintenance-recovery, br-ovy6e), and unit tests use per-test
-# isolated databases (`:memory:` or a fresh tempdir) so there is no cross-test
-# shared-DB deadlock. The remaining risk is therefore environmental, not a code
-# defect — exactly the case a runner-level watchdog is meant to cover.
+# Tool-layer retries, DB MVCC backoff, and pool busy timeouts bound common
+# waits. Tests can still deadlock in fixture helpers or block on subprocesses.
+# The runner-level watchdog bounds those failures as well as environmental
+# stalls, including failures that isolated per-test databases cannot prevent.
 #
 # cargo-nextest runs each test in its OWN process (and, on Unix, its own process
 # group). `slow-timeout.terminate-after` makes nextest send SIGTERM and then,

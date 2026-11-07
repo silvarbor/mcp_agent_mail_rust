@@ -31,11 +31,30 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         .env("AM_INTERFACE_MODE", "cli")
         .env("STORAGE_ROOT", tempdir)
         .env("DATABASE_URL", db_url)
+        // Registrations below intentionally use test paths inside this private
+        // mailbox; the production guard still rejects them by default.
+        .env("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")
         .env("AM_DOCTOR_BACKUPS_DIR", tempdir.join(".doctor"))
+        .env("XDG_CONFIG_HOME", tempdir.join("config"))
+        .env("XDG_DATA_HOME", tempdir.join("data"))
+        .env("XDG_CACHE_HOME", tempdir.join("cache"))
+        .env("XDG_STATE_HOME", tempdir.join("state"))
+        .env("HTTP_HOST", "127.0.0.1")
+        .env("HTTP_PORT", "0")
+        .env("AGENT_MAIL_URL", "http://127.0.0.1:0/mcp/")
+        .env("AM_ATC_ENABLED", "false")
+        .env("AM_ATC_WRITE_MODE", "off")
+        .env("ATC_LEARNING_DISABLED", "1")
+        .env("LLM_ENABLED", "false")
+        .env("NOTIFICATIONS_ENABLED", "false")
+        .env("TUI_ENABLED", "false")
         // Don't let the test inherit the operator's HTTP_BEARER_TOKEN
         // etc. — the doctor's wrong-mcp-url FM compares against the
         // canonical URL derived from HTTP_HOST/PORT/PATH.
         .env_remove("HTTP_BEARER_TOKEN")
+        .env_remove("AGENT_MAIL_TOKEN")
+        .env_remove("AM_AGENT_TOKEN")
+        .env_remove("AGENT_MAIL_SENDER_TOKEN")
         .env_remove("AM_DOCTOR_YES")
         .current_dir(tempdir)
         .output()
@@ -45,6 +64,157 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+#[test]
+fn am_reports_missing_shared_archive_head_and_preserves_database_mail() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let root = td.path();
+    let project = root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project_key = project.to_str().unwrap();
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_head_or_broken_git_shape::FM_ID;
+    let run_ok = |args: &[&str]| {
+        let (code, stdout, stderr) = run_am(root, args);
+        assert_eq!(code, 0, "command {args:?}: {stderr}\n{stdout}");
+        (stdout, stderr)
+    };
+    let send = |body: &str| {
+        run_ok(&[
+            "mail",
+            "send",
+            "--project",
+            project_key,
+            "--from",
+            "RedFox",
+            "--to",
+            "RedFox",
+            "--subject",
+            "Shared archive HEAD regression",
+            "--body",
+            body,
+            "--json",
+        ])
+    };
+    let archived_message = |body: &str| {
+        walkdir::WalkDir::new(root.join("projects"))
+            .into_iter()
+            .map(|entry| entry.expect("read archive tree"))
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "md")
+                    && entry
+                        .path()
+                        .components()
+                        .any(|part| part.as_os_str() == "messages")
+            })
+            .find_map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("read canonical message");
+                String::from_utf8_lossy(&bytes)
+                    .contains(body)
+                    .then(|| (entry.into_path(), bytes))
+            })
+    };
+
+    run_ok(&[
+        "macros",
+        "start-session",
+        "--project",
+        project_key,
+        "--program",
+        "archive-regression",
+        "--model",
+        "real-cli",
+        "--agent-name",
+        "RedFox",
+        "--json",
+    ]);
+    let old_body = "healthy mail and history survive missing shared HEAD";
+    let (_, healthy_stderr) = send(old_body);
+    assert!(!healthy_stderr.contains("Git archive writes failed or remain pending"));
+    let (old_path, old_bytes) = archived_message(old_body).expect("healthy canonical message");
+    let repo = git2::Repository::open(root).expect("real shared archive");
+    let old_tip = repo.head().unwrap().target().unwrap();
+    drop(repo);
+    let head_path = root.join(".git/HEAD");
+    let saved_head = root.join("saved-HEAD");
+    let head_bytes = std::fs::read(&head_path).unwrap();
+    std::fs::rename(&head_path, &saved_head).expect("preserve HEAD while planting fault");
+
+    let (diagnosis, _) = run_ok(&["doctor", "fix", "--only", fm_id, "--list", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_str(&diagnosis).unwrap();
+    let finding = &diagnosis["findings"][0];
+    assert_eq!(finding["id"], fm_id);
+    assert_eq!(finding["evidence"]["broken"][0]["kind"], "head_missing");
+    assert_eq!(
+        finding["evidence"]["broken"][0]["repo_path"],
+        root.to_str().unwrap()
+    );
+    assert_eq!(finding["remediation"]["auto_fixable"], false);
+    assert!(!head_path.exists(), "diagnosis must not invent a HEAD");
+
+    let missing_body = "database mail accepted while shared Git HEAD is missing";
+    let (sent, failed_stderr) = send(missing_body);
+    let _: serde_json::Value = serde_json::from_str(&sent).expect("stdout stays valid JSON");
+    assert!(
+        failed_stderr.contains("Git archive writes failed or remain pending"),
+        "archive failure must be visible without tracing: {failed_stderr}"
+    );
+    assert!(failed_stderr.contains("avoid resending"));
+    assert!(archived_message(missing_body).is_none());
+    assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    assert_eq!(std::fs::read(&saved_head).unwrap(), head_bytes);
+    assert!(
+        !head_path.exists(),
+        "failed send must preserve the missing-HEAD fault"
+    );
+    let (inbox, _) = run_ok(&[
+        "mail",
+        "inbox",
+        "--project",
+        project_key,
+        "--agent",
+        "RedFox",
+        "--include-bodies",
+        "--json",
+    ]);
+    assert!(inbox.contains(old_body));
+    assert!(
+        inbox.contains(missing_body),
+        "DB-accepted mail must survive CLI exit"
+    );
+
+    // Restore only the exact HEAD that this test preserved. No guessed branch,
+    // database reconstruction, reinitialization or history replacement.
+    std::fs::rename(&saved_head, &head_path).unwrap();
+    let (diagnosis, _) = run_ok(&["doctor", "fix", "--only", fm_id, "--list", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_str(&diagnosis).unwrap();
+    assert_eq!(diagnosis["findings"].as_array().unwrap().len(), 0);
+    let recovered_body = "new canonical mail commits after exact HEAD restoration";
+    let (_, recovered_stderr) = send(recovered_body);
+    assert!(!recovered_stderr.contains("Git archive writes failed or remain pending"));
+    assert!(archived_message(recovered_body).is_some());
+    assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    let repo = git2::Repository::open(root).unwrap();
+    let new_tip = repo.head().unwrap().target().unwrap();
+    assert!(repo.find_commit(old_tip).is_ok());
+    assert!(repo.graph_descendant_of(new_tip, old_tip).unwrap());
+    let (inbox, _) = run_ok(&[
+        "mail",
+        "inbox",
+        "--project",
+        project_key,
+        "--agent",
+        "RedFox",
+        "--include-bodies",
+        "--json",
+    ]);
+    assert!(
+        inbox.contains(old_body) && inbox.contains(missing_body) && inbox.contains(recovered_body)
+    );
 }
 
 #[test]
@@ -532,4 +702,196 @@ fn am_doctor_fix_only_exits_two_on_partial_fix() {
     assert_eq!(envelope["exit_code"], 2);
     assert_eq!(envelope["actions_taken"], 1);
     assert!(envelope["summary"]["total_findings"].as_u64().unwrap_or(0) >= 1);
+}
+
+/// Every `detail` of a `check: "mcp_config"` result, wherever it is nested.
+fn mcp_config_details(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("check").and_then(serde_json::Value::as_str) == Some("mcp_config")
+                && let Some(detail) = map.get("detail").and_then(serde_json::Value::as_str)
+            {
+                out.push(detail.to_string());
+            }
+            for nested in map.values() {
+                mcp_config_details(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                mcp_config_details(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+const STALE_MCP_ENTRY: &str =
+    r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/"}}}"#;
+
+/// A private HOME, project and storage root for a hermetic legacy
+/// `am doctor fix --dry-run` (br-u2vt2).
+struct LegacyFixSandbox {
+    _td: tempfile::TempDir,
+    home: PathBuf,
+    project: PathBuf,
+    storage: PathBuf,
+}
+
+impl LegacyFixSandbox {
+    fn new() -> Self {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        // Detection reports the project through current_dir(), which resolves
+        // symlinks; canonicalize so planned paths compare exactly.
+        let root = std::fs::canonicalize(td.path()).expect("canonical tempdir");
+        let sandbox = Self {
+            home: root.join("home"),
+            project: root.join("project"),
+            storage: root.join("storage"),
+            _td: td,
+        };
+        for dir in [&sandbox.home, &sandbox.project, &sandbox.storage] {
+            std::fs::create_dir_all(dir).expect("fixture dir");
+        }
+        sandbox
+    }
+
+    /// Writes a stale Agent Mail entry at every path.
+    fn seed(paths: &[&PathBuf]) {
+        for path in paths {
+            std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+            std::fs::write(path, STALE_MCP_ENTRY).expect("seed stale entry");
+        }
+    }
+
+    /// The `mcp_config` repair details the legacy fixer plans, with `extra_env`
+    /// layered on the private environment.
+    fn planned_repairs(&self, extra_env: &[(&str, &str)]) -> Vec<String> {
+        let mut command = Command::new(am_bin());
+        command
+            .args(["doctor", "fix", "--dry-run", "--json"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_CACHE_HOME", self.home.join(".cache"))
+            .env("XDG_STATE_HOME", self.home.join(".local/state"))
+            .env("STORAGE_ROOT", &self.storage)
+            .env(
+                "DATABASE_URL",
+                format!("sqlite:///{}/storage.sqlite3", self.storage.display()),
+            )
+            .env("AM_INTERFACE_MODE", "cli")
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "8765")
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&self.project);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let out = command.output().expect("invoke am");
+        assert!(
+            out.status.success(),
+            "dry-run must succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("am doctor fix --dry-run --json emits JSON");
+        let mut details = Vec::new();
+        mcp_config_details(&report, &mut details);
+        details
+    }
+}
+
+fn is_planned(details: &[String], path: &std::path::Path) -> bool {
+    let needle = format!(" in {} to ", path.display());
+    details.iter().any(|detail| detail.contains(&needle))
+}
+
+fn assert_unchanged(paths: &[&PathBuf]) {
+    for path in paths {
+        assert_eq!(
+            std::fs::read_to_string(path).expect("fixture survives"),
+            STALE_MCP_ENTRY,
+            "dry-run rewrote {}",
+            path.display()
+        );
+    }
+}
+
+/// br-u2vt2: the legacy `am doctor fix` (no `--only`) plans MCP config repairs
+/// only for files Agent Mail may write. OMP reads its compatibility fallbacks
+/// but never writes them, so a stale entry there must be left alone; the
+/// active and project OMP primaries are still repaired. Dry-run keeps this
+/// hermetic: HOME is private and nothing is rewritten.
+#[test]
+fn legacy_doctor_fix_never_targets_omp_read_only_compat_files() {
+    let sandbox = LegacyFixSandbox::new();
+    let writable = [
+        sandbox.home.join(".omp/agent/mcp.json"),
+        sandbox.project.join(".omp/mcp.json"),
+    ];
+    let read_only = [
+        sandbox.home.join(".omp/agent/.mcp.json"),
+        sandbox.project.join(".omp/.mcp.json"),
+        sandbox.project.join("mcp.json"),
+        sandbox.project.join(".mcp.json"),
+    ];
+    let all: Vec<&PathBuf> = writable.iter().chain(read_only.iter()).collect();
+    LegacyFixSandbox::seed(&all);
+
+    let details = sandbox.planned_repairs(&[]);
+    for path in &writable {
+        assert!(
+            is_planned(&details, path),
+            "{} must be repaired: {details:#?}",
+            path.display()
+        );
+    }
+    for path in &read_only {
+        assert!(
+            !is_planned(&details, path),
+            "{} is OMP read-only and must not be targeted: {details:#?}",
+            path.display()
+        );
+    }
+    assert_unchanged(&all);
+}
+
+/// br-u2vt2: a named-profile session repairs only its own OMP profile, never
+/// the default or another named profile, and an invalid profile name leaves
+/// every OMP file alone instead of falling back to the default profile. The
+/// Cursor config is the control that proves the MCP fix pass ran.
+#[test]
+fn legacy_doctor_fix_targets_only_the_active_omp_profile() {
+    let sandbox = LegacyFixSandbox::new();
+    let active = sandbox.home.join(".omp/profiles/work/agent/mcp.json");
+    let default_profile = sandbox.home.join(".omp/agent/mcp.json");
+    let other_profile = sandbox.home.join(".omp/profiles/other/agent/mcp.json");
+    let cursor = sandbox.home.join(".cursor/mcp.json");
+    let all = [&active, &default_profile, &other_profile, &cursor];
+    LegacyFixSandbox::seed(&all);
+
+    let details = sandbox.planned_repairs(&[("OMP_PROFILE", "work")]);
+    assert!(is_planned(&details, &cursor), "control: {details:#?}");
+    assert!(is_planned(&details, &active), "active: {details:#?}");
+    for inactive in [&default_profile, &other_profile] {
+        assert!(
+            !is_planned(&details, inactive),
+            "inactive profile {} must not be targeted: {details:#?}",
+            inactive.display()
+        );
+    }
+
+    let details = sandbox.planned_repairs(&[("OMP_PROFILE", "Work")]);
+    assert!(is_planned(&details, &cursor), "control: {details:#?}");
+    for omp in [&active, &default_profile, &other_profile] {
+        assert!(
+            !is_planned(&details, omp),
+            "an invalid profile must not target {}: {details:#?}",
+            omp.display()
+        );
+    }
+    assert_unchanged(&all);
 }
