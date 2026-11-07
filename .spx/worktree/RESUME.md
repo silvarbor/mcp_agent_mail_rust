@@ -1,5 +1,34 @@
 # Resume — local Agent Mail fork
 
+## November 7: recovery-test isolation repair
+
+The b4f05eb9 CI run 41354260527 completed with seven CLI unit-test failures
+(3025 passed, nine ignored). Six failures reported another active recovery;
+the archive-ahead reconciliation test saw one project instead of two. The
+recovery controller in db/src/pool.rs is explicitly process-wide, while CLI
+tests deliberately occupy/reset that same controller and other tests call
+recovery concurrently. The primary workspace job used the shared-process
+libtest runner despite the repository's process-per-test nextest policy.
+
+The main workflow now installs prebuilt nextest 0.9.149, runs the workspace
+with two test workers, and separately runs all Cargo doctests. Tests execute
+at nice 19. Existing test bodies, production admission behavior, assertions,
+and nextest timeouts are preserved. Actionlint and whitespace validation pass;
+runtime confirmation awaits hosted CI. The previous shared target directory
+under upstream-integration is absent as of this inspection, so no local
+recompilation was started. Do not claim focused local runtime verification.
+
+Terminal b4f05eb9 results: dashboard, both installers, observability, XFS and
+tmpfs passed. Main Build & Test failed as above; dependent functional jobs
+were skipped. Archive Perf failed, ATC was cancelled, and ext4-ordered,
+ext4-journal, Btrfs and APFS failed. Btrfs batch p95 was 728.670ms against
+500ms; Btrfs was excluded from the paired comparison and its regression
+attribution is unresolved. Preserve that distinction from the compared Linux
+filesystems. APFS also remains unresolved pending a matched baseline.
+
+Goal resumed; the prior blocked-audit counter resets. Review-route question
+remains pending, while correctness work continues. PR #4 remains open.
+
 ## November 1: active merge goal and current evidence
 
 Finish and merge PR #4, then hand over the functional fork with an upstream
