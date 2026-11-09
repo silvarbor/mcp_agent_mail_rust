@@ -202,6 +202,23 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                 }
                 if let Some(check_name) = out.get("check").and_then(Value::as_str) {
                     match check_name {
+                        // Both supported login shells satisfy the same resolution contract.
+                        "binary_resolution"
+                            if out.get("status").and_then(Value::as_str) == Some("ok") =>
+                        {
+                            if let Some(detail) =
+                                out.get("detail").and_then(Value::as_str).map(str::to_owned)
+                                && detail.starts_with("'am' resolves to ")
+                                && let Some(path) = detail
+                                    .strip_suffix(" (zsh)")
+                                    .or_else(|| detail.strip_suffix(" (bash)"))
+                            {
+                                out.insert(
+                                    "detail".to_string(),
+                                    Value::String(format!("{path} (<LOGIN_SHELL>)")),
+                                );
+                            }
+                        }
                         // Environment-dependent connector inventory.
                         "installed_agents" => {
                             out.insert(
@@ -373,6 +390,50 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
 }
 
 #[test]
+fn normalize_json_preserves_binary_resolution_failures_and_paths() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for shell in ["bash", "zsh"] {
+        let normalized = normalize_json(
+            serde_json::json!({
+                "check": "binary_resolution", "status": "ok",
+                "detail": format!("'am' resolves to /unexpected/bin/am ({shell})"),
+            }),
+            tmp.path(),
+        );
+        assert_eq!(
+            normalized["detail"],
+            "'am' resolves to /unexpected/bin/am (<LOGIN_SHELL>)"
+        );
+        assert_eq!(normalized["status"], "ok");
+    }
+    for (check, status, detail) in [
+        (
+            "binary_resolution",
+            "warn",
+            "'am' resolves to /unexpected/bin/am (bash)",
+        ),
+        (
+            "binary_resolution",
+            "fail",
+            "'am' is aliased in zsh: alias am=python",
+        ),
+        (
+            "binary_resolution",
+            "ok",
+            "'am' resolves to /unexpected/bin/am (fish)",
+        ),
+        (
+            "other_check",
+            "ok",
+            "'am' resolves to /unexpected/bin/am (bash)",
+        ),
+    ] {
+        let original = serde_json::json!({"check": check, "status": status, "detail": detail});
+        assert_eq!(normalize_json(original.clone(), tmp.path()), original);
+    }
+}
+
+#[test]
 fn normalize_json_redacts_user_scoped_search_index_roots() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let value = serde_json::json!({
@@ -497,6 +558,10 @@ impl TestEnv {
                 self.storage_root().display().to_string(),
             ),
             ("HOME".to_string(), self.home_dir.display().to_string()),
+            (
+                "TMPDIR".to_string(),
+                std::env::temp_dir().display().to_string(),
+            ),
             (
                 "XDG_CONFIG_HOME".to_string(),
                 self.home_dir.join(".config").display().to_string(),
@@ -979,6 +1044,28 @@ fn assert_json_snapshot(env: &TestEnv, case: &str, cwd: Option<&Path>, args: &[&
 
     match read_fixture(&fixture_path) {
         Some(expected_raw) => {
+            // The fixture records Linux's warning for an absent listener.
+            // Other platforms explicitly skip the /proc-only descriptor
+            // probe, so expect its successful skip and one fewer warning.
+            #[cfg(not(target_os = "linux"))]
+            let expected_raw = if case == "doctor_check" {
+                let mut expected: Value =
+                    serde_json::from_str(&expected_raw).expect("doctor fixture JSON");
+                let descriptor = expected["checks"]
+                    .as_array_mut()
+                    .expect("doctor fixture checks")
+                    .iter_mut()
+                    .find(|check| check["check"] == "server_descriptors")
+                    .expect("doctor descriptor check");
+                descriptor["status"] = Value::String("ok".to_string());
+                expected["diagnostic_payload"]["finding_counts"]["total"] = 17.into();
+                expected["diagnostic_payload"]["finding_counts"]["warning"] = 17.into();
+                expected["summary"]["category_breakdown"]["live_incident_findings"] = 6.into();
+                expected["summary"]["secondary_warning_count"] = 16.into();
+                format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
+            } else {
+                expected_raw
+            };
             if expected_raw == actual {
                 return;
             }

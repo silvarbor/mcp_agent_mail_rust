@@ -58,13 +58,17 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let suffix = unique_suffix();
-    let db_path = format!("/tmp/idem-tool-{suffix}.sqlite3");
-    let database_url = format!("sqlite://{db_path}");
-    let storage_root = format!("/tmp/idem-tool-storage-{suffix}");
+    let fixture = tempfile::tempdir().expect("create idempotency fixture");
+    let fixture_root = fixture
+        .path()
+        .canonicalize()
+        .expect("canonical fixture root");
+    let database_url = format!("sqlite://{}", fixture_root.join("mail.sqlite3").display());
+    let storage_root = fixture_root.join("storage").display().to_string();
     let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
     ];
     env.extend_from_slice(extra_env);
     with_process_env_overrides_for_test(&env, || {

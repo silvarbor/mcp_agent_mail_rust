@@ -26079,6 +26079,7 @@ fn remove_storage_root_entry_for_reset(path: &Path) -> CliResult<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MailboxSupervisor {
     /// A systemd unit; `user` selects the per-user manager (`systemctl --user`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Systemd { unit: String, user: bool },
     /// The LaunchAgent that `am service install` registers on macOS.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -50627,7 +50628,7 @@ http_headers = { Authorization = "Bearer secret" }
                     .expect("open absolute db");
                 for stmt in [
                     "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                    "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                    "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                     "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]', topic TEXT)",
                     "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                     "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -50700,7 +50701,7 @@ http_headers = { Authorization = "Bearer secret" }
                     mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
                 for stmt in [
                     "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
-                    "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                    "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, display_name TEXT)",
                     "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, topic TEXT, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
                     "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
                     "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
@@ -56766,7 +56767,7 @@ http_headers = { Authorization = "Bearer secret" }
     #[cfg(target_os = "macos")]
     #[test]
     fn hardened_directory_walkers_accept_macos_system_temp_alias() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in("/var/tmp").expect("macOS system tempdir");
 
         assert!(
             dir.path().starts_with("/var") || dir.path().starts_with("/private/var"),
@@ -66726,8 +66727,8 @@ startup_timeout_sec = 42
             "an unopenable main file must still reconstruct: {strategy:?}"
         );
 
-        // The open-probe layer reports the composite cause with every branch
-        // readable instead of truncating it down to the first clause.
+        // A live-owner refusal must retain the branch diagnostics without
+        // authorizing automatic reconstruction through the open-probe path.
         let archive_root = dir.path().join("projects");
         let probe = doctor_database_fix_strategy_read_only_probes(
             &db_url,
@@ -66738,11 +66739,11 @@ startup_timeout_sec = 42
             None,
             true,
         )
-        .expect("open-probe strategy");
+        .expect_err("live-owner refusal must not authorize automatic reconstruction");
         match probe {
-            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+            CliError::Other(detail) => {
                 assert!(
-                    detail.starts_with("Database open probe failed: "),
+                    detail.starts_with("Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: "),
                     "{detail}"
                 );
                 for clause in [
@@ -66760,20 +66761,16 @@ startup_timeout_sec = 42
                     "the offline clause must carry the real guard refusal: {detail}"
                 );
                 assert!(
-                    detail.contains("archive recovery is available under"),
-                    "{detail}"
-                );
-                assert!(
                     detail.chars().count()
                         <= DOCTOR_OPEN_PROBE_DETAIL_LIMIT
-                            + "Database open probe failed: ".len()
-                            + "; archive recovery is available under ".len()
-                            + archive_root.display().to_string().len(),
+                            + "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: ".len(),
                     "open-probe detail must stay bounded ({} chars): {detail}",
                     detail.chars().count()
                 );
             }
-            other => panic!("truncated main file must report an open-probe failure: {other:?}"),
+            other => {
+                panic!("live-owner refusal must retain the composite probe failure: {other:?}")
+            }
         }
         drop(writer);
     }
@@ -105016,7 +105013,7 @@ fn update_check_cache_ignores_symlinked_cache_file() {
     let home_text = home.to_string_lossy().to_string();
 
     mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-        &[("HOME", home_text.as_str())],
+        &[("HOME", home_text.as_str()), ("XDG_CACHE_HOME", "")],
         || {
             let cache_path = update_check_cache_path();
             let outside = temp.path().join("outside-update-cache.json");
@@ -105719,16 +105716,18 @@ fn try_generate_age_recipient(dir: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    combined
-        .lines()
-        .find(|line| line.contains("public key:"))
-        .and_then(|line| line.split_whitespace().last())
-        .map(str::to_string)
+    let output = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg(&identity_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|recipient| recipient.trim().to_string())
+        .filter(|recipient| !recipient.is_empty())
 }
 
 #[test]

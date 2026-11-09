@@ -917,8 +917,11 @@ fn default_reply_preserves_foreign_sender_identity_before_any_delivery_effects()
         for scenario in ["namesake", "blocked", "alias"] {
             let project_a = format!("/tmp/reply-source-{scenario}-{}", unique_suffix());
             let project_b = format!("/tmp/reply-target-{scenario}-{}", unique_suffix());
+            if scenario == "alias" {
+                std::fs::create_dir_all(&project_b).expect("create aliased project directory");
+            }
             let foreign_sender = register_open_agent(&ctx, &project_a, "GreenCastle").await;
-            register_open_agent(&ctx, &project_b, "BronzeHare").await;
+            let replier_id = register_open_agent(&ctx, &project_b, "BronzeHare").await;
             if scenario != "blocked" {
                 let local_namesake = register_open_agent(&ctx, &project_b, "GreenCastle").await;
                 assert_ne!(foreign_sender, local_namesake);
@@ -963,7 +966,6 @@ fn default_reply_preserves_foreign_sender_identity_before_any_delivery_effects()
             } else if scenario == "alias" {
                 // Model legacy project rows whose paths resolve to the same
                 // directory. Their distinct sender IDs still cannot be swapped.
-                std::fs::create_dir_all(&project_b).expect("create aliased project directory");
                 assert_eq!(
                     mcp_agent_mail_core::identity::resolve_project_path(&project_b),
                     mcp_agent_mail_core::identity::resolve_project_path(&format!("{project_b}/."))
@@ -980,6 +982,19 @@ fn default_reply_preserves_foreign_sender_identity_before_any_delivery_effects()
                 )
                 .expect("legacy project path alias");
             }
+
+            // Slugs select exact legacy rows even when their paths are aliases.
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("pool");
+            let replier = mcp_agent_mail_db::queries::get_agent_by_id_fresh(&cx, &pool, replier_id)
+                .await
+                .into_result()
+                .expect("replier identity");
+            let project_b =
+                mcp_agent_mail_db::queries::get_project_by_id(&cx, &pool, replier.project_id)
+                    .await
+                    .into_result()
+                    .expect("replier project")
+                    .slug;
 
             mcp_agent_mail_storage::wbq_flush();
             let before_counts = delivery_counts(&cx).await;

@@ -20501,6 +20501,10 @@ mod tests {
         // Runtime workers can rehydrate Config from the environment. Keep
         // their whole lifetime in a private process, even under cargo test.
         let dir = tempfile::tempdir().expect("private worker environment");
+        let config_dir = dir.path().join("config").join("mcp-agent-mail");
+        std::fs::create_dir_all(&config_dir).expect("private configuration directory");
+        std::fs::write(config_dir.join("config.env"), "")
+            .expect("prevent fallback to the operator configuration");
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args(["--exact", test_name, "--nocapture"])
             .env(CHILD_TEST, test_name)
