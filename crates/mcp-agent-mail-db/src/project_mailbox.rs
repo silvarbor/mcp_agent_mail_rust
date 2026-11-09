@@ -652,7 +652,7 @@ fn reference_project_mailbox_rows_from_conn(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
-                pr.read_ts AS read_ts, pr.ack_ts AS ack_ts \
+                pr.read_ts AS read_ts, pr.ack_ts AS ack_ts, s.display_name AS sender_display_name \
          FROM project_mailbox_deliveries d \
          JOIN messages m ON m.id = d.message_id \
          JOIN agents viewer ON viewer.id = ? \
@@ -752,6 +752,7 @@ fn reference_project_mailbox_rows_from_conn(
             },
             kind: PROJECT_MAILBOX_KIND.to_string(),
             sender_name: text(12)?,
+            sender_display_name: optional_text(15)?,
             read_ts: integer(13)?,
             ack_ts: integer(14)?,
         });
@@ -772,7 +773,7 @@ pub fn product_inbox_select_sql(body_select: &str) -> String {
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 '{PROJECT_MAILBOX_KIND}' AS kind, COALESCE(s.name, ?) AS sender_name, \
-                pr.read_ts, pr.ack_ts \
+                pr.read_ts, pr.ack_ts, s.display_name AS sender_display_name \
          FROM product_project_links ppl \
          JOIN agents viewer ON viewer.project_id = ppl.project_id AND viewer.name = ? COLLATE NOCASE \
          JOIN project_mailbox_deliveries d ON d.project_id = ppl.project_id \
@@ -794,7 +795,8 @@ pub fn product_inbox_select_sql(body_select: &str) -> String {
 pub fn visible_events_sql() -> String {
     format!(
         "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
-                COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+                COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required, \
+                sender.display_name AS sender_display_name, m.recipients_json \
          FROM inbox_delivery_events AS e \
          JOIN project_mailbox_deliveries AS d ON d.message_id = e.message_id \
          JOIN messages AS m ON m.id = e.message_id \
@@ -1744,6 +1746,7 @@ mod tests {
     fn add_reader_columns(conn: &DbConn) {
         for addition in [
             "agents ADD COLUMN name TEXT NOT NULL DEFAULT 'Viewer'",
+            "agents ADD COLUMN display_name TEXT",
             "messages ADD COLUMN thread_id TEXT",
             "messages ADD COLUMN topic TEXT",
             "messages ADD COLUMN subject TEXT NOT NULL DEFAULT 'shared'",
@@ -2503,6 +2506,7 @@ mod tests {
             },
             kind: kind.to_string(),
             sender_name: String::new(),
+            sender_display_name: None,
             read_ts: None,
             ack_ts: None,
         };

@@ -681,6 +681,7 @@ fn hydrate(
                 message,
                 kind: receipt.kind,
                 sender_name: UNKNOWN_SENDER_DISPLAY.to_string(),
+                sender_display_name: None,
                 read_ts: receipt.read_ts,
                 ack_ts: receipt.ack_ts,
             });
@@ -700,17 +701,22 @@ fn hydrate(
     senders.dedup();
     let mut names = HashMap::new();
     for chunk in senders.chunks(PAGE_SIZE) {
-        let (sql, params) = lookup_query("agents", "id, name", chunk);
+        let (sql, params) = lookup_query("agents", "id, name, display_name", chunk);
         for row in query(conn, &sql, &params)? {
             names.insert(
                 row.get_named::<i64>("id").map_err(db_error)?,
-                row.get_named::<String>("name").map_err(db_error)?,
+                (
+                    row.get_named::<String>("name").map_err(db_error)?,
+                    row.get_named::<Option<String>>("display_name")
+                        .map_err(db_error)?,
+                ),
             );
         }
     }
     for row in &mut out {
-        if let Some(name) = names.get(&row.message.sender_id) {
+        if let Some((name, display_name)) = names.get(&row.message.sender_id) {
             row.sender_name.clone_from(name);
+            row.sender_display_name.clone_from(display_name);
         }
     }
     out.sort_unstable_by_key(|row| std::cmp::Reverse((row.message.created_ts, row.message.id)));
