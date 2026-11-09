@@ -41,8 +41,9 @@ fixture_root="$(cd "$fixture_root" && pwd -P)"
 export STORAGE_ROOT="$fixture_root/storage"
 export DATABASE_URL="sqlite://$fixture_root/test.sqlite3"
 export XDG_CONFIG_HOME="$fixture_root/config"
-export TMPDIR="$fixture_root/tmp"
-mkdir -p "$TMPDIR"
+# Resolve the system temp alias without lengthening path-derived project slugs.
+# Each tempfile user still creates its own private randomized directory.
+export TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 mkdir -p "$XDG_CONFIG_HOME/mcp-agent-mail"
 : > "$XDG_CONFIG_HOME/mcp-agent-mail/config.env"
 # macOS strips DYLD_* when starting a system shell. Restore nextest's copies
