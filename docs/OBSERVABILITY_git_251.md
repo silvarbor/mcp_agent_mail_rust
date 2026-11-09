@@ -73,7 +73,7 @@ Draft 2020-12, has a stable `$id` under
 
 | schema | covers |
 |---|---|
-| `run_git_locked.schema.json` | `run_git_locked_*`, `git_locked_exit_*`, `git_spawn_failed`, `flock_acquire_failed`, and `git_binary_*` resolution/catalog events |
+| `run_git_locked.schema.json` | `git_locked_exit_*`, git retry attempts and successes, and git binary resolution/catalog events |
 | `git_segfault_retry.schema.json` | `git_segfault_retry_*`, `guard_git_segfault_retry*` |
 | `git_repo_lock.schema.json` | Per-process repo mutex events and metrics. |
 | `git_flock.schema.json` | `flock_*` events from cooperative repo flocking. |
