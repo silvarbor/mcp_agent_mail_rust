@@ -20823,6 +20823,13 @@ fn render_server_file_reservations(
 fn run_file_reservations_mutation(
     action: &FileReservationsCommand,
 ) -> CliResult<serde_json::Value> {
+    if let FileReservationsCommand::Reserve { project, .. } = action
+        && parse_unknown_project_placeholder(project.trim()).is_some()
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "cannot reserve files for orphaned project {project}; restore its project identity first"
+        )));
+    }
     if let Some(payload) = try_proxy_file_reservations_mutation(action)? {
         return Ok(payload);
     }
