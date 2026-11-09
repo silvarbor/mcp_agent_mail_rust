@@ -64,6 +64,7 @@ impl AgentIdentity {
 struct AgentRow {
     identity: AgentIdentity,
     name: String,
+    display_name: Option<String>,
     project: String,
     program: String,
     model: String,
@@ -206,6 +207,11 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
             &[],
         )
         .is_ok_and(|rows| !rows.is_empty());
+    let display_name_select = if agent_columns.contains("display_name") {
+        "a.display_name"
+    } else {
+        "NULL AS display_name"
+    };
     let mut lifecycle_predicates = Vec::with_capacity(2);
     if agent_columns.contains("retired_at") {
         lifecycle_predicates.push("a.retired_at IS NULL");
@@ -238,7 +244,8 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
                a.program, \
                COALESCE(a.model, '') AS model, \
                a.last_active_ts, \
-               COUNT(DISTINCT am.message_id) AS cnt \
+               COUNT(DISTINCT am.message_id) AS cnt, \
+               {display_name_select} \
              FROM agents a \
              LEFT JOIN projects p ON p.id = a.project_id \
              LEFT JOIN agent_messages am ON am.agent_id = a.id \
@@ -296,6 +303,7 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
             Some(AgentRow {
                 identity: AgentIdentity::new(project.clone(), name.clone()),
                 name,
+                display_name: row.get_named::<String>("display_name").ok(),
                 project,
                 program,
                 model,
@@ -604,6 +612,7 @@ impl AgentsScreen {
                     AgentRow {
                         identity: identity.clone(),
                         name: a.name.clone(),
+                        display_name: a.display_name.clone(),
                         project: a.project.clone(),
                         program: a.program.clone(),
                         model: if a.model.is_empty() {
@@ -630,10 +639,13 @@ impl AgentsScreen {
         }
 
         // Apply filter
-        let filter_text = self.filter.trim().to_ascii_lowercase();
+        let filter_text = self.filter.trim().to_lowercase();
         if !filter_text.is_empty() {
             rows.retain(|r| {
                 crate::tui_screens::contains_ci(&r.name, &filter_text)
+                    || r.display_name
+                        .as_deref()
+                        .is_some_and(|label| label.to_lowercase().contains(&filter_text))
                     || crate::tui_screens::contains_ci(&r.program, &filter_text)
                     || crate::tui_screens::contains_ci(&r.model, &filter_text)
             });
@@ -1336,7 +1348,17 @@ impl AgentsScreen {
 
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
 
-        lines.push(("Name".into(), agent.name.clone(), None));
+        lines.push((
+            "Name".into(),
+            mcp_agent_mail_core::models::format_agent_label(
+                &agent.name,
+                agent.display_name.as_deref(),
+            ),
+            None,
+        ));
+        if agent.display_name.is_some() {
+            lines.push(("Address".into(), agent.name.clone(), None));
+        }
         if !agent.project.is_empty() {
             lines.push(("Project".into(), agent.project.clone(), None));
         }
@@ -1540,11 +1562,28 @@ impl AgentsScreen {
                 // Status badge prepended to name
                 let status = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
                 let duplicate_name = name_counts.get(agent.name.as_str()).copied().unwrap_or(0) > 1;
-                let name_display = if duplicate_name && !agent.project.is_empty() {
-                    format!("{} {} [{}]", status.icon(), agent.name, agent.project)
+                let project_suffix = if duplicate_name && !agent.project.is_empty() {
+                    format!(" [{}]", agent.project)
                 } else {
-                    format!("{} {}", status.icon(), agent.name)
+                    String::new()
                 };
+                let name_column_percent = if narrow {
+                    45
+                } else if wide {
+                    20
+                } else {
+                    26
+                };
+                let name_width = area.width.saturating_mul(name_column_percent) / 100;
+                let label = crate::tui_events::agent_label_with_width(
+                    &agent.name,
+                    agent.display_name.as_deref(),
+                    name_width.saturating_sub(
+                        3 + u16::try_from(ftui::text::display_width(&project_suffix))
+                            .unwrap_or(u16::MAX),
+                    ),
+                );
+                let name_display = format!("{} {label}{project_suffix}", status.icon());
 
                 if narrow {
                     Row::new(vec![name_display, health_str, active_str]).style(style)
@@ -1803,6 +1842,67 @@ mod tests {
         TuiSharedState::new(&config)
     }
 
+    #[test]
+    fn display_name_directory_keeps_selection_and_routing_when_label_changes() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    project: "alpha".into(),
+                    name: "BlueLake".into(),
+                    display_name: Some("Reviewer".into()),
+                    program: "agent".into(),
+                    last_active_ts: 100,
+                    ..Default::default()
+                },
+                crate::tui_events::AgentSummary {
+                    project: "alpha".into(),
+                    name: "RedStone".into(),
+                    display_name: Some("Reviewer".into()),
+                    program: "agent".into(),
+                    last_active_ts: 100,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let mut screen = AgentsScreen::new();
+        screen.filter = "reviewer".into();
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.agents.len(), 2);
+        screen.table_state.selected = Some(0);
+        assert_eq!(screen.agents[0].name, "BlueLake");
+        let mut snapshot = state.db_stats_snapshot().unwrap();
+        snapshot.agents_list[0].display_name = Some("Officer Alpha".into());
+        state.update_db_stats(snapshot);
+        screen.filter.clear();
+        screen.rebuild_from_state(&state);
+        assert_eq!(
+            screen.agents[screen.table_state.selected.unwrap()].identity,
+            AgentIdentity::new("alpha", "BlueLake")
+        );
+        assert_eq!(screen.copyable_content().as_deref(), Some("BlueLake"));
+        assert!(
+            screen
+                .build_detail_lines(
+                    &screen.agents[0],
+                    &crate::tui_theme::TuiThemePalette::current()
+                )
+                .iter()
+                .any(|(_, value, _)| value == "Officer Alpha <BlueLake>")
+        );
+        let mut snapshot = state.db_stats_snapshot().unwrap();
+        snapshot.agents_list[0].display_name = None;
+        state.update_db_stats(snapshot);
+        screen.rebuild_from_state(&state);
+        assert_eq!(
+            screen.agents[screen.table_state.selected.unwrap()].display_name,
+            None
+        );
+        assert_eq!(screen.copyable_content().as_deref(), Some("BlueLake"));
+    }
+
     fn set_database_url(state: &std::sync::Arc<TuiSharedState>, database_url: String) {
         let mut snapshot = state.config_snapshot();
         snapshot.database_url = database_url.clone();
@@ -1825,6 +1925,7 @@ mod tests {
         AgentRow {
             identity: agent_identity(project, name),
             name: name.to_string(),
+            display_name: None,
             project: project.to_string(),
             program: program.to_string(),
             model: model.to_string(),
@@ -1995,6 +2096,7 @@ mod tests {
                 crate::tui_events::AgentSummary {
                     project: String::new(),
                     name: "RedFox".to_string(),
+                    display_name: None,
                     program: "claude-code".to_string(),
                     model: String::new(),
                     last_active_ts: 100,
@@ -2003,6 +2105,7 @@ mod tests {
                 crate::tui_events::AgentSummary {
                     project: String::new(),
                     name: "BlueLake".to_string(),
+                    display_name: None,
                     program: "codex-cli".to_string(),
                     model: String::new(),
                     last_active_ts: 200,
@@ -2186,6 +2289,7 @@ mod tests {
             agents: 3,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -2194,6 +2298,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -2231,6 +2336,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
@@ -2259,6 +2365,7 @@ mod tests {
             agents: 0,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -2267,6 +2374,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -2596,6 +2704,7 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -2604,6 +2713,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -2640,6 +2750,7 @@ mod tests {
             agents_list: vec![
                 // But poller only provides 2 (simulating cap)
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -2648,6 +2759,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -2690,6 +2802,7 @@ mod tests {
             agents: 3,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -2698,6 +2811,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -2706,6 +2820,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "GreenPeak".to_string(),
                     program: "claude-code".to_string(),
@@ -2774,6 +2889,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "TestAgent".to_string(),
                 program: "test".to_string(),
@@ -2826,6 +2942,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "TickLatch".to_string(),
                 program: "codex".to_string(),
@@ -2909,6 +3026,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
@@ -2935,6 +3053,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
@@ -3118,6 +3237,7 @@ mod tests {
             messages: 4,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -3126,6 +3246,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
@@ -3228,6 +3349,7 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: "alpha".to_string(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
@@ -3236,6 +3358,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: "beta".to_string(),
                     name: "RedFox".to_string(),
                     program: "codex-cli".to_string(),
@@ -3351,6 +3474,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: "alpha".to_string(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
@@ -3480,6 +3604,7 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                display_name: None,
                 project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
@@ -3514,6 +3639,7 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "AliceRiver".to_string(),
                     program: "codex-cli".to_string(),
@@ -3522,6 +3648,7 @@ mod tests {
                     health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    display_name: None,
                     project: String::new(),
                     name: "BobStone".to_string(),
                     program: "claude-code".to_string(),
