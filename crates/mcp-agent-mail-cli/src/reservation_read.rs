@@ -1335,11 +1335,14 @@ pub(crate) mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Config::from_env resolves existing ancestors even when the mailbox
+        // itself is absent. Advertise the same physical fixture identity.
+        let fixture_root = directory.path().canonicalize().unwrap();
         let config = Config {
             database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
-                &directory.path().join("never-opened.sqlite3"),
+                &fixture_root.join("never-opened.sqlite3"),
             ),
-            storage_root: directory.path().join("never-opened-archive"),
+            storage_root: fixture_root.join("never-opened-archive"),
             http_host: "127.0.0.1".into(),
             http_port: port,
             http_path: "/mcp/".into(),
