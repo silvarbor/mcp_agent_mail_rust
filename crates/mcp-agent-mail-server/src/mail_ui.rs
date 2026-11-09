@@ -7,7 +7,7 @@
 
 mod unified;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use std::future::Future;
@@ -21,6 +21,7 @@ use asupersync::time::wall_now;
 #[cfg(test)]
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
+use mcp_agent_mail_core::models::format_agent_label;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::search_planner::TextFieldScope;
@@ -505,6 +506,9 @@ first body
             project_slug: "demo".to_string(),
             project_name: "Demo".to_string(),
             sender: "GreenCastle".to_string(),
+            sender_id: 1,
+            sender_label: "GreenCastle".to_string(),
+            recipient_labels: BTreeMap::new(),
             recipients: BTreeSet::from(["BlueLake".to_string(), "AmberPeak".to_string()]),
             recipient_read: BTreeMap::from([
                 ("AmberPeak".to_string(), true),
@@ -542,6 +546,9 @@ first body
             project_slug: "demo".to_string(),
             project_name: "Demo".to_string(),
             sender: "GreenCastle".to_string(),
+            sender_id: 1,
+            sender_label: "GreenCastle".to_string(),
+            recipient_labels: BTreeMap::new(),
             recipients: BTreeSet::from(["BlueLake".to_string()]),
             recipient_read: BTreeMap::from([("BlueLake".to_string(), false)]),
             all_read: false,
@@ -1217,6 +1224,379 @@ first body
             .expect("attachments route should return html");
         assert!(html.contains("artifact.txt"), "{html}");
         assert!(html.contains("Orphaned attachment delivery"), "{html}");
+    }
+
+    #[test]
+    fn display_names_are_escaped_without_changing_mail_routes() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("display-names");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-names-{}", unique_nonce()),
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            &sender.name,
+            Some("Réviseur <img src=x onerror=alert(1)> & \"Alpha\""),
+        )));
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            &recipient.name,
+            Some("Recipient <script>alert(1)</script>"),
+        )));
+        assert!(matches!(
+            block_on(queries::set_agent_display_name(
+                &cx,
+                &pool,
+                project.id.unwrap_or(0),
+                &sender.name,
+                Some("Invalid\u{0007}label"),
+            )),
+            Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument { .. })
+        ));
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project.id.unwrap_or(0),
+            sender.id.unwrap_or(0),
+            "Display-name routing",
+            "Message sent to a stable address",
+            Some("display-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let directory = render_project(&cx, &pool, &project.slug, false)
+            .expect("render agent directory")
+            .expect("directory HTML");
+        assert!(directory.contains(
+            "Réviseur &lt;img src=x onerror=alert(1)&gt; &amp; &quot;Alpha&quot; &lt;BlueLake&gt;"
+        ));
+        assert!(!directory.contains("<img src=x onerror=alert(1)>"));
+        assert!(directory.contains(&format!("href=\"/mail/{}/inbox/BlueLake\"", project.slug)));
+        assert!(directory.contains("data-agent-name=\"BlueLake\""));
+        assert!(
+            directory.contains(
+                "Recipient &lt;script&gt;alert(1)&lt;&#x2f;script&gt; &lt;GreenCastle&gt;"
+            )
+        );
+        assert!(!directory.contains("<script>alert(1)</script>"));
+
+        let detail = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
+            .expect("render message")
+            .expect("message HTML");
+        assert!(detail.contains(
+            "Réviseur &lt;img src=x onerror=alert(1)&gt; &amp; &quot;Alpha&quot; &lt;BlueLake&gt;"
+        ));
+        assert!(!detail.contains("<img src=x onerror=alert(1)>"));
+        assert!(
+            detail.contains(
+                "Recipient &lt;script&gt;alert(1)&lt;&#x2f;script&gt; &lt;GreenCastle&gt;"
+            )
+        );
+        assert!(!detail.contains("<script>alert(1)</script>"));
+
+        let thread = render_thread(&cx, &pool, &project.slug, "display-thread", false)
+            .expect("render thread")
+            .expect("thread HTML");
+        assert!(thread.contains("Réviseur &lt;img src=x onerror=alert(1)&gt;"));
+        assert!(!thread.contains("<img src=x onerror=alert(1)>"));
+        let unified = render_unified_inbox(&cx, &pool, 50, None, false)
+            .expect("render unified inbox")
+            .expect("unified HTML");
+        assert!(unified.contains("Réviseur \\u003cimg src=x onerror=alert(1)\\u003e"));
+        assert!(!unified.contains("<img src=x onerror=alert(1)>"));
+        let compose = render_overseer_compose(&cx, &pool, &project.slug)
+            .expect("render compose")
+            .expect("compose HTML");
+        assert!(compose.contains("value=\"GreenCastle\""));
+        assert!(
+            compose.contains(
+                "Recipient &lt;script&gt;alert(1)&lt;&#x2f;script&gt; &lt;GreenCastle&gt;"
+            )
+        );
+        assert!(!compose.contains("<script>alert(1)</script>"));
+
+        let inbox = render_inbox(&cx, &pool, &project.slug, &recipient.name, 50, 1, false)
+            .expect("render inbox by canonical recipient")
+            .expect("inbox HTML");
+        assert!(inbox.contains("Réviseur \\u003cimg src=x onerror=alert(1)\\u003e"));
+        assert!(!inbox.contains("<img src=x onerror=alert(1)>"));
+        assert!(inbox.contains("\"sender\":\"BlueLake\""));
+        assert!(inbox.contains("x-text=\"item.sender_label\""));
+    }
+
+    #[test]
+    fn cross_project_sender_display_name_is_rendered_by_identity() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("foreign-display-name");
+        let local = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-local-{}", unique_nonce()),
+        )));
+        let foreign = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-display-foreign-{}", unique_nonce()),
+        )));
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            foreign.id.unwrap(),
+            "RedStone",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let same_address = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            "RedStone",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            &same_address.name,
+            Some("Local agent"),
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        assert_ne!(sender.project_id, recipient.project_id);
+        outcome_ok(block_on(queries::set_agent_display_name(
+            &cx,
+            &pool,
+            foreign.id.unwrap(),
+            &sender.name,
+            Some("Reviewer"),
+        )));
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            local.id.unwrap(),
+            sender.id.unwrap(),
+            "Foreign sender",
+            "Delivered across projects",
+            Some("foreign-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap(), "to")],
+        )));
+        let inbox = render_inbox(&cx, &pool, &local.slug, &recipient.name, 50, 1, false)
+            .expect("render foreign sender")
+            .expect("inbox HTML");
+        assert!(inbox.contains("\"sender_label\":\"Reviewer \\u003cRedStone\\u003e\""));
+        assert!(inbox.contains("\"sender\":\"RedStone\""));
+        assert!(inbox.contains("x-text=\"item.sender_label\""));
+        let payload: serde_json::Value = serde_json::from_str(
+            &render_api_unified_inbox(&cx, &pool, "limit=10")
+                .expect("unified API")
+                .expect("unified JSON"),
+        )
+        .expect("parse unified JSON");
+        assert_eq!(payload["messages"][0]["sender"], "RedStone");
+        assert_eq!(
+            payload["messages"][0]["sender_label"],
+            "Reviewer <RedStone>"
+        );
+        let thread = render_thread(&cx, &pool, &local.slug, "foreign-thread", false)
+            .expect("foreign thread")
+            .expect("thread HTML");
+        assert!(thread.contains("Reviewer &lt;RedStone&gt;"));
+        assert!(!thread.contains("Local agent"));
+    }
+
+    #[test]
+    fn display_names_refresh_without_changing_web_addresses_or_history() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("web-label-refresh");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-label-refresh-{}", unique_nonce()),
+        )));
+        let blue = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let red = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            "RedStone",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        for agent in [&blue, &red] {
+            outcome_ok(block_on(queries::set_agent_display_name(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                &agent.name,
+                Some("Reviewer"),
+            )));
+        }
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            blue.id.unwrap(),
+            "Label conversation",
+            "Original history",
+            Some("label-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(red.id.unwrap(), "to")],
+        )));
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project.id.unwrap(),
+            red.id.unwrap(),
+            "Reply",
+            "Preserved reply",
+            Some("label-thread"),
+            "normal",
+            false,
+            "[]",
+            &[(blue.id.unwrap(), "to")],
+        )));
+        let compose = render_overseer_compose(&cx, &pool, &project.slug)
+            .expect("compose with duplicate labels")
+            .expect("compose HTML");
+        assert!(compose.contains("Reviewer &lt;BlueLake&gt;"));
+        assert!(compose.contains("Reviewer &lt;RedStone&gt;"));
+        assert!(compose.contains("value=\"BlueLake\""));
+        assert!(compose.contains("value=\"RedStone\""));
+        assert!(!compose.contains("value=\"Reviewer\""));
+        for (label, expected) in [
+            (Some("Reviewer"), "Reviewer <BlueLake>"),
+            (Some("Officer Alpha"), "Officer Alpha <BlueLake>"),
+            (Some("   "), "BlueLake"),
+        ] {
+            let updated = outcome_ok(block_on(queries::set_agent_display_name(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                &blue.name,
+                label,
+            )));
+            assert_eq!(updated.id, blue.id);
+            assert_eq!(updated.name, blue.name);
+            let payload: serde_json::Value = serde_json::from_str(
+                &render_api_unified_inbox(&cx, &pool, "limit=10")
+                    .expect("refresh unified inbox")
+                    .expect("unified JSON"),
+            )
+            .expect("parse unified JSON");
+            let messages = payload["messages"].as_array().expect("messages array");
+            assert_eq!(messages.len(), 2);
+            let original = messages
+                .iter()
+                .find(|message| message["id"] == root.id.unwrap())
+                .expect("original message retained");
+            assert_eq!(original["sender"], "BlueLake");
+            assert_eq!(original["sender_label"], expected);
+            assert_eq!(original["recipient_names"], serde_json::json!(["RedStone"]));
+            assert_eq!(
+                original["recipient_labels"]["RedStone"],
+                "Reviewer <RedStone>"
+            );
+            assert_eq!(original["body_md"], "Original history");
+            let reply = messages
+                .iter()
+                .find(|message| message["sender"] == "RedStone")
+                .expect("reply retained");
+            assert_eq!(reply["recipient_names"], serde_json::json!(["BlueLake"]));
+            assert_eq!(reply["recipient_labels"]["BlueLake"], expected);
+            assert_eq!(reply["recipient_read"]["BlueLake"], false);
+            let profiles: serde_json::Value = serde_json::from_str(
+                &render_api_project_agents(&cx, &pool, &project.slug)
+                    .expect("refresh agent profiles")
+                    .expect("profiles JSON"),
+            )
+            .expect("parse profiles JSON");
+            assert_eq!(
+                profiles["agents"],
+                serde_json::json!(["BlueLake", "RedStone"])
+            );
+            assert_eq!(profiles["agent_profiles"][0]["id"], blue.id.unwrap());
+            assert_eq!(profiles["agent_profiles"][0]["label"], expected);
+            let detail = render_message(&cx, &pool, &project.slug, root.id.unwrap(), false)
+                .expect("message detail")
+                .expect("message HTML");
+            assert!(detail.contains("Reviewer &lt;RedStone&gt;"));
+            assert!(detail.contains("Original history"));
+            assert!(detail.contains("Part of a Conversation Thread"));
+        }
+        let (status, error) = handle_overseer_send(&cx, &pool, &project.slug, &serde_json::json!({
+            "intent": OVERSEER_SEND_INTENT, "recipients": ["Reviewer"], "subject": "Address required",
+            "body_md": "Resolve addresses only", "reason": "routing check",
+        }).to_string()).expect_err("display names must not resolve as recipients");
+        assert_eq!(status, 400);
+        assert!(error.contains("Unknown recipient(s): Reviewer"));
     }
 
     #[test]
@@ -3344,6 +3724,7 @@ struct UnifiedProject {
 struct UnifiedAgent {
     id: i64,
     name: String,
+    label: String,
     program: String,
     model: String,
     last_active: String,
@@ -3365,8 +3746,11 @@ struct UnifiedMessage {
     project_slug: String,
     project_name: String,
     sender: String,
+    sender_label: String,
     recipients: String,
+    recipients_label: String,
     recipient_names: Vec<String>,
+    recipient_labels: BTreeMap<String, String>,
     recipient_read: BTreeMap<String, bool>,
     read: bool,
     excerpt: String,
@@ -3383,16 +3767,28 @@ struct UnifiedMessageAggregate {
     project_slug: String,
     project_name: String,
     sender: String,
+    sender_id: i64,
+    sender_label: String,
     recipients: std::collections::BTreeSet<String>,
+    recipient_labels: BTreeMap<String, String>,
     recipient_read: BTreeMap<String, bool>,
     all_read: bool,
 }
 
 impl UnifiedMessageAggregate {
-    fn from_inbox_row(project: &ProjectRow, recipient_name: &str, row: &queries::InboxRow) -> Self {
+    fn from_inbox_row(
+        project: &ProjectRow,
+        recipient_name: &str,
+        recipient_display_name: Option<&str>,
+        row: &queries::InboxRow,
+    ) -> Self {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
+        let recipient_labels = BTreeMap::from([(
+            recipient_name.to_string(),
+            format_agent_label(recipient_name, recipient_display_name),
+        )]);
         let mut recipient_read = BTreeMap::new();
         recipient_read.insert(recipient_name.to_string(), row.read_ts.is_some());
         Self {
@@ -3408,14 +3804,26 @@ impl UnifiedMessageAggregate {
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
             sender: row.sender_name.clone(),
+            sender_id: message.sender_id,
+            sender_label: row.sender_name.clone(),
             recipients,
+            recipient_labels,
             recipient_read,
             all_read: row.read_ts.is_some(),
         }
     }
 
-    fn absorb(&mut self, recipient_name: &str, row: &queries::InboxRow) {
+    fn absorb(
+        &mut self,
+        recipient_name: &str,
+        recipient_display_name: Option<&str>,
+        row: &queries::InboxRow,
+    ) {
         self.recipients.insert(recipient_name.to_string());
+        self.recipient_labels.insert(
+            recipient_name.to_string(),
+            format_agent_label(recipient_name, recipient_display_name),
+        );
         self.recipient_read
             .insert(recipient_name.to_string(), row.read_ts.is_some());
         self.all_read &= row.read_ts.is_some();
@@ -3424,6 +3832,12 @@ impl UnifiedMessageAggregate {
     fn into_view(self) -> UnifiedMessage {
         let recipient_names = self.recipients.into_iter().collect::<Vec<_>>();
         let recipients = recipient_names.join(", ");
+        let recipients_label = self
+            .recipient_labels
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         let created = ts_display(self.created_ts);
         UnifiedMessage {
             id: self.id,
@@ -3441,8 +3855,11 @@ impl UnifiedMessageAggregate {
             project_slug: self.project_slug,
             project_name: self.project_name,
             sender: self.sender,
+            sender_label: self.sender_label,
             recipients,
+            recipients_label,
             recipient_names,
+            recipient_labels: self.recipient_labels,
             recipient_read: self.recipient_read,
             read: self.all_read,
         }
@@ -3456,7 +3873,14 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    unified::collect(cx, pool, projects_rows, limit, filter_importance)
+    let mut messages = unified::collect(cx, pool, projects_rows, limit, filter_importance)?;
+    let labels = load_agent_labels(cx, pool, messages.iter().map(|message| message.sender_id))?;
+    for message in &mut messages {
+        if let Some(label) = labels.get(&message.sender_id) {
+            message.sender_label.clone_from(label);
+        }
+    }
+    Ok(messages)
 }
 
 #[cfg(test)]
@@ -3493,21 +3917,26 @@ fn reference_collect_unified_message_aggregates(
                 if !matches_importance_filter(&message.importance, filter_importance) {
                     continue;
                 }
-                project_inbox_rows.push((agent.name.clone(), row));
+                project_inbox_rows.push((agent, row));
             }
         }
 
-        for (agent_name, row) in project_inbox_rows {
+        for (agent, row) in project_inbox_rows {
             let message = &row.message;
             let Some(message_id) = message.id else {
                 continue;
             };
             if let Some(entry) = messages.get_mut(&message_id) {
-                entry.absorb(&agent_name, &row);
+                entry.absorb(&agent.name, agent.display_name.as_deref(), &row);
                 continue;
             }
 
-            let aggregate = UnifiedMessageAggregate::from_inbox_row(project, &agent_name, &row);
+            let aggregate = UnifiedMessageAggregate::from_inbox_row(
+                project,
+                &agent.name,
+                agent.display_name.as_deref(),
+                &row,
+            );
             messages.insert(message_id, aggregate);
         }
     }
@@ -3515,7 +3944,38 @@ fn reference_collect_unified_message_aggregates(
     let mut out: Vec<UnifiedMessageAggregate> = messages.into_values().collect();
     out.sort_by(|a, b| b.created_ts.cmp(&a.created_ts).then(b.id.cmp(&a.id)));
     out.truncate(limit);
+    let sender_labels = load_agent_labels(cx, pool, out.iter().map(|message| message.sender_id))?;
+    for message in &mut out {
+        if let Some(label) = sender_labels.get(&message.sender_id) {
+            message.sender_label.clone_from(label);
+        }
+    }
     Ok(out)
+}
+
+/// Resolve labels by stable agent ID, including senders from another project.
+fn load_agent_labels(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_ids: impl Iterator<Item = i64>,
+) -> Result<BTreeMap<i64, String>, (u16, String)> {
+    let ids = agent_ids
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(
+        block_on_outcome(cx, queries::get_agents_by_ids(cx, pool, &ids))?
+            .into_iter()
+            .filter_map(|agent| {
+                agent.id.map(|id| {
+                    (
+                        id,
+                        format_agent_label(&agent.name, agent.display_name.as_deref()),
+                    )
+                })
+            })
+            .collect(),
+    )
 }
 
 fn render_unified_inbox(
@@ -3545,6 +4005,7 @@ fn render_unified_inbox(
             .map(|a| UnifiedAgent {
                 id: a.id.unwrap_or(0),
                 name: a.name.clone(),
+                label: format_agent_label(&a.name, a.display_name.as_deref()),
                 program: a.program.clone(),
                 model: a.model.clone(),
                 last_active: ts_display(a.last_active_ts),
@@ -3611,8 +4072,11 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "thread_id": message.thread_id,
         "thread_url": message.thread_url,
         "sender": message.sender,
+        "sender_label": message.sender_label,
         "recipients": message.recipients,
+        "recipients_label": message.recipients_label,
         "recipient_names": message.recipient_names,
+        "recipient_labels": message.recipient_labels,
         "recipient_read": message.recipient_read,
         "project_slug": message.project_slug,
         "project_name": message.project_name,
@@ -3677,6 +4141,7 @@ struct ProjectView {
 struct AgentView {
     id: i64,
     name: String,
+    label: String,
     program: String,
     model: String,
     task_description: String,
@@ -3722,6 +4187,7 @@ fn agent_view(a: &AgentRow) -> AgentView {
     AgentView {
         id: a.id.unwrap_or(0),
         name: a.name.clone(),
+        label: format_agent_label(&a.name, a.display_name.as_deref()),
         program: a.program.clone(),
         model: a.model.clone(),
         task_description: a.task_description.clone(),
@@ -4141,6 +4607,7 @@ mod conversation_ui_tests {
 struct InboxCtx {
     project: ProjectView,
     agent: String,
+    agent_label: String,
     items: Vec<InboxMessage>,
     page: usize,
     limit: usize,
@@ -4156,6 +4623,7 @@ struct InboxMessage {
     subject: String,
     body_html: String,
     sender: String,
+    sender_label: String,
     importance: String,
     thread_id: String,
     thread_url: String,
@@ -4197,6 +4665,24 @@ fn render_inbox(
     )?;
     let total = inbox.len();
     let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
+    let sender_ids: Vec<i64> = page_rows
+        .iter()
+        .map(|row| row.message.sender_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let sender_labels: BTreeMap<i64, String> =
+        block_on_outcome(cx, queries::get_agents_by_ids(cx, pool, &sender_ids))?
+            .into_iter()
+            .filter_map(|agent| {
+                agent.id.map(|id| {
+                    (
+                        id,
+                        format_agent_label(&agent.name, agent.display_name.as_deref()),
+                    )
+                })
+            })
+            .collect();
     let mut items = Vec::new();
     for row in page_rows {
         let m = &row.message;
@@ -4206,6 +4692,10 @@ fn render_inbox(
             subject: m.subject.clone(),
             body_html: markdown::render_markdown_to_safe_html(&m.body_md),
             sender: row.sender_name.clone(),
+            sender_label: sender_labels
+                .get(&m.sender_id)
+                .cloned()
+                .unwrap_or_else(|| row.sender_name.clone()),
             importance: m.importance.clone(),
             thread_id: thread_id.clone(),
             thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
@@ -4227,6 +4717,7 @@ fn render_inbox(
         "mail_inbox.html",
         InboxCtx {
             project: project_view(&p),
+            agent_label: format_agent_label(&a.name, a.display_name.as_deref()),
             agent: a.name,
             items,
             page,
@@ -4267,18 +4758,21 @@ struct MessageView {
     created: String,
     ack_required: bool,
     sender: String,
+    sender_label: String,
 }
 
 #[derive(Serialize)]
 struct MessageRecipientView {
     kind: String,
     name: String,
+    label: String,
 }
 
 #[derive(Serialize, Clone)]
 struct MessageThreadPreview {
     id: i64,
     from: String,
+    from_label: String,
     subject: String,
 }
 
@@ -4296,25 +4790,43 @@ fn render_message(
         return Err((404, "Message not found".to_string()));
     }
     let current_message_id = m.id.unwrap_or(0);
-    let sender = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, m.sender_id))
-        .map(|agent| agent.name)
-        .unwrap_or_else(|_| format!("[unknown-agent-{}]", m.sender_id));
+    let (sender, sender_label) =
+        block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, m.sender_id))
+            .map(|agent| {
+                let label = format_agent_label(&agent.name, agent.display_name.as_deref());
+                (agent.name, label)
+            })
+            .unwrap_or_else(|_| {
+                let placeholder = format!("[unknown-agent-{}]", m.sender_id);
+                (placeholder.clone(), placeholder)
+            });
     let recipients = block_on_outcome(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
     )?;
+    let recipient_labels = load_agent_labels(
+        cx,
+        pool,
+        recipients.iter().map(|recipient| recipient.agent_id),
+    )?;
     let thread_ref = queries::canonical_thread_id(current_message_id, m.thread_id.as_deref());
-    let thread_items = block_on_outcome(
+    let items = block_on_outcome(
         cx,
         queries::list_canonical_thread_messages(cx, pool, pid, &thread_ref, None),
-    )?
-    .into_iter()
-    .map(|item| MessageThreadPreview {
-        id: item.id,
-        from: item.from,
-        subject: item.subject,
-    })
-    .collect::<Vec<_>>();
+    )?;
+    let labels = load_agent_labels(cx, pool, items.iter().map(|item| item.sender_id))?;
+    let thread_items = items
+        .into_iter()
+        .map(|item| MessageThreadPreview {
+            id: item.id,
+            from_label: labels
+                .get(&item.sender_id)
+                .cloned()
+                .unwrap_or_else(|| item.from.clone()),
+            from: item.from,
+            subject: item.subject,
+        })
+        .collect::<Vec<_>>();
     let other_thread_items = thread_items
         .iter()
         .filter(|item| item.id != current_message_id)
@@ -4336,11 +4848,16 @@ fn render_message(
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
                 sender,
+                sender_label,
             },
             recipients: recipients
                 .into_iter()
                 .map(|recipient| MessageRecipientView {
                     kind: recipient.kind,
+                    label: recipient_labels
+                        .get(&recipient.agent_id)
+                        .cloned()
+                        .unwrap_or_else(|| recipient.name.clone()),
                     name: recipient.name,
                 })
                 .collect(),
@@ -4460,6 +4977,7 @@ struct ThreadMessage {
     body_md: String,
     body_html: String,
     sender: String,
+    sender_label: String,
     created: String,
     importance: String,
 }
@@ -4480,6 +4998,11 @@ fn render_thread(
     if thread_msgs.is_empty() {
         return Err((404, "Thread not found".to_string()));
     }
+    let sender_labels = load_agent_labels(
+        cx,
+        pool,
+        thread_msgs.iter().map(|message| message.sender_id),
+    )?;
 
     let messages: Vec<ThreadMessage> = thread_msgs
         .iter()
@@ -4489,6 +5012,10 @@ fn render_thread(
             body_md: tm.body_md.clone(),
             body_html: markdown::render_markdown_to_safe_html(&tm.body_md),
             sender: tm.from.clone(),
+            sender_label: sender_labels
+                .get(&tm.sender_id)
+                .cloned()
+                .unwrap_or_else(|| tm.from.clone()),
             created: ts_display(tm.created_ts),
             importance: tm.importance.clone(),
         })
@@ -5579,10 +6106,24 @@ fn render_api_unified_inbox(
 }
 
 fn render_api_project_agents(
-    _cx: &Cx,
-    _pool: &DbPool,
+    cx: &Cx,
+    pool: &DbPool,
     project_slug: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    match block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug)) {
+        Ok(project) => {
+            let mut agents =
+                block_on_outcome(cx, queries::list_agents(cx, pool, project.id.unwrap_or(0)))?;
+            agents.sort_by(|left, right| left.name.cmp(&right.name));
+            let profiles = agents.iter().map(agent_view).collect::<Vec<_>>();
+            return json_ok(&serde_json::json!({
+                "agents": agents.iter().map(|agent| &agent.name).collect::<Vec<_>>(),
+                "agent_profiles": profiles,
+            }));
+        }
+        Err((404, _)) => {}
+        Err(error) => return Err(error),
+    }
     let archive = match get_project_archive(project_slug) {
         Ok(archive) => archive,
         Err((status, detail)) => return json_detail_err(status, &detail),

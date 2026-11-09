@@ -140,6 +140,7 @@ fn in_snapshot<C: SyncQuery, T>(
 #[derive(Debug)]
 struct Viewer {
     name: String,
+    display_name: Option<String>,
     inception: i64,
     retired: bool,
     deregistered: bool,
@@ -158,6 +159,7 @@ struct Header {
 #[derive(Debug)]
 struct Receipt {
     name: String,
+    display_name: Option<String>,
     kind: String,
     shared: bool,
     read: Option<i64>,
@@ -219,11 +221,17 @@ pub(super) fn collect(
             selected.inbox.read_ts = receipt.read;
             selected.inbox.ack_ts = receipt.ack;
             if let Some(aggregate) = &mut aggregate {
-                UnifiedMessageAggregate::absorb(aggregate, &receipt.name, &selected.inbox);
+                UnifiedMessageAggregate::absorb(
+                    aggregate,
+                    &receipt.name,
+                    receipt.display_name.as_deref(),
+                    &selected.inbox,
+                );
             } else {
                 aggregate = Some(UnifiedMessageAggregate::from_inbox_row(
                     project,
                     &receipt.name,
+                    receipt.display_name.as_deref(),
                     &selected.inbox,
                 ));
             }
@@ -342,7 +350,7 @@ fn current_viewers(
             conn,
             "agents",
             "id",
-            "id, project_id, name, inception_ts, retired_at, contact_policy",
+            "id, project_id, name, display_name, inception_ts, retired_at, contact_policy",
             chunk,
         )? {
             let id = integer(&row, "id")?;
@@ -360,6 +368,7 @@ fn current_viewers(
                 .map_err(database_error)?;
             let viewer = Viewer {
                 name: row.get_named("name").map_err(database_error)?,
+                display_name: row.get_named("display_name").map_err(database_error)?,
                 inception: integer(&row, "inception_ts")?,
                 retired: row
                     .get_named::<Option<i64>>("retired_at")
@@ -514,6 +523,7 @@ fn recipients(
         };
         let receipt = Receipt {
             name: viewer.name.clone(),
+            display_name: viewer.display_name.clone(),
             kind: row.get_named("kind").map_err(database_error)?,
             shared: false,
             read: row.get_named("read_ts").map_err(database_error)?,
@@ -562,6 +572,7 @@ fn recipients(
                 .entry(agent)
                 .or_insert_with(|| Receipt {
                     name: viewer.name.clone(),
+                    display_name: viewer.display_name.clone(),
                     kind: "project".into(),
                     shared: true,
                     read: None,
@@ -657,13 +668,18 @@ fn hydrate(
         .collect();
     let mut senders = HashMap::new();
     for chunk in sender_ids.chunks(PAGE_SIZE) {
-        for row in lookup(conn, "agents", "id", "id, name", chunk)? {
+        for row in lookup(conn, "agents", "id", "id, name, display_name", chunk)? {
             let id = integer(&row, "id")?;
             let name = row
                 .get_named::<Option<String>>("name")
                 .map_err(database_error)?
                 .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-            if chunk.binary_search(&id).is_err() || senders.insert(id, name).is_some() {
+            let display_name = row
+                .get_named::<Option<String>>("display_name")
+                .map_err(database_error)?;
+            if chunk.binary_search(&id).is_err()
+                || senders.insert(id, (name, display_name)).is_some()
+            {
                 return Err(DbError::Internal(
                     "unrequested or duplicate unified inbox sender".into(),
                 ));
@@ -692,8 +708,11 @@ fn hydrate(
                     kind: String::new(),
                     sender_name: senders
                         .get(&header.sender)
-                        .cloned()
+                        .map(|(name, _)| name.clone())
                         .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
+                    sender_display_name: senders
+                        .get(&header.sender)
+                        .and_then(|(_, label)| label.clone()),
                     read_ts: None,
                     ack_ts: None,
                 },
@@ -717,7 +736,7 @@ mod tests {
         );
         for sql in [
             "PRAGMA journal_mode=WAL",
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT, display_name TEXT)",
             "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, created_ts INTEGER, importance TEXT, thread_id TEXT, topic TEXT, subject TEXT DEFAULT 'subject', body_md TEXT DEFAULT 'body', ack_required INTEGER DEFAULT 1, recipients_json TEXT DEFAULT '{}', attachments TEXT DEFAULT '[]')",
             "CREATE INDEX idx_messages_created_ts ON messages(created_ts)",
@@ -725,7 +744,7 @@ mod tests {
             "CREATE INDEX recipients_by_message ON message_recipients(message_id)",
             "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER)",
             "CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
-            "INSERT INTO agents VALUES (10,1,'Sender',0,NULL,'auto'), (11,1,'BlueLake',0,NULL,'auto'), (12,1,'GoldFox',0,NULL,'auto'), (13,1,'LateFox',10000,NULL,'auto'), (14,1,'BlockedFox',0,NULL,'BLOCK_ALL'), (15,1,'RetiredFox',0,1,'auto'), (21,2,'BlueLake',0,NULL,'auto')",
+            "INSERT INTO agents (id,project_id,name,inception_ts,retired_at,contact_policy) VALUES (10,1,'Sender',0,NULL,'auto'), (11,1,'BlueLake',0,NULL,'auto'), (12,1,'GoldFox',0,NULL,'auto'), (13,1,'LateFox',10000,NULL,'auto'), (14,1,'BlockedFox',0,NULL,'BLOCK_ALL'), (15,1,'RetiredFox',0,1,'auto'), (21,2,'BlueLake',0,NULL,'auto')",
             "INSERT INTO messages (id,project_id,sender_id,created_ts,importance) VALUES (1,1,10,100,'urgent'), (2,1,10,400,'normal'), (3,1,10,300,'high'), (4,2,10,500,'urgent'), (5,1,10,600,'normal')",
             "INSERT INTO message_recipients VALUES (1,12,'bcc',NULL,NULL), (2,11,'to',7,8), (2,12,'cc',NULL,NULL), (3,11,'bcc',NULL,NULL), (4,21,'to',9,10)",
             "INSERT INTO project_mailbox_deliveries VALUES (1,1), (3,1), (5,2)",
