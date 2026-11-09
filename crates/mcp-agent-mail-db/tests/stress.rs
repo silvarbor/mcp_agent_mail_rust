@@ -1754,6 +1754,7 @@ fn cache_zipfian_thrashing() {
                 reaper_exempt: 0,
                 registration_token: None,
                 retired_at: None,
+                display_name: None,
             }
         })
         .collect();
@@ -1852,6 +1853,7 @@ fn cache_zipfian_within_capacity() {
             reaper_exempt: 0,
             registration_token: None,
             retired_at: None,
+            display_name: None,
         })
         .collect();
 
@@ -1924,6 +1926,7 @@ fn cache_concurrent_zipfian_access() {
                 reaper_exempt: 0,
                 registration_token: None,
                 retired_at: None,
+                display_name: None,
             })
             .collect(),
     );

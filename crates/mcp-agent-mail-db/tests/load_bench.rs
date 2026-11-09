@@ -2416,6 +2416,7 @@ fn make_cache_profile_agent(idx: usize) -> AgentRow {
         reaper_exempt: 0,
         registration_token: None,
         retired_at: None,
+        display_name: None,
     }
 }
 

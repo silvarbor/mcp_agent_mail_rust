@@ -2435,6 +2435,11 @@ fn discover_agents(
             &profile_source,
             stats,
         );
+        let display_name = json_str(&profile, "display_name")
+            .map(mcp_agent_mail_core::models::normalize_display_name)
+            .transpose()
+            .map_err(|error| DbError::invalid("display_name", error.to_string()))?
+            .flatten();
         // Exempt agents must remain exempt after rebuilding from the archive;
         // otherwise the inactivity reaper can retire an identity that the
         // operator explicitly protected. Older profiles omit this field.
@@ -2462,8 +2467,8 @@ fn discover_agents(
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
-             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at, reaper_exempt) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, retired_at, reaper_exempt, display_name) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
@@ -2476,6 +2481,7 @@ fn discover_agents(
                 Value::Text(contact_policy),
                 retired_at.map_or(Value::Null, Value::BigInt),
                 Value::BigInt(i64::from(reaper_exempt)),
+                display_name.map_or(Value::Null, Value::Text),
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
@@ -4251,11 +4257,13 @@ fn enrich_existing_agent_from_salvage(
     salvaged_registration_token: Option<&str>,
     salvage_has_registration_token: bool,
     salvaged_retired_at: Option<i64>,
+    salvaged_display_name: Option<&str>,
+    salvage_has_display_name: bool,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let existing_rows = conn
         .query_sync(
-            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at \
+            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at, display_name \
              FROM agents WHERE id = ? LIMIT 1",
             &[Value::BigInt(agent_id)],
         )
@@ -4290,6 +4298,9 @@ fn enrich_existing_agent_from_salvage(
         .unwrap_or_default();
     let current_retired_at = existing_row
         .get_named::<Option<i64>>("retired_at")
+        .unwrap_or_default();
+    let current_display_name = existing_row
+        .get_named::<Option<String>>("display_name")
         .unwrap_or_default();
     if salvage_has_registration_token
         && let (Some(current), Some(salvaged)) = (
@@ -4379,6 +4390,11 @@ fn enrich_existing_agent_from_salvage(
             current_contact_policy.clone()
         };
     let next_reaper_exempt = salvaged_reaper_exempt.unwrap_or(current_reaper_exempt);
+    let next_display_name = if salvage_has_display_name {
+        salvaged_display_name.map(str::to_string)
+    } else {
+        current_display_name.clone()
+    };
     let next_registration_token = match current_registration_token.as_deref() {
         Some(_) => current_registration_token.clone(),
         None if salvage_has_registration_token => salvaged_registration_token.map(str::to_string),
@@ -4403,6 +4419,7 @@ fn enrich_existing_agent_from_salvage(
         || next_reaper_exempt != current_reaper_exempt
         || next_registration_token != current_registration_token
         || next_retired_at != current_retired_at
+        || next_display_name != current_display_name
     {
         conn.execute_sync(
             "UPDATE agents SET \
@@ -4415,7 +4432,8 @@ fn enrich_existing_agent_from_salvage(
                  contact_policy = ?, \
                  reaper_exempt = ?, \
                  registration_token = ?, \
-                 retired_at = ? \
+                 retired_at = ?, \
+                 display_name = ? \
              WHERE id = ?",
             &[
                 Value::Text(next_program),
@@ -4428,6 +4446,7 @@ fn enrich_existing_agent_from_salvage(
                 Value::BigInt(i64::from(next_reaper_exempt)),
                 next_registration_token.map_or(Value::Null, Value::Text),
                 next_retired_at.map_or(Value::Null, Value::BigInt),
+                next_display_name.map_or(Value::Null, Value::Text),
                 Value::BigInt(agent_id),
             ],
         )
@@ -4689,6 +4708,7 @@ fn merge_salvaged_database(
                     "reaper_exempt",
                     "registration_token",
                     "retired_at",
+                    "display_name",
                 ],
                 stats,
                 salvage_db_path,
@@ -4745,6 +4765,21 @@ fn merge_salvaged_database(
                     )));
                 }
 
+                let salvaged_display_name = if agent_columns.contains("display_name") {
+                    row.get_named::<Option<String>>("display_name")
+                        .map_err(|error| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: decode display_name for {name}: {error}"
+                            ))
+                        })?
+                        .as_deref()
+                        .map(mcp_agent_mail_core::models::normalize_display_name)
+                        .transpose()
+                        .map_err(|error| DbError::invalid("display_name", error.to_string()))?
+                        .flatten()
+                } else {
+                    None
+                };
                 let salvaged_program_raw = row.get_named::<String>("program").ok();
                 let salvaged_model_raw = row.get_named::<String>("model").ok();
                 let salvaged_task_description = row
@@ -4846,8 +4881,8 @@ fn merge_salvaged_database(
                 target_conn
                 .execute_sync(
                     "INSERT OR IGNORE INTO agents \
-                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at, display_name) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     &[
                         Value::BigInt(target_project_id),
                         Value::Text(name.clone()),
@@ -4863,6 +4898,7 @@ fn merge_salvaged_database(
                             .clone()
                             .map_or(Value::Null, Value::Text),
                         salvaged_retired_at.map_or(Value::Null, Value::BigInt),
+                        salvaged_display_name.clone().map_or(Value::Null, Value::Text),
                     ],
                 )
                 .map_err(|e| {
@@ -4896,6 +4932,8 @@ fn merge_salvaged_database(
                         salvaged_registration_token.as_deref(),
                         agent_columns.contains("registration_token"),
                         salvaged_retired_at,
+                        salvaged_display_name.as_deref(),
+                        agent_columns.contains("display_name"),
                         stats,
                     )?;
                 }
@@ -9033,6 +9071,7 @@ mod tests {
 
         let profile = serde_json::json!({
             "name": "TestAgent",
+            "display_name": "Reviewer 東京",
             "program": "claude-code",
             "model": "opus-4.6",
             "task_description": "testing",
@@ -9084,7 +9123,7 @@ mod tests {
         );
         let lifecycle_rows = conn
             .query_sync(
-                "SELECT a.retired_at, d.deregistered_at \
+                "SELECT a.retired_at, a.display_name, d.deregistered_at \
                  FROM agents a \
                  JOIN agent_deregistrations d ON d.agent_id = a.id \
                  WHERE a.name = 'TestAgent'",
@@ -9092,6 +9131,12 @@ mod tests {
             )
             .expect("query reconstructed lifecycle state");
         assert_eq!(lifecycle_rows.len(), 1);
+        assert_eq!(
+            lifecycle_rows[0]
+                .get_named::<String>("display_name")
+                .unwrap(),
+            "Reviewer 東京"
+        );
         assert_eq!(
             lifecycle_rows[0]
                 .get_named::<i64>("retired_at")

@@ -1398,6 +1398,7 @@ mod tests {
             reaper_exempt: 0,
             registration_token: None,
             retired_at: None,
+            display_name: None,
         }
     }
 
