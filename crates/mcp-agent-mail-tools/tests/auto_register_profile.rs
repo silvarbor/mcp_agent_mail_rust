@@ -128,6 +128,7 @@ fn explicit_task_identities_keep_canonical_registration_and_archive() {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("resume using a differently cased task name"),
@@ -319,6 +320,7 @@ fn auto_registered_recipient_gets_an_archived_profile() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register sender");
@@ -392,6 +394,7 @@ fn send_to_cross_project_contact_is_refused_instead_of_misdelivered() {
                 "codex-cli".to_string(),
                 "gpt-5".to_string(),
                 Some(name.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -596,15 +599,18 @@ fn send_to_product_peer_name_is_refused_instead_of_misdelivered() {
 }
 
 async fn register_open_agent(ctx: &McpContext, project: &str, name: &str) -> i64 {
-    ensure_project(ctx, project.to_string(), None)
-        .await
-        .expect("ensure project");
+    if Path::new(project).is_absolute() {
+        ensure_project(ctx, project.to_string(), None)
+            .await
+            .expect("ensure project");
+    }
     let agent = register_agent(
         ctx,
         project.to_string(),
         "codex-cli".to_string(),
         "gpt-5".to_string(),
         Some(name.to_string()),
+        None,
         None,
         None,
         None,
@@ -644,6 +650,218 @@ async fn peek_inbox(ctx: &McpContext, project: &str, agent: &str) -> Vec<Value> 
     .await
     .expect("peek inbox");
     serde_json::from_str(&inbox).expect("inbox JSON")
+}
+
+/// An isolated-store demo of two labels sharing distinct mail addresses.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn display_name_demo_preserves_routing_and_history() {
+    run_with_storage_and_env(
+        &[
+            ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "false"),
+            ("TMUX_PANE", ""),
+        ],
+        |cx, storage_root| async move {
+            let ctx = McpContext::new(cx.clone(), 1);
+            let project = format!("/tmp/display-name-demo-{}", unique_suffix());
+            let first_id = register_open_agent(&ctx, &project, "BlueLake").await;
+            let second_id = register_open_agent(&ctx, &project, "RedStone").await;
+            assert_ne!(first_id, second_id);
+
+            let register_label = |name: &str, label: Option<&str>| {
+                register_agent(
+                    &ctx,
+                    project.clone(),
+                    "test-client".to_string(),
+                    "test-model".to_string(),
+                    Some(name.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    label.map(str::to_string),
+                )
+            };
+            for (name, id) in [("BlueLake", first_id), ("RedStone", second_id)] {
+                let raw = register_label(name, Some(" Reviewer "))
+                    .await
+                    .expect("set duplicate label");
+                let profile: Value = serde_json::from_str(&raw).expect("profile JSON");
+                assert_eq!(profile["id"], id);
+                assert_eq!(profile["name"], name);
+                assert_eq!(profile["display_name"], "Reviewer");
+                println!("Reviewer <{name}> (id={id})");
+            }
+
+            let reservation = mcp_agent_mail_tools::file_reservation_paths(
+                &ctx,
+                project.clone(),
+                "BlueLake".to_string(),
+                vec!["src/display_name_demo.rs".to_string()],
+                Some(3600),
+                Some(true),
+                Some("display label demo".to_string()),
+                None,
+            )
+            .await
+            .expect("reserve through stable address");
+            let reservation: Value = serde_json::from_str(&reservation).expect("reservation JSON");
+            assert_eq!(reservation["granted"].as_array().expect("grants").len(), 1);
+
+            let send = |sender: &str, to: &str, subject: &str| {
+                send_message(
+                    &ctx,
+                    project.clone(),
+                    sender.to_string(),
+                    vec![to.to_string()],
+                    subject.to_string(),
+                    "The routing address stays stable.".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            send("RedStone", "BlueLake", "Before rename")
+                .await
+                .expect("deliver by agent name");
+            let history = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["from"], "RedStone");
+
+            let renamed: Value = serde_json::from_str(
+                &register_label("BlueLake", Some("Officer Alpha"))
+                    .await
+                    .expect("rename label"),
+            )
+            .expect("renamed profile JSON");
+            assert_eq!(renamed["name"], "BlueLake");
+            assert_eq!(renamed["id"], first_id);
+            assert_eq!(renamed["display_name"], "Officer Alpha");
+            let mut after_rename = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_rename.len(), 1);
+            assert_eq!(
+                after_rename[0]["to_display_names"],
+                serde_json::json!({"BlueLake": "Officer Alpha"})
+            );
+            // Labels are a current profile projection; the stored message
+            // and its routing identity remain unchanged after a relabel.
+            let mut history = history;
+            for messages in [&mut after_rename, &mut history] {
+                messages[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("to_display_names");
+            }
+            assert_eq!(after_rename, history);
+            println!(
+                "Officer Alpha <BlueLake> (id={first_id}); history unchanged: message {}",
+                history[0]["id"]
+            );
+
+            mcp_agent_mail_storage::wbq_flush();
+            let profiles = find_agent_profiles(&storage_root, "BlueLake");
+            assert_eq!(profiles.len(), 1);
+            let archived: Value = serde_json::from_str(
+                &std::fs::read_to_string(&profiles[0]).expect("read archived profile"),
+            )
+            .expect("archive JSON");
+            assert_eq!(archived["name"], "BlueLake");
+            assert_eq!(archived["display_name"], "Officer Alpha");
+
+            send("BlueLake", "RedStone", "After rename")
+                .await
+                .expect("renamed agent sends by stable address");
+            let other_history = peek_inbox(&ctx, &project, "RedStone").await;
+            assert_eq!(other_history.len(), 1);
+            assert_eq!(other_history[0]["from"], "BlueLake");
+            let counts = delivery_counts(&cx).await;
+            assert!(
+                send("RedStone", "Reviewer", "Ambiguous label")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(delivery_counts(&cx).await, counts);
+
+            let unchanged: Value = serde_json::from_str(
+                &register_label("BlueLake", None)
+                    .await
+                    .expect("old client omits label"),
+            )
+            .expect("old client response");
+            assert_eq!(unchanged["display_name"], "Officer Alpha");
+            assert!(
+                register_label("BlueLake", Some("Officer\nAlpha"))
+                    .await
+                    .is_err()
+            );
+            let profile: Value = serde_json::from_str(
+                &mcp_agent_mail_tools::whois(&ctx, project.clone(), "BlueLake".into(), None, None)
+                    .await
+                    .expect("profile after invalid label"),
+            )
+            .expect("whois JSON");
+            assert_eq!(profile["display_name"], "Officer Alpha");
+            assert_eq!(profile["id"], first_id);
+
+            let cleared: Value = serde_json::from_str(
+                &register_label("BlueLake", Some("  "))
+                    .await
+                    .expect("clear label"),
+            )
+            .expect("cleared profile JSON");
+            assert!(cleared.get("display_name").is_none());
+            assert_eq!(cleared["id"], first_id);
+            assert_eq!(cleared["name"], "BlueLake");
+            let mut after_clear = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_clear.len(), 1);
+            assert_eq!(
+                after_clear[0]["to_display_names"],
+                serde_json::json!({"BlueLake": null})
+            );
+            after_clear[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("to_display_names");
+            assert_eq!(after_clear, history);
+            mcp_agent_mail_storage::wbq_flush();
+            let archived: Value = serde_json::from_str(
+                &std::fs::read_to_string(&profiles[0]).expect("read cleared profile"),
+            )
+            .expect("cleared archive JSON");
+            assert!(archived.get("display_name").is_none());
+            assert_eq!(archived["name"], "BlueLake");
+
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("pool");
+            let conn = pool.acquire(&cx).await.into_result().expect("checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT contact_policy, \
+                     (SELECT COUNT(*) FROM file_reservations WHERE agent_id = agents.id \
+                      AND released_ts IS NULL) AS reservations \
+                     FROM agents WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(first_id)],
+                )
+                .expect("identity relationships");
+            assert_eq!(
+                rows[0].get_named::<String>("contact_policy").unwrap(),
+                "open"
+            );
+            assert_eq!(rows[0].get_named::<i64>("reservations").unwrap(), 1);
+            println!("Cleared label: BlueLake (id={first_id}); inbox and reservation preserved.");
+            println!("Isolated archive: {storage_root}");
+        },
+    );
 }
 
 async fn delivery_counts(cx: &Cx) -> (i64, i64, i64) {
@@ -1739,6 +1957,7 @@ async fn register_for_token(ctx: &McpContext, project: &str, name: &str) -> Stri
         "codex-cli".to_string(),
         "gpt-5".to_string(),
         Some(name.to_string()),
+        None,
         None,
         None,
         None,

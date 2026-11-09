@@ -966,6 +966,8 @@ pub struct AgentSummary {
 pub struct AgentListEntry {
     pub id: i64,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -1028,6 +1030,7 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         let entry = AgentListEntry {
             id: agent_id,
             name: agent.name,
+            display_name: agent.display_name,
             program: agent.program,
             model: agent.model,
             task_description: agent.task_description,
@@ -2685,6 +2688,8 @@ pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<S
 pub struct ProjectAgentEntry {
     pub id: i64,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub program: String,
     pub model: String,
     pub task_description: String,
@@ -2913,6 +2918,7 @@ async fn project_details_impl(
             .map(|a| ProjectAgentEntry {
                 id: a.id.unwrap_or(0),
                 name: a.name,
+                display_name: a.display_name,
                 program: a.program,
                 model: a.model,
                 task_description: a.task_description,
@@ -3424,6 +3430,7 @@ fn priority_inbox_snapshot_json(
     let mut messages = Vec::with_capacity(snapshot.rows.len());
     for row in snapshot.rows {
         let message = row.message;
+        let recipients = crate::tool_util::parse_recipients_lists(&message.recipients_json);
         if message.id.is_none_or(|id| id <= 0)
             || message.project_id != snapshot.project.id.unwrap_or(0)
             || message.sender_id <= 0
@@ -3444,6 +3451,8 @@ fn priority_inbox_snapshot_json(
             "project_id": message.project_id,
             "sender_id": message.sender_id,
             "from": row.sender_name,
+            "sender_display_name": row.sender_display_name,
+            "to_display_names": crate::messaging::primary_recipient_display_names(&recipients.to, &snapshot.display_names),
             "subject": message.subject,
             "thread_id": message.thread_id,
             "topic": message.topic,
@@ -3475,6 +3484,7 @@ fn priority_inbox_snapshot_json(
             "id": snapshot.agent.id,
             "project_id": snapshot.agent.project_id,
             "name": snapshot.agent.name,
+            "display_name": snapshot.agent.display_name,
             "inception_ts": micros_to_iso(snapshot.agent.inception_ts),
         },
         "captured_ts": micros_to_iso(snapshot.captured_ts),
@@ -7322,6 +7332,7 @@ mod resource_shape_tests {
             },
             captured_ts: 2_000_000_000,
             ack_overdue_before: 200_000_000,
+            display_names: std::collections::BTreeMap::new(),
             rows: vec![queries::InboxRow {
                 message: MessageRow {
                     id: Some(13),
@@ -7335,6 +7346,7 @@ mod resource_shape_tests {
                 },
                 kind: "to".to_string(),
                 sender_name: "RedPeak".to_string(),
+                sender_display_name: None,
                 read_ts: None,
                 ack_ts: None,
             }],
@@ -9537,6 +9549,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("register_agent"),
@@ -9621,6 +9634,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -9631,6 +9645,7 @@ mod resource_shape_tests {
                     "gpt-5".to_string(),
                     Some("RedPeak".to_string()),
                     Some("resource visibility regression".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -11250,6 +11265,7 @@ mod resource_shape_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register_agent GreenLake");
@@ -11261,6 +11277,7 @@ mod resource_shape_tests {
                     "sonnet-4.5".to_string(),
                     Some("BlueDog".to_string()),
                     Some("frontend work".to_string()),
+                    None,
                     None,
                     None,
                     None,

@@ -21,6 +21,8 @@ struct ResetConfigCache;
 
 impl Drop for ResetConfigCache {
     fn drop(&mut self) {
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
         Config::reset_cached();
     }
 }
@@ -230,6 +232,7 @@ fn real_tools_do_not_borrow_names_or_mutate_mail_and_profiles_after_eviction() {
             "codex-cli".to_string(),
             "gpt-5".to_string(),
             Some(fixture.victim.clone()),
+            None,
             None,
             None,
             None,

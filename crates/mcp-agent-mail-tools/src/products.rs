@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::llm;
-use crate::messaging::InboxMessage;
+use crate::messaging::{InboxMessage, primary_recipient_display_names};
 use crate::search::{ExampleMessage, ThreadSummary};
 #[cfg(test)]
 use crate::tool_util::get_db_pool;
@@ -855,6 +855,21 @@ pub async fn fetch_inbox_product(
     )?;
     phase.mark("sqlite_query");
 
+    let mut labels_by_project = std::collections::BTreeMap::new();
+    for row in &rows {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            labels_by_project.entry(row.message.project_id)
+        {
+            entry.insert(db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_agent_display_names(
+                    ctx.cx(),
+                    &pool,
+                    row.message.project_id,
+                )
+                .await,
+            )?);
+        }
+    }
     let out: Vec<InboxMessage> = rows
         .into_iter()
         .map(|row| {
@@ -862,6 +877,10 @@ pub async fn fetch_inbox_product(
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
             let recipients = parse_recipients_lists(&msg.recipients_json);
+            let to_display_names = labels_by_project
+                .get(&msg.project_id)
+                .map(|labels| primary_recipient_display_names(&recipients.to, labels))
+                .unwrap_or_default();
             InboxMessage {
                 id,
                 project_id: msg.project_id,
@@ -872,6 +891,8 @@ pub async fn fetch_inbox_product(
                 importance: msg.importance,
                 ack_required: msg.ack_required != 0,
                 from: row.sender_name,
+                sender_display_name: row.sender_display_name,
+                to_display_names,
                 to: recipients.to,
                 cc: recipients.cc,
                 bcc: Vec::new(),
@@ -2777,6 +2798,12 @@ mod tests {
                     assert_eq!(messages.len(), 1);
                     assert_eq!(messages[0]["subject"], "Healthy project message");
                     assert_eq!(messages[0]["from"], "BlueLake");
+                    assert!(messages[0].get("sender_display_name").is_some());
+                    assert!(messages[0]["sender_display_name"].is_null());
+                    assert_eq!(
+                        messages[0]["to_display_names"],
+                        serde_json::json!({"RedPeak": null})
+                    );
                     assert_eq!(
                         messages[0]["project_id"].as_i64(),
                         Some(healthy_project.id.unwrap_or(0))
@@ -2787,6 +2814,39 @@ mod tests {
                             .is_some_and(|body| body.contains("healthy linked project")),
                         "expected healthy project body in product inbox: {value}"
                     );
+                    for agent in [&sender, &recipient] {
+                        assert!(matches!(
+                            mcp_agent_mail_db::queries::set_agent_display_name(
+                                &cx,
+                                &pool,
+                                healthy_project.id.unwrap(),
+                                agent.name.as_str(),
+                                Some("Reviewer"),
+                            )
+                            .await,
+                            Outcome::Ok(_)
+                        ));
+                    }
+                    let labeled = fetch_inbox_product(
+                        &ctx,
+                        "prod-missing-agent".into(),
+                        "RedPeak".into(),
+                        Some(10),
+                        Some(false),
+                        Some(false),
+                        None,
+                    )
+                    .await
+                    .expect("read current product labels without message bodies");
+                    let labeled: serde_json::Value = serde_json::from_str(&labeled).unwrap();
+                    assert_eq!(labeled[0]["id"], messages[0]["id"]);
+                    assert_eq!(labeled[0]["from"], "BlueLake");
+                    assert_eq!(labeled[0]["sender_display_name"], "Reviewer");
+                    assert_eq!(
+                        labeled[0]["to_display_names"],
+                        serde_json::json!({"RedPeak": "Reviewer"})
+                    );
+                    assert!(labeled[0].get("body_md").is_none());
                 });
             },
         );

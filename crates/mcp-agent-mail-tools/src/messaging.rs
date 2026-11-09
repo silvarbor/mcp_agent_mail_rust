@@ -18,7 +18,7 @@ use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -2409,7 +2409,13 @@ pub struct MessagePayload {
     pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     pub from: String,
+    /// Current sender profile label; the routing address remains `from`.
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
     pub to: Vec<String>,
+    /// Current labels keyed by stable primary recipients, excluding CC and BCC.
+    #[serde(default)]
+    pub to_display_names: BTreeMap<String, Option<String>>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
 }
@@ -2437,6 +2443,8 @@ pub struct RedactedSendMessageReceipt {
     pub message_id: i64,
     pub project_id: i64,
     pub sender_id: i64,
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
     pub thread_id: Option<String>,
     pub created_ts: String,
     pub verified_sender: bool,
@@ -2457,6 +2465,8 @@ pub struct RedactedReplyMessageReceipt {
     pub message_id: i64,
     pub project_id: i64,
     pub sender_id: i64,
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
     pub thread_id: Option<String>,
     pub created_ts: String,
     pub reply_to: i64,
@@ -2636,6 +2646,12 @@ pub struct InboxMessage {
     pub importance: String,
     pub ack_required: bool,
     pub from: String,
+    /// Current profile metadata, including when reading historical messages.
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
+    /// Visible primary recipients only; labels never identify mailboxes.
+    #[serde(default)]
+    pub to_display_names: BTreeMap<String, Option<String>>,
     #[serde(default, skip_serializing)]
     pub to: Vec<String>,
     #[serde(default, skip_serializing)]
@@ -2715,7 +2731,11 @@ pub struct ReplyMessageResponse {
     pub attachments: Vec<serde_json::Value>,
     pub body_md: String,
     pub from: String,
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
     pub to: Vec<String>,
+    #[serde(default)]
+    pub to_display_names: BTreeMap<String, Option<String>>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub reply_to: i64,
@@ -2728,14 +2748,16 @@ pub struct ReplyMessageResponse {
 /// Render a retry from the accepted row, never from newly processed files or
 /// the current recipient/contact configuration. The caller still authenticates
 /// the sender before reading this receipt.
-fn recorded_message_response(
-    config: &Config,
+async fn recorded_message_response(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
     project: &mcp_agent_mail_db::ProjectRow,
     sender: &mcp_agent_mail_db::AgentRow,
     message: mcp_agent_mail_db::MessageRow,
     reply_to: Option<i64>,
     verified_sender: bool,
 ) -> McpResult<String> {
+    let config = Config::get();
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RecordedRecipients {
@@ -2784,6 +2806,7 @@ fn recorded_message_response(
                 message_id: id,
                 project_id: message.project_id,
                 sender_id: message.sender_id,
+                sender_display_name: sender.display_name.clone(),
                 thread_id: message.thread_id,
                 created_ts,
                 reply_to: parent,
@@ -2797,6 +2820,7 @@ fn recorded_message_response(
                 message_id: id,
                 project_id: message.project_id,
                 sender_id: message.sender_id,
+                sender_display_name: sender.display_name.clone(),
                 thread_id: message.thread_id,
                 created_ts,
                 verified_sender,
@@ -2806,6 +2830,15 @@ fn recorded_message_response(
     } else {
         let attachments: Vec<Value> =
             serde_json::from_str(&message.attachments).map_err(|_| invalid_result())?;
+        let labels = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agent_display_names(
+                ctx.cx(),
+                pool,
+                message.project_id,
+            )
+            .await,
+        )?;
+        let to_display_names = primary_recipient_display_names(&recipients.to, &labels);
         let payload = MessagePayload {
             id,
             project_id: message.project_id,
@@ -2819,7 +2852,9 @@ fn recorded_message_response(
             created_ts: Some(created_ts),
             attachments,
             from: sender.name.clone(),
+            sender_display_name: sender.display_name.clone(),
             to: recipients.to,
+            to_display_names,
             cc: recipients.cc,
             bcc: recipients.bcc,
         };
@@ -2828,6 +2863,22 @@ fn recorded_message_response(
     response
         .map(|json| crate::idempotency::with_replay_marker(json, true))
         .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+/// Label metadata is keyed by stable primary-recipient addresses only.
+pub(crate) fn primary_recipient_display_names(
+    recipients: &[String],
+    labels: &BTreeMap<String, Option<String>>,
+) -> BTreeMap<String, Option<String>> {
+    recipients
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                labels.get(&name.to_ascii_lowercase()).cloned().flatten(),
+            )
+        })
+        .collect()
 }
 
 fn recorded_message_payload_response(
@@ -2850,7 +2901,9 @@ fn recorded_message_payload_response(
             attachments: payload.attachments.clone(),
             body_md: payload.body_md.clone(),
             from: payload.from.clone(),
+            sender_display_name: payload.sender_display_name.clone(),
             to: payload.to.clone(),
+            to_display_names: payload.to_display_names.clone(),
             cc: payload.cc.clone(),
             bcc: payload.bcc.clone(),
             reply_to: parent,
@@ -2965,13 +3018,15 @@ async fn try_replay_message(
                 )?
             };
             recorded_message_response(
-                config,
+                ctx,
+                &pool,
                 &delivery,
                 &sender,
                 message,
                 reply_to,
                 verified_sender,
             )
+            .await
             .map(|json| Some(with_sender_proof_marker(json, sender_proof)))
         }
         Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
@@ -3862,13 +3917,15 @@ effective_free_bytes={free}"
 
     if idempotent_replay {
         return recorded_message_response(
-            config,
+            ctx,
+            &pool,
             delivery,
             &sender,
             message,
             reply_to,
             verified_sender,
         )
+        .await
         .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
@@ -4000,6 +4057,7 @@ effective_free_bytes={free}"
                 message_id,
                 project_id: delivery_id,
                 sender_id,
+                sender_display_name: sender.display_name.clone(),
                 thread_id: message.thread_id,
                 created_ts: micros_to_iso(message.created_ts),
                 reply_to: parent,
@@ -4013,6 +4071,7 @@ effective_free_bytes={free}"
                 message_id,
                 project_id: delivery_id,
                 sender_id,
+                sender_display_name: sender.display_name.clone(),
                 thread_id: message.thread_id,
                 created_ts: micros_to_iso(message.created_ts),
                 verified_sender,
@@ -4020,6 +4079,17 @@ effective_free_bytes={free}"
             })
         }
     } else {
+        let to_display_names = resolved_to
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    recipient_map
+                        .get(&name.to_ascii_lowercase())
+                        .and_then(|agent| agent.display_name.clone()),
+                )
+            })
+            .collect();
         let payload = MessagePayload {
             id: message_id,
             project_id: delivery_id,
@@ -4033,7 +4103,9 @@ effective_free_bytes={free}"
             created_ts: Some(micros_to_iso(message.created_ts)),
             attachments: all_attachment_meta,
             from: sender.name.clone(),
+            sender_display_name: sender.display_name.clone(),
             to: envelope_to,
+            to_display_names,
             cc: envelope_cc,
             bcc: resolved_bcc_recipients.into_vec(),
         };
@@ -4849,13 +4921,15 @@ effective_free_bytes={free}"
 
     if idempotent_replay {
         return recorded_message_response(
-            config,
+            ctx,
+            &pool,
             &project,
             &sender,
             reply,
             Some(message_id),
             verified_sender,
         )
+        .await
         .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
@@ -4974,6 +5048,7 @@ effective_free_bytes={free}"
             message_id: reply_id,
             project_id,
             sender_id,
+            sender_display_name: sender.display_name.clone(),
             thread_id: Some(thread_id),
             created_ts: micros_to_iso(reply.created_ts),
             reply_to: message_id,
@@ -4985,6 +5060,17 @@ effective_free_bytes={free}"
             ),
         })
     } else {
+        let to_display_names = resolved_to
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    recipient_map
+                        .get(&name.to_ascii_lowercase())
+                        .and_then(|agent| agent.display_name.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let payload = MessagePayload {
             id: reply_id,
             project_id,
@@ -4998,7 +5084,9 @@ effective_free_bytes={free}"
             created_ts: Some(micros_to_iso(reply.created_ts)),
             attachments: all_attachment_meta.clone(),
             from: sender.name.clone(),
+            sender_display_name: sender.display_name.clone(),
             to: resolved_to.to_vec(),
+            to_display_names: to_display_names.clone(),
             cc: resolved_cc_recipients.to_vec(),
             bcc: resolved_bcc_recipients.to_vec(),
         };
@@ -5016,7 +5104,9 @@ effective_free_bytes={free}"
             attachments: all_attachment_meta,
             body_md: reply.body_md,
             from: sender.name.clone(),
+            sender_display_name: sender.display_name.clone(),
             to: resolved_to.into_vec(),
+            to_display_names,
             cc: resolved_cc_recipients.into_vec(),
             bcc: resolved_bcc_recipients.into_vec(),
             reply_to: message_id,
@@ -5201,6 +5291,14 @@ pub async fn fetch_inbox(
     )?;
     phase.mark("sqlite_query");
 
+    let labels = if inbox_rows.is_empty() {
+        BTreeMap::new()
+    } else {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agent_display_names(ctx.cx(), &read_pool, project_id)
+                .await,
+        )?
+    };
     let mut messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
@@ -5208,6 +5306,7 @@ pub async fn fetch_inbox(
             let recipients = parse_recipients_lists(&row.message.recipients_json);
 
             let to = recipients.to;
+            let to_display_names = primary_recipient_display_names(&to, &labels);
             let cc = recipients.cc;
             let bcc = if row.message.sender_id == agent_id {
                 recipients.bcc
@@ -5225,6 +5324,8 @@ pub async fn fetch_inbox(
                 importance: row.message.importance,
                 ack_required: row.message.ack_required != 0,
                 from: row.sender_name,
+                sender_display_name: row.sender_display_name,
+                to_display_names,
                 to,
                 cc,
                 bcc,
@@ -5557,12 +5658,20 @@ pub async fn fetch_inbox_events(
         outcome => db_outcome_to_mcp_result(outcome)?,
     };
 
+    let labels = if position_now.unwrap_or(false) || page.events.is_empty() {
+        BTreeMap::new()
+    } else {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_agent_display_names(ctx.cx(), &pool, project_id).await,
+        )?
+    };
     let events = if position_now.unwrap_or(false) {
         Vec::new()
     } else {
         page.events
             .into_iter()
             .map(|event| {
+                let recipients = parse_recipients_lists(&event.recipients_json);
                 json!({
                     "cursor": event.seq,
                     "message_id": event.message_id,
@@ -5570,6 +5679,8 @@ pub async fn fetch_inbox_events(
                     "delivered_ts": micros_to_iso(event.delivered_ts),
                     "subject": event.subject,
                     "from": event.sender_name,
+                    "sender_display_name": event.sender_display_name,
+                    "to_display_names": primary_recipient_display_names(&recipients.to, &labels),
                     "importance": event.importance,
                     "ack_required": event.ack_required,
                 })
@@ -6544,6 +6655,249 @@ mod tests {
     }
 
     #[test]
+    fn display_labels_follow_current_profiles_without_changing_mail_identity() {
+        with_messaging_mailbox(
+            &[
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+            ],
+            |_| {
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs label test context");
+                    let ctx = McpContext::new(cx, 1);
+                    crate::ensure_project(&ctx, "/position-labels".into(), None)
+                        .await
+                        .expect("ensure project");
+                    let mut sender = serde_json::Value::Null;
+                    for (name, label) in [
+                        ("BlueLake", Some("Reviewer")),
+                        ("RedPeak", Some("Reviewer")),
+                        ("GreenStone", Some("Private recipient")),
+                    ] {
+                        let registration = crate::register_agent(
+                            &ctx,
+                            "/position-labels".into(),
+                            "test-client".into(),
+                            "test-model".into(),
+                            Some(name.into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            label.map(str::to_string),
+                        )
+                        .await
+                        .expect("register labeled identity");
+                        let registration: serde_json::Value =
+                            serde_json::from_str(&registration).expect("profile JSON");
+                        assert_eq!(registration["name"], name);
+                        if name == "BlueLake" {
+                            sender = registration;
+                        }
+                    }
+                    let sent = send_message(
+                        &ctx,
+                        "/position-labels".into(),
+                        "BlueLake".into(),
+                        vec!["RedPeak".into()],
+                        "Reviewer coordination".into(),
+                        "Identity survives label changes".into(),
+                        None,
+                        Some(vec!["GreenStone".into()]),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        sender["registration_token"].as_str().map(str::to_string),
+                        Some("position-label-history".into()),
+                    )
+                    .await
+                    .expect("authenticated send by stable address");
+                    let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+                    let message_id = sent["deliveries"][0]["payload"]["id"].clone();
+                    assert_eq!(sent["verified_sender"], true);
+                    assert_eq!(sent["deliveries"][0]["payload"]["from"], "BlueLake");
+                    assert_eq!(
+                        sent["deliveries"][0]["payload"]["sender_display_name"],
+                        "Reviewer"
+                    );
+                    assert_eq!(
+                        sent["deliveries"][0]["payload"]["to_display_names"],
+                        json!({"RedPeak": "Reviewer"})
+                    );
+                    let sender_id = sender["id"].clone();
+                    for (input, expected) in [
+                        (
+                            Some("  Officer Alpha Ω <Commander>  "),
+                            Some("Officer Alpha Ω <Commander>"),
+                        ),
+                        (None, Some("Officer Alpha Ω <Commander>")),
+                        (Some("   "), None),
+                    ] {
+                        let registration = crate::register_agent(
+                            &ctx,
+                            "/position-labels".into(),
+                            "test-client".into(),
+                            "test-model".into(),
+                            Some("BlueLake".into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            input.map(str::to_string),
+                        )
+                        .await
+                        .expect("synchronize position on the same identity");
+                        sender = serde_json::from_str(&registration).unwrap();
+                        assert_eq!(sender["id"], sender_id);
+                        assert_eq!(sender["name"], "BlueLake");
+                        for include_bodies in [false, true] {
+                            let inbox = fetch_inbox(
+                                &ctx,
+                                "/position-labels".into(),
+                                "RedPeak".into(),
+                                None,
+                                None,
+                                None,
+                                Some(include_bodies),
+                                None,
+                                None,
+                                None,
+                                Some(false),
+                            )
+                            .await
+                            .expect("read label-aware inbox");
+                            let inbox: serde_json::Value = serde_json::from_str(&inbox).unwrap();
+                            assert_eq!(inbox[0]["id"], message_id);
+                            assert_eq!(inbox[0]["from"], "BlueLake");
+                            assert!(inbox[0].get("sender_display_name").is_some());
+                            assert_eq!(inbox[0]["sender_display_name"], json!(expected));
+                            assert_eq!(
+                                inbox[0]["to_display_names"],
+                                json!({"RedPeak": "Reviewer"})
+                            );
+                            assert!(inbox[0]["to_display_names"].get("GreenStone").is_none());
+                            assert_eq!(inbox[0].get("body_md").is_some(), include_bodies);
+                        }
+                        let events = fetch_inbox_events(
+                            &ctx,
+                            "/position-labels".into(),
+                            "RedPeak".into(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("read label-aware event feed");
+                        let events: serde_json::Value = serde_json::from_str(&events).unwrap();
+                        assert_eq!(events["events"][0]["message_id"], message_id);
+                        assert_eq!(events["events"][0]["from"], "BlueLake");
+                        assert_eq!(events["events"][0]["sender_display_name"], json!(expected));
+                        assert_eq!(
+                            events["events"][0]["to_display_names"],
+                            json!({"RedPeak": "Reviewer"})
+                        );
+                        assert!(events["events"][0].get("body_md").is_none());
+                        let replay = send_message(
+                            &ctx,
+                            "/position-labels".into(),
+                            "BlueLake".into(),
+                            vec!["RedPeak".into()],
+                            "Reviewer coordination".into(),
+                            "Identity survives label changes".into(),
+                            None,
+                            Some(vec!["GreenStone".into()]),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            sender["registration_token"].as_str().map(str::to_string),
+                            Some("position-label-history".into()),
+                        )
+                        .await
+                        .expect("authenticated replay after position synchronization");
+                        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+                        assert_eq!(replay["verified_sender"], true);
+                        assert_eq!(replay["idempotent_replay"], true);
+                        assert_eq!(replay["deliveries"][0]["payload"]["id"], message_id);
+                        assert_eq!(
+                            replay["deliveries"][0]["payload"]["sender_display_name"],
+                            json!(expected)
+                        );
+                        assert_eq!(
+                            replay["deliveries"][0]["payload"]["to_display_names"],
+                            json!({"RedPeak": "Reviewer"})
+                        );
+                    }
+                    let sent = send_message(
+                        &ctx,
+                        "/position-labels".into(),
+                        "BlueLake".into(),
+                        vec!["RedPeak".into()],
+                        "After position change".into(),
+                        "The adapter uses its refreshed owner credentials".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        sender["registration_token"].as_str().map(str::to_string),
+                        None,
+                    )
+                    .await
+                    .expect("authenticated send after label clearing");
+                    let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+                    assert_eq!(sent["verified_sender"], true);
+                    assert!(sent["deliveries"][0]["payload"]["sender_display_name"].is_null());
+                    let reply = reply_message(
+                        &ctx,
+                        "/position-labels".into(),
+                        message_id.as_i64().unwrap(),
+                        "BlueLake".into(),
+                        "Reply after position synchronization".into(),
+                        Some(vec!["RedPeak".into()]),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        sender["registration_token"].as_str().map(str::to_string),
+                        None,
+                    )
+                    .await
+                    .expect("authenticated reply by stable address");
+                    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+                    assert_eq!(reply["from"], "BlueLake");
+                    assert_eq!(reply["verified_sender"], true);
+                    assert!(reply["sender_display_name"].is_null());
+                    assert_eq!(reply["to_display_names"], json!({"RedPeak": "Reviewer"}));
+                    assert_eq!(reply["reply_to"], message_id);
+                });
+            },
+        );
+    }
+
+    #[test]
     fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
         with_messaging_mailbox(&[], |mailbox| {
             let database_path = &mailbox.database_path;
@@ -6852,6 +7206,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -6864,6 +7219,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7179,6 +7535,7 @@ mod tests {
                                     None,
                                     None,
                                     None,
+                                    None,
                                 )
                                 .await
                             }
@@ -7386,6 +7743,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register sender");
@@ -7397,6 +7755,7 @@ mod tests {
                     Some("GreenStone".to_string()),
                     Some("stable recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7416,6 +7775,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("register replaceable recipient");
@@ -7430,6 +7790,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("recipient activity refresh".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7462,6 +7823,7 @@ mod tests {
                     Some("AzureCanyon".to_string()),
                     Some("replacement recipient".to_string()),
                     Some("auto".to_string()),
+                    None,
                     None,
                     None,
                     None,
@@ -7532,6 +7894,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("contact lookup".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -7715,6 +8078,7 @@ mod tests {
                         "gpt-5".to_string(),
                         Some(name.to_string()),
                         Some("repeated request".to_string()),
+                        None,
                         None,
                         None,
                         None,
@@ -10885,6 +11249,7 @@ mod tests {
             message_id: 41,
             project_id: 7,
             sender_id: 11,
+            sender_display_name: Some("Reviewer".into()),
             thread_id: Some("bd-237".to_string()),
             created_ts: "2026-08-12T19:00:00Z".to_string(),
             verified_sender: true,
@@ -10898,6 +11263,7 @@ mod tests {
 
         assert_eq!(json["receipt_mode"], "redacted");
         assert_eq!(json["message_id"], 41);
+        assert_eq!(json["sender_display_name"], "Reviewer");
         assert_eq!(json["target_outcomes"][0]["recipient"], "BlueLake");
         assert_eq!(json["target_outcomes"][1]["kind"], "cc");
         for forbidden in ["subject", "body_md", "attachments", "deliveries"] {
@@ -10915,6 +11281,7 @@ mod tests {
             message_id: 42,
             project_id: 7,
             sender_id: 11,
+            sender_display_name: None,
             thread_id: Some("bd-237".to_string()),
             created_ts: "2026-08-12T19:05:00Z".to_string(),
             reply_to: 41,
@@ -10956,6 +11323,8 @@ mod tests {
             importance: "normal".into(),
             ack_required: false,
             from: "BlueLake".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             to: vec![],
             cc: vec![],
             bcc: vec![],
@@ -10983,6 +11352,8 @@ mod tests {
             importance: "normal".into(),
             ack_required: true,
             from: "BlueLake".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             to: vec![],
             cc: vec![],
             bcc: vec![],
@@ -11022,6 +11393,8 @@ mod tests {
         assert_eq!(parsed.to, [] as [String; 0]);
         assert_eq!(parsed.cc, [] as [String; 0]);
         assert_eq!(parsed.bcc, [] as [String; 0]);
+        assert!(parsed.sender_display_name.is_none());
+        assert!(parsed.to_display_names.is_empty());
     }
 
     #[test]
@@ -11036,6 +11409,8 @@ mod tests {
             importance: "normal".into(),
             ack_required: false,
             from: "BlueLake".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             to: vec!["RedFox".into()],
             cc: vec!["GoldHawk".into()],
             bcc: vec!["SilverPeak".into()],
@@ -11069,6 +11444,8 @@ mod tests {
                 importance: "normal".into(),
                 ack_required: false,
                 from: "BlueLake".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 to: vec![],
                 cc: vec![],
                 bcc: vec![],
@@ -11090,6 +11467,8 @@ mod tests {
                 importance: "normal".into(),
                 ack_required: false,
                 from: "BlueLake".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 to: vec![],
                 cc: vec![],
                 bcc: vec![],
@@ -11111,6 +11490,8 @@ mod tests {
                 importance: "normal".into(),
                 ack_required: false,
                 from: "BlueLake".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 to: vec![],
                 cc: vec![],
                 bcc: vec![],
@@ -11145,6 +11526,8 @@ mod tests {
             importance: "normal".into(),
             ack_required: false,
             from: "BlueLake".into(),
+            sender_display_name: None,
+            to_display_names: std::collections::BTreeMap::new(),
             to: vec![],
             cc: vec![],
             bcc: vec![],
@@ -11228,7 +11611,9 @@ mod tests {
             created_ts: Some("2026-02-06T00:00:00Z".into()),
             attachments: vec![json!({"path": "file.webp"})],
             from: "BlueLake".into(),
+            sender_display_name: Some("Reviewer".into()),
             to: vec!["RedFox".into()],
+            to_display_names: BTreeMap::from([("RedFox".into(), None)]),
             cc: vec!["GoldHawk".into()],
             bcc: vec![],
         };
@@ -11261,7 +11646,9 @@ mod tests {
             attachments: vec![],
             body_md: "Reply body".into(),
             from: "BlueLake".into(),
+            sender_display_name: None,
             to: vec!["RedFox".into()],
+            to_display_names: BTreeMap::from([("RedFox".into(), None)]),
             cc: vec![],
             bcc: vec![],
             reply_to: 3,
@@ -12137,6 +12524,8 @@ mod tests {
                 created_ts: None,
                 attachments: vec![],
                 from: "A".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 to: vec!["B".into()],
                 cc: vec![],
                 bcc: vec![],
@@ -12163,6 +12552,8 @@ mod tests {
             created_ts: None,
             attachments: vec![],
             from: "X".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             to: vec![],
             cc: vec![],
             bcc: vec![],
