@@ -94,6 +94,37 @@ pub(crate) use visible_to_viewer_sql;
 
 const VISIBLE_TO_VIEWER_SQL: &str = visible_to_viewer_sql!();
 
+/// Recipients for an operator receipt action, including eligible shared viewers.
+pub fn receipt_agent_ids_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    message_id: i64,
+) -> Result<Vec<i64>, DbError> {
+    let direct = "SELECT agent_id AS id FROM message_recipients WHERE message_id = ?";
+    let sql = format!(
+        "{direct} UNION SELECT viewer.id AS id FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         JOIN agents viewer ON viewer.project_id = d.project_id \
+         WHERE d.message_id = ? AND {VISIBLE_TO_VIEWER_SQL} ORDER BY id"
+    );
+    let rows = match conn.query_sync(
+        &sql,
+        &[Value::BigInt(message_id), Value::BigInt(message_id)],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            allow_absent_shared_schema(conn, &error.to_string())?;
+            conn.query_sync(direct, &[Value::BigInt(message_id)])
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+        }
+    };
+    rows.into_iter()
+        .map(|row| {
+            row.get_named("id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))
+        })
+        .collect()
+}
+
 /// The project identifier named by a shared-mailbox address, or `None` when
 /// `raw` is not one.
 ///
