@@ -25,6 +25,13 @@ use crate::tool_util::{
     legacy_tool_error, resolve_existing_project, resolve_project,
 };
 
+#[cfg(test)]
+thread_local! {
+    // One-shot failure after the real lookup; writes and session binding use
+    // the production path so the regression checks their absence on failure.
+    static REGISTRATION_LOOKUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
 /// for `register_agent` (#98). Matches the same shape the lib.rs error mapper
 /// converts into a `RESOURCE_BUSY` MCP response — those are by definition
@@ -3147,9 +3154,20 @@ Check that all parameters have valid values."
     let existing_before = if crate::session_identity::enabled()
         && let Some(agent_name) = explicit_name.as_deref()
     {
-        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await {
+        let lookup =
+            mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await;
+        #[cfg(test)]
+        let lookup = if REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.replace(false)) {
+            Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(
+                "injected registration lookup contention".into(),
+            ))
+        } else {
+            lookup
+        };
+        match lookup {
             asupersync::Outcome::Ok(existing) => Some(existing),
-            _ => None,
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            other => Some(db_outcome_to_mcp_result(other)?),
         }
     } else {
         None
@@ -4401,6 +4419,108 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    #[test]
+    fn registration_lookup_failure_preserves_profile_token_and_binding() {
+        static REGISTRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &REGISTRATION_TEST_LOCK,
+            "registration lookup failure",
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            |mailbox| {
+                let root = mailbox
+                    .database_path
+                    .parent()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap();
+                Config::reset_cached();
+                RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        let cx = Cx::current().expect("runtime context");
+                        let owner = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        let response = register_agent(
+                            &owner,
+                            root.display().to_string(),
+                            "owner-program".into(),
+                            "owner-model".into(),
+                            Some("BlueLake".into()),
+                            Some("owner task".into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("Owner label".into()),
+                        )
+                        .await
+                        .expect("owner registration");
+                        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                        let before = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                            &cx,
+                            &get_db_pool_for_request(&owner).unwrap(),
+                            response["id"].as_i64().unwrap(),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap();
+                        REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.set(true));
+                        let outsider = McpContext::with_state(
+                            cx.clone(),
+                            2,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        let error = register_agent(
+                            &outsider,
+                            root.display().to_string(),
+                            "changed-program".into(),
+                            "changed-model".into(),
+                            Some("BlueLake".into()),
+                            Some("changed task".into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("Changed label".into()),
+                        )
+                        .await
+                        .expect_err("lookup failure must precede registration writes");
+                        assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+                        assert!(!REGISTRATION_LOOKUP_FAILURE.with(std::cell::Cell::get));
+                        let after = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                            &cx,
+                            &get_db_pool_for_request(&owner).unwrap(),
+                            before.id.unwrap(),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(after).unwrap(),
+                            serde_json::to_value(&before).unwrap()
+                        );
+                        assert!(crate::session_identity::holds(&owner, before.id));
+                        assert_eq!(
+                            crate::session_identity::session_bindings(&outsider),
+                            Vec::<crate::session_identity::SessionBinding>::new()
+                        );
+                    });
+                REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.set(false));
+                Config::reset_cached();
+            },
+        );
+    }
 
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.
