@@ -12064,9 +12064,17 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        // Bind sessions to the caller's authorization before the localhost
+        // POST adapter can synthesize a header. DELETE uses this same principal.
+        let session_principal = self
+            .config
+            .messaging_session_identity
+            .then(|| http_sessions::principal_digest(header_value(&req, "authorization")));
+
         // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
-        if self.config.messaging_session_identity && matches!(req.method, Http1Method::Delete) {
-            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+        if let Some(principal) = session_principal
+            && matches!(req.method, Http1Method::Delete)
+        {
             let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
                 .is_some_and(|id| self.http_sessions.terminate(id, principal));
             if !ended {
@@ -12127,7 +12135,9 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
+        let (session_state, new_session_id) = session_principal.map_or((None, None), |principal| {
+            self.resolve_mcp_session(&req, &json_rpc, principal)
+        });
         let response = self
             .dispatch_with_session(json_rpc, session_state)
             .await
@@ -12163,11 +12173,8 @@ impl HttpState {
         &self,
         req: &Http1Request,
         request: &JsonRpcRequest,
+        principal: [u8; 32],
     ) -> (Option<SessionState>, Option<String>) {
-        if !self.config.messaging_session_identity {
-            return (None, None);
-        }
-        let principal = http_sessions::principal_digest(header_value(req, "authorization"));
         if request.method == "initialize" {
             return self
                 .http_sessions
@@ -26749,13 +26756,12 @@ first body
                 ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ],
             |project_key| {
-                // Sessions, not HTTP auth, are under test (GH#349): without
-                // these the first tools/call got RBAC's 403 (no loopback peer),
-                // or initialize got 401 from a host's user-level config.env
-                // bearer token, and the session code never ran.
+                // Explicit auth configuration isolates this test from host
+                // settings and exercises localhost header synthesis.
                 let mut state = build_state(mcp_agent_mail_core::Config {
                     http_rbac_enabled: false,
-                    http_bearer_token: None,
+                    http_bearer_token: Some("session-test-token".into()),
+                    http_allow_localhost_unauthenticated: true,
                     http_jwt_enabled: false,
                     ..mcp_agent_mail_core::Config::from_env()
                 });
@@ -26768,7 +26774,12 @@ first body
                         let headers: Vec<(&str, &str)> = session
                             .map(|session| vec![("Mcp-Session-Id", session)])
                             .unwrap_or_default();
-                        let mut req = make_request(Http1Method::Post, "/api", &headers);
+                        let mut req = make_request_with_peer_addr(
+                            Http1Method::Post,
+                            "/api",
+                            &headers,
+                            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                        );
                         req.body =
                             serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
                                 .expect("serialize json-rpc");
@@ -26828,7 +26839,7 @@ first body
                     2,
                     Some(&session),
                 );
-                assert!(!failed, "{project}");
+                assert!(!failed, "ensure_project failed: {project}");
                 let identity = serde_json::json!({
                     "project_key": project_key,
                     "program": "codex-cli",
@@ -26880,10 +26891,38 @@ first body
                 let (failed, _) = tool("send_message", send_args.clone(), 8, None);
                 assert!(failed, "a stateless request has no session identity");
 
-                let mut end = make_request(
+                let mut alias_probe = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Mcp-Session-Id", session.as_str())],
+                    Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                );
+                alias_probe.body = serde_json::to_vec(&JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({"name": "session_state_probe", "arguments": {}})),
+                    12_i64,
+                ))
+                .expect("serialize alias session probe");
+                let alias_response = block_on(state.handle(alias_probe));
+                assert_eq!(alias_response.status, 200);
+                let alias_body: serde_json::Value =
+                    serde_json::from_slice(&alias_response.body).expect("alias response");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        alias_body["result"]["content"][0]["text"]
+                            .as_str()
+                            .expect("alias probe text"),
+                    )
+                    .expect("alias probe result")["has_session_state"],
+                    true,
+                    "the base-path adapter must preserve session identity across aliases"
+                );
+
+                let mut end = make_request_with_peer_addr(
                     Http1Method::Delete,
                     "/api",
                     &[("Mcp-Session-Id", session.as_str())],
+                    Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
                 );
                 end.body = Vec::new();
                 assert_eq!(block_on(state.handle(end)).status, 204);
