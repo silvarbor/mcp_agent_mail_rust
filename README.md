@@ -1,5 +1,48 @@
 # MCP Agent Mail (Rust)
 
+## Maintaining the Silvarbor fork
+
+We maintain [this fork](https://github.com/silvarbor/mcp_agent_mail_rust) on
+`main`, using [upstream](https://github.com/Dicklesworthstone/mcp_agent_mail_rust)
+as the baseline for updates. Configure `origin` for the fork and `upstream`
+for the original repository. The quick-install commands below download upstream
+releases. Install a qualified fork build to use the fork's additions.
+
+The functional candidate adds optional display names, current profile labels
+alongside stable routing names, and offline message retention. It also carries
+mailbox correctness fixes that upstream has not supplied. Qualification is
+pending. Keep performance experiments separate from this candidate.
+
+### Updating from upstream
+
+1. Fetch both remotes and record the selected upstream commit.
+2. Inventory fork commits and uncommitted files. Classify each change as required
+   functionality, supplied upstream, optional work, or an obsolete repair.
+3. Create an integration branch from the selected upstream commit. Preserve the
+   published fork branches and outstanding work as references.
+4. Transplant the required changes. Record original commit IDs when splitting
+   mixed patches. Verify upstream replacements against the fork's behavior.
+5. Inspect dependency changes, macOS support and test fixtures before compiling.
+   Reuse a compatible cache and run local checks with `nice -n 19` and two build jobs.
+6. Verify workspace targets, production features, strict Clippy, formatting and
+   the affected behavior. Check relabeling, stable identities, non-consuming reads,
+   explicit receipts, retention recovery and message-ID preservation.
+7. Open a pull request against the fork's `main`. Explain retained changes,
+   upstream replacements and verification results. Account for the old candidate
+   before superseding its pull request.
+
+Preserve published history when integrating the replacement branch. Keep inherited
+Actions disabled until the configured triggers, resource costs and publication
+targets have been reviewed. Upstream ancestry alone does not establish that a
+database-engine update works on macOS.
+
+### Publishing a fork build
+
+Publish from a clean, qualified commit with a fork-specific tag. Record the full
+commit ID, tag, dependency lockfile, binary hashes and validation results in the
+installation manifest. Verify installed binary hashes against that manifest.
+Retain rollback material for at most eight hours under the operator's policy.
+
 <div align="center">
   <img src="docs/assets/am_illustration.webp" alt="MCP Agent Mail - A mail-like coordination layer for AI coding agents">
 </div>
@@ -33,6 +76,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 
 ## Table of Contents
 
+- [Maintaining the Silvarbor fork](#maintaining-the-silvarbor-fork)
 - [TL;DR](#tldr)
 - [Why This Exists](#why-this-exists)
 - [What People Are Saying](#what-people-are-saying)
