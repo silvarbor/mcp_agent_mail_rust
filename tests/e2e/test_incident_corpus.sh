@@ -93,8 +93,13 @@ run_cargo_fixture() {
         return 1
     fi
     local passed
-    passed=$(grep -oP 'test result: ok\. \K\d+(?= passed)' "${log}" \
-        | awk '{s+=$1} END {print s+0}')
+    passed=$(awk '
+        match($0, /test result: ok\. [0-9]+ passed/) {
+            split(substr($0, RSTART, RLENGTH), fields, " ")
+            total += fields[4]
+        }
+        END { print total + 0 }
+    ' "${log}")
     if grep -q 'test result: FAILED' "${log}"; then
         return 1
     fi

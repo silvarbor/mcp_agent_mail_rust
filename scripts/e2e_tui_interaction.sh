@@ -81,20 +81,39 @@ run_pty_interaction() {
     shift 3
 
     local raw_output="${E2E_ARTIFACT_DIR}/pty_${label}_raw.txt"
+    local require_natural_exit=0
+    if [ "${label}" = "quit" ]; then
+        require_natural_exit=1
+    fi
     e2e_log "PTY interaction (${label}): running ${*}"
 
-    python3 - "${raw_output}" "${keystroke_script}" "$@" <<'PYEOF'
-import sys, os, pty, select, time, json, re, signal
+    python3 - "${raw_output}" "${keystroke_script}" "${require_natural_exit}" "$@" <<'PYEOF'
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+from typing import Final, Optional
 
 output_file = sys.argv[1]
 keystroke_script = json.loads(sys.argv[2])
-cmd = sys.argv[3:]
+require_natural_exit = sys.argv[3] == "1"
+cmd = sys.argv[4:]
+NATURAL_EXIT_TIMEOUT_SECONDS: Final = 5.0
+TERMINATION_TIMEOUT_SECONDS: Final = 5.0
+REAP_TIMEOUT_SECONDS: Final = 2.0
+PTY_POLL_INTERVAL_SECONDS: Final = 0.1
 
 # Open a PTY
 master_fd, slave_fd = pty.openpty()
 
 # Set terminal size (80x24 is standard)
-import struct, fcntl, termios
 winsize = struct.pack("HHHH", 24, 80, 0, 0)
 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
 
@@ -119,7 +138,7 @@ else:
     os.close(slave_fd)
     chunks = []
 
-    def read_available(timeout=0.3):
+    def read_available(timeout: float = 0.3) -> None:
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -134,6 +153,15 @@ else:
                     chunks.append(chunk)
                 except OSError:
                     break
+
+    def wait_for_child(timeout: float) -> Optional[int]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                return status
+            read_available(timeout=PTY_POLL_INTERVAL_SECONDS)
+        return None
 
     # Initial read: wait for TUI to render
     read_available(timeout=2.0)
@@ -153,16 +181,42 @@ else:
     # Final read
     read_available(timeout=0.5)
 
-    # Cleanup
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+    child_status = (
+        wait_for_child(NATURAL_EXIT_TIMEOUT_SECONDS) if require_natural_exit else None
+    )
+    natural_exit_failed = require_natural_exit and (
+        child_status is None
+        or not os.WIFEXITED(child_status)
+        or os.WEXITSTATUS(child_status) != 0
+    )
+    if natural_exit_failed:
+        print("PTY child did not exit successfully after quit", file=sys.stderr)
+
+    # Keep draining the PTY while the child restores its terminal settings.
+    # Waiting without reading can block tcsetattr on macOS indefinitely.
+    if child_status is None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        child_status = wait_for_child(TERMINATION_TIMEOUT_SECONDS)
+    cleanup_timed_out = child_status is None
+    if cleanup_timed_out:
+        print("PTY child exceeded its cleanup deadline", file=sys.stderr)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     os.close(master_fd)
+    if cleanup_timed_out:
+        deadline = time.monotonic() + REAP_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(PTY_POLL_INTERVAL_SECONDS)
 
     output = b"".join(chunks)
     # Strip ANSI escape sequences
@@ -184,13 +238,16 @@ else:
     with open(output_file, "w") as f:
         f.write(clean)
 
-    sys.exit(0)
+    sys.exit(1 if cleanup_timed_out or natural_exit_failed else 0)
 PYEOF
 
     local rc=$?
     e2e_save_artifact "pty_${label}_normalized.txt" "$(cat "${raw_output}" 2>/dev/null || echo '<empty>')"
     if [ -f "${raw_output}" ]; then
         cp "${raw_output}" "${output_file}"
+    fi
+    if [ "${rc}" -ne 0 ]; then
+        e2e_fail "PTY interaction (${label}) failed to stop cleanly (rc=${rc})"
     fi
     return $rc
 }
@@ -472,8 +529,7 @@ set -e
 if [ "$QUIT_RC" -eq 0 ]; then
     e2e_pass "quit: process exited cleanly"
 else
-    # PTY interaction returns the child's exit code; some cleanup paths give non-zero
-    e2e_pass "quit: process terminated (rc=${QUIT_RC})"
+    e2e_fail "quit: process did not exit cleanly (rc=${QUIT_RC})"
 fi
 
 # Verify the TUI was actually running (tab bar present)
