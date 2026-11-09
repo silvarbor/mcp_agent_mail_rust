@@ -29,6 +29,8 @@ const COOKIE_ENV: &str = "AM_STARTUP_PAGE_LEAK_COOKIE";
 struct PageAudit {
     page_count: i64,
     freelist_count: i64,
+    messages: i64,
+    recipients: i64,
     unused_pages: Vec<i64>,
     other_findings: Vec<String>,
 }
@@ -75,6 +77,8 @@ fn try_audit(path: &Path) -> Result<PageAudit, Box<SqlError>> {
     Ok(PageAudit {
         page_count,
         freelist_count,
+        messages: pragma_i64(&conn, "SELECT COUNT(*) FROM messages")?,
+        recipients: pragma_i64(&conn, "SELECT COUNT(*) FROM message_recipients")?,
         unused_pages,
         other_findings,
     })
@@ -393,6 +397,8 @@ fn clean_compacted_mailbox_stays_clean_across_service_startup() {
 
     let clean = compact_and_verify(&db_path);
     eprintln!("after compaction: {clean:?}");
+    assert_eq!(clean.messages, seeded.messages);
+    assert_eq!(clean.recipients, seeded.recipients);
     assert_corrupted_copy_is_rejected(&root, &db_path, &clean);
 
     // Stage 1: pool creation + init gate (schema-version refusal, migrations,
@@ -415,12 +421,16 @@ fn clean_compacted_mailbox_stays_clean_across_service_startup() {
     let after_write = audit(&db_path);
     eprintln!("after first write: {after_write:?}");
     assert_no_new_orphans("first write after startup", &clean, &after_write);
+    assert_eq!(after_write.messages, clean.messages + 1);
+    assert_eq!(after_write.recipients, clean.recipients + 1);
 
     // Stage 4: a second cold start on the already-started file.
     run_child_phase("restart", &root, cookie);
     let after_restart = audit(&db_path);
     eprintln!("after second start: {after_restart:?}");
     assert_no_new_orphans("second start", &clean, &after_restart);
+    assert_eq!(after_restart.messages, after_write.messages);
+    assert_eq!(after_restart.recipients, after_write.recipients);
 }
 
 #[derive(Debug, Default)]
