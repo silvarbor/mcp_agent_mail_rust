@@ -59,6 +59,11 @@ where
     let db_path = format!("/tmp/auto-register-profile-{suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/auto-register-profile-storage-{suffix}");
+    std::fs::create_dir_all(&storage_root).expect("create test storage root");
+    let storage_root = std::fs::canonicalize(&storage_root)
+        .expect("canonical test storage root")
+        .to_string_lossy()
+        .into_owned();
     let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),

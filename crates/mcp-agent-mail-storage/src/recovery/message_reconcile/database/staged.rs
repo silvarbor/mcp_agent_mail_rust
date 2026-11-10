@@ -711,6 +711,10 @@ mod tests {
     fn scoped_metadata_scan_keeps_entry_and_blob_bounds_and_exact_prefixes() {
         let (_temp, config, original, archive) = git_fixture();
         let repo = Repository::open(&archive.repo_root).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", false)
+            .unwrap();
         let canonical = crate::message_paths_for_bundle(
             &archive,
             &original.message,
@@ -748,6 +752,18 @@ mod tests {
                     .storage_root
                     .join(format!("retained-prefix-{number}.md")),
             );
+            // Build the exact Git namespace even when the host filesystem
+            // canonicalizes Project to the existing project directory.
+            let physical_relative =
+                crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            if physical_relative != relative {
+                let mut index = repo.index().unwrap();
+                let mut entry = index.get_path(Path::new(&physical_relative), 0).unwrap();
+                index.remove_path(Path::new(&physical_relative)).unwrap();
+                entry.path = relative.as_bytes().to_vec();
+                index.add(&entry).unwrap();
+                index.write().unwrap();
+            }
             if number < 2 {
                 expected_bytes += bytes.len();
             }
