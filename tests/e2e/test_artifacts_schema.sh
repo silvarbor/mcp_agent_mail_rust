@@ -384,10 +384,8 @@ fi
 e2e_case_banner "Wrapper seals late stderr and preserves delegate failures"
 WRAPPER_DELEGATE="${FIX_ROOT}/wrapper_delegate.sh"
 cat > "$WRAPPER_DELEGATE" <<'SH'
-source "$1/scripts/e2e_lib.sh"
-E2E_RUN_STARTED_AT="2026-10-23T01:00:00Z"
-E2E_RUN_ENDED_AT="2026-10-23T01:00:01Z"
-e2e_write_bundle_manifest "$2"
+# The copied fixture already has a validated manifest and matching metrics.
+# Preserve that seal before emitting output the wrapper must capture afterward.
 cp "$2/bundle.json" "$2.original-manifest.json"
 echo "stderr after delegate manifest" >&2
 if [ "$3" = "tamper" ]; then
