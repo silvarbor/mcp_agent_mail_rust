@@ -31,10 +31,22 @@ pending. Keep performance experiments separate from this candidate.
    upstream replacements and verification results. Account for the old candidate
    before superseding its pull request.
 
-Preserve published history when integrating the replacement branch. Keep inherited
-Actions disabled until the configured triggers, resource costs and publication
-targets have been reviewed. Upstream ancestry alone does not establish that a
-database-engine update works on macOS.
+Preserve published history when integrating the replacement branch. Upstream
+ancestry alone does not establish that a database-engine update works on macOS.
+
+### Continuous integration
+
+The fork runs one workflow, `.github/workflows/fork-ci.yml`: lint and the
+production feature graph on Linux, the workspace test suite on macOS and Linux,
+and the offline installer cases. Its end-to-end job starts by hand.
+
+Keep every inherited workflow switched off in the repository's Actions settings
+and leave its file identical to upstream. The Actions policy allows only the
+actions pinned in `fork-ci.yml`, so an inherited workflow that starts anyway
+stops at its first action. After an update from upstream, switch off each
+workflow the update added; the `Workflow allowlist` job names them. To tell
+inherited failures from the fork's own, push the selected upstream commit plus
+`fork-ci.yml` to a `ci-baseline/` branch and compare the two runs.
 
 ### Publishing a fork build
 
