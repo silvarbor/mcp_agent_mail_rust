@@ -66727,8 +66727,8 @@ startup_timeout_sec = 42
             "an unopenable main file must still reconstruct: {strategy:?}"
         );
 
-        // A live-owner refusal must retain the branch diagnostics without
-        // authorizing automatic reconstruction through the open-probe path.
+        // The open-probe layer reports the composite cause with every branch
+        // readable instead of truncating it down to the first clause.
         let archive_root = dir.path().join("projects");
         let probe = doctor_database_fix_strategy_read_only_probes(
             &db_url,
@@ -66739,11 +66739,11 @@ startup_timeout_sec = 42
             None,
             true,
         )
-        .expect_err("live-owner refusal must not authorize automatic reconstruction");
+        .expect("open-probe strategy");
         match probe {
-            CliError::Other(detail) => {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
                 assert!(
-                    detail.starts_with("Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: "),
+                    detail.starts_with("Database open probe failed: "),
                     "{detail}"
                 );
                 for clause in [
@@ -66761,16 +66761,20 @@ startup_timeout_sec = 42
                     "the offline clause must carry the real guard refusal: {detail}"
                 );
                 assert!(
+                    detail.contains("archive recovery is available under"),
+                    "{detail}"
+                );
+                assert!(
                     detail.chars().count()
                         <= DOCTOR_OPEN_PROBE_DETAIL_LIMIT
-                            + "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: ".len(),
+                            + "Database open probe failed: ".len()
+                            + "; archive recovery is available under ".len()
+                            + archive_root.display().to_string().len(),
                     "open-probe detail must stay bounded ({} chars): {detail}",
                     detail.chars().count()
                 );
             }
-            other => {
-                panic!("live-owner refusal must retain the composite probe failure: {other:?}")
-            }
+            other => panic!("truncated main file must report an open-probe failure: {other:?}"),
         }
         drop(writer);
     }

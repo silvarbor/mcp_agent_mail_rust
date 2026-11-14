@@ -317,10 +317,8 @@ mod tests {
             let stop = AtomicBool::new(false);
             let error = run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
                 .expect_err("a regular-file parent cannot admit a database");
-            // The pool opens lazily. The worker reports the failed page read;
-            // the engine's nested diagnostic depends on its connection state.
             assert!(
-                error.starts_with("failed to read overdue ACK page:"),
+                error.contains("ACK scan database admission failed"),
                 "{error}"
             );
             assert!(pool.is_none());
