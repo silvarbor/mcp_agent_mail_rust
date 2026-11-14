@@ -36,17 +36,29 @@ ancestry alone does not establish that a database-engine update works on macOS.
 
 ### Continuous integration
 
-The fork runs one workflow, `.github/workflows/fork-ci.yml`: lint and the
-production feature graph on Linux, the workspace test suite on macOS and Linux,
-and the offline installer cases. Its end-to-end job starts by hand.
+The fork runs one workflow, `.github/workflows/fork-ci.yml`. On a pull request
+and on `main` it runs lint and the production feature graph on Linux, the
+offline installer cases, and on macOS and Linux the tests that live in files
+the fork changed relative to upstream. A failure there is the fork's to fix.
+`.github/fork-ci/select_tests.py` derives that selection from the diff against
+the commit in `.github/fork-ci/upstream-base`. The whole suite and the
+end-to-end suites start by hand.
 
 Keep every inherited workflow switched off in the repository's Actions settings
 and leave its file identical to upstream. The Actions policy allows only the
 actions pinned in `fork-ci.yml`, so an inherited workflow that starts anyway
-stops at its first action. After an update from upstream, switch off each
-workflow the update added; the `Workflow allowlist` job names them. To tell
-inherited failures from the fork's own, push the selected upstream commit plus
-`fork-ci.yml` to a `ci-baseline/` branch and compare the two runs.
+stops at its first action.
+
+After an update from upstream:
+
+1. Write the new upstream commit to `.github/fork-ci/upstream-base`.
+2. Push that upstream commit plus the fork's `.github/` directory to a
+   `ci-baseline/` branch. Its run executes the whole suite and lists the failed
+   tests in its summary.
+3. Replace `.github/fork-ci/upstream-failures.txt` with the tests from that list
+   that also fail on the fork. Those failures are upstream's or the runner's.
+4. Switch off each workflow the update added; the `Workflow allowlist` job names
+   them.
 
 ### Publishing a fork build
 

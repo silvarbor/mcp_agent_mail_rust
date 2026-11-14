@@ -3,26 +3,35 @@
 # Every workflow file inherited from upstream is switched off in this
 # repository's Actions settings; the files themselves stay identical to
 # upstream so that an upstream sync never conflicts with them. The `allowlist`
-# job below fails when any other workflow is enabled or newly arrived.
+# job below fails when any other workflow is enabled.
 #
 # The repository's Actions policy allows only the three actions pinned in this
 # file, at exactly these commits. An inherited workflow that starts anyway
 # stops at its first `uses:` step.
+#
+# What runs, and why:
+#   - On a pull request and on main: lint, the production feature graph, the
+#     installer cases, and the tests that live in files the fork changed
+#     relative to the upstream commit in `.github/fork-ci/upstream-base`. A
+#     failure there is the fork's to fix. Tests that already fail on that
+#     upstream commit are listed in `.github/fork-ci/upstream-failures.txt`
+#     and left out.
+#   - On a `ci-baseline/**` branch, or started by hand with `full`: the whole
+#     workspace suite. It takes over an hour and fails for upstream's reasons
+#     too, so it is the tool for an upstream sync, not for every change.
 name: Fork CI
 
 on:
   pull_request:
     branches: [main]
   push:
-    # `ci-baseline/**` holds an upstream revision plus this file, to tell
-    # failures inherited from upstream apart from failures the fork introduced.
     branches: [main, "ci-baseline/**"]
   workflow_dispatch:
     inputs:
       run:
         description: What to run
         type: choice
-        options: [checks, e2e]
+        options: [checks, full, e2e]
         default: checks
 
 permissions:
@@ -37,11 +46,16 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Decide freshness by file content, not by timestamp. A fresh checkout gives
+  # every source file a new timestamp, which would otherwise rebuild all of the
+  # workspace's own crates even when the cache holds them.
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: "true"
   RUSTFLAGS: "-D warnings"
 
 jobs:
   allowlist:
     name: Workflow allowlist
+    if: ${{ !startsWith(github.ref, 'refs/heads/ci-baseline/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -83,7 +97,7 @@ jobs:
 
   lint:
     name: Lint and production build
-    if: github.event_name != 'workflow_dispatch' || inputs.run == 'checks'
+    if: ${{ !startsWith(github.ref, 'refs/heads/ci-baseline/') && (github.event_name != 'workflow_dispatch' || inputs.run == 'checks') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -97,6 +111,9 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          cache-workspace-crates: true
       - name: Observability drift
         run: python3 scripts/check_observability_drift.py --pretty
       # Each check reports by itself; an earlier failure does not hide the rest.
@@ -111,14 +128,55 @@ jobs:
         run: cargo check --workspace --lib --bins --locked
 
   test:
-    name: Tests / ${{ matrix.os }}
-    if: github.event_name != 'workflow_dispatch' || inputs.run == 'checks'
+    name: Tests of changed code / ${{ matrix.os }}
+    if: ${{ !startsWith(github.ref, 'refs/heads/ci-baseline/') && (github.event_name != 'workflow_dispatch' || inputs.run == 'checks') }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Fetch the upstream commit the fork is built on
+        run: git fetch --no-tags --depth=1 origin "$(cat .github/fork-ci/upstream-base)"
+      - name: Install the pinned toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Select the tests in files the fork changed
+        run: |
+          set -euo pipefail
+          python3 .github/fork-ci/select_tests.py \
+            --base "$(cat .github/fork-ci/upstream-base)" \
+            --exclude .github/fork-ci/upstream-failures.txt \
+            --explain > "${RUNNER_TEMP}/nextest-filter.txt"
+      - name: Run the selected tests
+        env:
+          STORAGE_ROOT: ${{ runner.temp }}/agent-mail-storage
+        run: |
+          set -euo pipefail
+          mkdir -p "$STORAGE_ROOT"
+          cargo nextest run --workspace --locked --profile ci --no-fail-fast --no-tests=pass \
+            -E "$(cat "${RUNNER_TEMP}/nextest-filter.txt")"
+
+  full:
+    name: Whole suite / ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/heads/ci-baseline/') || (github.event_name == 'workflow_dispatch' && inputs.run == 'full') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -130,24 +188,52 @@ jobs:
           rustup toolchain install "$channel" --profile minimal
           rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+          cache-on-failure: true
+          cache-workspace-crates: true
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-nextest@0.9.149
-      - name: Free disk space before the build
-        run: df -h .
-      - name: Workspace test suite
+      - name: Run the whole workspace suite
+        id: suite
         env:
           STORAGE_ROOT: ${{ runner.temp }}/agent-mail-storage
         run: |
+          # The result is reported by the last step, after the failed tests
+          # have been listed, so a failing suite must not stop this step.
+          set +e
           mkdir -p "$STORAGE_ROOT"
-          cargo nextest run --workspace --locked --profile ci --no-fail-fast
-      - name: Free disk space after the build
-        if: always()
-        run: df -h .
+          cargo nextest run --workspace --locked --profile ci --no-fail-fast 2>&1 \
+            | tee "${RUNNER_TEMP}/nextest.log"
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: List the failed tests
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python3 .github/fork-ci/select_tests.py --list-failures "${RUNNER_TEMP}/nextest.log" \
+            > "${RUNNER_TEMP}/failed-tests.txt"
+          {
+            echo "## Failed tests"
+            echo
+            echo "$(wc -l < "${RUNNER_TEMP}/failed-tests.txt") tests failed. The lines below use the format of"
+            echo "\`.github/fork-ci/upstream-failures.txt\`."
+            echo
+            echo '```text'
+            cat "${RUNNER_TEMP}/failed-tests.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "${RUNNER_TEMP}/failed-tests.txt"
+      - name: Report the suite result
+        if: ${{ !cancelled() }}
+        env:
+          SUITE_STATUS: ${{ steps.suite.outputs.status }}
+        run: |
+          [ "${SUITE_STATUS:-1}" = "0" ] || { echo "The suite exited with status ${SUITE_STATUS:-unknown}."; exit 1; }
 
   installer:
     name: Installer / ${{ matrix.os }}
-    if: github.event_name != 'workflow_dispatch' || inputs.run == 'checks'
+    if: ${{ !startsWith(github.ref, 'refs/heads/ci-baseline/') && (github.event_name != 'workflow_dispatch' || inputs.run == 'checks') }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +253,7 @@ jobs:
 
   e2e:
     name: End-to-end suites
-    if: github.event_name == 'workflow_dispatch' && inputs.run == 'e2e'
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run == 'e2e' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -181,6 +267,9 @@ jobs:
           rustup toolchain install "$channel" --profile minimal
           rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          cache-workspace-crates: true
       - name: Build both binaries
         run: |
           cargo build --locked -p mcp-agent-mail-cli -p mcp-agent-mail
