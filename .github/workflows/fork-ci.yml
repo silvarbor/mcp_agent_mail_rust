@@ -48,7 +48,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Require every other workflow to be switched off
@@ -68,8 +68,10 @@ jobs:
               disabled_manually)
                 ;;
               "")
-                echo "::error file=${file}::GitHub has not registered this workflow yet, so it cannot be switched off. It becomes active when it reaches main. Switch it off right after the merge: gh workflow disable $(basename "$file") --repo ${GITHUB_REPOSITORY}"
-                failed=1
+                # Nothing can be done before the merge, so this must not fail
+                # the pull request. On main the workflow is registered and the
+                # branch below fails until it is switched off.
+                echo "::warning file=${file}::GitHub has not registered this workflow yet, so it cannot be switched off. It becomes active when it reaches main. Switch it off right after the merge: gh workflow disable $(basename "$file") --repo ${GITHUB_REPOSITORY}"
                 ;;
               *)
                 echo "::error file=${file}::This workflow is ${state}. Switch it off: gh workflow disable $(basename "$file") --repo ${GITHUB_REPOSITORY}"
@@ -85,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
@@ -97,11 +99,15 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Observability drift
         run: python3 scripts/check_observability_drift.py --pretty
+      # Each check reports by itself; an earlier failure does not hide the rest.
       - name: Formatting
+        if: ${{ !cancelled() }}
         run: cargo fmt --all --check
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Production feature graph
+        if: ${{ !cancelled() }}
         run: cargo check --workspace --lib --bins --locked
 
   test:
@@ -114,7 +120,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
@@ -149,7 +155,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Shell syntax and offline exit status cases
@@ -165,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
