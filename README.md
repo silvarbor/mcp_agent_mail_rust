@@ -15,23 +15,28 @@ pending. Keep performance experiments separate from this candidate.
 
 ### Updating from upstream
 
-1. Fetch both remotes and record the selected upstream commit.
-2. Inventory fork commits and uncommitted files. Classify each change as required
-   functionality, supplied upstream, optional work, or an obsolete repair.
-3. Create an integration branch from the selected upstream commit. Preserve the
-   published fork branches and outstanding work as references.
-4. Transplant the required changes. Record original commit IDs when splitting
-   mixed patches. Verify upstream replacements against the fork's behavior.
-5. Inspect dependency changes, macOS support and test fixtures before compiling.
+1. Fetch both remotes and pick one upstream commit. Upstream gains dozens of
+   commits a day, so fix the commit before starting and finish on it.
+2. Branch from the fork's `main` and merge that commit.
+3. Resolve each conflict by taking upstream's structure and keeping the fork's
+   behavior on top of it. Where upstream now supplies what the fork carried,
+   drop the fork's version.
+4. Compile every target with `-D warnings` before trusting the merge. The two
+   sides can disagree where Git reports no conflict.
+5. Inspect dependency changes, macOS support and test fixtures.
    Reuse a compatible cache and run local checks with `nice -n 19` and two build jobs.
 6. Verify workspace targets, production features, strict Clippy, formatting and
    the affected behavior. Check relabeling, stable identities, non-consuming reads,
    explicit receipts, retention recovery and message-ID preservation.
-7. Open a pull request against the fork's `main`. Explain retained changes,
-   upstream replacements and verification results. Account for the old candidate
-   before superseding its pull request.
+7. Follow "After an update from upstream" under "Continuous integration".
+8. Open a pull request against the fork's `main`. Explain how each conflict was
+   resolved, what upstream replaced, and the verification results.
 
-Preserve published history when integrating the replacement branch. Upstream
+Rebuilding the fork on a fresh upstream commit, by transplanting its changes one
+by one, is the exception. It was done once, in November 2026, to shed a fork
+history that could no longer be merged. Do not repeat it for a routine update.
+
+Preserve published history when integrating a branch. Upstream
 ancestry alone does not establish that a database-engine update works on macOS.
 
 ### Continuous integration
