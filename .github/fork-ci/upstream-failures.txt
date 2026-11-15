@@ -3,19 +3,21 @@
 # because their failure is not the fork's to fix.
 #
 # Regenerate after every update from upstream: push the new upstream commit
-# plus `.github/` to a `ci-baseline/` branch, take the failed-test list from
-# the summary of its full-suite job, and keep the entries that also fail on
-# the fork. One test per line: nextest binary id, a space, the test name.
+# plus `.github/` to a `ci-baseline/` branch, push the updated fork to a second
+# `ci-baseline/` branch, take the failed-test list from the summary of each
+# full-suite job, and keep the entries that fail on both. One test per line:
+# nextest binary id, a space, the test name.
 #
-# Source: upstream 9ba8eede54a42f9adc1f34603f40244d09781fed, run
-# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43614866583,
-# compared with the fork at 2063d047, run
-# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43615481013.
+# Source: upstream 9e9dbb897e91ed043d3ad1924444639d2d1979c6, run
+# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43700208425,
+# compared with the fork at bdc2b0a8, run
+# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43700208547.
 mcp-agent-mail-cli reservation_read::tests::automatic_mailbox_selection_does_not_fall_back_after_rejection_or_bad_identity
 mcp-agent-mail-cli reservation_read::tests::history_pagination_never_negotiates_after_authentication_or_unrelated_rpc_errors
 mcp-agent-mail-cli reservation_read::tests::materialized_history_failures_discard_partial_rows_and_preserve_server_rejections
 mcp-agent-mail-cli robot::commands::tests::build_agent_lifecycle_diagnostics_reports_identity_drift_without_deleting
 mcp-agent-mail-cli robot::commands::tests::robot_inbox_snapshot_negotiates_before_data_and_refuses_changed_authority
+mcp-agent-mail-cli run_share_export_reports_encrypted_archive_as_final_output
 mcp-agent-mail-cli tests::beads_issue_awareness_counts_from_temp_beads_dir_reports_counts
 mcp-agent-mail-cli tests::br_discovery_rejects_lossy_non_utf8_workspace_names
 mcp-agent-mail-cli tests::br_json_command_fails_closed_for_non_utf8_beads_directory
@@ -28,7 +30,6 @@ mcp-agent-mail-cli tests::resolve_beads_dir_accepts_parent_components_after_chec
 mcp-agent-mail-cli tests::resolve_beads_dir_allows_only_self_redirect_in_exact_mode
 mcp-agent-mail-cli tests::resolve_beads_dir_explicit_project_outranks_ambient_beads_dir
 mcp-agent-mail-cli tests::resolve_beads_dir_treats_explicit_dot_and_underscore_directories_exactly
-mcp-agent-mail-cli::it http_transport_harness::native_http_transport_gate
 mcp-agent-mail-cli::it integration_runs::beads_show_renders_real_issue_and_preserves_json_response
 mcp-agent-mail-cli::it integration_runs::reservation_history_real_server_byte_pages_remain_immutable_between_requests
 mcp-agent-mail-cli::it share_verify_decrypt::share_decrypt_existing_outputs_preserve_original_bytes
@@ -41,7 +42,8 @@ mcp-agent-mail-cli::it share_verify_decrypt::share_decrypt_tampered_passphrase_c
 mcp-agent-mail-cli::it share_verify_decrypt::share_decrypt_terminal_preserves_whitespace_without_echo
 mcp-agent-mail-cli::it share_verify_decrypt::share_decrypt_wrong_identity_publishes_nothing
 mcp-agent-mail-cli::it share_verify_decrypt::share_decrypt_wrong_passphrase_publishes_nothing
-mcp-agent-mail-db reconstruct::tests::snapshot_project_event_migration_rolls_back_and_can_retry
+mcp-agent-mail-conformance::it conformance::force_release_file_reservation_happy_path_is_covered
+mcp-agent-mail-db pool_impl::tests::archive_ahead_delta_refuses_when_an_archive_file_does_not_parse
 mcp-agent-mail-db recovery_retention::namespace::tests::a_clean_preflight_never_caches_authority_over_a_later_reader
 mcp-agent-mail-db recovery_retention::namespace::tests::deletion_accounting_distinguishes_sparse_length_from_allocated_blocks
 mcp-agent-mail-db recovery_retention::namespace::tests::deletion_permission_failure_retains_bytes_and_does_not_claim_unlink
@@ -56,22 +58,40 @@ mcp-agent-mail-db recovery_retention::namespace::tests::empty_directory_reclamat
 mcp-agent-mail-db recovery_retention::namespace::tests::empty_directory_reclamation_rejects_replacement_symlinks_and_new_evidence
 mcp-agent-mail-db recovery_retention::namespace::tests::empty_directory_reclamation_reports_completed_unconfirmed_removal
 mcp-agent-mail-db recovery_retention::namespace::tests::reclamation_preserves_our_workers_private_descriptor_tables
+mcp-agent-mail-db search_service::tests::lexical_search_continues_after_candidates_disappear
+mcp-agent-mail-db::it search_benchmark::ranking_mode_comparison
+mcp-agent-mail-db::it search_conformance_fuzz::conformance_ranking_modes
+mcp-agent-mail-db::it search_planner_unit::like_respects_recency_ranking_mode
+mcp-agent-mail-db::it search_planner_unit::ranking_filter_only_both_modes_use_recency
+mcp-agent-mail-db::it search_planner_unit::ranking_like_orders_by_recency
 mcp-agent-mail-db::it startup_page_leak::existing_mailbox_reads_have_bounded_connection_memory
 mcp-agent-mail-db::it startup_page_leak::existing_mailbox_reads_remain_bounded_with_larger_unread_bodies
 mcp-agent-mail-db::it timeout_backpressure::product_search_budget_many_project_p95_and_diagnostics
+mcp-agent-mail-db::it timeout_backpressure::search_with_cost_quota_budget
+mcp-agent-mail-server atc_replay::tests::scenario_cusum_regime_change_passes
+mcp-agent-mail-server backup_rotation::tests::empty_directory_cleanup_consumes_the_background_first_unit
+mcp-agent-mail-server backup_rotation::tests::empty_directory_limit_defers_only_remaining_native_batches
 mcp-agent-mail-server backup_rotation::tests::empty_rotation_backlog_drains_past_the_inventory_limit_without_losing_evidence
+mcp-agent-mail-server backup_rotation::tests::expired_empty_directory_lookahead_preserves_continuation_after_progress
 mcp-agent-mail-server backup_rotation::tests::explicit_incident_deletion_preserves_live_readers_and_unverified_evidence
 mcp-agent-mail-server backup_rotation::tests::exporter_cleanup_cannot_adopt_a_replaced_database_parent
 mcp-agent-mail-server backup_rotation::tests::periodic_retention_ranks_resident_and_native_history_together
 mcp-agent-mail-server backup_rotation::tests::periodic_retention_reenabled_after_staging_honors_the_current_keep_count
 mcp-agent-mail-server backup_rotation::tests::reclamation_shortens_the_window_using_confirmed_aggregate_capacity
 mcp-agent-mail-server backup_rotation::tests::recorded_and_interrupted_quarantines_remain_recoverable_and_accounted
+mcp-agent-mail-server backup_rotation::tests::rotation_delete_requires_explicit_optin
 mcp-agent-mail-server backup_rotation::tests::spent_budget_leaves_empty_rotation_directories_for_the_next_pass
+mcp-agent-mail-server backup_rotation::tests::spent_directory_limit_defers_a_batch_emptied_by_payload_reclamation
+mcp-agent-mail-server cleanup::tests::cleanup_cycle_publishes_generation_bound_terminal_artifacts
+mcp-agent-mail-server integrity_guard::tests::active_snapshot_reader_defers_repair_without_spending_export_allowance
 mcp-agent-mail-server integrity_guard::tests::default_retention_repairs_large_backlogs_without_verification_authority
 mcp-agent-mail-server integrity_guard::tests::refused_automatic_admission_reclaims_safe_backlog_without_export
+mcp-agent-mail-server integrity_guard::tests::refused_periodic_inventory_drains_empty_batches_without_export
 mcp-agent-mail-server integrity_guard::tests::repeated_hourly_real_publication_keeps_verified_recovery_and_disk_usage_bounded
-mcp-agent-mail-server mail_ui::request_budget_tests::mail_ui_db_bridge_preserves_completed_write_and_ambient_context
+mcp-agent-mail-server tests::bearer_auth_blocks_non_health_routes
 mcp-agent-mail-server tests::mail_archive_snapshot_validation_error_returns_json_content_type
+mcp-agent-mail-server tests::mail_post_rbac_preserves_auth_csrf_and_local_policy
+mcp-agent-mail-server tui_screens::messages::tests::ensure_compose_sender_uses_live_mailbox_when_screen_reads_archive_snapshot
 mcp-agent-mail-share crypto::tests::age_corrupted_ciphertext_fails_decrypt
 mcp-agent-mail-share crypto::tests::age_decrypt_with_wrong_identity_fails
 mcp-agent-mail-share crypto::tests::age_encrypt_decrypt_roundtrip
@@ -83,9 +103,4 @@ mcp-agent-mail-share crypto::tests::age_roundtrip_incremental_bundle_zip_preserv
 mcp-agent-mail-share crypto::tests::age_roundtrip_large_payload
 mcp-agent-mail-share crypto::tests::age_roundtrip_privacy_proof_bundle_preserves_redacted_replay_artifacts
 mcp-agent-mail-share crypto::tests::age_roundtrip_zip_bundle
-mcp-agent-mail-tools identity::tests::agent_name_special_chars_rejected
-mcp-agent-mail-tools search::tests::recipient_kind_database_truth_is_project_scoped_batched_and_duplicate_free
-mcp-agent-mail-tools search::tests::recipient_kind_search_cancellation_is_an_error
-mcp-agent-mail-tools search::tests::recipient_kind_search_drains_real_lexical_and_hint_only_pages_exactly
-mcp-agent-mail-tools search::tests::recipient_kind_search_sparse_budget_retains_a_resumable_empty_page
-mcp-agent-mail-tools search::tests::recipient_kind_tool_applies_offset_after_filtering_and_keeps_bcc_private
+mcp-agent-mail-tools resources::resource_shape_tests::resources_refuse_incomplete_empty_archive_instead_of_serving_empty_mailbox

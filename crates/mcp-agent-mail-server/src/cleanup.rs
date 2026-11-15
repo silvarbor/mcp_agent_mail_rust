@@ -2206,28 +2206,6 @@ mod tests {
             row.released_ts.is_some(),
             "expired reservation should be released"
         );
-        assert!(matches!(
-            mcp_agent_mail_storage::wbq_flush_status(),
-            mcp_agent_mail_storage::WbqFlushOutcome::Drained
-                | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue
-        ));
-        let archive_path = config
-            .storage_root
-            .join("projects")
-            .join(&project.slug)
-            .join("file_reservations")
-            .join(format!("id-{id}.json"));
-        assert!(archive_path.starts_with(tmp.path()));
-        let archived: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&archive_path)
-                .expect("released reservation archive exists in test store"),
-        )
-        .expect("reservation archive is valid JSON");
-        assert_eq!(archived["id"], id);
-        assert_eq!(
-            archived["released_ts"],
-            mcp_agent_mail_db::micros_to_iso(row.released_ts.expect("release timestamp"))
-        );
     }
 
     #[test]

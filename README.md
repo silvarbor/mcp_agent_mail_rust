@@ -58,10 +58,12 @@ After an update from upstream:
 
 1. Write the new upstream commit to `.github/fork-ci/upstream-base`.
 2. Push that upstream commit plus the fork's `.github/` directory to a
-   `ci-baseline/` branch. Its run executes the whole suite on Linux and lists
-   the failed tests in its summary.
-3. Replace `.github/fork-ci/upstream-failures.txt` with the tests from that list
-   that also fail on the fork. Those failures are upstream's or the runner's.
+   `ci-baseline/` branch, and the updated fork to a second `ci-baseline/`
+   branch. Each run executes the whole suite on Linux and lists the failed
+   tests in its summary.
+3. A test that fails only on the updated fork is the update's to fix. Replace
+   `.github/fork-ci/upstream-failures.txt` with the tests that fail in both
+   runs. Those failures are upstream's or the runner's.
 4. Upstream does not build its tests on macOS, so that run has no macOS
    counterpart. When a test fails only in the macOS job, follow the procedure
    at the top of `.github/fork-ci/macos-failures.txt`.
