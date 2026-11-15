@@ -11822,7 +11822,7 @@ first body
 
     #[test]
     fn action_menu_receipts_support_shared_only_and_mixed_deliveries() {
-        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        use crate::tui_screens::{complete_operator_task, seed_operator_test_project};
         crate::tui_screens::with_operator_test_mailbox(|project_key| {
             let slug =
                 seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
@@ -11859,6 +11859,13 @@ first body
                 .unwrap();
                 let id = sent["deliveries"][0]["payload"]["id"].as_i64().unwrap();
                 let mut screen = MessageBrowserScreen::new();
+                // The receipt action verifies the mailbox behind the screen.
+                let config = MessageBrowserScreen::runtime_config_from_state(None);
+                screen.bind_observability_db(
+                    &config.database_url,
+                    &config.storage_root,
+                    "operator shared receipt test",
+                );
                 screen.results.push(MessageEntry {
                     to_agents: if mixed {
                         format!("BlueLake, project:{slug}")
@@ -11868,8 +11875,8 @@ first body
                     project_slug: slug.clone(),
                     ..test_message_entry(id, "shared", "operator shared receipt")
                 });
-                let (status, _, text) =
-                    expect_operator_result(screen.handle_action(&format!("mark_read:{id}"), ""));
+                let cmd = screen.handle_action(&format!("mark_read:{id}"), "");
+                let (status, _, text) = complete_operator_task(&mut screen, cmd);
                 assert_eq!(status, "ok", "{text}");
                 assert!(text.contains("2 recipient"), "{text}");
                 let shared_before = crate::tui_screens::with_operator_test_conn(|conn| {
@@ -11888,8 +11895,8 @@ first body
                         .iter()
                         .all(|(_, read, ack)| read.is_some() && ack.is_none())
                 );
-                let (status, _, text) =
-                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                let cmd = screen.handle_action(&format!("acknowledge:{id}"), "");
+                let (status, _, text) = complete_operator_task(&mut screen, cmd);
                 assert_eq!(status, "ok", "{text}");
                 let shared_after = crate::tui_screens::with_operator_test_conn(|conn| {
                     conn.query_sync(
