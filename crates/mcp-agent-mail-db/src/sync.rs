@@ -145,9 +145,22 @@ pub fn append_message_delivery_signal_receipt(
 ///
 /// The mutable recipient `.signal` file is intentionally not read here: it is
 /// a debounced latest-state hint that can point at another message. Only the
-/// append-only receipt ledger establishes the `signaled` fact.
+/// append-only receipt ledger establishes the `signaled` fact. Message,
+/// direct-recipient, and shared-mailbox observations share one read snapshot
+/// so a concurrent acknowledgement or lifecycle change cannot mix generations
+/// of delivery facts. A caller's existing transaction remains owned by it.
 pub fn message_delivery_receipt_from_conn(
-    conn: &DbConn,
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    message_id: i64,
+) -> Result<MessageDeliveryReceipt, DbError> {
+    with_read_snapshot(conn, || {
+        message_delivery_receipt_in_snapshot(conn, project_id, message_id)
+    })
+}
+
+fn message_delivery_receipt_in_snapshot(
+    conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     message_id: i64,
 ) -> Result<MessageDeliveryReceipt, DbError> {
@@ -1693,16 +1706,20 @@ fn is_agent_name_unique_violation(message: &str) -> bool {
         && normalized.contains("agents.name")
 }
 
-fn lookup_agent_id_by_name(
+/// Resolve a participant after the message transaction has started. The TUI's
+/// displayed roster can be stale; retirement and permanent deregistration are
+/// authoritative even for an overseer that bypasses ordinary contact policy.
+fn lookup_active_agent_id_by_name(
     conn: &DbConn,
     project_id: i64,
     agent_name: &str,
 ) -> Result<Option<i64>, DbError> {
     let rows = conn
         .query_sync(
-            "SELECT id FROM agents \
-             WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE \
-             ORDER BY id ASC LIMIT 1",
+            "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.project_id = ?1 AND a.name = ?2 COLLATE NOCASE \
+             ORDER BY a.id ASC LIMIT 1",
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.trim().to_string()),
@@ -1710,10 +1727,35 @@ fn lookup_agent_id_by_name(
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| row.get_named::<i64>("id").ok()))
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let name = row
+        .get_named::<String>("name")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    // Match ordinary message admission: a ledger entry wins over retirement,
+    // and a timestamp of zero still means the identity is inactive.
+    if let Some(timestamp) = row
+        .get_named::<Option<i64>>("deregistered_at")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?
+    {
+        return Err(DbError::invalid(
+            "agent_deregistered",
+            format!("Agent '{name}' was deregistered at {timestamp}"),
+        ));
+    }
+    if let Some(timestamp) = row
+        .get_named::<Option<i64>>("retired_at")
+        .map_err(|error| DbError::Sqlite(error.to_string()))?
+    {
+        return Err(DbError::invalid(
+            "agent_retired",
+            format!("Agent '{name}' was retired at {timestamp}"),
+        ));
+    }
+    row.get_named::<i64>("id")
+        .map(Some)
+        .map_err(|error| DbError::Sqlite(error.to_string()))
 }
 
 fn resolve_root_project_id(conn: &DbConn) -> Result<i64, DbError> {
@@ -1737,7 +1779,7 @@ fn resolve_or_create_sender_id(
     sender_name: &str,
     now: i64,
 ) -> Result<i64, DbError> {
-    if let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)? {
+    if let Some(sender_id) = lookup_active_agent_id_by_name(conn, project_id, sender_name)? {
         return Ok(sender_id);
     }
 
@@ -1755,7 +1797,8 @@ fn resolve_or_create_sender_id(
         Err(err) => {
             let message = err.to_string();
             if is_agent_name_unique_violation(&message)
-                && let Some(sender_id) = lookup_agent_id_by_name(conn, project_id, sender_name)?
+                && let Some(sender_id) =
+                    lookup_active_agent_id_by_name(conn, project_id, sender_name)?
             {
                 return Ok(sender_id);
             }
@@ -1763,7 +1806,7 @@ fn resolve_or_create_sender_id(
         }
     }
 
-    lookup_agent_id_by_name(conn, project_id, sender_name)?
+    lookup_active_agent_id_by_name(conn, project_id, sender_name)?
         .ok_or_else(|| DbError::Internal("Failed to resolve sender ID after insert".into()))
 }
 
@@ -1787,9 +1830,12 @@ fn insert_root_message(
         .filter(|tid| !tid.is_empty())
         .map_or(Value::Null, |tid| Value::Text(tid.to_string()));
 
+    // Compose accepts a thread key, not an immediate reply parent. Record
+    // that known absence so DB-only threaded mail can reach the archive after
+    // a restart; NULL is reserved for legacy rows with unknown reply metadata.
     conn.execute_sync(
-        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+        "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, ack_required, thread_id, created_ts, archive_metadata_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, '{}')",
         &[
             Value::BigInt(project_id),
             Value::BigInt(sender_id),
@@ -1825,7 +1871,7 @@ fn insert_message_recipients(
     let mut missing_seen: HashSet<String> = HashSet::new();
 
     for (name, kind) in recipients {
-        let Some(aid) = lookup_agent_id_by_name(conn, project_id, name)? else {
+        let Some(aid) = lookup_active_agent_id_by_name(conn, project_id, name)? else {
             let normalized = name.trim().to_ascii_lowercase();
             if missing_seen.insert(normalized) {
                 missing_names.push(name.trim().to_string());
@@ -1873,25 +1919,36 @@ fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbErro
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
 
-    let recipients_json = rows
-        .into_iter()
-        .map(|row| {
-            let name = row
-                .get_named::<String>("name")
-                .map_err(|e| DbError::Sqlite(e.to_string()))?;
-            let kind = row
-                .get_named::<String>("kind")
-                .map_err(|e| DbError::Sqlite(e.to_string()))?;
-            Ok(serde_json::json!({
-                "name": name,
-                "kind": kind,
-            }))
-        })
-        .collect::<Result<Vec<_>, DbError>>()
-        .and_then(|payload| {
-            serde_json::to_string(&payload)
-                .map_err(|e| DbError::Internal(format!("failed to encode recipients JSON: {e}")))
-        })?;
+    // Match the canonical envelope used by ordinary sends. Readers and archive
+    // recovery require all three role arrays, including when a role is empty.
+    let mut to_names = Vec::new();
+    let mut cc_names = Vec::new();
+    let mut bcc_names = Vec::new();
+    for row in rows {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        let kind = row
+            .get_named::<String>("kind")
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        match kind.as_str() {
+            "to" => to_names.push(name),
+            "cc" => cc_names.push(name),
+            "bcc" => bcc_names.push(name),
+            _ => {
+                return Err(DbError::invalid(
+                    "recipients",
+                    format!("unsupported recipient kind {kind:?}; expected to, cc, or bcc"),
+                ));
+            }
+        }
+    }
+    let recipients_json = serde_json::json!({
+        "to": to_names,
+        "cc": cc_names,
+        "bcc": bcc_names,
+    })
+    .to_string();
 
     conn.execute_sync(
         "UPDATE messages SET recipients_json = ? WHERE id = ?",
@@ -1904,7 +1961,8 @@ fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbErro
 /// Dispatch a message from the first available project (TUI context).
 ///
 /// Handles project resolution, sender auto-registration (for overseer),
-/// message insertion, and recipient linking in a single transaction.
+/// lifecycle admission, message insertion, and recipient linking in a single
+/// transaction. Overseer contact-policy bypass never revives inactive agents.
 pub fn dispatch_root_message(
     conn: &DbConn,
     sender_name: &str,
@@ -3576,6 +3634,161 @@ mod tests {
     }
 
     #[test]
+    fn message_delivery_receipt_snapshot_keeps_direct_and_shared_facts_on_one_commit() {
+        event_snapshot_fixture(|reader, writer, project, viewer| {
+            let shared_viewer = insert_agent(reader, project, "SharedViewer");
+            let message = reader
+                .query_sync(
+                    "SELECT message_id FROM message_recipients WHERE agent_id = ?",
+                    &[Value::BigInt(viewer)],
+                )
+                .unwrap()[0]
+                .get_named::<i64>("message_id")
+                .unwrap();
+            writer
+                .execute_sync(
+                    "INSERT INTO project_mailbox_deliveries \
+                     (message_id, project_id, kind, delivered_ts) VALUES (?, ?, 'to', 1000000)",
+                    &[Value::BigInt(message), Value::BigInt(project)],
+                )
+                .unwrap();
+            reader.execute_raw("PRAGMA query_only = ON").unwrap();
+
+            struct PeerCommit<'a> {
+                reader: &'a DbConn,
+                writer: &'a DbConn,
+                message: i64,
+                shared_viewer: i64,
+                committed: std::cell::Cell<bool>,
+            }
+            impl crate::pool::SyncQuery for PeerCommit<'_> {
+                fn query_sync(
+                    &self,
+                    sql: &str,
+                    params: &[Value],
+                ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                    let rows = self.reader.query_sync(sql, params)?;
+                    if sql.starts_with("SELECT agent.name AS recipient")
+                        && !self.committed.replace(true)
+                    {
+                        self.writer.execute_raw("BEGIN IMMEDIATE")?;
+                        self.writer.execute_sync(
+                            "UPDATE message_recipients SET ack_ts = 2000000 WHERE message_id = ?",
+                            &[Value::BigInt(self.message)],
+                        )?;
+                        self.writer.execute_sync(
+                            "UPDATE project_mailbox_deliveries SET kind = 'cc', delivered_ts = 2000000 \
+                             WHERE message_id = ?",
+                            &[Value::BigInt(self.message)],
+                        )?;
+                        self.writer.execute_sync(
+                            "INSERT INTO project_mailbox_receipts \
+                             (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, 2000000, 2000000)",
+                            &[
+                                Value::BigInt(self.message),
+                                Value::BigInt(self.shared_viewer),
+                            ],
+                        )?;
+                        self.writer.execute_raw("COMMIT")?;
+                    }
+                    Ok(rows)
+                }
+
+                fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                    self.reader.execute_raw(sql)
+                }
+            }
+
+            let race = PeerCommit {
+                reader,
+                writer,
+                message,
+                shared_viewer,
+                committed: std::cell::Cell::new(false),
+            };
+            let receipt = message_delivery_receipt_from_conn(&race, project, message).unwrap();
+            assert!(
+                race.committed.get(),
+                "the real peer transaction must commit"
+            );
+            assert_eq!(receipt.recipients.len(), 1);
+            assert_eq!(receipt.recipients[0].acknowledged_ts, None);
+            let shared = receipt.project_mailbox.unwrap();
+            assert_eq!(
+                shared.kind, "to",
+                "delivery facts must precede the peer commit"
+            );
+            assert_eq!(shared.delivered_ts, 1_000_000);
+            assert_eq!(shared.agents.len(), 1);
+            assert_eq!(shared.agents[0].agent_id, shared_viewer);
+            assert_eq!(shared.agents[0].read_ts, None);
+            assert_eq!(shared.agents[0].ack_ts, None);
+
+            let fresh = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(fresh.recipients[0].acknowledged_ts, Some(2_000_000));
+            let shared = fresh.project_mailbox.unwrap();
+            assert_eq!(shared.kind, "cc");
+            assert_eq!(shared.delivered_ts, 2_000_000);
+            assert_eq!(shared.agents[0].read_ts, Some(2_000_000));
+            assert_eq!(shared.agents[0].ack_ts, Some(2_000_000));
+            assert_eq!(
+                reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            reader.execute_raw("BEGIN; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn message_delivery_receipt_snapshot_preserves_caller_transaction_and_error_cleanup() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            let message = reader
+                .query_sync(
+                    "SELECT message_id FROM message_recipients WHERE agent_id = ?",
+                    &[Value::BigInt(viewer)],
+                )
+                .unwrap()[0]
+                .get_named::<i64>("message_id")
+                .unwrap();
+            reader.execute_raw("BEGIN IMMEDIATE").unwrap();
+            reader
+                .execute_sync(
+                    "UPDATE message_recipients SET ack_ts = 3000000 WHERE message_id = ?",
+                    &[Value::BigInt(message)],
+                )
+                .unwrap();
+            let pending = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(pending.recipients[0].acknowledged_ts, Some(3_000_000));
+            assert!(matches!(
+                message_delivery_receipt_from_conn(reader, project + 1, message),
+                Err(DbError::NotFound {
+                    entity: "Message",
+                    ..
+                })
+            ));
+            reader.execute_raw("ROLLBACK").unwrap();
+            let restored = message_delivery_receipt_from_conn(reader, project, message).unwrap();
+            assert_eq!(restored.recipients[0].acknowledged_ts, None);
+
+            reader.execute_raw("PRAGMA query_only = ON").unwrap();
+            assert!(matches!(
+                message_delivery_receipt_from_conn(reader, project, i64::MAX),
+                Err(DbError::NotFound {
+                    entity: "Message",
+                    ..
+                })
+            ));
+            assert_eq!(
+                message_delivery_receipt_from_conn(reader, project, message).unwrap(),
+                restored
+            );
+            reader.execute_raw("BEGIN; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
     fn message_delivery_signal_receipts_are_message_bound_and_ack_separate() {
         let conn = test_conn();
         let project_id = insert_project(&conn);
@@ -3949,6 +4162,7 @@ mod tests {
         let _sender = insert_agent(&conn, pid, "Sender");
         let _r1 = insert_agent(&conn, pid, "Recipient1");
         let _r2 = insert_agent(&conn, pid, "Recipient2");
+        let _r3 = insert_agent(&conn, pid, "Recipient3");
 
         let msg_id = dispatch_root_message(
             &conn,
@@ -3960,6 +4174,7 @@ mod tests {
             &[
                 ("Recipient1".to_string(), "to".to_string()),
                 ("Recipient2".to_string(), "cc".to_string()),
+                ("Recipient3".to_string(), "bcc".to_string()),
             ],
         )
         .unwrap();
@@ -3975,7 +4190,7 @@ mod tests {
             .next()
             .and_then(|r| r.get_named::<i64>("cnt").ok())
             .unwrap();
-        assert_eq!(cnt, 2, "should have 2 recipients");
+        assert_eq!(cnt, 3, "should have 3 recipients");
 
         let message_rows = conn
             .query_sync(
@@ -3988,8 +4203,14 @@ mod tests {
             .next()
             .and_then(|row| row.get_named::<String>("recipients_json").ok())
             .unwrap();
-        assert!(recipients_json.contains("Recipient1"));
-        assert!(recipients_json.contains("Recipient2"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": ["Recipient1"],
+                "cc": ["Recipient2"],
+                "bcc": ["Recipient3"],
+            })
+        );
     }
 
     #[test]
@@ -4036,9 +4257,14 @@ mod tests {
             .next()
             .and_then(|row| row.get_named::<String>("recipients_json").ok())
             .unwrap();
-        assert!(
-            recipients_json.contains(&format!("[unknown-agent-{recipient_id}]")),
-            "orphaned recipient placeholder missing from {recipients_json}"
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": [format!("[unknown-agent-{recipient_id}]")],
+                "cc": [],
+                "bcc": [],
+            }),
+            "orphaned recipient placeholder must retain its role"
         );
     }
 
@@ -4157,6 +4383,110 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_root_message_rejects_inactive_participants_and_rolls_back() {
+        for (retired_at, deregistered_at, expected_field) in [
+            (Some(0), None, "agent_retired"),
+            (None, Some(0), "agent_deregistered"),
+            (Some(10), Some(20), "agent_deregistered"),
+        ] {
+            for role in ["sender", "to", "cc", "bcc"] {
+                let conn = test_conn();
+                let project = insert_project(&conn);
+                let active = insert_agent(&conn, project, "Active");
+                let inactive = insert_agent(&conn, project, "Inactive");
+                let historical = insert_message(&conn, project, active, "existing-thread");
+                conn.execute_sync(
+                    "INSERT INTO message_recipients \
+                     (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, 'to', 7, 9)",
+                    &[Value::BigInt(historical), Value::BigInt(inactive)],
+                )
+                .unwrap();
+                if let Some(timestamp) = retired_at {
+                    conn.execute_sync(
+                        "UPDATE agents SET retired_at = ? WHERE id = ?",
+                        &[Value::BigInt(timestamp), Value::BigInt(inactive)],
+                    )
+                    .unwrap();
+                }
+                if let Some(timestamp) = deregistered_at {
+                    conn.execute_sync(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, ?)",
+                        &[Value::BigInt(inactive), Value::BigInt(timestamp)],
+                    )
+                    .unwrap();
+                }
+                let counts = || {
+                    [
+                        "agents",
+                        "messages",
+                        "message_recipients",
+                        "inbox_delivery_events",
+                    ]
+                    .map(|table| {
+                        conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                            .unwrap()[0]
+                            .get_as::<i64>(0)
+                            .unwrap()
+                    })
+                };
+                let before = counts();
+                let sender = if role == "sender" {
+                    " inactive "
+                } else {
+                    "NewOverseer"
+                };
+                // The active recipient is inserted first, so recipient rejection
+                // must also roll back partial deliveries and the new overseer.
+                let mut recipients = vec![("Active".to_string(), "to".to_string())];
+                if role != "sender" {
+                    recipients.push((" inactive ".to_string(), role.to_string()));
+                }
+                let dispatch = |subject| {
+                    dispatch_root_message(
+                        &conn,
+                        sender,
+                        subject,
+                        "Body",
+                        "normal",
+                        None,
+                        &recipients,
+                    )
+                };
+                let error = dispatch("Rejected draft")
+                    .expect_err("inactive participants must not authorize new work");
+                assert!(
+                    matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field),
+                    "wrong {role} lifecycle error: {error:?}"
+                );
+                assert_eq!(
+                    counts(),
+                    before,
+                    "{role} rejection must leave no partial writes"
+                );
+                let historical_rows = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                        &[Value::BigInt(historical)],
+                    )
+                    .unwrap();
+                assert_eq!(historical_rows[0].get_named::<i64>("read_ts").unwrap(), 7);
+                assert_eq!(historical_rows[0].get_named::<i64>("ack_ts").unwrap(), 9);
+
+                if deregistered_at.is_none() {
+                    conn.execute_sync(
+                        "UPDATE agents SET retired_at = NULL, contact_policy = 'block_all' WHERE id = ?",
+                        &[Value::BigInt(inactive)],
+                    )
+                    .unwrap();
+                    dispatch("Unretired draft").expect(
+                        "unretirement restores overseer send/receive despite contact policy",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_root_message_unknown_recipient_returns_not_found_and_rolls_back() {
         let conn = test_conn();
         let _pid = insert_project(&conn);
@@ -4198,6 +4528,46 @@ mod tests {
             cnt, 0,
             "message insert should roll back on unknown recipient"
         );
+    }
+
+    #[test]
+    fn dispatch_root_message_invalid_recipient_kind_rolls_back_message_and_sender() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _recipient = insert_agent(&conn, pid, "Recipient1");
+
+        let error = dispatch_root_message(
+            &conn,
+            "NewOverseer",
+            "Invalid recipient kind",
+            "Body",
+            "normal",
+            Some("thread"),
+            &[("Recipient1".to_string(), "observer".to_string())],
+        )
+        .expect_err("unsupported kinds must not become canonical To recipients");
+        assert!(matches!(
+            error,
+            DbError::InvalidArgument {
+                field: "recipients",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("unsupported recipient kind"));
+
+        for table in ["messages", "message_recipients", "inbox_delivery_events"] {
+            let rows = conn
+                .query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .unwrap();
+            assert_eq!(
+                rows[0].get_as::<i64>(0).unwrap(),
+                0,
+                "failed dispatch must roll back {table}"
+            );
+        }
+        let agents = conn.query_sync("SELECT name FROM agents", &[]).unwrap();
+        assert_eq!(agents.len(), 1, "auto-created overseer must roll back");
+        assert_eq!(agents[0].get_named::<String>("name").unwrap(), "Recipient1");
     }
 
     #[test]
@@ -4759,7 +5129,7 @@ mod tests {
     fn sync_read_write_failure_checks_the_whole_batch_after_the_last_chunk() {
         for ignore_last in [false, true] {
             write_failure_fixture(|conn, project, recipient, first, second| {
-                let sender = lookup_agent_id_by_name(conn, project, "Sender")
+                let sender = lookup_active_agent_id_by_name(conn, project, "Sender")
                     .unwrap()
                     .unwrap();
                 conn.execute_raw("BEGIN IMMEDIATE").unwrap();

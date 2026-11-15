@@ -743,7 +743,6 @@ pub const ARCHIVE_EPOCH_FILE_NAME: &str = "agent-mail-archive-epoch";
 const ARCHIVE_EPOCH_FORMAT_VERSION: u8 = b'1';
 const ARCHIVE_EPOCH_GIT_DIR_CACHE_CAP: usize = 64;
 
-static ARCHIVE_EPOCH_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static ARCHIVE_EPOCH_GIT_DIR_CACHE: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -806,6 +805,48 @@ fn resolve_archive_epoch_git_dir(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Atomically publish an advisory control file using a private, newly created
+/// staging file inside the Git directory. This must not use the ordinary
+/// archive atomic writer: that writer enters a mutation guard and would
+/// recursively rewrite the epoch marker.
+fn write_archive_control_file(
+    git_dir: &Path,
+    file_name: &str,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let destination = git_dir.join(file_name);
+    let validate_destination = || -> std::io::Result<()> {
+        if path_existing_prefix_has_symlink(&destination)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive control path must not include symlinks",
+            ));
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if !metadata.is_file() => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive control path must be a regular file",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    };
+    validate_destination()?;
+    // A predictable PID/counter path can already belong to another file or
+    // symlink. create_new staging owns its name and cleans up only that file
+    // when writing or publishing fails; it never truncates a foreign entry.
+    let mut staged = tempfile::Builder::new()
+        .prefix("agent-mail-control.tmp-")
+        .tempfile_in(git_dir)?;
+    staged.write_all(content)?;
+    validate_destination()?;
+    staged.persist(&destination).map_err(|error| error.error)?;
+    // These markers are advisory, not durability receipts. Preserve their
+    // existing no-fsync contract; archive payload publication owns durability.
+    Ok(())
+}
+
 /// Rewrite the persisted mutation-epoch token inside `git_dir` with fresh
 /// randomness, via temp-file-in-git-dir + atomic rename. Best-effort: any
 /// failure is logged and swallowed — the in-process
@@ -822,15 +863,8 @@ fn rewrite_archive_epoch_file(git_dir: &Path) {
     let mut content = String::with_capacity(33);
     content.push(char::from(ARCHIVE_EPOCH_FORMAT_VERSION));
     content.push_str(&token[..32]);
-    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = git_dir.join(format!(
-        "{ARCHIVE_EPOCH_FILE_NAME}.tmp-{}-{seq}",
-        std::process::id()
-    ));
-    let result = fs::write(&tmp, content.as_bytes())
-        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_EPOCH_FILE_NAME)));
+    let result = write_archive_control_file(git_dir, ARCHIVE_EPOCH_FILE_NAME, content.as_bytes());
     if let Err(error) = result {
-        let _ = fs::remove_file(&tmp);
         tracing::warn!(
             "archive epoch token rewrite failed at {}: {error}",
             git_dir.display()
@@ -931,6 +965,16 @@ impl Drop for ArchiveMutationGuard {
         ARCHIVE_MUTATION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         drop(self.fence.take());
     }
+}
+
+/// Run a cross-crate test action inside the real physical mutation window.
+/// The private guard remains on this thread and unwinds with the action.
+#[cfg(any(test, feature = "test-internals"))]
+#[doc(hidden)]
+#[track_caller]
+pub fn with_archive_mutation_for_test<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+    let _mutation = ArchiveMutationGuard::begin_at(path);
+    action()
 }
 
 /// Run a non-blocking snapshot publication check while physical archive
@@ -1748,16 +1792,33 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 /// blocking acquirers leave it.
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
+type DirectPublicationAfterRepairProbeTestHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK:
+        std::cell::RefCell<Option<DirectPublicationAfterRepairProbeTestHook>> =
+            const { std::cell::RefCell::new(None) };
+}
+
 /// A scheduling hint only: never reserve the fence or change holder metadata
 /// or mutation epochs while deciding whether to give a repair an opening.
 fn publication_fence_available_for_repair_turn() -> bool {
     let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return false,
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     };
+    let available = guard.is_some();
     drop(guard);
-    true
+    #[cfg(test)]
+    if let Some(hook) =
+        DIRECT_PUBLICATION_AFTER_REPAIR_PROBE_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+    {
+        hook(available);
+    }
+    available
 }
 
 /// Admit a direct write to the publication fence. Contention is retried with a
@@ -1777,13 +1838,14 @@ fn admit_direct_publication(
     let mut waiting = None;
     let mut repair_turn_given = false;
     loop {
-        if !repair_turn_given
+        let repair_turn_pending = !repair_turn_given
             && REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
             && ARCHIVE_MUTATION_DEPTH
                 .try_with(std::cell::Cell::get)
-                .is_ok_and(|depth| depth == 0)
-            && publication_fence_available_for_repair_turn()
-        {
+                .is_ok_and(|depth| depth == 0);
+        let fence_busy_before_repair_turn =
+            repair_turn_pending && !publication_fence_available_for_repair_turn();
+        if repair_turn_pending && !fence_busy_before_repair_turn {
             repair_turn_given = true;
             let turn_deadline = deadline.min(Instant::now() + DIRECT_WAITER_GIVE_WAY);
             while REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0 {
@@ -1801,9 +1863,28 @@ fn admit_direct_publication(
                 std::thread::sleep(remaining.min(Duration::from_micros(200)));
             }
         }
-        let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
-            Err(error @ StorageError::LockContention { .. }) => error,
-            admitted_or_failed => return admitted_or_failed,
+        let contention = if fence_busy_before_repair_turn {
+            // The owner can release after the scheduling probe. A second
+            // acquisition here would then barge ahead of the waiting repair
+            // without giving its opening. Retain the ordinary cancellable
+            // contention path and start that bounded opening only after a
+            // later probe actually observes the fence free.
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "direct archive publication admission cancelled",
+                )
+                .into());
+            }
+            StorageError::LockContention {
+                message: "archive repair publication admission deferred: publication fence busy"
+                    .to_string(),
+            }
+        } else {
+            match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
+                Err(error @ StorageError::LockContention { .. }) => error,
+                admitted_or_failed => return admitted_or_failed,
+            }
         };
         waiting.get_or_insert_with(DirectFenceWaiter::register);
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2531,10 +2612,15 @@ impl ArchiveRetryBacklog {
 
     /// Current `(depth, oldest_age_us)` of the backlog.
     fn backlog_state(&self) -> (u64, u64) {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sample_backlog_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_default()
+    }
+
+    fn sample_backlog_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<(u64, u64), &'static str> {
+        let queue = archive_lag_lock(&self.queue, policy, "archive_backlog.queue")?;
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
         let oldest = queue
             .iter()
@@ -2543,7 +2629,7 @@ impl ArchiveRetryBacklog {
             .map_or(0, |enqueued_at| {
                 duration_as_micros_u64(enqueued_at.elapsed())
             });
-        (depth, oldest)
+        Ok((depth, oldest))
     }
 
     /// Process the front entry once (single-drainer; the front is stable across
@@ -3424,6 +3510,34 @@ pub struct ArchiveLagSnapshot {
     pub wbq_since_progress_us: u64,
 }
 
+/// A diagnostic sample could not inspect a queue without waiting for its owner.
+#[derive(Debug, Clone, Copy, Error)]
+#[error("archive lag sample unavailable at {unavailable_lock}")]
+pub struct ArchiveLagSnapshotUnavailable {
+    pub unavailable_lock: &'static str,
+    /// Confirmed lower bounds only. Missing queue evidence is not an empty queue.
+    pub lower_bound: ArchiveLagSnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveLagLockPolicy {
+    Wait,
+    Try,
+}
+
+fn archive_lag_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    policy: ArchiveLagLockPolicy,
+    site: &'static str,
+) -> std::result::Result<std::sync::MutexGuard<'a, T>, &'static str> {
+    match policy {
+        ArchiveLagLockPolicy::Wait => Ok(mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        ArchiveLagLockPolicy::Try => mutex.try_lock().map_err(|_| site),
+    }
+}
+
 /// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
 /// now; 0 when no batch is in flight (br-kp1in.23).
 static WBQ_INFLIGHT_SINCE_US: AtomicU64 = AtomicU64::new(0);
@@ -3501,7 +3615,9 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
     )
 }
 
-/// Snapshot the live archive-materialization lag for `health_check`.
+/// Blocking archive-materialization lag snapshot for accounting.
+///
+/// Health diagnostics use [`try_archive_lag_snapshot`] to avoid queue waits.
 ///
 /// `oldest_unmaterialized_us` covers the retry backlog, the commit coalescer
 /// AND the batch the WBQ drain is executing. Before br-kp1in.23 the WBQ was
@@ -3509,13 +3625,41 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
 /// reported 0 ms of lag (observed 2026-09-23).
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
+    sample_archive_lag(ArchiveLagLockPolicy::Wait).0
+}
+
+/// Sample health without waiting for an archive queue mutex.
+///
+/// Unavailable queue ages must remain unknown. The error retains already
+/// observed lower bounds, including the lock-free WBQ stall signals.
+///
+/// # Errors
+/// Returns the unavailable lock and confirmed lower bounds on contention or
+/// a poisoned queue mutex.
+pub fn try_archive_lag_snapshot()
+-> std::result::Result<ArchiveLagSnapshot, Box<ArchiveLagSnapshotUnavailable>> {
+    let (snapshot, unavailable_lock) = sample_archive_lag(ArchiveLagLockPolicy::Try);
+    unavailable_lock.map_or(Ok(snapshot), |unavailable_lock| {
+        Err(Box::new(ArchiveLagSnapshotUnavailable {
+            unavailable_lock,
+            lower_bound: snapshot,
+        }))
+    })
+}
+
+fn sample_archive_lag(policy: ArchiveLagLockPolicy) -> (ArchiveLagSnapshot, Option<&'static str>) {
     let backlog = &*ARCHIVE_BACKLOG;
-    let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
-    let (coalescer_pending, coalescer_lag) = COMMIT_COALESCER
-        .get()
-        .map_or((0, CoalescerLagState::default()), |c| {
-            (c.pending_requests(), c.lag_state())
-        });
+    // Blocking accounting samples WBQ ages after queue waits, as before.
+    // Diagnostics need those lock-free lower bounds before any try-lock fails.
+    let blocking = matches!(policy, ArchiveLagLockPolicy::Wait).then(|| {
+        let backlog_state = backlog.backlog_state();
+        let coalescer = COMMIT_COALESCER
+            .get()
+            .map_or((0, CoalescerLagState::default()), |coalescer| {
+                (coalescer.pending_requests(), coalescer.lag_state())
+            });
+        (backlog_state, coalescer)
+    });
     let now_us = now_micros_u64();
     let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
     let wbq_depth = mcp_agent_mail_core::global_metrics()
@@ -3528,18 +3672,18 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
         WBQ_BACKLOG_SINCE_US.load(Ordering::Relaxed),
     );
-    ArchiveLagSnapshot {
-        backlog_depth,
-        backlog_oldest_age_us,
-        coalescer_pending,
-        coalescer_oldest_age_us: coalescer_lag.oldest_age_us,
-        coalescer_since_progress_us: coalescer_lag.since_progress_us,
+    let mut snapshot = ArchiveLagSnapshot {
+        coalescer_pending: blocking.map_or_else(
+            || {
+                COMMIT_COALESCER
+                    .get()
+                    .map_or(0, CommitCoalescer::pending_requests)
+            },
+            |(_, (pending, _))| pending,
+        ),
         // Queued work that has not advanced for this long is at least this
         // stale, even when no batch is in flight (dead or idle drain).
-        oldest_unmaterialized_us: backlog_oldest_age_us
-            .max(coalescer_lag.oldest_age_us)
-            .max(wbq_inflight_oldest_age_us)
-            .max(wbq_since_progress_us),
+        oldest_unmaterialized_us: wbq_inflight_oldest_age_us.max(wbq_since_progress_us),
         wbq_depth,
         wbq_inflight_oldest_age_us,
         wbq_inflight_execution_us,
@@ -3549,7 +3693,40 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
         dead_lettered_total: backlog.dead_lettered_total.load(Ordering::Relaxed),
         ephemeral_total: backlog.ephemeral_total.load(Ordering::Relaxed),
+        ..ArchiveLagSnapshot::default()
+    };
+    let backlog_state = blocking.map_or_else(
+        || backlog.sample_backlog_state(policy),
+        |(state, _)| Ok(state),
+    );
+    let mut unavailable_lock = None;
+    match backlog_state {
+        Ok((depth, age)) => {
+            snapshot.backlog_depth = depth;
+            snapshot.backlog_oldest_age_us = age;
+            snapshot.oldest_unmaterialized_us = snapshot.oldest_unmaterialized_us.max(age);
+        }
+        Err(site) => unavailable_lock = Some(site),
     }
+    // A busy retry queue does not make the independent coalescer evidence
+    // unavailable. Keep collecting confirmed bounds without waiting, while
+    // retaining the first refusal so this never becomes a complete sample.
+    if let Some(coalescer) = COMMIT_COALESCER.get() {
+        let (lag, unavailable) = if let Some((_, (_, lag))) = blocking {
+            (lag, None)
+        } else {
+            match coalescer.sample_lag_state(policy) {
+                Ok(lag) => (lag, None),
+                Err((site, lag)) => (lag, Some(site)),
+            }
+        };
+        snapshot.coalescer_oldest_age_us = lag.oldest_age_us;
+        snapshot.coalescer_since_progress_us = lag.since_progress_us;
+        snapshot.oldest_unmaterialized_us =
+            snapshot.oldest_unmaterialized_us.max(lag.oldest_age_us);
+        unavailable_lock = unavailable_lock.or(unavailable);
+    }
+    (snapshot, unavailable_lock)
 }
 
 /// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
@@ -4996,25 +5173,176 @@ fn quarantine_startup_artifact_if_exists(
     path: &Path,
     fallback_name: &str,
     context: &str,
+    absent_counterpart: &Path,
 ) -> Option<PathBuf> {
-    if !path_is_occupied(path) {
-        return None;
-    }
-
-    let quarantine = next_startup_quarantine_path(path, fallback_name);
-    match fs::rename(path, &quarantine) {
-        Ok(()) => Some(quarantine),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
-                quarantine = %quarantine.display(),
                 error = %error,
-                "[startup-heal] failed to quarantine {context}"
+                "[startup-heal] failed to inspect {context}; preserving it"
             );
-            None
+            return None;
+        }
+    };
+    quarantine_startup_artifact_with_witness(
+        path,
+        fallback_name,
+        context,
+        &file,
+        Some(absent_counterpart),
+    )
+}
+
+/// Bind cleanup to an opened regular file, not a pathname that another owner
+/// may have replaced while we inspected its metadata or waited for its lock.
+fn startup_artifact_matches_file(path: &Path, file: &fs::File) -> std::io::Result<bool> {
+    if path_existing_prefix_has_symlink(path)? || !file.metadata()?.file_type().is_file() {
+        return Ok(false);
+    }
+    let observed = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let expected = file.metadata()?;
+        Ok(expected.dev() == observed.dev() && expected.ino() == observed.ino())
+    }
+    #[cfg(windows)]
+    {
+        let _ = observed;
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+        Ok(mcp_agent_mail_core::disk::windows_file_identity(file)?
+            == mcp_agent_mail_core::disk::windows_file_identity(&current)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = observed;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "startup quarantine requires a stable file identity",
+        ))
+    }
+}
+
+fn move_startup_artifact_noreplace(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+) -> std::io::Result<bool> {
+    move_startup_artifact_noreplace_with_parent_sync(
+        path,
+        quarantine,
+        file,
+        sync_startup_artifact_move_parents,
+    )
+}
+
+fn sync_startup_artifact_move_parents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fn parent(path: &Path) -> &Path {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        }
+        let source_parent = parent(source);
+        let destination_parent = parent(destination);
+        fs::File::open(destination_parent)?.sync_all()?;
+        if destination_parent != source_parent {
+            fs::File::open(source_parent)?.sync_all()?;
         }
     }
+    // The Windows no-replace primitive uses MOVEFILE_WRITE_THROUGH. Portable
+    // File::open cannot open Windows directories; match recovery's Unix-only
+    // additional parent-directory durability barrier.
+    #[cfg(not(unix))]
+    let _ = (source, destination);
+    Ok(())
+}
+
+fn move_startup_artifact_noreplace_with_parent_sync(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+    sync_parents: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    if !startup_artifact_matches_file(path, file)? {
+        return Ok(false);
+    }
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(path, quarantine)?;
+    // A replacement that wins after the pre-move check is not our evidence.
+    // Restore it without overwriting a subsequently installed source path.
+    if !matches!(startup_artifact_matches_file(quarantine, file), Ok(true)) {
+        let mut detail = match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+            quarantine, path,
+        ) {
+            Ok(()) => "startup artifact changed during quarantine; restored raced file".to_string(),
+            Err(error) => format!(
+                "startup artifact changed during quarantine; retained {} because restoring {} without replacement failed: {error}",
+                quarantine.display(),
+                path.display(),
+            ),
+        };
+        // Sync the final namespace even when restoration failed and the raced
+        // artifact must remain at the quarantine name for recovery.
+        if let Err(error) = sync_parents(path, quarantine) {
+            detail.push_str(&format!(
+                "; failed to sync affected parent directories: {error}"
+            ));
+        }
+        return Err(std::io::Error::other(detail));
+    }
+    sync_parents(path, quarantine).map_err(|error| {
+        // The move already happened. Do not let a NotFound or AlreadyExists
+        // sync error look like a harmless pre-publication race to the caller.
+        std::io::Error::other(format!(
+            "startup artifact remains at {} after moving from {}, but parent directory sync failed: {error}",
+            quarantine.display(),
+            path.display(),
+        ))
+    })?;
+    Ok(true)
+}
+
+fn quarantine_startup_artifact_with_witness(
+    path: &Path,
+    fallback_name: &str,
+    context: &str,
+    file: &fs::File,
+    absent_counterpart: Option<&Path>,
+) -> Option<PathBuf> {
+    for _ in 0..1024 {
+        // A new lock owner may have installed its metadata after the old lock
+        // moved. Do not quarantine that owner's sidecar as an orphan.
+        if absent_counterpart.is_some_and(path_is_occupied) {
+            return None;
+        }
+        let quarantine = next_startup_quarantine_path(path, fallback_name);
+        match move_startup_artifact_noreplace(path, &quarantine, file) {
+            Ok(true) => return Some(quarantine),
+            Ok(false) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    quarantine = %quarantine.display(),
+                    error = %error,
+                    "[startup-heal] failed to quarantine {context}; preserving evidence"
+                );
+                return None;
+            }
+        }
+    }
+    tracing::warn!(path = %path.display(), "[startup-heal] no unoccupied quarantine destination for {context}");
+    None
 }
 
 static FILE_LOCK_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicU64>>>> =
@@ -5358,10 +5686,11 @@ impl FileLock {
             return Ok(false);
         }
 
-        let file = match fs::OpenOptions::new().write(true).open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return Ok(false),
-        };
+        let file =
+            match mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&self.path) {
+                Ok(f) => f,
+                Err(_) => return Ok(false),
+            };
         if file.try_lock_exclusive().is_err() {
             return Ok(false);
         }
@@ -5410,25 +5739,29 @@ impl FileLock {
             return Ok(false);
         }
 
-        // Try quarantining while lock is held (best race safety).
-        let quarantine = next_startup_quarantine_path(&self.path, "archive-lock-artifact");
-        let quarantined = match fs::rename(&self.path, &quarantine) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Windows can require closing/unlocking first before renaming.
-                let _ = file.unlock();
-                drop(file);
-                fs::rename(&self.path, &quarantine).is_ok()
-            }
-            Err(_) => false,
-        };
+        let metadata_file =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.metadata_path).ok();
+        // Retain the exclusive lock through publication. An unlock-and-retry
+        // fallback would let a live owner acquire the inode before we move it.
+        let quarantined = quarantine_startup_artifact_with_witness(
+            &self.path,
+            "archive-lock-artifact",
+            "stale archive lock",
+            &file,
+            None,
+        )
+        .is_some();
 
         if quarantined {
-            let _ = quarantine_startup_artifact_if_exists(
-                &self.metadata_path,
-                "archive-lock-artifact",
-                "stale lock owner metadata",
-            );
+            if let Some(metadata_file) = metadata_file {
+                let _ = quarantine_startup_artifact_with_witness(
+                    &self.metadata_path,
+                    "archive-lock-artifact",
+                    "stale lock owner metadata",
+                    &metadata_file,
+                    Some(&self.path),
+                );
+            }
             return Ok(true);
         }
 
@@ -6085,7 +6418,9 @@ const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESC
 const DEFAULT_COALESCER_ADAPTIVE_FLUSH_ENABLED: bool = false;
 const DEFAULT_COALESCER_TARGET_ARCHIVE_LAG_MS: u64 = DEFAULT_ARCHIVE_BATCH_MS;
 
-const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
+/// Configured outstanding-request bound, available before lazy worker startup
+/// so health reporting can remain observational.
+pub const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
@@ -6672,50 +7007,68 @@ impl CommitCoalescer {
     }
 
     fn lag_state(&self) -> CoalescerLagState {
+        self.sample_lag_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_else(|(_, lower_bound)| lower_bound)
+    }
+
+    fn sample_lag_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<CoalescerLagState, (&'static str, CoalescerLagState)> {
         let now = Instant::now();
-        let repos = self
-            .repos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut lag = CoalescerLagState::default();
+        let repos = archive_lag_lock(&self.repos, policy, "commit_coalescer.repos")
+            .map_err(|site| (site, lag))?;
+        let mut unavailable_lock = None;
         for rq in repos.values() {
-            // Keep all three ownership locations locked together. In
-            // particular, a failed commit can move from in-flight back into
-            // the queue while this snapshot is being sampled.
-            let queue = rq
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let spill = rq
-                .spill
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
-            if let Some(repo) = spill.inner.as_ref() {
-                oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
-                    o.min(repo.earliest_enqueued_at)
-                }));
-            }
-            let progress = rq
-                .progress
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(inflight) = progress.inflight_oldest {
-                oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
-            }
-            if let Some(oldest) = oldest {
-                lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(oldest),
-                ));
-                let last_progress = progress
-                    .last_completed
-                    .map_or(oldest, |completed| completed.max(oldest));
-                lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(last_progress),
-                ));
+            let sampled = (|| {
+                // Keep all three ownership locations locked together. In
+                // particular, a failed commit can move from in-flight back into
+                // the queue while this snapshot is being sampled.
+                let queue = archive_lag_lock(&rq.queue, policy, "commit_coalescer.queue")?;
+                let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let spill = archive_lag_lock(&rq.spill, policy, "commit_coalescer.spill")?;
+                if let Some(repo) = spill.inner.as_ref() {
+                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                        o.min(repo.earliest_enqueued_at)
+                    }));
+                }
+                // Queued work is already confirmed pending while these
+                // guards are held. Preserve its age if progress is unavailable.
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let progress = archive_lag_lock(&rq.progress, policy, "commit_coalescer.progress")?;
+                if let Some(inflight) = progress.inflight_oldest {
+                    oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
+                }
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                    let last_progress = progress
+                        .last_completed
+                        .map_or(oldest, |completed| completed.max(oldest));
+                    lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(last_progress),
+                    ));
+                }
+                Ok(())
+            })();
+            // Each repository has independent ownership locations. A busy
+            // one must not hide another repository's confirmed stalled work.
+            if let Err(site) = sampled {
+                unavailable_lock = unavailable_lock.or(Some(site));
             }
         }
-        lag
+        unavailable_lock.map_or(Ok(lag), |site| Err((site, lag)))
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -8771,12 +9124,15 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             .join(format!("{}.lock", refname.replace('/', "-"))),
         "stale-ref-lock",
     );
+    let Ok(file) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&lock_path) else {
+        return false;
+    };
     // The decision was made on this exact file; a replaced lock is left alone.
     if git_lock_identity(&lock_path).as_ref() != Some(&identity) {
         return false;
     }
-    match fs::rename(&lock_path, &quarantine) {
-        Ok(()) => {
+    match move_startup_artifact_noreplace(&lock_path, &quarantine, &file) {
+        Ok(true) => {
             tracing::warn!(
                 lock = %lock_path.display(),
                 quarantine = %quarantine.display(),
@@ -8785,6 +9141,7 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             );
             true
         }
+        Ok(false) => false,
         Err(error) => {
             tracing::warn!(
                 lock = %lock_path.display(),
@@ -9196,37 +9553,34 @@ fn heal_archive_locks_with_checkpoint(
 
         // Try to acquire exclusive lock. If successful, it means no one else
         // is holding it, so we can treat it as a stale artifact from a previous run.
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        if let Ok(f) = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path) {
             use fs2::FileExt;
             if f.try_lock_exclusive().is_ok() {
                 checkpoint()?;
-                let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
-                let mut quarantined = false;
-                match fs::rename(path, &quarantine) {
-                    Ok(()) => quarantined = true,
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Windows can require closing/unlocking first before renaming.
-                        let _ = f.unlock();
-                        drop(f);
-                        checkpoint()?;
-                        quarantined = fs::rename(path, &quarantine).is_ok();
-                    }
-                    Err(_) => {}
-                }
-
-                if quarantined {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                let metadata_file =
+                    mcp_agent_mail_core::disk::open_regular_file_no_follow(&meta_path).ok();
+                if let Some(quarantine) = quarantine_startup_artifact_with_witness(
+                    path,
+                    "archive-lock-artifact",
+                    "stale archive lock",
+                    &f,
+                    None,
+                ) {
                     result
                         .locks_quarantined
                         .push(quarantine.display().to_string());
-                    // Try to quarantine corresponding metadata file.
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let meta_path = path.with_file_name(format!("{name}.owner.json"));
                     checkpoint()?;
-                    if let Some(meta_quarantine) = quarantine_startup_artifact_if_exists(
-                        &meta_path,
-                        "archive-lock-artifact",
-                        "archive lock owner metadata",
-                    ) {
+                    if let Some(metadata_file) = metadata_file
+                        && let Some(meta_quarantine) = quarantine_startup_artifact_with_witness(
+                            &meta_path,
+                            "archive-lock-artifact",
+                            "archive lock owner metadata",
+                            &metadata_file,
+                            Some(path),
+                        )
+                    {
                         result
                             .metadata_quarantined
                             .push(meta_quarantine.display().to_string());
@@ -9357,6 +9711,7 @@ fn heal_archive_locks_with_checkpoint(
                 &path,
                 "archive-lock-artifact",
                 "orphan archive lock owner metadata",
+                &lock_candidate,
             )
         {
             result
@@ -9957,7 +10312,199 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     write_agent_profile_with_config(archive, &Config::get(), agent)
 }
 
+const MAX_AGENT_PROFILE_PUBLICATION_BYTES: u64 = 1024 * 1024;
+
+fn agent_profile_publication_conflict(message: &str) -> StorageError {
+    StorageError::InvalidPath(format!(
+        "agent profile publication refused: {message}; existing evidence retained"
+    ))
+}
+
+fn agent_profile_publication_inception(profile: &serde_json::Value) -> Result<Option<i64>> {
+    let mut inception = None;
+    for field in ["inception_ts", "registered_ts"] {
+        if let Some(value) = profile.get(field).filter(|value| !value.is_null()) {
+            let timestamp = archive_publication_timestamp(value).ok_or_else(|| {
+                agent_profile_publication_conflict("invalid agent inception timestamp")
+            })?;
+            if inception.is_some_and(|prior| prior != timestamp) {
+                return Err(agent_profile_publication_conflict(
+                    "agent inception timestamps disagree",
+                ));
+            }
+            inception = Some(timestamp);
+        }
+    }
+    Ok(inception)
+}
+
+fn agent_profile_publication_deregistration(profile: &serde_json::Value) -> Result<Option<i64>> {
+    if let Some(value) = profile
+        .get("deregistered_at")
+        .filter(|value| !value.is_null())
+    {
+        return archive_publication_timestamp(value)
+            .map(Some)
+            .ok_or_else(|| {
+                agent_profile_publication_conflict("invalid permanent deregistration timestamp")
+            });
+    }
+    // Reconstruction also recognizes this legacy permanent tombstone. A
+    // missing or null newer field must not turn its identity active again.
+    let legacy = profile
+        .get("task_description")
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| {
+            mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+                description,
+            )
+        })
+        .filter(|_| {
+            profile
+                .get("contact_policy")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"))
+        });
+    legacy
+        .map(|description| {
+            mcp_agent_mail_db::models::deregistered_task_timestamp_micros(description).ok_or_else(
+                || {
+                    agent_profile_publication_conflict(
+                        "unverifiable legacy deregistration tombstone",
+                    )
+                },
+            )
+        })
+        .transpose()
+}
+
+/// Merge only evidence for the same identity. Ordinary queued writes carry a
+/// captured profile, not a lifecycle revision: archive lock order cannot prove
+/// they are newer than a surviving permanent tombstone. Refuse that conflict
+/// rather than silently making stale input appear authoritative. Retirement
+/// remains reversible; only deregistration is monotonic.
+fn merge_agent_profile_publication(
+    incoming: &serde_json::Value,
+    committed: Option<&serde_json::Value>,
+    working: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    let fields = incoming.as_object().ok_or_else(|| {
+        agent_profile_publication_conflict("incoming profile must be a JSON object")
+    })?;
+    let name = incoming
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
+    if incoming
+        .get("agent_name")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_str() != Some(name))
+    {
+        return Err(agent_profile_publication_conflict(
+            "incoming agent name aliases conflict",
+        ));
+    }
+    if fields.contains_key("registration_token") {
+        return Err(agent_profile_publication_conflict(
+            "registration credentials must not be archived",
+        ));
+    }
+    let inception = agent_profile_publication_inception(incoming)?;
+    let deregistered_at = agent_profile_publication_deregistration(incoming)?;
+    let mut merged = serde_json::Map::new();
+    for published in [committed, working].into_iter().flatten() {
+        let published_fields = published.as_object().ok_or_else(|| {
+            agent_profile_publication_conflict("archived profile must be a JSON object")
+        })?;
+        // Older archive profiles use agent_name. Every supplied identity
+        // spelling must agree before their extensions or lifecycle are merged.
+        let published_name = published
+            .get("name")
+            .filter(|value| !value.is_null())
+            .or_else(|| published.get("agent_name"));
+        if published_name.and_then(serde_json::Value::as_str) != Some(name)
+            || published
+                .get("agent_name")
+                .filter(|value| !value.is_null())
+                .is_some_and(|value| value.as_str() != Some(name))
+        {
+            return Err(agent_profile_publication_conflict(
+                "archived agent name conflicts with the incoming identity",
+            ));
+        }
+        let published_inception = agent_profile_publication_inception(published)?;
+        if published_inception.is_some() && published_inception != inception {
+            return Err(agent_profile_publication_conflict(
+                "archived agent inception conflicts with the incoming identity",
+            ));
+        }
+        let published_deregistration = agent_profile_publication_deregistration(published)?;
+        if published_deregistration.is_some() && published_deregistration != deregistered_at {
+            return Err(agent_profile_publication_conflict(
+                "permanent deregistration conflicts with the incoming profile",
+            ));
+        }
+        merged.extend(published_fields.clone());
+    }
+    // Working extensions supersede committed extensions; explicit incoming
+    // fields supersede both. Credentials are never carried into a new commit.
+    merged.extend(fields.clone());
+    // A display label is cleared by leaving it out of the incoming profile,
+    // so a published label must not survive the merge.
+    if !fields.contains_key("display_name") {
+        merged.remove("display_name");
+    }
+    merged.remove("registration_token");
+    let bytes = serde_json::to_vec_pretty(&merged)?;
+    if bytes.len() as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "merged profile exceeds the artifact byte bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn committed_agent_profile_publication(
+    repo_root: &Path,
+    relative: &str,
+) -> Result<Option<serde_json::Value>> {
+    let repo = Repository::open(repo_root)?;
+    let tree = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let entry = match tree.get_path(Path::new(relative)) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if entry.kind() != Some(git2::ObjectType::Blob)
+        || !matches!(entry.filemode(), 0o100644 | 0o100755)
+    {
+        return Err(agent_profile_publication_conflict(
+            "committed profile is not a regular file",
+        ));
+    }
+    let (size, kind) = repo.odb()?.read_header(entry.id())?;
+    if kind != git2::ObjectType::Blob || size as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "committed profile exceeds the artifact byte bound",
+        ));
+    }
+    let blob = repo.find_blob(entry.id())?;
+    serde_json::from_slice(blob.content())
+        .map(Some)
+        .map_err(StorageError::from)
+}
+
 /// Write an agent's profile.json using explicit config for author info.
+///
+/// Permanent lifecycle evidence in both the working file and Git HEAD is
+/// checked under the publication/project locks before replacement. A stale
+/// active write cannot erase a tombstone even when the working file is lost.
 pub fn write_agent_profile_with_config(
     archive: &ProjectArchive,
     config: &Config,
@@ -9966,7 +10513,7 @@ pub fn write_agent_profile_with_config(
     let name = agent
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
     let name = validate_archive_component("agent name", name)?;
 
     let repo_root = archive_repo_root_checked(archive)?;
@@ -9977,11 +10524,26 @@ pub fn write_agent_profile_with_config(
     let rel = with_project_lock_inner(archive, true, false, || {
         let project_root = archive_project_root_checked(archive)?;
         let profile_dir = project_root.join("agents").join(name);
-        ensure_dir(&profile_dir)?;
-
         let profile_path = profile_dir.join("profile.json");
-        write_json(&profile_path, agent, true)?;
-        rel_path_cached(&archive.canonical_repo_root, &profile_path)
+        if path_existing_prefix_has_symlink(&profile_path)? {
+            return Err(agent_profile_publication_conflict(
+                "profile path contains a symlink",
+            ));
+        }
+        let relative = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
+        let committed = committed_agent_profile_publication(repo_root, &relative)?;
+        let working = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            &profile_path,
+            MAX_AGENT_PROFILE_PUBLICATION_BYTES,
+        ) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = merge_agent_profile_publication(agent, committed.as_ref(), working.as_ref())?;
+        ensure_dir(&profile_dir)?;
+        atomic_write_bytes(&profile_path, &bytes, true)?;
+        Ok(relative)
     })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
@@ -10094,7 +10656,7 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
     format!("{subject}\n\n{}", lines.join("\n"))
 }
 
-fn reservation_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
+fn archive_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value.as_str().and_then(|text| {
             let text = text.trim();
@@ -10143,15 +10705,32 @@ fn reservation_publication_conflict(id: i64, message: impl Into<String>) -> Stor
 // the guard itself) cannot read.
 const MAX_RESERVATION_PUBLICATION_BYTES: u64 = 1024 * 1024;
 
+/// Legacy artifacts precede the durable row revision and therefore occupy
+/// revision zero. A malformed explicit value is uncertainty, never permission
+/// to replace a newer guard-visible lease with an older snapshot.
+fn reservation_publication_revision(id: i64, record: &serde_json::Value) -> Result<i64> {
+    match record.get("revision") {
+        None => Ok(0),
+        Some(value) => value
+            .as_i64()
+            .filter(|revision| *revision >= 0)
+            .ok_or_else(|| {
+                reservation_publication_conflict(id, "reservation revision is invalid; retained")
+            }),
+    }
+}
+
 /// A generation-stamped row has an immutable owner and creation identity.
-/// Expiry only increases; release is terminal. Reacquisition can change the
-/// reason and exclusive mode without increasing expiry, so neither field can
-/// serve as an immutable identity or a revision number here.
+/// Expiry only increases; release is terminal. The database revision orders
+/// reacquisitions even when their expiry is unchanged and their reason or
+/// exclusive mode changes. It never substitutes for generation or identity.
 fn validate_reservation_publication_version(
     id: i64,
     incoming: &serde_json::Value,
     published: &serde_json::Value,
 ) -> Result<()> {
+    let incoming_revision = reservation_publication_revision(id, incoming)?;
+    let published_revision = reservation_publication_revision(id, published)?;
     for field in ["id", "project", "agent", "path_pattern", "db_generation"] {
         if let (Some(before), Some(after)) = (published.get(field), incoming.get(field)) {
             if !before.is_null() && !after.is_null() && before != after {
@@ -10189,8 +10768,8 @@ fn validate_reservation_publication_version(
     }
     if let (Some(before), Some(after)) = (published.get("created_ts"), incoming.get("created_ts")) {
         let same = match (
-            reservation_publication_timestamp(before),
-            reservation_publication_timestamp(after),
+            archive_publication_timestamp(before),
+            archive_publication_timestamp(after),
         ) {
             (Some(before), Some(after)) => before == after,
             _ => before == after || before.is_null() || after.is_null(),
@@ -10209,12 +10788,39 @@ fn validate_reservation_publication_version(
             "a terminal release is already published; refusing the stale active snapshot",
         ));
     }
+    if !incoming_released {
+        if incoming_revision < published_revision {
+            return Err(reservation_publication_conflict(
+                id,
+                "a later reservation revision is already published; refusing the stale active snapshot",
+            ));
+        }
+        if incoming_revision > 0 && incoming_revision == published_revision {
+            for field in ["exclusive", "reason"] {
+                if incoming.get(field) != published.get(field) {
+                    return Err(reservation_publication_conflict(
+                        id,
+                        format!("equal reservation revision has conflicting {field}; retained"),
+                    ));
+                }
+            }
+            if archive_publication_timestamp(&incoming["expires_ts"])
+                != archive_publication_timestamp(&published["expires_ts"])
+                || archive_publication_timestamp(&incoming["expires_ts"]).is_none()
+            {
+                return Err(reservation_publication_conflict(
+                    id,
+                    "equal reservation revision has conflicting expiry; retained",
+                ));
+            }
+        }
+    }
     // A terminal release must win even if its captured expiry predates a
     // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
     if !incoming_released
         && let (Some(before), Some(after)) = (
-            reservation_publication_timestamp(&published["expires_ts"]),
-            reservation_publication_timestamp(&incoming["expires_ts"]),
+            archive_publication_timestamp(&published["expires_ts"]),
+            archive_publication_timestamp(&incoming["expires_ts"]),
         )
         && after < before
     {
@@ -10232,6 +10838,7 @@ fn validate_reservation_publication_version(
 fn validate_reservation_publications(checks: &[(PathBuf, i64, serde_json::Value)]) -> Result<()> {
     let mut previous: HashMap<&Path, &serde_json::Value> = HashMap::new();
     for (path, id, incoming) in checks {
+        reservation_publication_revision(*id, incoming)?;
         if let Some(published) = previous.get(path.as_path()) {
             validate_reservation_publication_version(*id, incoming, published)?;
         } else {
@@ -10391,9 +10998,9 @@ fn publish_reservation_writes(
 /// exactly as `atomic_write_bytes` does it.
 /// Canonical generation-stamped working artifacts are checked under the
 /// project lock as well: a delayed ACTIVE snapshot cannot erase a terminal
-/// release or shorten a published renewal. This does not order equal-expiry
-/// intent changes, reconstruct missing working artifacts from Git, or make
-/// the separate database mutation atomic with publication.
+/// release, shorten a published renewal, or overwrite a newer intent revision.
+/// This does not reconstruct missing working artifacts from Git or make the
+/// separate database mutation atomic with publication.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -10423,6 +11030,30 @@ fn write_file_reservation_records_admitted(
     let mut publication_checks = Vec::new();
     let mut normalized_reservations = Vec::with_capacity(reservations.len());
     for res in reservations {
+        let id = res
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let revision = reservation_publication_revision(id, res)?;
+        if revision > 0
+            && (id <= 0
+                || !res
+                    .get("db_generation")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|generation| {
+                        !generation.is_empty()
+                            && generation.len() <= 128
+                            && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }))
+        {
+            // A failed generation lookup must not silently route a versioned
+            // snapshot through the unordered legacy publication path. Without
+            // the common generation/id key its revision proves no ordering.
+            return Err(reservation_publication_conflict(
+                id,
+                "positive reservation revision requires a positive id and valid database generation; nothing published",
+            ));
+        }
         let path_pattern = res
             .get("path_pattern")
             .or_else(|| res.get("path"))
@@ -15557,17 +16188,8 @@ fn write_archive_index_sync_record(
     tree: git2::Oid,
     identity: &str,
 ) -> std::io::Result<()> {
-    let seq = ARCHIVE_EPOCH_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = git_dir.join(format!(
-        "{ARCHIVE_INDEX_SYNC_FILE_NAME}.tmp-{}-{seq}",
-        std::process::id()
-    ));
     let content = format!("{ARCHIVE_INDEX_SYNC_FORMAT_VERSION}\n{tree}\n{identity}\n");
-    fs::write(&tmp, content)
-        .and_then(|()| fs::rename(&tmp, git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME)))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })
+    write_archive_control_file(git_dir, ARCHIVE_INDEX_SYNC_FILE_NAME, content.as_bytes())
 }
 
 /// Whether `tree` is the tree of `head` or of one of its recent first-parent
@@ -17130,10 +17752,14 @@ fn check_archive_consistency_with_checkpoint(
         let fallback_subject_marker = format!("__{subject_slug}");
 
         let messages_dir = project_dir.join("messages").join(&year).join(&month);
+        // Native writers use second-resolution UTC filenames. Probe that
+        // exact path first: enumerating a populated month for every recent
+        // message turns a 100-row startup sample into 100 directory walks.
+        let canonical_name = format!("{iso_prefix}Z__{subject_slug}__{}.md", msg.message_id);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
-        // We check both the computed path and do a directory scan fallback
-        // because the archive ID suffix can vary.
+        // Other timestamp spellings and archive ID suffixes retain the
+        // directory scan fallback.
         //
         // After `doctor reconstruct`, DB IDs may have been remapped from
         // canonical frontmatter IDs, so the `__{id}.md` suffix in the
@@ -17144,6 +17770,10 @@ fn check_archive_consistency_with_checkpoint(
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if path_existing_prefix_has_symlink(&messages_dir).unwrap_or(true) {
             false
+        } else if validate_archive_component("message filename", &canonical_name).is_ok()
+            && path_is_nonsymlink_file(&messages_dir.join(&canonical_name))
+        {
+            true
         } else if path_is_nonsymlink_dir(&messages_dir) {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
@@ -18250,6 +18880,292 @@ mod tests {
         assert!(profile_path.exists());
     }
 
+    fn publication_agent_profile() -> serde_json::Value {
+        serde_json::json!({
+            "name": "BlueLake",
+            "program": "test",
+            "model": "test-model",
+            "task_description": "preserve this identity's history",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+            "reaper_exempt": false,
+            "retired_at": null,
+            "deregistered_at": null,
+        })
+    }
+
+    fn publication_deregistered_profile() -> serde_json::Value {
+        let mut profile = publication_agent_profile();
+        profile["deregistered_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        profile["contact_policy"] = serde_json::json!("block_all");
+        profile["task_description"] =
+            serde_json::json!("[DEREGISTERED 2026-01-03T00:00:00Z] preserve history");
+        profile
+    }
+
+    fn committed_publication_profile(archive: &ProjectArchive) -> Vec<u8> {
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let relative = format!("projects/{}/agents/BlueLake/profile.json", archive.slug);
+        let entry = tree.get_path(Path::new(&relative)).unwrap();
+        repo.find_blob(entry.id()).unwrap().content().to_vec()
+    }
+
+    #[test]
+    fn agent_profile_publication_rejects_delayed_active_write_before_reconstruction() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("archive"));
+        let archive = ensure_archive(&config, "profile-publication").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/profile-publication").unwrap();
+
+        // Capture the actual mutable WBQ operation before deregistration. Its
+        // producer can be delayed after committing SQLite but before enqueue,
+        // so acquisition order of the archive locks is not lifecycle order.
+        let delayed = WriteOp::AgentProfile {
+            project_slug: archive.slug.clone(),
+            config: config.clone(),
+            agent_json: publication_agent_profile(),
+        };
+        wbq_execute_op(&delayed, "profile publication regression").unwrap();
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let path = archive.root.join("agents/BlueLake/profile.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        let result = wbq_execute_op(&delayed, "delayed profile publication regression");
+        assert!(
+            result.is_err(),
+            "an old active write must refuse to erase durable deregistration"
+        );
+        flush_async_commits();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        // Recovery has no live DB or queued lifecycle write to repair from.
+        // The retained artifact alone must prevent resurrection.
+        let recovered = tmp.path().join("reconstructed.sqlite3");
+        let stats = mcp_agent_mail_db::reconstruct::reconstruct_from_archive(
+            &recovered,
+            &config.storage_root,
+        )
+        .unwrap();
+        assert_eq!(stats.agents, 1);
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(recovered.to_string_lossy()).unwrap(),
+            "agent publication reconstruction regression",
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT a.name, d.deregistered_at FROM agents a \
+                 JOIN agent_deregistrations d ON d.agent_id = a.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "BlueLake");
+        assert_eq!(
+            rows[0].get_named::<i64>("deregistered_at").unwrap(),
+            mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_committed_tombstones_when_working_copy_regresses() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for regressed in [false, true] {
+            let slug = if regressed { "regressed" } else { "missing" };
+            let archive = ensure_archive(&config, slug).unwrap();
+            write_agent_profile_with_config(&archive, &config, &publication_deregistered_profile())
+                .unwrap();
+            flush_async_commits();
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            let committed = committed_publication_profile(&archive);
+            fs::rename(&path, path.with_file_name("retained-profile.json")).unwrap();
+            let working = regressed.then(|| {
+                let bytes = serde_json::to_vec(&publication_agent_profile()).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                bytes
+            });
+
+            assert!(
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .is_err(),
+                "committed evidence survives a {slug} working profile"
+            );
+            flush_async_commits();
+            match working {
+                Some(bytes) => assert_eq!(fs::read(&path).unwrap(), bytes),
+                None => assert!(!path.exists()),
+            }
+            assert_eq!(committed_publication_profile(&archive), committed);
+        }
+        // A tombstone in another project is never authority over this one.
+        let separate = ensure_archive(&config, "separate").unwrap();
+        write_agent_profile_with_config(&separate, &config, &publication_agent_profile()).unwrap();
+        assert_eq!(
+            read_agent_profile(&separate, "BlueLake").unwrap(),
+            Some(publication_agent_profile())
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_upgrades_legacy_name_without_merging_alias_conflicts() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for null_name in [false, true] {
+            let slug = if null_name {
+                "legacy-null-name"
+            } else {
+                "legacy-name"
+            };
+            let archive = ensure_archive(&config, slug).unwrap();
+            let canonical = publication_deregistered_profile();
+            let mut legacy = canonical.clone();
+            let fields = legacy.as_object_mut().unwrap();
+            let inception = fields.remove("inception_ts").unwrap();
+            fields.remove("name");
+            fields.remove("deregistered_at");
+            fields.insert("agent_name".to_string(), serde_json::json!("BlueLake"));
+            fields.insert("registered_ts".to_string(), inception);
+            fields.insert(
+                "extension".to_string(),
+                serde_json::json!({"note": "retain"}),
+            );
+            if null_name {
+                fields.insert("name".to_string(), serde_json::Value::Null);
+            }
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+            fs::write(&path, &legacy_bytes).unwrap();
+            let relative = format!("projects/{slug}/agents/BlueLake/profile.json");
+            enqueue_async_commit(
+                &archive.repo_root,
+                &config,
+                "legacy profile fixture",
+                &[relative],
+            );
+            flush_async_commits();
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            let error =
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .unwrap_err();
+            assert!(error.to_string().contains("permanent deregistration"));
+            assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            write_agent_profile_with_config(&archive, &config, &canonical).unwrap();
+            flush_async_commits();
+            let before = fs::read(&path).unwrap();
+            let stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(stored["name"], "BlueLake");
+            assert_eq!(stored["agent_name"], "BlueLake");
+            assert_eq!(stored["registered_ts"], legacy["registered_ts"]);
+            assert_eq!(stored["extension"], legacy["extension"]);
+            assert_eq!(stored["deregistered_at"], canonical["deregistered_at"]);
+            assert_eq!(committed_publication_profile(&archive), before);
+
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut incoming = canonical.clone();
+                incoming["agent_name"] = alias;
+                assert!(write_agent_profile_with_config(&archive, &config, &incoming).is_err());
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut foreign = stored.clone();
+                foreign["agent_name"] = alias;
+                let foreign_bytes = serde_json::to_vec_pretty(&foreign).unwrap();
+                fs::write(&path, &foreign_bytes).unwrap();
+                assert!(write_agent_profile_with_config(&archive, &config, &canonical).is_err());
+                assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_profile_publication_drops_a_display_name_the_update_leaves_out() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-labels").unwrap();
+        let mut labelled = publication_agent_profile();
+        labelled["display_name"] = serde_json::json!("Officer Alpha");
+        labelled["extension"] = serde_json::json!({"operator_note": "retain"});
+        write_agent_profile_with_config(&archive, &config, &labelled).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert_eq!(stored["display_name"], "Officer Alpha");
+
+        // Clearing a label omits the field. Other published fields stay.
+        write_agent_profile_with_config(&archive, &config, &publication_agent_profile()).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert!(stored.get("display_name").is_none());
+        assert_eq!(stored["extension"], labelled["extension"]);
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_extensions_and_allows_reversible_retirement() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-updates").unwrap();
+        let mut original = publication_agent_profile();
+        original["extension"] = serde_json::json!({"operator_note": "retain", "values": [1, 2]});
+        write_agent_profile_with_config(&archive, &config, &original).unwrap();
+        flush_async_commits();
+
+        let mut update = publication_agent_profile();
+        update["inception_ts"] = serde_json::json!(
+            mcp_agent_mail_core::iso_to_micros("2026-01-01T00:00:00Z")
+                .unwrap()
+                .to_string()
+        );
+        update["program"] = serde_json::json!("updated-client");
+        update["retired_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        for retired_at in [update["retired_at"].clone(), serde_json::Value::Null] {
+            update["retired_at"] = retired_at.clone();
+            write_agent_profile_with_config(&archive, &config, &update).unwrap();
+            flush_async_commits();
+            let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+            assert_eq!(stored["retired_at"], retired_at);
+            assert_eq!(stored["program"], "updated-client");
+            assert_eq!(stored["extension"], original["extension"]);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&committed_publication_profile(
+                    &archive
+                ))
+                .unwrap(),
+                stored
+            );
+        }
+
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let mut equivalent = deregistered.clone();
+        equivalent["deregistered_at"] =
+            serde_json::json!(mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap());
+        equivalent["reaper_exempt"] = serde_json::Value::Bool(true);
+        write_agent_profile_with_config(&archive, &config, &equivalent).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert_eq!(stored["reaper_exempt"], true);
+        assert_eq!(stored["extension"], original["extension"]);
+        assert_eq!(stored["deregistered_at"], equivalent["deregistered_at"]);
+    }
+
     #[test]
     fn operator_reaper_exemption_preserves_other_profile_fields_and_noop_bytes() {
         let _pressure = DiskPressureReset::set(0);
@@ -18930,8 +19846,8 @@ mod tests {
         assert_eq!(fs::read(&stable).unwrap(), latest);
         assert_eq!(fs::read(&alias).unwrap(), latest);
 
-        // Reacquisition can change intent with the same expiry. No revision
-        // number exists for ordering those changes, so they remain supported.
+        // Legacy revision-zero artifacts retain their historical semantics.
+        // Versioned reacquisitions are ordered independently of expiry below.
         renewed["exclusive"] = serde_json::json!(false);
         renewed["reason"] = serde_json::json!("observe");
         renewed["created_ts"] = serde_json::json!(
@@ -18973,6 +19889,167 @@ mod tests {
         assert!(!fresh_stable.exists());
         assert!(!fresh_alias.exists());
         assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_revisions_order_intent_changes_without_extending_the_lease() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-revision").unwrap();
+        let mut shared = publication_test_reservation(18, "aabbccdd");
+        shared["revision"] = serde_json::json!(1);
+        shared["exclusive"] = serde_json::json!(false);
+        shared["reason"] = serde_json::json!("observing");
+        write_file_reservation_record(&archive, &config, &shared).unwrap();
+        let mut exclusive = shared.clone();
+        exclusive["revision"] = serde_json::json!(2);
+        exclusive["exclusive"] = serde_json::json!(true);
+        exclusive["reason"] = serde_json::json!("editing");
+        assert_eq!(exclusive["expires_ts"], shared["expires_ts"]);
+        write_file_reservation_record(&archive, &config, &exclusive).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &shared);
+        let protected = fs::read(&stable).unwrap();
+
+        // An older DB grant reaches publication after a newer exclusive grant.
+        // It must not make the guard lose the newer exclusive protection.
+        let error = write_file_reservation_record(&archive, &config, &shared).unwrap_err();
+        assert!(error.to_string().contains("later reservation revision"));
+        assert_eq!(fs::read(&stable).unwrap(), protected);
+        assert_eq!(fs::read(&alias).unwrap(), protected);
+        let mut legacy = shared.clone();
+        legacy.as_object_mut().unwrap().remove("revision");
+        assert!(write_file_reservation_record(&archive, &config, &legacy).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), protected);
+
+        for field in ["exclusive", "reason", "expires_ts"] {
+            let mut conflicting = exclusive.clone();
+            conflicting[field] = match field {
+                "exclusive" => serde_json::json!(false),
+                "reason" => serde_json::json!("different intent"),
+                "expires_ts" => serde_json::json!("2031-10-01T00:00:00Z"),
+                _ => unreachable!(),
+            };
+            assert!(write_file_reservation_record(&archive, &config, &conflicting).is_err());
+            assert_eq!(fs::read(&stable).unwrap(), protected, "{field}");
+            assert_eq!(fs::read(&alias).unwrap(), protected, "{field}");
+        }
+
+        // A newer downgrade is valid; a delayed exclusive snapshot cannot undo
+        // it. Terminal release still dominates every ACTIVE revision, even
+        // when the terminal payload was captured before a concurrent renewal.
+        shared["revision"] = serde_json::json!(3);
+        write_file_reservation_record(&archive, &config, &shared).unwrap();
+        let downgraded = fs::read(&stable).unwrap();
+        assert!(write_file_reservation_record(&archive, &config, &exclusive).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), downgraded);
+        exclusive["released_ts"] = serde_json::json!(42);
+        write_file_reservation_record(&archive, &config, &exclusive).unwrap();
+        let terminal = fs::read(&stable).unwrap();
+        shared["revision"] = serde_json::json!(4);
+        assert!(write_file_reservation_record(&archive, &config, &shared).is_err());
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+    }
+
+    #[test]
+    fn reservation_publication_refuses_malformed_revisions_before_first_publication() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-invalid-revision").unwrap();
+        let original = publication_test_reservation(19, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        for naming in ["stamped", "legacy", "digest-only"] {
+            for revision in [
+                serde_json::Value::Null,
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("2"),
+                serde_json::json!(true),
+                serde_json::json!(u64::MAX),
+            ] {
+                let mut value = original.clone();
+                if naming != "stamped" {
+                    value.as_object_mut().unwrap().remove("db_generation");
+                }
+                if naming == "digest-only" {
+                    value.as_object_mut().unwrap().remove("id");
+                }
+                value["revision"] = revision;
+                let error = write_file_reservation_record(&archive, &config, &value).unwrap_err();
+                assert!(
+                    error.to_string().contains("revision is invalid"),
+                    "{naming}"
+                );
+                assert!(!stable.exists());
+                assert!(!archive.root.join("file_reservations/id-19.json").exists());
+                assert!(!alias.exists());
+                assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn positive_reservation_revisions_require_generation_and_id_before_any_publication() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-revision-identity").unwrap();
+        let mut original = publication_test_reservation(20, "aabbccdd");
+        original["revision"] = serde_json::json!(1);
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        let protected = fs::read(&stable).unwrap();
+        let mut fresh = publication_test_reservation(21, "aabbccdd");
+        fresh["revision"] = serde_json::json!(1);
+        let (fresh_stable, fresh_alias) = publication_test_paths(&archive, &fresh);
+
+        for released in [false, true] {
+            for (field, replacement) in [
+                ("id", None),
+                ("id", Some(serde_json::Value::Null)),
+                ("id", Some(serde_json::json!(0))),
+                ("id", Some(serde_json::json!(-1))),
+                ("id", Some(serde_json::json!("20"))),
+                ("id", Some(serde_json::json!(u64::MAX))),
+                ("db_generation", None),
+                ("db_generation", Some(serde_json::Value::Null)),
+                ("db_generation", Some(serde_json::json!(42))),
+                ("db_generation", Some(serde_json::json!(""))),
+                ("db_generation", Some(serde_json::json!("not-a-generation"))),
+                ("db_generation", Some(serde_json::json!("../aabb"))),
+                ("db_generation", Some(serde_json::json!("a".repeat(129)))),
+            ] {
+                let mut invalid = original.clone();
+                if let Some(replacement) = replacement {
+                    invalid[field] = replacement;
+                } else {
+                    invalid.as_object_mut().unwrap().remove(field);
+                }
+                if released {
+                    invalid["released_ts"] = serde_json::json!(42);
+                }
+                let error =
+                    write_file_reservation_records(&archive, &config, &[fresh.clone(), invalid])
+                        .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("positive reservation revision requires")
+                );
+                assert_eq!(
+                    fs::read(&stable).unwrap(),
+                    protected,
+                    "{field}, released={released}"
+                );
+                assert_eq!(
+                    fs::read(&alias).unwrap(),
+                    protected,
+                    "{field}, released={released}"
+                );
+                assert!(!fresh_stable.exists());
+                assert!(!fresh_alias.exists());
+                assert_eq!(fs::read_dir(stable.parent().unwrap()).unwrap().count(), 2);
+            }
+        }
     }
 
     #[test]
@@ -22871,6 +23948,163 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn startup_quarantine_preserves_destination_created_after_allocation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "source evidence").unwrap();
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path).unwrap();
+        let occupied = next_startup_quarantine_path(&path, "lock");
+        // A competing publisher wins after the allocation's occupancy check.
+        fs::write(&occupied, "competing evidence").unwrap();
+        let error = move_startup_artifact_noreplace(&path, &occupied, &file).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+
+        let published =
+            quarantine_startup_artifact_with_witness(&path, "lock", "test evidence", &file, None)
+                .unwrap();
+        assert_ne!(published, occupied);
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&published).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+    }
+
+    #[test]
+    fn startup_quarantine_preserves_moved_evidence_on_parent_sync_failure() {
+        for error_kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let source_parent = tmp.path().join("refs/heads");
+            fs::create_dir_all(&source_parent).unwrap();
+            let source = source_parent.join("main.lock");
+            let quarantine = tmp.path().join("retained-ref-lock");
+            fs::write(&source, "ref lock evidence").unwrap();
+            let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&source).unwrap();
+            let sync_attempted = std::cell::Cell::new(false);
+            let error = move_startup_artifact_noreplace_with_parent_sync(
+                &source,
+                &quarantine,
+                &file,
+                |from, to| {
+                    assert_eq!(from, source);
+                    assert_eq!(to, quarantine);
+                    assert!(!source.exists(), "sync follows the actual move");
+                    assert_eq!(
+                        fs::read_to_string(&quarantine).unwrap(),
+                        "ref lock evidence"
+                    );
+                    sync_attempted.set(true);
+                    Err(std::io::Error::new(
+                        error_kind,
+                        "injected directory sync failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert!(sync_attempted.get());
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(error.to_string().contains("parent directory sync failed"));
+            assert!(!source.exists());
+            assert_eq!(
+                fs::read_to_string(&quarantine).unwrap(),
+                "ref lock evidence"
+            );
+            assert!(startup_artifact_matches_file(&quarantine, &file).unwrap());
+            // A later durability retry can sync both real parent directories
+            // without moving or replacing the preserved evidence again.
+            sync_startup_artifact_move_parents(&source, &quarantine).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_quarantine_refuses_replaced_inode_and_rebound_owner_metadata() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "equal bytes").unwrap();
+        let file =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        file.try_lock_exclusive().unwrap();
+        let retained = path.with_file_name("retained-old-lock");
+        fs::rename(&path, &retained).unwrap();
+        fs::write(&path, "equal bytes").unwrap();
+        let owner =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let destination = next_startup_quarantine_path(&path, "lock");
+        assert!(!move_startup_artifact_noreplace(&path, &destination, &file).unwrap());
+        assert!(!destination.exists());
+        assert!(startup_artifact_matches_file(&path, &owner).unwrap());
+        assert!(startup_artifact_matches_file(&retained, &file).unwrap());
+
+        let metadata = path.with_extension("lock.owner.json");
+        fs::write(&metadata, "new owner metadata").unwrap();
+        assert!(
+            quarantine_startup_artifact_if_exists(
+                &metadata,
+                "metadata",
+                "new owner metadata",
+                &path,
+            )
+            .is_none()
+        );
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "equal bytes");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "equal bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_healer_preserves_replacement_while_old_inode_is_locked() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = tmp.path().join("projects/raced-heal");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(".archive.lock");
+        let metadata = project.join(".archive.lock.owner.json");
+        let retained = project.join("retained-old-lock");
+        fs::write(&path, "old lock evidence").unwrap();
+        fs::write(&metadata, "old owner metadata").unwrap();
+        let replacement = std::cell::RefCell::new(None);
+        let report = heal_archive_locks_with_checkpoint(&config, &|| {
+            if replacement.borrow().is_none() {
+                let probe =
+                    mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                // Synchronize with the real exclusive lock, rather than
+                // assuming a directory order or replacing any I/O operation.
+                if probe.try_lock_exclusive().is_err() {
+                    fs::rename(&path, &retained)?;
+                    fs::write(&path, "new lock evidence")?;
+                    fs::write(&metadata, "new owner metadata")?;
+                    let owner =
+                        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                    owner.try_lock_exclusive()?;
+                    *replacement.borrow_mut() = Some(owner);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            replacement.borrow().is_some(),
+            "the locked-inode race must run"
+        );
+        assert!(report.locks_quarantined.is_empty());
+        assert!(report.metadata_quarantined.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new lock evidence");
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "old lock evidence");
+    }
+
+    #[test]
     fn test_heal_archive_locks_empty() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -24596,6 +25830,228 @@ mod tests {
         );
     }
 
+    fn write_archive_control_marker_for_test(
+        git_dir: &Path,
+        file_name: &str,
+    ) -> std::io::Result<()> {
+        match file_name {
+            ARCHIVE_EPOCH_FILE_NAME => {
+                rewrite_archive_epoch_file(git_dir);
+                Ok(())
+            }
+            ARCHIVE_INDEX_SYNC_FILE_NAME => write_archive_index_sync_record(
+                git_dir,
+                git2::Oid::ZERO_SHA1,
+                "test-index-identity",
+            ),
+            _ => panic!("unexpected archive control marker: {file_name}"),
+        }
+    }
+
+    fn assert_archive_control_marker_is_valid(git_dir: &Path, file_name: &str) {
+        match file_name {
+            ARCHIVE_EPOCH_FILE_NAME => {
+                assert!(read_archive_epoch_token(git_dir).is_some());
+            }
+            ARCHIVE_INDEX_SYNC_FILE_NAME => {
+                assert_eq!(
+                    read_archive_index_sync_record(git_dir),
+                    Some((git2::Oid::ZERO_SHA1, "test-index-identity".to_string()))
+                );
+            }
+            _ => panic!("unexpected archive control marker: {file_name}"),
+        }
+    }
+
+    #[test]
+    fn archive_control_publish_preserves_preexisting_staging_files() {
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_preserves_preexisting_staging_files",
+        ) {
+            return;
+        }
+        for (seq, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            let tmp = TempDir::new().unwrap();
+            let git_dir = tmp.path().canonicalize().unwrap().join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            // The old shared counter starts at zero in the isolated child.
+            // Leave an unrelated file exactly where that writer would stage.
+            let legacy_staging =
+                git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+            fs::write(&legacy_staging, b"retained staging evidence").unwrap();
+            let destination = git_dir.join(file_name);
+            fs::write(&destination, b"previous marker").unwrap();
+
+            write_archive_control_marker_for_test(&git_dir, file_name).unwrap();
+
+            assert_eq!(
+                fs::read(&legacy_staging).unwrap(),
+                b"retained staging evidence",
+                "publishing {file_name} must not consume or truncate a foreign staging file"
+            );
+            assert_archive_control_marker_is_valid(&git_dir, file_name);
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "published control markers must retain private staging permissions"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_control_publish_preserves_staging_link_targets() {
+        use std::os::unix::fs::symlink;
+
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_preserves_staging_link_targets",
+        ) {
+            return;
+        }
+        for (marker_index, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            for (link_index, hardlink) in [false, true].into_iter().enumerate() {
+                let tmp = TempDir::new().unwrap();
+                let root = tmp.path().canonicalize().unwrap();
+                let git_dir = root.join(".git");
+                fs::create_dir(&git_dir).unwrap();
+                let sentinel = root.join("foreign-sentinel");
+                fs::write(&sentinel, b"foreign bytes must survive").unwrap();
+                let seq = marker_index * 2 + link_index;
+                let legacy_staging =
+                    git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+                if hardlink {
+                    fs::hard_link(&sentinel, &legacy_staging).unwrap();
+                } else {
+                    symlink(&sentinel, &legacy_staging).unwrap();
+                }
+
+                write_archive_control_marker_for_test(&git_dir, file_name).unwrap();
+
+                assert_eq!(
+                    fs::read(&sentinel).unwrap(),
+                    b"foreign bytes must survive",
+                    "publishing {file_name} must not write through a planted staging link"
+                );
+                assert_eq!(
+                    fs::read(&legacy_staging).unwrap(),
+                    b"foreign bytes must survive"
+                );
+                assert_eq!(
+                    fs::symlink_metadata(&legacy_staging)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    !hardlink
+                );
+                assert_archive_control_marker_is_valid(&git_dir, file_name);
+                assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_control_publish_refuses_symlinked_destinations_and_parents() {
+        use std::os::unix::fs::symlink;
+
+        for file_name in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let git_dir = root.join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            let sentinel = root.join("foreign-sentinel");
+            fs::write(&sentinel, b"foreign control bytes").unwrap();
+            let destination = git_dir.join(file_name);
+            symlink(&sentinel, &destination).unwrap();
+
+            let result = write_archive_control_marker_for_test(&git_dir, file_name);
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                fs::symlink_metadata(&destination)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"foreign control bytes");
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 1);
+
+            let real_git = root.join("real-git");
+            fs::create_dir(&real_git).unwrap();
+            let retained = real_git.join(file_name);
+            fs::write(&retained, b"retained marker bytes").unwrap();
+            let alias = root.join("git-alias");
+            symlink(&real_git, &alias).unwrap();
+
+            let result = write_archive_control_marker_for_test(&alias, file_name);
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(fs::read(&retained).unwrap(), b"retained marker bytes");
+            assert_eq!(fs::read_dir(&real_git).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn archive_control_publish_failure_preserves_foreign_staging_and_destination() {
+        if !isolated_coalescer_regression(
+            "tests::archive_control_publish_failure_preserves_foreign_staging_and_destination",
+        ) {
+            return;
+        }
+        for (seq, file_name) in [ARCHIVE_EPOCH_FILE_NAME, ARCHIVE_INDEX_SYNC_FILE_NAME]
+            .into_iter()
+            .enumerate()
+        {
+            let tmp = TempDir::new().unwrap();
+            let git_dir = tmp.path().canonicalize().unwrap().join(".git");
+            fs::create_dir(&git_dir).unwrap();
+            let legacy_staging =
+                git_dir.join(format!("{file_name}.tmp-{}-{seq}", std::process::id()));
+            fs::write(&legacy_staging, b"retained staging evidence").unwrap();
+            // A nonempty directory makes the old rename fail after it has
+            // already truncated the foreign staging file. Its error cleanup
+            // then unlinks that foreign file; neither action is ours to take.
+            let destination = git_dir.join(file_name);
+            fs::create_dir(&destination).unwrap();
+            let retained = destination.join("owner-data");
+            fs::write(&retained, b"retained destination evidence").unwrap();
+
+            let result = write_archive_control_marker_for_test(&git_dir, file_name);
+
+            if file_name == ARCHIVE_INDEX_SYNC_FILE_NAME {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                fs::read(&legacy_staging).unwrap(),
+                b"retained staging evidence"
+            );
+            assert_eq!(
+                fs::read(&retained).unwrap(),
+                b"retained destination evidence"
+            );
+            assert_eq!(fs::read_dir(&git_dir).unwrap().count(), 2);
+        }
+    }
+
     #[test]
     fn atomic_write_and_commit_paths_rewrite_persisted_epoch_token() {
         // Doctor/reconstruct route through atomic_write_bytes + commit_paths;
@@ -24745,6 +26201,13 @@ mod tests {
             stuck.oldest_unmaterialized_us >= stuck.wbq_inflight_oldest_age_us,
             "overall lag must include the blocked WBQ batch: {stuck:?}"
         );
+
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        let unavailable = try_archive_lag_snapshot().unwrap_err();
+        assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+        assert!(unavailable.lower_bound.wbq_inflight_execution_us >= 1_000_000);
+        assert!(unavailable.lower_bound.oldest_unmaterialized_us >= 1_000_000);
+        drop(backlog);
 
         drop(fence);
         assert_eq!(
@@ -27529,6 +28992,54 @@ mod tests {
     }
 
     #[test]
+    fn archive_lag_nonblocking_sample_names_real_held_queue_mutexes() {
+        if !isolated_coalescer_regression(
+            "tests::archive_lag_nonblocking_sample_names_real_held_queue_mutexes",
+        ) {
+            return;
+        }
+        let coalescer = get_commit_coalescer();
+        let root = TempDir::new().unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(root.path()));
+        assert!(try_archive_lag_snapshot().is_ok());
+
+        // These are the actual global queues used by production sampling,
+        // not independent fixture mutexes. A blocking regression deadlocks
+        // against this same-thread holder and is terminated by nextest.
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "archive_backlog.queue"
+        );
+        drop(backlog);
+        let repos = coalescer.repos.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.repos"
+        );
+        drop(repos);
+        let queue = rq.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.queue"
+        );
+        drop(queue);
+        let spill = rq.spill.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.spill"
+        );
+        drop(spill);
+        let progress = rq.progress.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.progress"
+        );
+        drop(progress);
+        assert_eq!(try_archive_lag_snapshot().unwrap(), archive_lag_snapshot());
+    }
+
+    #[test]
     fn archive_lag_reports_coalescer_batch_blocked_in_flight() {
         if !isolated_coalescer_regression(
             "tests::archive_lag_reports_coalescer_batch_blocked_in_flight",
@@ -27574,6 +29085,23 @@ mod tests {
                 repo.head().is_err(),
                 "the blocked request must not be committed yet"
             );
+
+            // An unrelated busy backlog must not hide this independently
+            // observable in-flight commit. The sample remains incomplete,
+            // but its confirmed coalescer age/progress bounds must survive.
+            let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+            let unavailable = try_archive_lag_snapshot().unwrap_err();
+            assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+            let lower_bound = unavailable.lower_bound;
+            assert_eq!(lower_bound.coalescer_pending, 1);
+            assert!(lower_bound.coalescer_oldest_age_us >= stuck.coalescer_oldest_age_us);
+            assert!(lower_bound.coalescer_since_progress_us >= stuck.coalescer_since_progress_us);
+            assert!(lower_bound.oldest_unmaterialized_us >= lower_bound.coalescer_oldest_age_us);
+            assert!(
+                repo.head().is_err(),
+                "sampling cannot publish the blocked commit"
+            );
+            drop(backlog);
 
             drop(fence);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -27938,6 +29466,57 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_partial_sample_keeps_other_repositories_confirmed_progress() {
+        // Seed diagnostic ownership state without waking a worker. The real
+        // fenced Git regression above separately exercises in-flight commits.
+        let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
+        let root = TempDir::new().unwrap();
+        let first = coalescer.get_or_create_repo(&root.path().join("first"));
+        let second = coalescer.get_or_create_repo(&root.path().join("second"));
+        let oldest = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        for rq in [&first, &second] {
+            rq.progress.lock().unwrap().inflight_oldest = Some(oldest);
+        }
+        let minimum_age = duration_as_micros_u64(Duration::from_secs(120));
+        // Exercise both iteration orders without depending on HashMap order:
+        // holding whichever repository is visited first must still sample the
+        // other one. All three actual ownership mutexes are checked in turn.
+        for rq in [&first, &second] {
+            let queue = rq.queue.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.queue");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(queue);
+            let spill = rq.spill.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.spill");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(spill);
+            let progress = rq.progress.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.progress");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(progress);
+        }
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn commit_coalescer_oldest_pending_age_tracks_enqueue() {
         // Long flush interval so the worker cannot drain during the test window.
         let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
@@ -27948,6 +29527,7 @@ mod tests {
         let config = test_config(tmp.path());
         let repo_root = config.storage_root.join("projects").join("cproj");
         std::fs::create_dir_all(&repo_root).unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(&repo_root));
         coalescer.enqueue(
             repo_root,
             &config,
@@ -27963,6 +29543,25 @@ mod tests {
         assert!(
             coalescer.oldest_pending_age_us() > 0,
             "oldest uncommitted request reports commit-lag age"
+        );
+        let spill = rq.spill.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.spill");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(spill);
+        let progress = rq.progress.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.progress");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(progress);
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
         );
     }
 
@@ -30092,6 +31691,94 @@ mod tests {
         assert_eq!(report.found, 1);
         assert_eq!(report.missing, 0);
         assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_canonical_probes_do_not_walk_populated_month() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(&month).unwrap();
+        for index in 0..4096 {
+            fs::write(
+                month.join(format!("unrelated-{index}.md")),
+                "retained history",
+            )
+            .unwrap();
+        }
+        let refs: Vec<_> = (1..=100)
+            .map(|id| {
+                fs::write(
+                    month.join(format!("2026-02-08T03-29-30Z__hello-world__{id}.md")),
+                    "canonical archive message",
+                )
+                .unwrap();
+                ConsistencyMessageRef {
+                    project_slug: "test-project".into(),
+                    message_id: id,
+                    sender_name: "BlueLake".into(),
+                    subject: "hello world".into(),
+                    created_ts_iso: "2026-02-08T03:29:30.123456Z".into(),
+                }
+            })
+            .collect();
+        let checkpoints = std::cell::Cell::new(0);
+        let report = check_archive_consistency_with_checkpoint(dir.path(), &refs, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            if checkpoints.get() > refs.len() + 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "canonical archive probes must not enumerate month entries",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.sampled, refs.len());
+        assert_eq!(report.found, refs.len());
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistency_canonical_probe_rejects_symlinks_directories_and_timestamp_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(month.join("2026-02")).unwrap();
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "outside evidence").unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            month.join("2026-02-08T03-29-30Z__hello-world__1.md"),
+        )
+        .unwrap();
+        fs::create_dir(month.join("2026-02-08T03-29-30Z__hello-world__2.md")).unwrap();
+        // This would be the fast probe's target if an untrusted timestamp
+        // were joined without validating the complete filename component.
+        let escaped = month.parent().unwrap().join("escapZ__hello-world__3.md");
+        fs::write(&escaped, "foreign month evidence").unwrap();
+        let refs: Vec<_> = (1..=3)
+            .map(|id| ConsistencyMessageRef {
+                project_slug: "test-project".into(),
+                message_id: id,
+                sender_name: "BlueLake".into(),
+                subject: "hello world".into(),
+                created_ts_iso: if id == 3 {
+                    "2026-02/../../escape".into()
+                } else {
+                    "2026-02-08T03:29:30Z".into()
+                },
+            })
+            .collect();
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 3);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing_ids, [1, 2, 3]);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside evidence");
+        assert_eq!(
+            fs::read_to_string(&escaped).unwrap(),
+            "foreign month evidence"
+        );
     }
 
     #[test]

@@ -81,6 +81,14 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow headless start (`--no-tui`), use `LOG_LEVEL=info` in the launching
+environment. Look for `startup_phase_started` and `startup_phase_finished`.
+The `phase` field identifies listener detection,
+backup rotation, individual probes and archive preflight; `duration_us` records
+elapsed work. A finish event means the call returned; use the probe report to
+determine success. A start with no finish identifies an interrupted or still
+running phase. Work deferred during listener handoff has no phase events.
+
 For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
 only that startup probe. The background guard remains enabled and starts its
 first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,
@@ -95,6 +103,45 @@ maintenance. To disable only checkpoint/ANALYZE/VACUUM/journal-size maintenance,
 use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
 take effect when the server starts. Existing service overrides remain an
 operator decision; inspect them before changing a deployment.
+
+### Inspect a managed service from scripts [read-only]
+
+Use the native service manager for a status report that does not open the
+mailbox database or acquire its ownership lock:
+
+```bash
+am service status
+am service status --json
+am service status --json | jq '{service, pid, host, port, port_reachable}'
+```
+
+The JSON command emits one object with `schema_version: 1`. `manager` is
+`systemd` on Linux or `launchd` on macOS. `service` classifies the manager's
+state as `running`, `stopped`, `starting`, `stopping`, `reloading`, `failed`,
+`not_loaded`, `not_installed`, or `unknown`; `state` preserves the native state.
+`installed` is a boolean when installation is established, otherwise `null`.
+`manager_available` distinguishes a usable manager response from an unavailable
+user bus, missing command, or failed query. Inspect `error` when state is unknown.
+An unavailable manager is never reported as a stopped or absent service.
+
+`pid` comes from the native service manager and is `null` when no positive PID
+is known. `host` and `port` come from the generated service configuration;
+both remain `null` when its binding cannot be read. `port_reachable` reports a
+TCP connection probe, or `null` when the binding is unknown. A reachable port
+does not prove that Agent Mail owns the listener or that the mailbox is healthy.
+A stopped service can therefore have `port_reachable: true` if another process
+owns the port.
+
+A produced report exits successfully even when the service is stopped, missing,
+or unknown, so automation should inspect the fields. For example, this requires
+both a running supervisor state and a reachable configured port:
+
+```bash
+am service status --json | jq -e '.service == "running" and .port_reachable == true'
+```
+
+Unsupported platforms and failures to serialize the report remain command
+errors. Without `--json`, the existing human-readable status output is retained.
 
 ### Verify a mailbox before upgrading [read-only]
 
@@ -661,6 +708,55 @@ If that reconciler is not running or has stopped making progress, health exits
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
+
+### Interpreting descriptor growth
+
+The daemon's MCP `health_check` includes a `descriptors` health contributor
+with its current open-file count and soft limit. A rising descriptor floor
+also raises a warning before the limit is close: the minimum count must rise
+in six consecutive completed 30-minute windows, by at least 64 descriptors
+overall. Releasing descriptors clears that growth warning immediately when
+the sampler observes the recovery. A sampler restart or an unobserved window
+starts a new history instead of treating missing samples as evidence of growth.
+
+When both a rising floor and a finite limit are available, the contributor
+estimates the seconds to exhaust the remaining headroom at the observed rate.
+For example, 1,900 open descriptors, a limit of 2,048, and growth of 200 per hour
+produce an estimate of 2,664 seconds. The resource-monitor warning logs also
+include `observed_span_us` and `projected_exhaustion_seconds`. The rate uses the
+actual times at which the window minima were observed. This is a linear
+projection, not proof of a leak or a guaranteed deadline; a workload change
+can change it. Unknown or unlimited headroom produces no estimate. The
+existing pressure thresholds remain yellow at 70% and red at 90% utilization.
+
+### Controlling background archive repair
+
+The daemon has three independent repair lanes for file-backed mailboxes. Each
+defaults to enabled and accepts a process environment override:
+
+| Environment variable | Repair lane |
+|----------------------|-------------|
+| `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED` | Missing message archive artifacts |
+| `AM_AGENT_ARCHIVE_RECONCILE_ENABLED` | Agent profiles, including retirement and deregistration state |
+| `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED` | Terminal reservation release artifacts |
+
+Set the agent flag to `false` in the service environment to pause agent-profile
+repair while keeping message durability repair and reservation convergence on.
+Disabling the message flag does not disable the agent lane. Apply environment
+changes through the service's normal restart procedure. Explicit `true`, `1`,
+`yes`, and `on` values enable a lane (case-insensitive, surrounding whitespace
+ignored); other explicit values disable it. In-memory mailboxes never run these
+repair lanes.
+
+The startup log reports `message_archive_reconcile_enabled`,
+`agent_archive_reconcile_enabled`, and `reservation_release_reconcile_enabled`
+separately. Each enabled lane retains its own scan deadline and bounded backlog
+retries. Enabling any one lane starts the maintenance worker even when retention
+and quota reporting are off. Disabling all three removes repair work; the worker
+still runs if `RETENTION_REPORT_ENABLED`, `QUOTA_ENABLED`, or a positive
+`MESSAGES_RETENTION_DAYS` requests it. Otherwise it is not started. Repair flags
+do not enable destructive message retention or accelerate the reporting and
+pruning schedule.
 
 ### Automatic backup retention and actual disk reclamation
 

@@ -3023,9 +3023,7 @@ BINARY_TRANSACTION_LAST_ARCHIVE_PATH=""
 SOURCE_INSTALL_RECEIPT_ENABLED=0
 SOURCE_INSTALL_RELEASE_TAG=""
 SOURCE_INSTALL_COMMIT=""
-SOURCE_INSTALL_FRANKENSEARCH_COMMIT=""
-SOURCE_INSTALL_FAST_CMAES_COMMIT=""
-SOURCE_INSTALL_BEADS_RUST_COMMIT=""
+SOURCE_INSTALL_CARGO_LOCK_SHA256=""
 TXN_NONCE=""
 TXN_HAD_SERVER=""
 TXN_HAD_CLI=""
@@ -3279,9 +3277,8 @@ validate_binary_transaction_source_receipt() {
   local receipt="$journal/source-receipt"
   local witness_file="$journal/source-receipt.sha256"
   local witness="" extra="" actual="" witness_lines=""
-  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8="" l9="" l10=""
-  local release_tag="" source_commit="" frankensearch_commit=""
-  local fast_cmaes_commit="" beads_rust_commit="" server_hash="" cli_hash=""
+  local l1="" l2="" l3="" l4="" l5="" l6="" l7="" l8=""
+  local release_tag="" source_commit="" lock_hash="" server_hash="" cli_hash=""
 
   if [ "$TXN_SOURCE_RECEIPT_HASH" = "absent" ] && \
      ! installer_entry_exists "$receipt" && ! installer_entry_exists "$witness_file"; then
@@ -3320,25 +3317,19 @@ validate_binary_transaction_source_receipt() {
     IFS= read -r l5 || return 1
     IFS= read -r l6 || return 1
     IFS= read -r l7 || return 1
-    IFS= read -r l8 || return 1
-    IFS= read -r l9 || return 1
-    if IFS= read -r l10 || [ -n "$l10" ]; then return 1; fi
+    if IFS= read -r l8 || [ -n "$l8" ]; then return 1; fi
   } <"$receipt"
-  [ "$l1" = "schema=1" ] || return 1
+  [ "$l1" = "schema=2" ] || return 1
   [ "$l2" = "install_method=exact-tag-source" ] || return 1
   case "$l3" in release_tag=*) release_tag="${l3#release_tag=}" ;; *) return 1 ;; esac
   case "$l4" in source_commit=*) source_commit="${l4#source_commit=}" ;; *) return 1 ;; esac
-  case "$l5" in frankensearch_commit=*) frankensearch_commit="${l5#frankensearch_commit=}" ;; *) return 1 ;; esac
-  case "$l6" in fast_cmaes_commit=*) fast_cmaes_commit="${l6#fast_cmaes_commit=}" ;; *) return 1 ;; esac
-  case "$l7" in beads_rust_commit=*) beads_rust_commit="${l7#beads_rust_commit=}" ;; *) return 1 ;; esac
-  case "$l8" in server_sha256=*) server_hash="${l8#server_sha256=}" ;; *) return 1 ;; esac
-  case "$l9" in cli_sha256=*) cli_hash="${l9#cli_sha256=}" ;; *) return 1 ;; esac
+  case "$l5" in cargo_lock_sha256=*) lock_hash="${l5#cargo_lock_sha256=}" ;; *) return 1 ;; esac
+  case "$l6" in server_sha256=*) server_hash="${l6#server_sha256=}" ;; *) return 1 ;; esac
+  case "$l7" in cli_sha256=*) cli_hash="${l7#cli_sha256=}" ;; *) return 1 ;; esac
 
   [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
   [[ "$source_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$frankensearch_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$fast_cmaes_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$beads_rust_commit" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$lock_hash" =~ ^[a-f0-9]{64}$ ]] || return 1
   [ "$server_hash" = "$TXN_NEW_SERVER_HASH" ] || return 1
   [ "$cli_hash" = "$TXN_NEW_CLI_HASH" ] || return 1
 }
@@ -3351,17 +3342,13 @@ write_binary_transaction_source_receipt() {
   [ "$SOURCE_INSTALL_RECEIPT_ENABLED" -eq 1 ] || return 0
   [[ "$SOURCE_INSTALL_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || return 1
   [[ "$SOURCE_INSTALL_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$SOURCE_INSTALL_FRANKENSEARCH_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$SOURCE_INSTALL_FAST_CMAES_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
-  [[ "$SOURCE_INSTALL_BEADS_RUST_COMMIT" =~ ^[a-f0-9]{40}$ ]] || return 1
+  [[ "$SOURCE_INSTALL_CARGO_LOCK_SHA256" =~ ^[a-f0-9]{64}$ ]] || return 1
 
-  receipt="schema=1
+  receipt="schema=2
 install_method=exact-tag-source
 release_tag=$SOURCE_INSTALL_RELEASE_TAG
 source_commit=$SOURCE_INSTALL_COMMIT
-frankensearch_commit=$SOURCE_INSTALL_FRANKENSEARCH_COMMIT
-fast_cmaes_commit=$SOURCE_INSTALL_FAST_CMAES_COMMIT
-beads_rust_commit=$SOURCE_INSTALL_BEADS_RUST_COMMIT
+cargo_lock_sha256=$SOURCE_INSTALL_CARGO_LOCK_SHA256
 server_sha256=$TXN_NEW_SERVER_HASH
 cli_sha256=$TXN_NEW_CLI_HASH"
   printf '%s\n' "$receipt" \
@@ -8075,36 +8062,64 @@ checkout_exact_release_source() {
   verbose "source_checkout:tag=${release_tag} revision=${fetched_revision}"
 }
 
-release_dependency_pin() {
+source_dependency_lock_sha256() {
   local source_root="$1"
-  local key="$2"
-  local workflow="$source_root/.github/workflows/dist.yml"
-  local matches="" count=0 pin=""
+  local lock="$source_root/Cargo.lock" digest=""
 
-  [ -f "$workflow" ] || return 1
-  matches=$(awk -v key="${key}:" '$1 == key { print $2 }' "$workflow")
-  if [ -n "$matches" ]; then
-    count=$(printf '%s\n' "$matches" | grep -c . || true)
-  fi
-  [ "$count" -eq 1 ] || return 1
-  pin="$matches"
-  [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || return 1
-  printf '%s' "$pin"
+  [ ! -L "$lock" ] && [ -f "$lock" ] && [ -s "$lock" ] || return 1
+  digest=$(file_sha256_hex "$lock") || return 1
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s' "$digest"
 }
 
-checkout_pinned_dependency() {
-  local repository_url="$1"
-  local destination="$2"
-  local expected_revision="$3"
-  local actual_revision=""
+validate_source_dependency_paths() {
+  local source_root="$1" metadata="$2"
 
-  git init --quiet "$destination" || return 1
-  git -C "$destination" remote add origin "$repository_url" || return 1
-  git -C "$destination" fetch --quiet --depth 1 origin "$expected_revision" || return 1
-  git -C "$destination" checkout --quiet --detach FETCH_HEAD || return 1
-  actual_revision=$(git -C "$destination" rev-parse HEAD 2>/dev/null || true)
-  if [ "$actual_revision" != "$expected_revision" ]; then
-    err "Pinned dependency at $destination resolved to ${actual_revision:-missing}, expected $expected_revision."
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import json, pathlib' >/dev/null 2>&1; then
+    python3 - "$source_root" "$metadata" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    packages = json.load(stream)["packages"]
+if not root.is_dir() or not isinstance(packages, list) or not packages:
+    raise SystemExit("Source dependency metadata has no packages or valid source root")
+for package in packages:
+    if package["source"] is not None:
+        continue
+    manifest = pathlib.Path(package["manifest_path"]).resolve(strict=True)
+    try:
+        manifest.relative_to(root)
+    except ValueError:
+        raise SystemExit(f"Path dependency is outside the tagged source: {manifest}")
+    if not manifest.is_file():
+        raise SystemExit(f"Path dependency has no regular manifest: {manifest}")
+PY
+  elif command -v perl >/dev/null 2>&1 && perl -MJSON::PP -MCwd -MEncode -e 1 >/dev/null 2>&1; then
+    perl -MJSON::PP -MCwd=abs_path -MEncode=encode_utf8 - "$source_root" "$metadata" <<'PL'
+  use strict;
+  use warnings;
+
+  my $root = abs_path($ARGV[0]);
+  defined($root) && -d $root or die "Invalid source root\n";
+  open my $stream, '<', $ARGV[1] or die "Cannot read source dependency metadata: $!\n";
+  local $/;
+  my $metadata = decode_json(<$stream>);
+  ref($metadata) eq 'HASH' && ref($metadata->{packages}) eq 'ARRAY' && @{$metadata->{packages}}
+      or die "Source dependency metadata has no packages\n";
+  for my $package (@{$metadata->{packages}}) {
+      ref($package) eq 'HASH' && exists($package->{source}) or die "Invalid package source\n";
+      next if defined($package->{source});
+      defined($package->{manifest_path}) or die "Missing package manifest path\n";
+      my $manifest = abs_path(encode_utf8($package->{manifest_path}));
+      defined($manifest) && -f $manifest && index($manifest, "$root/") == 0
+          or die "Path dependency is outside the tagged source\n";
+  }
+PL
+  else
+    err "Source dependency verification requires working Python 3 or Perl with JSON::PP."
     return 1
   fi
 }
@@ -9569,33 +9584,15 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ensure_rust "$TMP/src" || exit 1
 
-  if ! frankensearch_commit=$(release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT) || \
-     ! fast_cmaes_commit=$(release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT) || \
-     ! beads_rust_commit=$(release_dependency_pin "$TMP/src" BEADS_RUST_COMMIT); then
-    err "Release tag $VERSION does not contain one exact full-SHA pin for every source-build sibling."
-    err "Expected FRANKENSEARCH_COMMIT, FAST_CMAES_COMMIT, and BEADS_RUST_COMMIT in dist.yml."
+  if ! source_lock_hash=$(source_dependency_lock_sha256 "$TMP/src"); then
+    err "Release tag $VERSION requires a non-empty regular Cargo.lock for a locked source build."
     exit 1
   fi
-
-  if ! checkout_pinned_dependency \
-      "https://github.com/Dicklesworthstone/frankensearch.git" \
-      "$TMP/frankensearch-rel-0332" "$frankensearch_commit" || \
-     ! checkout_pinned_dependency \
-      "https://github.com/Dicklesworthstone/fast_cmaes.git" \
-      "$TMP/fast_cmaes" "$fast_cmaes_commit" || \
-     ! checkout_pinned_dependency \
-      "https://github.com/Dicklesworthstone/beads_rust.git" \
-      "$TMP/beads_rust" "$beads_rust_commit"; then
-    err "Could not check out an exact pinned source-build dependency."
+  if ! (cd "$TMP/src" && cargo metadata --locked --format-version 1 > "$TMP/source-metadata.json") || \
+     ! validate_source_dependency_paths "$TMP/src" "$TMP/source-metadata.json"; then
+    err "Source builds require every local path dependency to stay inside the exact tagged checkout."
     exit 1
   fi
-
-  SOURCE_INSTALL_RECEIPT_ENABLED=1
-  SOURCE_INSTALL_RELEASE_TAG="$VERSION"
-  SOURCE_INSTALL_COMMIT="$source_commit"
-  SOURCE_INSTALL_FRANKENSEARCH_COMMIT="$frankensearch_commit"
-  SOURCE_INSTALL_FAST_CMAES_COMMIT="$fast_cmaes_commit"
-  SOURCE_INSTALL_BEADS_RUST_COMMIT="$beads_rust_commit"
 
   source_target_dir="$TMP/source-target"
   if ! (cd "$TMP/src" && \
@@ -9605,6 +9602,15 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     error_support_hint
     exit 1
   fi
+  if ! built_lock_hash=$(source_dependency_lock_sha256 "$TMP/src") || \
+     [ "$built_lock_hash" != "$source_lock_hash" ]; then
+    err "Cargo.lock changed during the locked source build; refusing installation."
+    exit 1
+  fi
+  SOURCE_INSTALL_RECEIPT_ENABLED=1
+  SOURCE_INSTALL_RELEASE_TAG="$VERSION"
+  SOURCE_INSTALL_COMMIT="$source_commit"
+  SOURCE_INSTALL_CARGO_LOCK_SHA256="$source_lock_hash"
   SERVER_BIN="$source_target_dir/release/$BIN_SERVER"
   CLI_BIN="$source_target_dir/release/$BIN_CLI"
   [ -x "$SERVER_BIN" ] || {
@@ -9681,8 +9687,6 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "  Source receipt: $source_receipt_path"
 fi
 prune_binary_transaction_history "$DEST"
-maybe_add_path
-install_local_bin_links
 
 if detect_mac_direct_exec_compat_mode; then
   warn "macOS direct execution compatibility mode enabled"
@@ -9771,40 +9775,10 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
 
     if [ "$MIGRATE_PYTHON" -eq 1 ]; then
       stop_python_server
-      if ! displace_python_alias; then
-        err "Failed to fully displace legacy 'am' alias/function definitions."
-        err "Please remove remaining alias/function manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
-      if ! displace_python_binary; then
-        err "Failed to displace legacy 'am' launcher in PATH."
-        err "Please remove or rename the legacy launcher manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
+      # GH#384: copying the source does not establish that Rust can use it.
+      # Keep the Python launchers, shell startup, env and client configs intact
+      # until migration, integrity and archive-parity verification succeed.
       resolve_database_path
-      # Only migrate env config if resolve_database_path actually copied a Python DB.
-      # PYTHON_DB_MIGRATED_PATH is set only when a DB was copied and needs migration.
-      if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
-        migrate_env_config
-      else
-        # No Python DB to migrate — alias/binary displacement was the entire migration.
-        # Write the marker now so future runs skip the migration prompt entirely.
-        # (Without this, the clone directory still triggers PYTHON_DETECTED=1 and the
-        # user is prompted on every `acfs update` — see GitHub issue #258.)
-        if [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
-          mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-          printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "${VERSION:-unknown}" \
-            > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-          verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
-          ok "Migration marker saved (no Python database found; alias/binary displaced)"
-        fi
-      fi
     fi
   fi
 fi
@@ -9827,21 +9801,6 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
       info "[$tool] $path (missing)"
     fi
   done <<< "$MCP_CONFIG_SCAN"
-fi
-
-# First run native setup so its atomic, Git-aware token writer durably commits
-# the one credential every subsequent client and service phase will use.
-# This also handles the broader non-Codex migration work:
-#   - Python→Rust command rewriting
-#   - env var preservation (bearer token, storage root)
-#   - BOM/JSONC/trailing-comma tolerance
-#   - Backup before modification
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
-    err "MCP client configuration failed."
-    error_support_hint
-    exit 1
-  fi
 fi
 
 collect_migration_counts() {
@@ -10745,19 +10704,6 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
     fi
   fi
 
-  if [ "$migration_succeeded" -eq 1 ]; then
-    # Write migration-complete marker so future installer runs skip Python migration entirely.
-    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      "${RUST_DB_PATH:-unknown}" \
-      "${PYTHON_DB_PATH:-unknown}" \
-      "${VERSION:-unknown}" \
-      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
-    ok "Python→Rust migration marker saved (future installs will skip migration)"
-  fi
-
   if [ "$migration_succeeded" -ne 1 ]; then
     err "Database migration could not be completed safely."
     err "Aborting install to avoid running with a potentially inconsistent migrated database."
@@ -10774,6 +10720,62 @@ fi
 if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
   warn "Rust database migration was skipped because this macOS host rejected direct execution of the installed Rust binaries."
   warn "The existing Python data path remains active through the compatibility launcher."
+fi
+
+# Commit the user-facing takeover only after all required database checks.
+# A refused migration above must not redirect clients to an unusable mailbox.
+if [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
+  # PYTHON_DB_MIGRATED_PATH is set only when a database needs migration.
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    migrate_env_config
+  fi
+  if ! displace_python_alias; then
+    err "Failed to fully displace legacy 'am' alias/function definitions."
+    err "Please remove remaining alias/function manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if ! displace_python_binary; then
+    err "Failed to displace legacy 'am' launcher in PATH."
+    err "Please remove or rename the legacy launcher manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${RUST_DB_PATH:-unknown}" \
+      "${PYTHON_DB_PATH:-unknown}" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
+    ok "Python→Rust migration marker saved (future installs will skip migration)"
+  elif [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
+    # GH#258: launcher-only migrations must not prompt on every later update.
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
+    ok "Migration marker saved (no Python database found; alias/binary displaced)"
+  fi
+fi
+
+maybe_add_path
+install_local_bin_links
+
+# Native setup durably commits the shared credential before clients/services
+# use it. Run only after the migrated mailbox has passed verification.
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
+  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
+    err "MCP client configuration failed."
+    error_support_hint
+    exit 1
+  fi
 fi
 
 if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ]; then

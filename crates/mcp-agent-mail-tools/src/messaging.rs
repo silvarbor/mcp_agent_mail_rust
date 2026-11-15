@@ -3850,69 +3850,55 @@ effective_free_bytes={free}"
         .iter()
         .map(|(id, kind)| (*id, kind.as_str()))
         .collect();
-    // Idempotency (br-idempotency-keys-mutating-tools-h0x9k): when the client
-    // supplied a key, route through the idempotent DB entry point. A matching
-    // prior key replays the original message — the index/notification/archive
-    // side effects below are then skipped (at-most-once) — while a differing
-    // payload under the same key is a typed conflict.
-    let (message, idempotent_replay) = if let Some(fingerprint) = idempotency_fingerprint.as_deref()
-    {
-        let key = idempotency_key.as_deref().unwrap_or_default();
+    #[cfg(test)]
+    tests::run_before_message_admission_hook();
+    // Both fresh and keyed sends share the same transaction-bound admission.
+    // The earlier cross-project contact check supplies helpful errors, but its
+    // result cannot authorize a send after attachment processing or pool waits.
+    let cross_project =
+        foreign_project
+            .as_ref()
+            .map(|_| mcp_agent_mail_db::queries::CrossProjectMessageScope {
+                sender_project_id: project_id,
+            });
+    let claim = idempotency_fingerprint.as_deref().map(|fingerprint| {
         // The claim is keyed by the sender's project (where a retry looks it
         // up), even when the message itself is stored in another project.
-        let claim = mcp_agent_mail_db::IdempotencyClaim {
+        mcp_agent_mail_db::IdempotencyClaim {
             project_id,
             tool: idempotency_tool,
-            key,
+            key: idempotency_key.as_deref().unwrap_or_default(),
             fingerprint,
-        };
-        match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_idempotent_topic(
-                ctx.cx(),
-                &pool,
-                delivery_id,
-                sender_id,
-                &subject,
-                &final_body,
-                thread_id.as_deref(),
-                topic.as_deref(),
-                reply_to,
-                &importance_val,
-                ack_required.unwrap_or(false),
-                &attachments_json,
-                &recipient_refs,
-                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
-                claim,
-            )
-            .await,
-        )? {
-            mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
-            mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
-            mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
-                return Err(crate::idempotency::idempotency_conflict_error(&info));
-            }
         }
-    } else {
-        let row = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_message_with_recipients_topic(
-                ctx.cx(),
-                &pool,
-                delivery_id,
-                sender_id,
-                &subject,
-                &final_body,
-                thread_id.as_deref(),
-                topic.as_deref(),
-                reply_to,
-                &importance_val,
-                ack_required.unwrap_or(false),
-                &attachments_json,
-                &recipient_refs,
-                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
-            )
-            .await,
-        )?;
-        (row, false)
+    });
+    // A replay returns before checking current contact permission and skips
+    // indexing, notification and archive side effects below: no new mail is sent.
+    let (message, idempotent_replay) = match db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::create_message_with_recipients_guarded(
+            ctx.cx(),
+            &pool,
+            delivery_id,
+            sender_id,
+            &subject,
+            &final_body,
+            thread_id.as_deref(),
+            topic.as_deref(),
+            reply_to,
+            &importance_val,
+            ack_required.unwrap_or(false),
+            &attachments_json,
+            &recipient_refs,
+            project_mailbox.as_ref().map(|mailbox| mailbox.kind),
+            cross_project,
+            claim,
+        )
+        .await,
+    )? {
+        mcp_agent_mail_db::IdempotentOutcome::Fresh(row) => (row, false),
+        mcp_agent_mail_db::IdempotentOutcome::Replayed(row) => (row, true),
+        mcp_agent_mail_db::IdempotentOutcome::Conflict(info) => {
+            return Err(crate::idempotency::idempotency_conflict_error(&info));
+        }
     };
 
     if idempotent_replay {
@@ -5598,8 +5584,10 @@ pub async fn fetch_inbox_events(
     // Cursor delivery is a durable database contract. Do not use the
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
-    // dishonest empty monitor page. Reading events never creates a project.
-    let pool = get_db_pool_for_request(ctx)?;
+    // dishonest empty monitor page. Query-only reads must not wait for writer
+    // admission or bootstrap recovery just to observe committed deliveries.
+    ensure_request_live(ctx)?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
@@ -5613,7 +5601,6 @@ pub async fn fetch_inbox_events(
     .await?;
     crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
-    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let page = match mcp_agent_mail_db::queries::fetch_inbox_delivery_events(
         ctx.cx(),
@@ -5657,6 +5644,7 @@ pub async fn fetch_inbox_events(
         }
         outcome => db_outcome_to_mcp_result(outcome)?,
     };
+    crate::tool_util::touch_acting_agent_after_live_read(ctx, &pool, agent.id).await;
 
     let labels = if position_now.unwrap_or(false) || page.events.is_empty() {
         BTreeMap::new()
@@ -5721,7 +5709,10 @@ pub async fn get_message_delivery_receipt(
     project_key: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let pool = get_db_pool_for_request(ctx)?;
+    // Receipts are existing live-database facts, not a reason to admit a
+    // writer, initialize a mailbox, or reconstruct an archive snapshot.
+    ensure_request_live(ctx)?;
+    let pool = get_coalescer_bypass_read_db_pool()?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let receipt = db_outcome_to_mcp_result(
@@ -6142,7 +6133,9 @@ async fn replay_single_ack_intent(
     intent: &crate::degraded_intents::QueuedAckIntent,
 ) -> Result<(), (String, bool)> {
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
-    let project = resolve_project(ctx, pool, &intent.project_key)
+    // Replay may acknowledge only an existing mailbox. A queued absolute key
+    // is not permission to recreate a project removed since the outage.
+    let project = resolve_existing_project(ctx, pool, &intent.project_key)
         .await
         .map_err(ack_intent_replay_error)?;
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
@@ -6159,47 +6152,37 @@ async fn replay_single_ack_intent(
     .map_err(ack_intent_replay_error)?;
     ensure_request_live(ctx).map_err(ack_intent_replay_error)?;
     let agent_id = agent.id.unwrap_or(0);
-    if let Some(idempotency) = &intent.idempotency {
-        let claim = mcp_agent_mail_db::IdempotencyClaim {
-            project_id,
-            tool: "acknowledge_message",
-            key: &idempotency.key,
-            fingerprint: &idempotency.fingerprint,
-        };
-        return match mcp_agent_mail_db::queries::acknowledge_message_idempotent(
-            ctx.cx(),
-            pool,
-            agent_id,
-            intent.message_id,
-            claim,
-        )
-        .await
-        {
-            Outcome::Ok(
-                mcp_agent_mail_db::IdempotentOutcome::Fresh(_)
-                | mcp_agent_mail_db::IdempotentOutcome::Replayed(_),
-            ) => Ok(()),
-            Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Conflict(_)) => Err((
-                "IDEMPOTENCY_KEY_CONFLICT: the original acknowledgement stands".to_string(),
-                false,
-            )),
-            Outcome::Err(error) => {
-                let retryable = db_error_supports_ack_intent(&error);
-                Err((error.to_string(), retryable))
-            }
-            Outcome::Cancelled(_) => Err(("ack replay cancelled".to_string(), true)),
-            Outcome::Panicked(_) => Err(("ack replay panicked".to_string(), true)),
-        };
-    }
-    match mcp_agent_mail_db::queries::acknowledge_message(
+    let claim =
+        intent
+            .idempotency
+            .as_ref()
+            .map(|idempotency| mcp_agent_mail_db::IdempotencyClaim {
+                project_id,
+                tool: "acknowledge_message",
+                key: &idempotency.key,
+                fingerprint: &idempotency.fingerprint,
+            });
+    // A queued acknowledgement is not permission to acknowledge a message or
+    // identity created later at the same ID. The DB guard covers direct and
+    // lazy shared-mailbox receipts atomically, including unkeyed intents.
+    match mcp_agent_mail_db::queries::acknowledge_message_with_replay_cutoff(
         ctx.cx(),
         pool,
         agent_id,
         intent.message_id,
+        intent.created_ts,
+        claim,
     )
     .await
     {
-        Outcome::Ok(_) => Ok(()),
+        Outcome::Ok(
+            mcp_agent_mail_db::IdempotentOutcome::Fresh(_)
+            | mcp_agent_mail_db::IdempotentOutcome::Replayed(_),
+        ) => Ok(()),
+        Outcome::Ok(mcp_agent_mail_db::IdempotentOutcome::Conflict(_)) => Err((
+            "IDEMPOTENCY_KEY_CONFLICT: the original acknowledgement stands".to_string(),
+            false,
+        )),
         Outcome::Err(error) => {
             let retryable = db_error_supports_ack_intent(&error);
             Err((error.to_string(), retryable))
@@ -6584,9 +6567,29 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{Cx, Outcome};
     use fastmcp::prelude::McpContext;
-    use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries};
+    use mcp_agent_mail_db::{AgentRow, DbPool, DbPoolConfig, ProjectRow, queries, sqlmodel_core};
 
     static MESSAGING_THREAD_ID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    std::thread_local! {
+        static BEFORE_MESSAGE_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_before_message_admission_hook() {
+        let hook = BEFORE_MESSAGE_ADMISSION.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    struct MessageAdmissionHookGuard;
+
+    impl Drop for MessageAdmissionHookGuard {
+        fn drop(&mut self) {
+            BEFORE_MESSAGE_ADMISSION.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
 
     /// Run a tool-driving test against a private mailbox. The harness drains
     /// this test's archive writes before its tempdir is removed, so a late
@@ -7747,7 +7750,7 @@ mod tests {
                 )
                 .await
                 .expect("register sender");
-                crate::register_agent(
+                let stable = crate::register_agent(
                     &ctx,
                     project_key.clone(),
                     "codex-cli".to_string(),
@@ -7763,6 +7766,9 @@ mod tests {
                 )
                 .await
                 .expect("register stable recipient");
+                let stable: serde_json::Value =
+                    serde_json::from_str(&stable).expect("parse stable recipient");
+                let stable_id = stable["id"].as_i64().expect("stable recipient id");
                 let initial = crate::register_agent(
                     &ctx,
                     project_key.clone(),
@@ -7782,6 +7788,9 @@ mod tests {
                 let initial: serde_json::Value =
                     serde_json::from_str(&initial).expect("parse initial recipient");
                 let initial_id = initial["id"].as_i64().expect("initial recipient id");
+                let project_id = initial["project_id"]
+                    .as_i64()
+                    .expect("recipient project id");
                 let refreshed = crate::register_agent(
                     &ctx,
                     project_key.clone(),
@@ -7808,14 +7817,27 @@ mod tests {
                     .await
                     .into_result()
                     .expect("acquire test connection");
-                conn.execute_raw(&format!("DELETE FROM agents WHERE id = {initial_id}"))
-                    .expect("replace recipient row");
+                let replacement_id = initial_id + 10_000;
+                // Replace the database row ID while preserving this identity's
+                // inception. Recreating the name with a new inception would
+                // correctly conflict with its surviving archive profile.
+                assert_eq!(
+                    conn.execute_sync(
+                        "UPDATE agents SET id = ?1 WHERE id = ?2",
+                        &[
+                            sqlmodel_core::Value::BigInt(replacement_id),
+                            sqlmodel_core::Value::BigInt(initial_id),
+                        ],
+                    )
+                    .expect("replace recipient row id"),
+                    1
+                );
                 drop(conn);
                 drop(pool);
 
                 // This mirrors a recipient re-registering after its row was
                 // replaced between recipient resolution attempts.
-                crate::register_agent(
+                let replacement = crate::register_agent(
                     &ctx,
                     project_key.clone(),
                     "codex-cli".to_string(),
@@ -7831,6 +7853,11 @@ mod tests {
                 )
                 .await
                 .expect("idempotent replacement registration");
+                let replacement: serde_json::Value =
+                    serde_json::from_str(&replacement).expect("parse replacement recipient");
+                assert_eq!(replacement["id"].as_i64(), Some(replacement_id));
+                assert_ne!(replacement_id, initial_id);
+                assert_eq!(replacement["inception_ts"], initial["inception_ts"]);
 
                 let sent = send_message(
                     &ctx,
@@ -7863,6 +7890,19 @@ mod tests {
                         .map(Vec::len),
                     Some(2)
                 );
+                let message_id = sent["deliveries"][0]["payload"]["id"]
+                    .as_i64()
+                    .expect("sent message id");
+                let pool = get_db_pool().expect("delivery readback pool");
+                for recipient_id in [stable_id, replacement_id] {
+                    let inbox =
+                        queries::fetch_inbox(&cx, &pool, project_id, recipient_id, false, None, 10)
+                            .await
+                            .into_result()
+                            .expect("read actual recipient delivery");
+                    assert_eq!(inbox.len(), 1);
+                    assert_eq!(inbox[0].message.id, Some(message_id));
+                }
             });
         });
     }
@@ -8051,6 +8091,101 @@ mod tests {
         assert!(any_qualified_recipient(&["GreenCastle@".to_string()]));
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cross_project_send_and_reply_recheck_contact_after_tool_preflight() {
+        with_messaging_mailbox(
+            &[
+                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
+                ("MESSAGING_SESSION_IDENTITY", "false"),
+            ],
+            |mailbox| {
+                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let pool = get_db_pool().expect("private test mailbox");
+                    let source = ensure_project_row(&cx, &pool, "/data/projects/admission-source").await;
+                    let target = ensure_project_row(&cx, &pool, "/data/projects/admission-target").await;
+                    let sender = register_agent_row(&cx, &pool, source.id.unwrap(), "BlueLake").await;
+                    let recipient = register_agent_row(&cx, &pool, target.id.unwrap(), "RedFox").await;
+                    queries::request_contact(
+                        &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                        target.id.unwrap(), recipient.id.unwrap(), "approved route", 3600,
+                    ).await.into_result().expect("request contact");
+                    queries::respond_contact(
+                        &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                        target.id.unwrap(), recipient.id.unwrap(), true, 3600,
+                    ).await.into_result().expect("approve contact");
+                    let send = |key: Option<String>| {
+                        send_message(
+                            &ctx, source.human_key.clone(), sender.name.clone(),
+                            vec![format!("{}@{}", recipient.name, target.slug)],
+                            "cross-project admission".to_string(), "body".to_string(),
+                            None, None, None, Some(false), None, Some(true), None, None,
+                            None, Some(false), None, key,
+                        )
+                    };
+                    let accepted: Value = serde_json::from_str(&send(None).await.expect("approved control send"))
+                        .expect("send receipt");
+                    let original_id = accepted["deliveries"][0]["payload"]["id"].as_i64().expect("message id");
+
+                    for mode in ["send", "keyed_send", "reply"] {
+                        queries::respond_contact(
+                            &cx, &pool, source.id.unwrap(), sender.id.unwrap(),
+                            target.id.unwrap(), recipient.id.unwrap(), true, 3600,
+                        ).await.into_result().expect("restore approval for preflight");
+                        let writer = mcp_agent_mail_db::DbConn::open_file(
+                            mailbox.database_path.to_str().expect("database path"),
+                        ).expect("independent contact writer");
+                        let before = ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
+                            .map(|table| writer.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                                .expect("pre-send counts")[0].get_as::<i64>(0).unwrap());
+                        let called = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let observed = std::rc::Rc::clone(&called);
+                        let from = sender.id.unwrap();
+                        let to = recipient.id.unwrap();
+                        let _hook_guard = MessageAdmissionHookGuard;
+                        BEFORE_MESSAGE_ADMISSION.with(|slot| {
+                            assert!(slot.borrow().is_none());
+                            *slot.borrow_mut() = Some(Box::new(move || {
+                                writer.execute_sync(
+                                    "UPDATE agent_links SET status = 'blocked' WHERE a_agent_id = ? AND b_agent_id = ?",
+                                    &[sqlmodel_core::Value::BigInt(from), sqlmodel_core::Value::BigInt(to)],
+                                ).expect("commit revocation after preflight");
+                                let status = writer.query_sync(
+                                    "SELECT status FROM agent_links WHERE a_agent_id = ? AND b_agent_id = ?",
+                                    &[sqlmodel_core::Value::BigInt(from), sqlmodel_core::Value::BigInt(to)],
+                                ).expect("read committed contact decision")[0].get_as::<String>(0).unwrap();
+                                assert_eq!(status, "blocked");
+                                observed.set(true);
+                                mcp_agent_mail_db::close_db_conn(writer, "contact-admission test writer");
+                            }));
+                        });
+                        let outcome = if mode == "reply" {
+                            reply_message(
+                                &ctx, target.human_key.clone(), original_id, recipient.name.clone(),
+                                "reply body".to_string(), None, None, None, None, None, None,
+                                None, Some(false), None, Some("reply-after-revocation".to_string()),
+                            ).await
+                        } else {
+                            send((mode == "keyed_send").then(|| "send-after-revocation".to_string())).await
+                        };
+                        let error = outcome.expect_err("committed revocation must prevent new mail");
+                        assert!(called.get(), "{mode} must reach the real DB admission after passing preflight");
+                        assert_eq!(crate::tool_util::tool_error_code(&error), Some("CONTACT_BLOCKED"), "{mode}: {error:?}");
+                        assert_eq!(error.data.as_ref().unwrap()["error"]["data"]["phase"], "message_admission");
+                        let conn = pool.acquire(&cx).await.into_result().expect("verify refusal state");
+                        let after = ["messages", "message_recipients", "inbox_delivery_events", "idempotency_keys"]
+                            .map(|table| conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                                .expect("post-refusal counts")[0].get_as::<i64>(0).unwrap());
+                        assert_eq!(after, before, "{mode} must not publish mail or an idempotency result");
+                    }
+                });
+            },
+        );
+    }
+
     /// br-xhfoz: requesting contact again with an already-approved peer (what a
     /// concurrent first-contact auto-handshake does) must not revoke the
     /// approval or send the peer another actionable intro.
@@ -8223,6 +8358,287 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delivery_observation_reads_bypass_recovery_writer_admission() {
+        // The real promotion barrier is process-wide. Isolate the test so a
+        // blocked pre-fix reader cannot interfere with unrelated tool tests.
+        const CHILD: &str = "AM_TEST_DELIVERY_OBSERVATION_ADMISSION_CHILD";
+        const PROJECT: &str = "/delivery-observation-admission";
+        const OTHER_PROJECT: &str = "/delivery-observation-other";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .output()
+                .expect("run isolated delivery observation test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated delivery observation test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        for warm in [false, true] {
+            with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |mailbox| {
+                use crate::tool_util::DB_POOL_BOOTSTRAP_PROMOTIONS;
+                use mcp_agent_mail_db::write_barrier::{
+                    active_writer_count, current_thread_holds_promotion_barrier,
+                    try_acquire_promotion_barrier_if_idle,
+                };
+                use std::sync::{atomic::Ordering, mpsc};
+                use std::time::{Duration, Instant};
+
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let (project_id, recipient_id, messages, cursors) = runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = DbPool::new(&DbPoolConfig::from_env()).expect("seed pool");
+                    let project = ensure_project_row(&cx, &pool, PROJECT).await;
+                    ensure_project_row(&cx, &pool, OTHER_PROJECT).await;
+                    let project_id = project.id.unwrap();
+                    let recipient = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                    let recipient_id = recipient.id.unwrap();
+                    let mut messages = [0; 2];
+                    for message in &mut messages {
+                        *message = create_ack_test_message(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender.id.unwrap(),
+                            &[(recipient_id, "to")],
+                        )
+                        .await;
+                    }
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed state");
+                    conn.execute_raw(&format!(
+                        "UPDATE message_recipients SET read_ts = 123, ack_ts = 456 \
+                         WHERE message_id = {}; UPDATE agents SET last_active_ts = 1",
+                        messages[0],
+                    ))
+                    .expect("make any observation-side write visible");
+                    let rows = conn
+                        .query_sync("SELECT seq FROM inbox_delivery_events ORDER BY seq", &[])
+                        .expect("durable delivery cursors");
+                    assert_eq!(rows.len(), 2);
+                    let cursors = [
+                        rows[0].get_named::<i64>("seq").unwrap(),
+                        rows[1].get_named::<i64>("seq").unwrap(),
+                    ];
+                    (project_id, recipient_id, messages, cursors)
+                });
+                let cfg = DbPoolConfig::from_env();
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                let warm_pool =
+                    warm.then(|| (*get_db_pool().expect("warm authoritative pool")).clone());
+                let persisted_state = || {
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        mailbox.database_path.to_str().unwrap(),
+                    )
+                    .expect("independent persisted-state reader");
+                    let activity = conn
+                        .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap();
+                    let receipts = conn
+                        .query_sync(
+                            "SELECT message_id, read_ts, ack_ts FROM message_recipients \
+                             ORDER BY message_id",
+                            &[],
+                        )
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.get_named::<i64>("message_id").unwrap(),
+                                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (activity, receipts)
+                };
+                let before = persisted_state();
+                assert_eq!(before.0, 2);
+                let bootstraps_before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let owner = try_acquire_promotion_barrier_if_idle().expect("hold actual recovery");
+                let (done_tx, done_rx) = mpsc::channel();
+                let mut requests = Vec::new();
+                let mut contexts = Vec::new();
+                for case in 0..7 {
+                    let done_tx = done_tx.clone();
+                    let ctx = McpContext::with_state(
+                        Cx::for_testing(),
+                        case + 1,
+                        fastmcp_core::SessionState::new(),
+                    );
+                    crate::session_identity::bind(&ctx, project_id, recipient_id, "BlueLake");
+                    contexts.push(ctx.clone());
+                    requests.push(std::thread::spawn(move || {
+                        let runtime = RuntimeBuilder::current_thread()
+                            .build()
+                            .expect("request runtime");
+                        let result = runtime.block_on(async {
+                            if case >= 5 {
+                                return get_message_delivery_receipt(
+                                    &ctx,
+                                    if case == 5 { PROJECT } else { OTHER_PROJECT }.to_string(),
+                                    messages[0],
+                                )
+                                .await;
+                            }
+                            let after = match case {
+                                1 => Some(cursors[0]),
+                                2 => None,
+                                3 => Some(cursors[1] + 1),
+                                _ => Some(0),
+                            };
+                            fetch_inbox_events(
+                                &ctx,
+                                PROJECT.to_string(),
+                                if case == 4 {
+                                    "GreenStone"
+                                } else {
+                                    " bluelake "
+                                }
+                                .to_string(),
+                                after,
+                                Some(1),
+                                Some(case == 2),
+                            )
+                            .await
+                        });
+                        done_tx.send((case, result)).unwrap();
+                    }));
+                }
+                drop(done_tx);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut completed = Vec::new();
+                while completed.len() < 7 {
+                    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(result) => completed.push(result),
+                        Err(_) => break,
+                    }
+                }
+                let finished_while_recovery_owned = completed.len();
+                let during = persisted_state();
+                let held = current_thread_holds_promotion_barrier();
+                let writers = active_writer_count();
+                let bootstraps_during = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+                let cached_writer_during = mcp_agent_mail_db::get_cached_pool(&cfg).is_some();
+                // Cancel and release before asserting even on the old path,
+                // where every observational request waits for writer admission.
+                for ctx in contexts {
+                    ctx.request_cancellation().cancel();
+                }
+                drop(owner);
+                for request in requests {
+                    request.join().expect("delivery observation request exits");
+                }
+                completed.extend(done_rx.try_iter());
+                completed.sort_by_key(|(case, _)| *case);
+                assert_eq!(finished_while_recovery_owned, 7, "warm={warm}");
+                assert!(held, "the reads must preserve recovery ownership");
+                assert_eq!(writers, 0);
+                assert_eq!(bootstraps_during, bootstraps_before);
+                assert_eq!(cached_writer_during, warm);
+                assert_eq!(
+                    during, before,
+                    "observation must preserve activity and receipts"
+                );
+                let first: Value = serde_json::from_str(completed[0].1.as_ref().unwrap()).unwrap();
+                assert_eq!(first["events"].as_array().unwrap().len(), 1);
+                assert_eq!(first["events"][0]["message_id"], messages[0]);
+                assert_eq!(first["events"][0]["from"], "GreenStone");
+                assert!(first["events"][0].get("body_md").is_none());
+                assert_eq!(first["next_cursor"], cursors[0]);
+                assert_eq!(first["tail_cursor"], cursors[1]);
+                assert_eq!(first["has_more"], true);
+                let next: Value = serde_json::from_str(completed[1].1.as_ref().unwrap()).unwrap();
+                assert_eq!(next["events"].as_array().unwrap().len(), 1);
+                assert_eq!(next["events"][0]["message_id"], messages[1]);
+                assert_eq!(next["next_cursor"], cursors[1]);
+                assert_eq!(next["has_more"], false);
+                let tail: Value = serde_json::from_str(completed[2].1.as_ref().unwrap()).unwrap();
+                assert_eq!(tail["events"], json!([]));
+                assert_eq!(tail["next_cursor"], cursors[1]);
+                assert_eq!(tail["has_more"], false);
+                assert_eq!(
+                    crate::tool_error_code(completed[3].1.as_ref().unwrap_err()),
+                    Some("CURSOR_AHEAD")
+                );
+                assert_eq!(
+                    crate::tool_error_code(completed[4].1.as_ref().unwrap_err()),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                let receipt: Value =
+                    serde_json::from_str(completed[5].1.as_ref().unwrap()).unwrap();
+                assert_eq!(receipt["message_id"], messages[0]);
+                assert_eq!(receipt["project_id"], project_id);
+                assert_eq!(receipt["persisted"], true);
+                assert_eq!(receipt["recipients"].as_array().unwrap().len(), 1);
+                assert_eq!(receipt["recipients"][0]["recipient"], "BlueLake");
+                assert_eq!(receipt["recipients"][0]["signaled"], false);
+                assert_eq!(receipt["recipients"][0]["acknowledged"], true);
+                assert_eq!(
+                    receipt["recipients"][0]["acknowledged_at"],
+                    micros_to_iso(456)
+                );
+                assert_eq!(
+                    crate::tool_error_code(completed[6].1.as_ref().unwrap_err()),
+                    Some("NOT_FOUND")
+                );
+                drop(warm_pool);
+            });
+        }
+    }
+
+    #[test]
+    fn delivery_observation_reads_do_not_bootstrap_missing_mailbox() {
+        for events in [false, true] {
+            with_messaging_mailbox(&[], |mailbox| {
+                let cfg = DbPoolConfig::from_env();
+                assert!(!mailbox.database_path.exists());
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                let result = runtime.block_on(async {
+                    let ctx = McpContext::new(Cx::current().expect("request context"), 1);
+                    if events {
+                        fetch_inbox_events(
+                            &ctx,
+                            "/missing-delivery-mailbox".to_string(),
+                            "BlueLake".to_string(),
+                            Some(0),
+                            Some(10),
+                            None,
+                        )
+                        .await
+                    } else {
+                        get_message_delivery_receipt(
+                            &ctx,
+                            "/missing-delivery-mailbox".to_string(),
+                            1,
+                        )
+                        .await
+                    }
+                });
+                assert!(result.is_err(), "missing delivery authority must refuse");
+                assert!(
+                    !mailbox.database_path.exists(),
+                    "a delivery read must not create a DB"
+                );
+                assert!(mcp_agent_mail_db::get_cached_pool(&cfg).is_none());
+                assert_eq!(std::fs::read_dir(&mailbox.storage_root).unwrap().count(), 0);
+            });
+        }
     }
 
     #[test]
@@ -8576,6 +8992,7 @@ mod tests {
                 runtime.block_on(async {
                     let cx = Cx::current().expect("fixture context");
                     let ctx = McpContext::new(cx.clone(), 1);
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = get_db_pool().expect("authoritative mailbox pool");
                     let project = ensure_project_row(&cx, &pool, "/ack-receipt-read-outage").await;
                     let project_id = project.id.unwrap();
@@ -9243,6 +9660,7 @@ mod tests {
                         assert_eq!(outage_config.min_connections, 1);
                         assert_eq!(outage_config.max_connections, 1);
                         assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                        crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let outage_pool = get_db_pool().expect("healthy configured mailbox");
                         assert_ne!(outage_pool.sqlite_path(), pool.sqlite_path());
                         let outage_engine = outage_pool.engine_identity_key();
@@ -9635,6 +10053,7 @@ mod tests {
                     assert_eq!(outage_config.min_connections, 1);
                     assert_eq!(outage_config.max_connections, 1);
                     assert_eq!(outage_config.acquire_timeout_ms, 1_000);
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let unavailable_pool = get_db_pool().expect("healthy configured mailbox");
                     assert_eq!(
                         Path::new(unavailable_pool.sqlite_path()),
@@ -9940,6 +10359,116 @@ mod tests {
     }
 
     #[test]
+    fn queued_ack_replay_abandons_later_targets_without_acknowledging_them() {
+        with_messaging_mailbox(&[], |_| {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = get_db_pool().unwrap();
+                let config = Config::get();
+                let project = ensure_project_row(&cx, &pool, "/queued-ack-cutoff").await;
+                let project_id = project.id.unwrap();
+                let original = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let replacement = register_agent_row(&cx, &pool, project_id, "GreenStone").await;
+                let original_id = original.id.unwrap();
+                let replacement_id = replacement.id.unwrap();
+                let mut cases = Vec::new();
+                for (label, agent) in [
+                    ("old", &original), ("later-message", &original), ("later-actor", &replacement),
+                ] {
+                    let message_id = create_ack_test_message(
+                        &cx, &pool, project_id, original_id, &[(agent.id.unwrap(), "to")],
+                    )
+                    .await;
+                    for keyed in [false, true] {
+                        let claim = keyed.then(|| ack_retry_claim(&agent.name, message_id, label));
+                        crate::degraded_intents::append_ack_intent(
+                            &config, &project.human_key, &agent.name, message_id,
+                            "acknowledge_message", "fixture outage", claim.as_ref(),
+                        )
+                        .unwrap();
+                    }
+                    cases.push((agent.id.unwrap(), message_id));
+                }
+                let intents = crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                assert_eq!(intents.len(), 6);
+                let later = intents.iter().map(|intent| intent.created_ts).max().unwrap() + 1;
+                // Model a later message/identity occupying the recorded IDs.
+                // The cached actor still has its earlier inception timestamp;
+                // only the transaction's current database evidence can refuse.
+                {
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_sync(
+                        "UPDATE messages SET created_ts = ? WHERE id = ?",
+                        &[sqlmodel_core::Value::BigInt(later), sqlmodel_core::Value::BigInt(cases[1].1)],
+                    ).unwrap();
+                    conn.execute_sync(
+                        "UPDATE agents SET inception_ts = ? WHERE id = ?",
+                        &[sqlmodel_core::Value::BigInt(later), sqlmodel_core::Value::BigInt(replacement_id)],
+                    ).unwrap();
+                }
+                replay_queued_ack_intents(&ctx, &pool, &config).await;
+                assert_eq!(crate::degraded_intents::read_queued_ack_intents(&config).unwrap(), []);
+                {
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    for (index, (agent_id, message_id)) in cases.into_iter().enumerate() {
+                        let rows = conn.query_sync(
+                            "SELECT read_ts, ack_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?",
+                            &[sqlmodel_core::Value::BigInt(agent_id), sqlmodel_core::Value::BigInt(message_id)],
+                        ).unwrap();
+                        assert_eq!(rows.len(), 1);
+                        for field in ["read_ts", "ack_ts"] {
+                            assert_eq!(rows[0].get_named::<Option<i64>>(field).unwrap().is_some(), index == 0, "{index}/{field}");
+                        }
+                    }
+                    let rows = conn.query_sync("SELECT COUNT(*) AS n FROM idempotency_keys", &[]).unwrap();
+                    assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+                }
+                let log = assert_ack_cutoff_replay_markers(&config);
+                replay_queued_ack_intents(&ctx, &pool, &config).await;
+                assert_eq!(std::fs::read_to_string(crate::degraded_intents::log_path(
+                    &config, crate::degraded_intents::ACK_INTENT_LOG_FILE,
+                )).unwrap(), log, "terminal refusals must not be retried forever");
+            });
+        });
+    }
+
+    fn assert_ack_cutoff_replay_markers(config: &Config) -> String {
+        let log = std::fs::read_to_string(crate::degraded_intents::log_path(
+            config,
+            crate::degraded_intents::ACK_INTENT_LOG_FILE,
+        ))
+        .unwrap();
+        let markers: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["kind"] == crate::degraded_intents::ACK_INTENT_REPLAY_KIND)
+            .collect();
+        assert_eq!(markers.len(), 6);
+        for (index, marker) in markers.iter().enumerate() {
+            if index < 2 {
+                assert_eq!(
+                    marker["status"],
+                    crate::degraded_intents::REPLAY_STATUS_REPLAYED
+                );
+            } else {
+                assert_eq!(
+                    marker["status"],
+                    crate::degraded_intents::REPLAY_STATUS_ABANDONED
+                );
+                assert!(
+                    marker["error_detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("acknowledgement intent time")
+                );
+            }
+        }
+        log
+    }
+
+    #[test]
     fn queued_ack_intent_response_reports_queued_ack() {
         // The queue-on-corruption wrapper that `acknowledge_message` returns
         // when the live mailbox is unavailable: it must persist a durable intent
@@ -10119,6 +10648,97 @@ mod tests {
                     .is_empty(),
                 "permanently-unreplayable ack intent should be abandoned, not retried forever"
             );
+        });
+    }
+
+    #[test]
+    fn replay_abandons_missing_project_without_creating_it_and_continues_valid_acks() {
+        run_thread_validation_test("ack-intent-missing-project.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/ack-intent-existing-project").await;
+            let project_id = project.id.unwrap();
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let recipient_id = recipient.id.unwrap();
+            let message_id = create_ack_test_message(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap(),
+                &[(recipient_id, "to")],
+            )
+            .await;
+            let intent_dir = tempfile::tempdir().unwrap();
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+            let missing = crate::degraded_intents::append_ack_intent(
+                &config,
+                "/ack-intent-missing-project",
+                &recipient.name,
+                message_id,
+                "get_db_pool",
+                "database unavailable",
+                None,
+            )
+            .unwrap();
+            let valid = crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &recipient.name,
+                message_id,
+                "get_db_pool",
+                "database unavailable",
+                None,
+            )
+            .unwrap();
+            let ctx = McpContext::new(cx.clone(), 1);
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let projects = conn
+                .query_sync("SELECT human_key FROM projects", &[])
+                .unwrap();
+            assert_eq!(projects.len(), 1, "ACK replay must never create a mailbox");
+            assert_eq!(
+                projects[0].get_named::<String>("human_key").unwrap(),
+                project.human_key
+            );
+            let receipts = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("read_ts")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+            );
+            let records: Vec<Value> = std::fs::read_to_string(&valid.intent_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for (receipt, status) in [
+                (&missing, crate::degraded_intents::REPLAY_STATUS_ABANDONED),
+                (&valid, crate::degraded_intents::REPLAY_STATUS_REPLAYED),
+            ] {
+                let replay = records
+                    .iter()
+                    .find(|record| {
+                        record["kind"] == crate::degraded_intents::ACK_INTENT_REPLAY_KIND
+                            && record["intent_id"] == receipt.intent_id
+                    })
+                    .expect("each accepted intent receives its terminal disposition");
+                assert_eq!(replay["status"], status);
+            }
         });
     }
 

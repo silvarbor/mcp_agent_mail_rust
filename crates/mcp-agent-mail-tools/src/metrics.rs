@@ -41,6 +41,12 @@ static TOOL_LATENCIES: LazyLock<[RwLock<Log2Histogram>; TOOL_COUNT]> =
 /// How many finished tool calls the in-memory ring keeps for
 /// `resource://tooling/recent/{window_seconds}`.
 pub const RECENT_TOOL_CALL_CAPACITY: usize = 512;
+/// Identity context is optional diagnostic metadata. Preserve supported values
+/// exactly for resource filters; omit oversized values rather than inventing
+/// an identity by truncating it. Together with the ring capacity this bounds
+/// retained identity strings to 4 MiB, including rejected tool calls.
+const RECENT_TOOL_CALL_IDENTITY_BYTES: usize = 4096;
+const RECENT_TOOL_CALL_NAME_BYTES: usize = 256;
 
 /// How a recorded tool call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,9 +67,9 @@ pub struct RecentToolCall {
     /// Microseconds since the Unix epoch at which the call finished.
     pub finished_at_micros: i64,
     pub tool: String,
-    /// `project_key` (or its aliases) as the caller passed it, if any.
+    /// `project_key` as passed, absent when missing or larger than 4 KiB.
     pub project: Option<String>,
-    /// `agent_name` (or its aliases) as the caller passed it, if any.
+    /// Agent context as passed, absent when missing or larger than 4 KiB.
     pub agent: Option<String>,
     pub latency_us: u64,
     pub outcome: RecentToolCallOutcome,
@@ -75,13 +81,35 @@ static RECENT_TOOL_CALLS: LazyLock<Mutex<VecDeque<RecentToolCall>>> =
 /// Append a finished call to the bounded ring, evicting the oldest entry
 /// once the ring is full. Called once per dispatched tool call.
 pub fn record_recent_call(call: RecentToolCall) {
+    if call.tool.len() > RECENT_TOOL_CALL_NAME_BYTES {
+        return;
+    }
+    // Fresh copies also release excessive spare capacity in caller-owned
+    // strings; String::truncate/clear alone would retain that allocation.
+    let bounded_call = RecentToolCall {
+        finished_at_micros: call.finished_at_micros,
+        tool: call.tool.as_str().to_owned(),
+        project: call
+            .project
+            .as_deref()
+            .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
+            .map(str::to_owned),
+        agent: call
+            .agent
+            .as_deref()
+            .filter(|value| value.len() <= RECENT_TOOL_CALL_IDENTITY_BYTES)
+            .map(str::to_owned),
+        latency_us: call.latency_us,
+        outcome: call.outcome,
+    };
+    drop(call);
     let mut ring = RECENT_TOOL_CALLS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if ring.len() >= RECENT_TOOL_CALL_CAPACITY {
         ring.pop_front();
     }
-    ring.push_back(call);
+    ring.push_back(bounded_call);
 }
 
 /// Calls that finished at or after `cutoff_micros`, newest first.
@@ -733,6 +761,37 @@ pub(crate) mod tests {
     /// modules such as `resources::tests` that read the same global registry
     /// can take the same lock.
     pub static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn recent_call_diagnostics_bound_identity_allocations_without_false_aliases() {
+        let _guard = METRICS_LOCK.lock().unwrap();
+        let mut overallocated = String::with_capacity(1024 * 1024);
+        overallocated.push_str("ExactAgent");
+        let mut tool = String::with_capacity(1024 * 1024);
+        tool.push_str("diagnostic_bounds_test");
+        record_recent_call(RecentToolCall {
+            finished_at_micros: i64::MAX,
+            tool,
+            project: Some("é".repeat(RECENT_TOOL_CALL_IDENTITY_BYTES)),
+            agent: Some(overallocated),
+            latency_us: 1,
+            outcome: RecentToolCallOutcome::Rejected,
+        });
+        let ring = RECENT_TOOL_CALLS.lock().unwrap();
+        let call = ring
+            .iter()
+            .find(|call| call.tool == "diagnostic_bounds_test")
+            .unwrap();
+        assert!(
+            call.project.is_none(),
+            "an omitted identity is not a prefix alias"
+        );
+        let agent = call.agent.as_ref().unwrap();
+        assert_eq!(agent, "ExactAgent");
+        assert_eq!(agent.capacity(), agent.len());
+        assert_eq!(call.tool.capacity(), call.tool.len());
+        drop(ring);
+    }
 
     #[test]
     fn record_and_snapshot() {

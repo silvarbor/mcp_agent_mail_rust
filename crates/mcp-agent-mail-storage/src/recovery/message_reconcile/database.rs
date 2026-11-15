@@ -221,6 +221,17 @@ impl ReconcileCursor {
         }
     }
 
+    /// Earliest retained retry, not permission to reuse an earlier source read.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.iter().map(|retry| retry.ready_at).min()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        self.retries.len() < MAX_RETRY_IDS
+    }
+
     fn advance(&mut self, id: i64, tail: bool) {
         if tail {
             self.tail_after = Some(self.tail_after.unwrap_or(0).max(id));
@@ -294,6 +305,8 @@ pub struct ReconcileReport {
     pub deferred_transient: usize,
     pub deferred_conflict: usize,
     pub retry_len: usize,
+    /// A scan watermark advanced, including a page of cooling retry IDs.
+    pub scan_advanced: bool,
     /// Serialized payload bytes admitted to archive work, excluding rejected
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
@@ -1250,10 +1263,28 @@ pub fn reconcile_message_batch(
     stop: &AtomicBool,
 ) -> Result<ReconcileReport, String> {
     if cursor.persist_progress {
+        // Check before checkpoint restoration can change scheduling hints or
+        // publish them. The inner pass samples again before row selection.
+        if !stop.load(Ordering::Acquire)
+            && cx.checkpoint().is_ok()
+            && !corruption_circuit_breaker().is_tripped()
+        {
+            sample_archive_lag_for_reconciliation()?;
+        }
         checkpoint::run(cx, pool, config, cursor, stop)
     } else {
         reconcile_message_batch_inner(cx, pool, config, cursor, stop)
     }
+}
+
+fn sample_archive_lag_for_reconciliation() -> Result<crate::ArchiveLagSnapshot, String> {
+    crate::try_archive_lag_snapshot().map_err(|unavailable| {
+        tracing::debug!(
+            unavailable_lock = unavailable.unavailable_lock,
+            "message reconciliation admission deferred: archive queue evidence is unavailable"
+        );
+        "message reconciliation deferred: recovery promotion or admission contention".to_string()
+    })
 }
 
 fn reconcile_message_batch_inner(
@@ -1281,6 +1312,18 @@ fn reconcile_message_batch_at(
     stop: &AtomicBool,
     now_us: i64,
 ) -> Result<ReconcileReport, String> {
+    reconcile_message_batch_with_clock(cx, pool, config, cursor, stop, now_us, Instant::now)
+}
+
+fn reconcile_message_batch_with_clock(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+    now_us: i64,
+    mut clock: impl FnMut() -> Instant,
+) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -1291,10 +1334,14 @@ fn reconcile_message_batch_at(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
+    // An unavailable queue cannot establish a safe cutoff. Defer admission
+    // without selecting rows or changing the cursor; never wait behind a
+    // wedged queue owner before the worker can observe cancellation again.
+    let archive_lag = sample_archive_lag_for_reconciliation()?;
     let cutoff = normal_archive_cutoff(
         now_us,
         cursor.settled_before_us,
-        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+        archive_lag.oldest_unmaterialized_us,
     );
     let selected = {
         // The selection itself must not enter a pool while promotion owns
@@ -1314,7 +1361,7 @@ fn reconcile_message_batch_at(
     let tail_next_id = selected.tail_next_id;
     let history_started_at = cursor.backfill_ceiling;
     let startup_started_at = cursor.startup_tail.as_ref().map(|range| range.ceiling);
-    let now = Instant::now();
+    let now = clock();
     let mut retries = cursor
         .retries
         .iter()
@@ -1345,7 +1392,7 @@ fn reconcile_message_batch_at(
         }
         if report.repaired >= MAX_REPAIRS_PER_BATCH
             || report.scanned >= MAX_IDS_PER_PASS
-            || (report.scanned > 0 && now.elapsed() >= MAX_BATCH_TURN)
+            || (report.scanned > 0 && clock().saturating_duration_since(now) >= MAX_BATCH_TURN)
         {
             report.budget_exhausted = true;
             break;
@@ -1456,7 +1503,10 @@ fn reconcile_message_batch_at(
                 report.unchanged += 1;
                 cursor.forget_retry(id);
             }
-            Err(error) => record_failure(id, error, cursor, &mut report, now),
+            // Source, filesystem or Git work can outlast the batch quantum.
+            // Cooldown starts when that attempt fails, not before the work
+            // that caused it; otherwise a slow refusal consumes its own rest.
+            Err(error) => record_failure(id, error, cursor, &mut report, clock()),
         }
         if let Some(lane) = lane {
             cursor.advance_scan(id, lane);
@@ -1472,6 +1522,7 @@ fn reconcile_message_batch_at(
     // cancelled or wholly blocked pass does not request extra polling here.
     let startup_scan_advanced = cursor.backfill_ceiling != history_started_at
         || cursor.startup_tail.as_ref().map(|range| range.ceiling) != startup_started_at;
+    report.scan_advanced = startup_scan_advanced || cursor.tail_after != tail_started_after;
     if cursor.persist_progress
         && (!cursor.startup_backfill_complete || cursor.startup_tail.is_some())
         && (report.scanned > 0 || startup_scan_advanced)
@@ -3828,6 +3879,7 @@ mod tests {
             assert_eq!(cooling.deferred, 0);
             assert_eq!(cooling.retry_len, 0);
             assert!(cooling.budget_exhausted);
+            assert!(cooling.scan_advanced);
             assert_eq!(cursor.tail_after, Some(916));
 
             // The unconsumed sentinel is an actual DB-only message, not proof
@@ -3856,6 +3908,62 @@ mod tests {
                 retained_message_ids(cx, pool),
                 (901..918).collect::<Vec<_>>()
             );
+        });
+    }
+
+    #[test]
+    fn gh383_cooling_retry_survives_checkpoint_restart_while_new_tail_converges() {
+        retention_fixture(2, |cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let ready_at = Instant::now() + MAX_RETRY_BACKOFF;
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(900);
+            cursor.backfill_ceiling = Some(900);
+            cursor.retries.push_back(DeferredRetry {
+                id: 901,
+                attempts: 6,
+                ready_at,
+            });
+
+            let first = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(first.repaired, 1);
+            assert!(first.scan_advanced);
+            assert_eq!(first.retry_len, 1);
+            assert_eq!(first.checkpoint_saved, Some(true));
+            assert_eq!(cursor.next_retry_at(), Some(ready_at));
+            assert!(cursor.has_retry_capacity());
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let repaired = prepare_message(cx, pool, 902).unwrap();
+            assert!(
+                verify_retention_archive(&archive, &repaired, &mut 0)
+                    .unwrap()
+                    .is_some()
+            );
+            let cooling = prepare_message(cx, pool, 901).unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &cooling.message,
+                &cooling.sender,
+                &cooling.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(!paths.canonical.exists());
+            drop(cursor);
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let resumed = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(resumed.checkpoint_restored);
+            assert_eq!(resumed.checkpoint_saved, Some(true));
+            assert_eq!(resumed.repaired, 0);
+            assert_eq!(resumed.retry_len, 1);
+            assert_eq!(restarted.retries[0].id, 901);
+            assert_eq!(restarted.retries[0].attempts, 6);
+            assert!(restarted.next_retry_at().unwrap() > Instant::now());
+            assert!(restarted.has_retry_capacity());
+            assert!(!paths.canonical.exists());
+            assert_eq!(retained_message_ids(cx, pool), [901, 902]);
         });
     }
 
@@ -3889,6 +3997,9 @@ mod tests {
                 assert_eq!(blocked.scanned, 0);
                 assert_eq!(blocked.repaired, 0);
                 assert_eq!(blocked.retry_len, MAX_RETRY_IDS);
+                assert!(!cursor.has_retry_capacity());
+                assert!(cursor.next_retry_at().is_some());
+                assert!(!blocked.scan_advanced);
                 assert!(!blocked.budget_exhausted);
                 assert_eq!(cursor.tail_after, Some(900));
             }

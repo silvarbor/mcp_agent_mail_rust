@@ -43,7 +43,7 @@ use crate::search_embedder::{
 #[cfg(feature = "hybrid")]
 use crate::search_embedding_jobs::{
     EmbeddingJobConfig, EmbeddingJobRunner, EmbeddingQueue, EmbeddingRequest, IndexRefreshWorker,
-    JobMetricsSnapshot, QueueStats, RefreshWorkerConfig,
+    JobMetricsSnapshot, JobResult, QueueStats, RefreshWorkerConfig,
 };
 #[cfg(feature = "hybrid")]
 use crate::search_metrics::{TwoTierAlertConfig, TwoTierMetrics, TwoTierMetricsSnapshot};
@@ -53,7 +53,9 @@ use crate::search_two_tier::{
 };
 #[cfg(feature = "hybrid")]
 use crate::search_vector_index::{VectorFilter, VectorIndex, VectorIndexConfig};
-use asupersync::{Budget, Cx, Outcome, Time};
+#[cfg(test)]
+use asupersync::{Budget, Time};
+use asupersync::{Cx, Outcome};
 #[cfg(feature = "hybrid")]
 use frankensearch as fs;
 #[cfg(feature = "hybrid")]
@@ -240,7 +242,7 @@ pub struct SearchOptions {
     /// Whether to emit telemetry events for this query.
     pub track_telemetry: bool,
     /// Search engine override. `None` = the surface's configured engine.
-    /// The rollout kill switches apply either way.
+    /// The rollout kill switches and canonical mailbox authority apply either way.
     pub search_engine: Option<SearchEngine>,
     /// Tool issuing the query (e.g. `"search_messages"`), which selects an
     /// `AM_SEARCH_ENGINE_FOR_<TOOL>` override. `None` = the global engine.
@@ -512,24 +514,44 @@ fn generate_zero_result_guidance(
 // Tantivy routing helpers
 // ────────────────────────────────────────────────────────────────────
 
+#[cfg(all(test, feature = "tantivy-engine"))]
+std::thread_local! {
+    // Exercise changes committed after candidate collection but before the
+    // service hydrates those candidates from the authoritative mailbox.
+    static LEXICAL_CANDIDATE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Try executing a search via the Tantivy bridge. Returns `None` if the
 /// bridge is not initialized (`init_bridge` not called).
 fn try_tantivy_search(
+    cx: &Cx,
     pool: &DbPool,
     query: &SearchQuery,
 ) -> Result<Option<Vec<SearchResult>>, DbError> {
     #[cfg(feature = "tantivy-engine")]
     {
-        crate::search_v3::search_database(
+        let results = crate::search_v3::search_database_with_cx(
+            cx,
+            pool,
             &lexical_backfill_database_url(pool),
             &direct_surface_index_dir(pool)?,
             query,
+            true,
         )
-        .map_err(|error| map_bridge_bootstrap_error(&error))
+        .map_err(|error| map_bridge_bootstrap_error(&error))?;
+        #[cfg(test)]
+        LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+            let hook = hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        Ok(results)
     }
     #[cfg(not(feature = "tantivy-engine"))]
     {
-        let _ = (pool, query);
+        let _ = (cx, pool, query);
         Ok(None)
     }
 }
@@ -722,39 +744,6 @@ fn detail_matches_agent_filter(
     }
 }
 
-fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchResult) -> bool {
-    let Some(agent_name) = query.agent_name.as_deref() else {
-        return true;
-    };
-
-    // This path runs after retrieval when deciding whether an unresolved
-    // lexical hit may survive final filtering. Missing metadata must not count
-    // as a match here, or stale index hits can leak through agent filters.
-    let sender_matches = result
-        .from_agent
-        .as_deref()
-        .is_some_and(|from_agent| from_agent.eq_ignore_ascii_case(agent_name));
-
-    // If the result has recipient info, check it.
-    let recipient_matches = result.to.as_ref().is_some_and(|to| {
-        to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            || result
-                .cc
-                .as_ref()
-                .is_some_and(|cc| cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
-            || result
-                .bcc
-                .as_ref()
-                .is_some_and(|bcc| bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
-    });
-
-    match query.direction {
-        Some(Direction::Outbox) => sender_matches,
-        Some(Direction::Inbox) => recipient_matches,
-        None => sender_matches || recipient_matches,
-    }
-}
-
 fn detail_matches_query_filters(
     query: &SearchQuery,
     detail: &crate::queries::ThreadMessageRow,
@@ -805,70 +794,6 @@ fn detail_matches_query_filters(
     true
 }
 
-fn raw_result_matches_query_filters(
-    query: &SearchQuery,
-    result: &SearchResult,
-    product_project_ids: Option<&HashSet<i64>>,
-) -> bool {
-    if let Some(project_id) = query.project_id
-        && result.project_id != Some(project_id)
-    {
-        return false;
-    }
-    if let Some(allowed_projects) = product_project_ids {
-        let Some(pid) = result.project_id else {
-            return false;
-        };
-        if !allowed_projects.contains(&pid) {
-            return false;
-        }
-    }
-    if !unresolved_result_matches_agent_filter(query, result) {
-        return false;
-    }
-    if let Some(thread_id) = query.thread_id.as_deref()
-        && result.thread_id.as_deref() != Some(thread_id)
-    {
-        return false;
-    }
-    if let Some(ack_required) = query.ack_required {
-        let Some(raw_ack) = result.ack_required else {
-            return false;
-        };
-        if raw_ack != ack_required {
-            return false;
-        }
-    }
-    if !query.importance.is_empty() {
-        let Some(raw_importance) = result.importance.as_deref() else {
-            return false;
-        };
-        let Some(level) = crate::search_planner::Importance::parse(raw_importance) else {
-            return false;
-        };
-        if !query.importance.contains(&level) {
-            return false;
-        }
-    }
-    if let Some(min_ts) = query.time_range.min_ts {
-        let Some(raw_ts) = result.created_ts else {
-            return false;
-        };
-        if raw_ts < min_ts {
-            return false;
-        }
-    }
-    if let Some(max_ts) = query.time_range.max_ts {
-        let Some(raw_ts) = result.created_ts else {
-            return false;
-        };
-        if raw_ts > max_ts {
-            return false;
-        }
-    }
-    true
-}
-
 const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
 
 type SemanticContentHashes = HashMap<(DocKind, i64), (Option<i64>, String)>;
@@ -889,7 +814,7 @@ async fn canonicalize_semantic_results(
     results: Vec<SearchResult>,
     proof: &SemanticCandidateProof,
 ) -> Outcome<Vec<SearchResult>, DbError> {
-    let mut results = match canonicalize_message_results(cx, pool, query, results, false).await {
+    let mut results = match canonicalize_message_results(cx, pool, query, results).await {
         Outcome::Ok(results) => results,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -983,7 +908,6 @@ async fn canonicalize_message_results(
     pool: &DbPool,
     query: &SearchQuery,
     raw_results: Vec<SearchResult>,
-    preserve_unresolved_hits: bool,
 ) -> Outcome<Vec<SearchResult>, DbError> {
     if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) || raw_results.is_empty() {
         return Outcome::Ok(raw_results);
@@ -1040,13 +964,9 @@ async fn canonicalize_message_results(
     let mut dropped_filter_mismatch = 0usize;
     for mut result in deduped {
         let Some(detail) = details_by_id.get(&result.id) else {
-            if preserve_unresolved_hits
-                && raw_result_matches_query_filters(query, &result, product_project_ids.as_ref())
-            {
-                canonical.push(result);
-            } else {
-                dropped_missing += 1;
-            }
+            // The index supplies candidates, never authority for a missing
+            // mailbox row. Engine overrides must keep this same boundary.
+            dropped_missing += 1;
             continue;
         };
         let recipient_names = recipient_names_by_message
@@ -1197,6 +1117,229 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
         return Ok(shared);
     }
     Ok(stable_direct_surface_index_dir(pool))
+}
+
+/// A cheap, process-local capability snapshot.
+///
+/// `verified` means that the last actual serving-pool observation matches a
+/// successfully sealed lexical source. Requests still check freshness; this is
+/// not a lease on future writes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct LexicalReadiness {
+    pub compiled: bool,
+    pub initialized: bool,
+    pub backfilling: bool,
+    /// A sealed generation can admit work; requests still reconcile a
+    /// possible append tail before returning results.
+    pub available: bool,
+    /// Sampled source coverage is not established. Includes possible append
+    /// tails and unavailable generations needing repair.
+    pub catch_up_required: bool,
+    pub verified: bool,
+}
+
+#[cfg(feature = "tantivy-engine")]
+struct LexicalReadinessSource {
+    bridge: std::sync::Weak<crate::search_v3::TantivyBridge>,
+    path: String,
+    generation: Option<String>,
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn lexical_readiness_sources() -> &'static Mutex<HashMap<String, LexicalReadinessSource>> {
+    static SOURCES: OnceLock<Mutex<HashMap<String, LexicalReadinessSource>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// No database or filesystem work is performed here.
+///
+/// Unknown pools and bridge replacements have no proof until the readiness
+/// worker samples the actual serving pool. The pool engine generation is part
+/// of this cache key.
+#[must_use]
+pub fn lexical_readiness(pool: &DbPool) -> LexicalReadiness {
+    let state = LexicalReadiness {
+        compiled: cfg!(feature = "tantivy-engine"),
+        ..LexicalReadiness::default()
+    };
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let Some(bridge) = crate::search_v3::try_get_bridge() else {
+            return state;
+        };
+        let Ok(sources) = lexical_readiness_sources().try_lock() else {
+            return state;
+        };
+        let Some(source) = sources.get(&pool.engine_identity_key()) else {
+            return state;
+        };
+        if !source
+            .bridge
+            .upgrade()
+            .is_some_and(|observed| Arc::ptr_eq(&observed, &bridge))
+        {
+            return state;
+        }
+        let backfilling = bridge.backfill_in_progress();
+        let verified =
+            !backfilling && bridge.source_is_verified(&source.path, source.generation.as_deref());
+        LexicalReadiness {
+            compiled: true,
+            initialized: true,
+            backfilling,
+            available: bridge.source_is_available(&source.path, source.generation.as_deref()),
+            catch_up_required: !verified,
+            verified,
+        }
+    }
+    #[cfg(not(feature = "tantivy-engine"))]
+    {
+        let _ = pool;
+        state
+    }
+}
+
+/// Sample the actual serving pool with its caller's admission/cancellation
+/// budget.
+///
+/// This reads one small snapshot and never launches a file-backed rebuild.
+/// The lifecycle-owned backfill worker owns that maintenance. Empty memory
+/// fixtures can be certified from this pool; a standalone :memory: connection
+/// cannot provide that proof.
+#[allow(clippy::too_many_lines)]
+pub async fn probe_lexical_readiness(cx: &Cx, pool: &DbPool) -> Outcome<LexicalReadiness, DbError> {
+    if let Err(error) = check_lexical_request(cx) {
+        return lexical_failure(cx, DbError::Sqlite(error));
+    }
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let rows = {
+            let conn = match pool.acquire(cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            // All four values come from one read snapshot. The existence
+            // probe reads at most one message, even on a large mailbox.
+            match conn
+                .query(
+                    cx,
+                    "SELECT \
+                     (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id, \
+                     (SELECT revision FROM lexical_change_clock WHERE id = 1) AS revision, \
+                     (SELECT rewrite_revision FROM lexical_change_clock WHERE id = 1) AS rewrite_revision, \
+                     EXISTS(SELECT 1 FROM messages LIMIT 1) AS has_messages",
+                    &[],
+                )
+                .await
+            {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        };
+        let snapshot = (|| -> Result<(Option<String>, i64, i64, bool), DbError> {
+            let row = rows
+                .first()
+                .ok_or_else(|| DbError::Sqlite("lexical source identity row is missing".into()))?;
+            // Legacy and fresh mailboxes may not have lazily seeded their
+            // generation token. Keep that absence: observation remains bound
+            // to the actual source file (or memory pool) and lexical clock.
+            let generation = row
+                .get_named::<Option<String>>("generation_id")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+                .filter(|generation| !generation.is_empty());
+            let revision = row
+                .get_named::<i64>("revision")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let rewrite_revision = row
+                .get_named::<i64>("rewrite_revision")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?;
+            let has_messages = row
+                .get_named::<i64>("has_messages")
+                .map_err(|error| DbError::Sqlite(error.to_string()))?
+                != 0;
+            Ok((generation, revision, rewrite_revision, has_messages))
+        })();
+        let (generation, revision, rewrite_revision, has_messages) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Outcome::Err(error),
+        };
+        let memory = pool.sqlite_path() == ":memory:";
+        if memory
+            && !has_messages
+            && let Err(error) = ensure_lexical_bridge_initialized(Some(cx), pool)
+        {
+            return lexical_failure(cx, error);
+        }
+        let Some(bridge) = crate::search_v3::get_bridge() else {
+            return Outcome::Ok(lexical_readiness(pool));
+        };
+        let index_dir = match direct_surface_index_dir(pool) {
+            Ok(path) => path,
+            Err(error) => return Outcome::Err(error),
+        };
+        if !crate::search_v3::is_bridge_initialized_for(&index_dir) {
+            return Outcome::Ok(LexicalReadiness {
+                compiled: true,
+                ..LexicalReadiness::default()
+            });
+        }
+        let path = if memory {
+            pool.sqlite_identity_key()
+        } else {
+            if let Ok(mut cache) = lexical_generation_cache().lock() {
+                if let Some(generation) = generation.as_ref() {
+                    cache.insert(pool.engine_identity_key(), generation.clone());
+                } else {
+                    cache.remove(&pool.engine_identity_key());
+                }
+            }
+            pool.search_identity_path().to_string()
+        };
+        crate::search_v3::observe_pool_source(
+            &bridge,
+            &path,
+            generation.as_deref(),
+            revision,
+            rewrite_revision,
+            memory,
+        );
+        if memory
+            && !has_messages
+            && let Err(error) = crate::search_v3::verify_empty_memory_source(
+                &bridge,
+                cx,
+                &path,
+                generation.as_deref(),
+                revision,
+                rewrite_revision,
+            )
+        {
+            return lexical_failure(cx, map_bridge_bootstrap_error(&error));
+        }
+        match lexical_readiness_sources().lock() {
+            Ok(mut sources) => {
+                sources.insert(
+                    pool.engine_identity_key(),
+                    LexicalReadinessSource {
+                        bridge: Arc::downgrade(&bridge),
+                        path,
+                        generation,
+                    },
+                );
+            }
+            Err(error) => {
+                return Outcome::Err(DbError::Sqlite(format!(
+                    "lexical readiness source lock poisoned: {error}"
+                )));
+            }
+        }
+    }
+    Outcome::Ok(lexical_readiness(pool))
 }
 
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
@@ -1835,7 +1978,112 @@ pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
-fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
+/// Refresh the frozen serving mailbox from a lifecycle-owned worker.
+///
+/// The caller keeps ownership until this function returns and joins the worker
+/// before releasing its mailbox lease. No ambient configuration is consulted.
+///
+/// Stop interrupts local mutex/backoff waits and scan/publication boundaries;
+/// an already-running native operation completes before the worker returns.
+///
+/// # Errors
+///
+/// Returns an error if the frozen mailbox/index authority no longer holds,
+/// native refresh fails, or the owner requests shutdown.
+pub fn refresh_lexical_index_cancellable(
+    pool: &DbPool,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<(), DbError> {
+    #[cfg(feature = "tantivy-engine")]
+    {
+        let result = refresh_bound_lexical_index_cancellable(pool, stopped);
+        if result.is_err() {
+            // Even a preflight/open error revokes this pool's earlier proof.
+            // Never revoke an unrelated process-global bridge after a switch.
+            let bound_source = lexical_readiness_sources().lock().ok().and_then(|sources| {
+                sources.get(&pool.engine_identity_key()).and_then(|source| {
+                    source
+                        .bridge
+                        .upgrade()
+                        .map(|bridge| (bridge, source.path.clone(), source.generation.clone()))
+                })
+            });
+            if let Some((bridge, path, generation)) = bound_source {
+                bridge.revoke_source_proof_for(&path, generation.as_deref());
+            }
+        }
+        result
+    }
+    #[cfg(not(feature = "tantivy-engine"))]
+    {
+        let _ = (pool, stopped);
+        Err(DbError::Sqlite(
+            "lexical index maintenance is not compiled in".into(),
+        ))
+    }
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn refresh_bound_lexical_index_cancellable(
+    pool: &DbPool,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" || pool.search_identity_path() != pool.sqlite_path() {
+        return Err(DbError::Sqlite(
+            "owned lexical maintenance requires the actual file-backed serving mailbox".into(),
+        ));
+    }
+    let check_stopped = || {
+        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+            Err(DbError::Sqlite(
+                "owned lexical maintenance cancelled".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let _guard = loop {
+        check_stopped()?;
+        match lexical_init_guard().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(DbError::Sqlite(format!(
+                    "search bootstrap lock poisoned: {error}"
+                )));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
+    check_stopped()?;
+    let index_dir = direct_surface_index_dir(pool)?;
+    pool.verify_sqlite_authority("owned lexical maintenance")?;
+    pool.verify_search_index_open_authority(&index_dir, "owned lexical maintenance")?;
+    crate::search_v3::init_or_switch_bridge(&index_dir)
+        .map_err(|error| map_bridge_bootstrap_error(&error))?;
+    let bridge = crate::search_v3::get_bridge()
+        .ok_or_else(|| DbError::Sqlite("lexical bridge disappeared".into()))?;
+    let sqlite_key = sqlite_key_for_pool(pool);
+    if let Err(error) = crate::search_v3::backfill_for_pool_cancellable(
+        pool,
+        &lexical_backfill_database_url(pool),
+        stopped,
+    ) {
+        bridge.revoke_source_proof();
+        lexical_bootstrap_state()
+            .lock()
+            .map_err(|error| {
+                DbError::Sqlite(format!("search bootstrap state lock poisoned: {error}"))
+            })?
+            .remove(&sqlite_key);
+        return Err(map_bridge_bootstrap_error(&error));
+    }
+    record_lexical_bootstrap_success(&sqlite_key)?;
+    Ok(())
+}
+
+fn run_lexical_backfill_for_pool(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
@@ -1845,36 +2093,66 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     let backfill = || {
         pool.verify_sqlite_authority("lexical search backfill")
             .map_err(|err| err.to_string())?;
+        #[cfg(feature = "tantivy-engine")]
+        if let Some(cx) = cx {
+            return crate::search_v3::backfill_for_request(
+                cx,
+                pool,
+                &db_url,
+                Some(pool.search_identity_path()),
+            );
+        }
         crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
     };
     #[cfg(feature = "tantivy-engine")]
-    let result = crate::search_v3::with_backfill_source_retry(backfill);
+    let result = match cx {
+        Some(cx) => crate::search_v3::with_backfill_source_retry_for_request(cx, backfill),
+        None => crate::search_v3::with_backfill_source_retry(backfill),
+    };
     // The feature-disabled bridge already defines a no-op backfill. It has no
     // native source connection to retry and no Tantivy retry helper to call.
     #[cfg(not(feature = "tantivy-engine"))]
-    let result = backfill();
+    let result = {
+        let _ = cx;
+        backfill()
+    };
     result.map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
     Ok(())
 }
 
-fn observe_live_lexical_source(pool: &DbPool) -> Result<(), DbError> {
+fn observe_live_lexical_source(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
     pool.verify_sqlite_authority("lexical source observation")?;
     #[cfg(feature = "tantivy-engine")]
-    crate::search_v3::observe_live_source_revision(&lexical_backfill_database_url(pool))
+    crate::search_v3::observe_live_source_revision(cx, &lexical_backfill_database_url(pool))
         .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    #[cfg(not(feature = "tantivy-engine"))]
+    let _ = cx;
     Ok(())
 }
 
-fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
+fn ensure_lexical_bridge_initialized(cx: Option<&Cx>, pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
     let index_dir = direct_surface_index_dir(pool)?;
-    let _guard = lexical_init_guard()
-        .lock()
-        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
+    let _guard = loop {
+        if let Some(cx) = cx {
+            check_lexical_request(cx).map_err(|error| map_bridge_bootstrap_error(&error))?;
+        }
+        match lexical_init_guard().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(DbError::Sqlite(format!(
+                    "search bootstrap init guard lock poisoned: {error}"
+                )));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
 
     let state_lock = lexical_bootstrap_state();
     let cached_state = state_lock
@@ -1901,7 +2179,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         // cached result sets before the cache is consulted. br-ekdk1: a full
         // catch-up here ran twice per query and serialized every search under
         // the init guard (search p50 ~2.8 s under sustained sends).
-        observe_live_lexical_source(pool)?;
+        observe_live_lexical_source(cx, pool)?;
         return Ok(());
     }
 
@@ -1918,8 +2196,16 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             // a fresh empty memory DB forces a full rebuild to an empty index
             // whenever the active in-memory pool changes.
             if !bridge_ready || active_key.as_deref() != Some(sqlite_key.as_str()) {
-                crate::search_v3::backfill_from_db("sqlite:///:memory:")
-                    .map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
+                #[cfg(feature = "tantivy-engine")]
+                let cleared = match cx {
+                    Some(cx) => {
+                        crate::search_v3::backfill_for_request(cx, pool, "sqlite:///:memory:", None)
+                    }
+                    None => crate::search_v3::backfill_from_db("sqlite:///:memory:"),
+                };
+                #[cfg(not(feature = "tantivy-engine"))]
+                let cleared = crate::search_v3::backfill_from_db("sqlite:///:memory:");
+                cleared.map_err(|err| map_bridge_bootstrap_error(&err).to_string())?;
                 set_lexical_active_db_key(&sqlite_key).map_err(|err| err.to_string())?;
             }
             return Ok(false);
@@ -1933,7 +2219,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             || active_key.as_deref() != Some(sqlite_key.as_str())
             || !has_run_lexical_backfill(&sqlite_key).map_err(|err| err.to_string())?;
         if should_backfill {
-            run_lexical_backfill_for_pool(pool).map_err(|err| err.to_string())?;
+            run_lexical_backfill_for_pool(cx, pool).map_err(|err| err.to_string())?;
         }
         Ok(true)
     })();
@@ -2046,6 +2332,58 @@ impl Embedder for AutoInitSemanticEmbedder {
 #[cfg(feature = "hybrid")]
 const SEMANTIC_BACKFILL_PAGE_SIZE: i64 = 64;
 
+#[cfg(feature = "hybrid")]
+const SEMANTIC_RECOVERY_PAGE_SIZE: i64 = 16;
+
+/// Only IDs are retained after the fast embedding retries are exhausted. A
+/// range can cover arbitrarily many failures without filling the live queue;
+/// valid vectors between its endpoints are checked, never embedded again.
+#[cfg(feature = "hybrid")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SemanticRecoveryRange {
+    first: i64,
+    last: i64,
+    after: Option<i64>,
+}
+
+#[cfg(feature = "hybrid")]
+#[derive(Default)]
+struct SemanticRecovery {
+    pending: Option<SemanticRecoveryRange>,
+    active: Option<SemanticRecoveryRange>,
+    not_before: Option<std::time::Instant>,
+    rounds: u32,
+    append_first: bool,
+}
+
+#[cfg(feature = "hybrid")]
+impl SemanticRecovery {
+    fn record_failure(&mut self, id: i64, now: std::time::Instant) {
+        let range = self.pending.get_or_insert(SemanticRecoveryRange {
+            first: id,
+            last: id,
+            after: None,
+        });
+        range.first = range.first.min(id);
+        range.last = range.last.max(id);
+        // New failures widen the next pass, including IDs behind an active
+        // cursor, but can never keep postponing its original deadline.
+        self.not_before.get_or_insert_with(|| {
+            let seconds = 30_u64.saturating_mul(1_u64 << self.rounds.min(5)).min(900);
+            now + std::time::Duration::from_secs(seconds)
+        });
+    }
+
+    fn ready_range(&mut self, now: std::time::Instant) -> Option<SemanticRecoveryRange> {
+        if self.active.is_none() && self.not_before.is_some_and(|deadline| deadline <= now) {
+            self.active = self.pending.take();
+            self.not_before = None;
+            self.rounds = self.rounds.saturating_add(1);
+        }
+        self.active
+    }
+}
+
 /// One mailbox owns the process-local semantic index. Reconstruct its message
 /// history lazily from bounded, read-only pages after the first semantic query.
 /// Source resets run on the embedding worker, between completed batches.
@@ -2061,6 +2399,7 @@ struct SemanticSourceState {
     scan_started_clock: Option<crate::search_v3::LexicalChangeClock>,
     tail_base_clock: Option<crate::search_v3::LexicalChangeClock>,
     tail_rows: u64,
+    recovery: SemanticRecovery,
     epoch: u64,
     last_error: Option<String>,
 }
@@ -2070,6 +2409,13 @@ struct SemanticSource {
     state: Mutex<SemanticSourceState>,
     queue: Arc<EmbeddingQueue>,
     index: Arc<RwLock<VectorIndex>>,
+}
+
+#[cfg(feature = "hybrid")]
+enum SemanticEnqueue {
+    Current,
+    Added,
+    Full,
 }
 
 /// An unavailable source is distinct from a current legacy source that has
@@ -2157,6 +2503,7 @@ impl SemanticSource {
         state.scan_started_clock = None;
         state.tail_base_clock = None;
         state.tail_rows = 0;
+        state.recovery = SemanticRecovery::default();
         state.epoch = state.epoch.wrapping_add(1);
         if had_work || had_vectors {
             invalidate_search_cache(InvalidationTrigger::IndexUpdate);
@@ -2193,6 +2540,83 @@ impl SemanticSource {
                 false
             }
         }
+    }
+
+    fn record_failures(&self, results: &[JobResult]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active_pool_key.is_none() {
+            // Before source binding, the first canonical scan will recover
+            // these IDs. A replacement binding likewise starts a fresh scan.
+            return;
+        }
+        let now = std::time::Instant::now();
+        for result in results {
+            if let JobResult::Failed {
+                doc_id,
+                doc_kind: SearchDocKind::Message,
+                ..
+            } = result
+            {
+                state.recovery.record_failure(*doc_id, now);
+            }
+        }
+    }
+
+    fn enqueue_canonical_request(&self, request: EmbeddingRequest) -> SemanticEnqueue {
+        let hash = crate::search_canonical::canonicalize_and_hash(
+            request.doc_kind,
+            &request.title,
+            &request.body,
+            crate::search_canonical::CanonPolicy::Full,
+        )
+        .1;
+        let up_to_date = read_guard_or_recover("semantic.vector_index", &self.index)
+            .get(request.doc_id, request.doc_kind)
+            .is_some_and(|entry| {
+                entry.metadata.project_id == request.project_id
+                    && entry.metadata.content_hash == hash
+            });
+        if up_to_date || self.queue.contains(request.doc_id, request.doc_kind) {
+            SemanticEnqueue::Current
+        } else if self.queue.enqueue(request) {
+            SemanticEnqueue::Added
+        } else {
+            SemanticEnqueue::Full
+        }
+    }
+
+    fn enqueue_canonical_page(
+        &self,
+        requests: Vec<EmbeddingRequest>,
+        after_id: &mut Option<i64>,
+    ) -> (u64, usize) {
+        let mut visited = 0;
+        let mut added = 0;
+        for request in requests {
+            let id = request.doc_id;
+            match self.enqueue_canonical_request(request) {
+                SemanticEnqueue::Current => {}
+                SemanticEnqueue::Added => added += 1,
+                // Neither cursor may skip a row the bounded queue refused.
+                SemanticEnqueue::Full => break,
+            }
+            *after_id = Some(id);
+            visited += 1;
+        }
+        (visited, added)
+    }
+
+    fn enqueue_recovery_page(
+        &self,
+        requests: Vec<EmbeddingRequest>,
+        recovery: &mut SemanticRecovery,
+    ) -> usize {
+        recovery.active.as_mut().map_or(0, |range| {
+            self.enqueue_canonical_page(requests, &mut range.after).1
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2246,23 +2670,40 @@ impl SemanticSource {
             ),
         }
         .map_err(|error| error.to_string())?;
-        let mut requests = Vec::with_capacity(rows.len());
-        for row in rows {
-            requests.push(EmbeddingRequest::new(
-                row.get_named::<i64>("id")
-                    .map_err(|error| error.to_string())?,
-                SearchDocKind::Message,
-                Some(
-                    row.get_named::<i64>("project_id")
-                        .map_err(|error| error.to_string())?,
-                ),
-                row.get_named::<String>("subject")
-                    .map_err(|error| error.to_string())?,
-                row.get_named::<String>("body_md")
-                    .map_err(|error| error.to_string())?,
-                ModelTier::Fast,
-            ));
-        }
+        let requests = semantic_history_requests(rows)?;
+        let recovery_range = if reset {
+            None
+        } else {
+            state.recovery.ready_range(std::time::Instant::now())
+        };
+        let recovery_requests = match recovery_range {
+            Some(range) => {
+                let (sql, start) = match range.after {
+                    Some(after) => (
+                        "SELECT id, project_id, subject, body_md FROM messages \
+                         WHERE id > ? AND id <= ? ORDER BY id LIMIT ?",
+                        after,
+                    ),
+                    None => (
+                        "SELECT id, project_id, subject, body_md FROM messages \
+                         WHERE id >= ? AND id <= ? ORDER BY id LIMIT ?",
+                        range.first,
+                    ),
+                };
+                let rows = conn
+                    .query_sync(
+                        sql,
+                        &[
+                            Value::BigInt(start),
+                            Value::BigInt(range.last),
+                            Value::BigInt(SEMANTIC_RECOVERY_PAGE_SIZE),
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                semantic_history_requests(rows)?
+            }
+            None => Vec::new(),
+        };
         conn.execute_raw("COMMIT")
             .map_err(|error| error.to_string())?;
 
@@ -2287,6 +2728,9 @@ impl SemanticSource {
         state.generation = generation;
         state.clock = Some(clock);
         state.scan_started_clock.get_or_insert(clock);
+        if recovery_range.is_some() && recovery_requests.is_empty() {
+            state.recovery.active = None;
+        }
         if requests.is_empty() {
             let complete = state.tail_base_clock.map_or_else(
                 || state.scan_started_clock == Some(clock),
@@ -2304,33 +2748,56 @@ impl SemanticSource {
             }
             state.tail_rows = 0;
         }
-        for request in requests {
-            let id = request.doc_id;
-            let hash = crate::search_canonical::canonicalize_and_hash(
-                request.doc_kind,
-                &request.title,
-                &request.body,
-                crate::search_canonical::CanonPolicy::Full,
-            )
-            .1;
-            let up_to_date = read_guard_or_recover("semantic.vector_index", &self.index)
-                .get(id, request.doc_kind)
-                .is_some_and(|entry| {
-                    entry.metadata.project_id == request.project_id
-                        && entry.metadata.content_hash == hash
-                });
-            if !up_to_date && !self.queue.enqueue(request) {
-                // Keep the cursor before the rejected row; model absence or a
-                // full live queue must never permanently skip historical mail.
-                break;
-            }
-            state.after_id = Some(id);
-            if state.tail_base_clock.is_some() {
-                state.tail_rows = state.tail_rows.saturating_add(1);
-            }
+        // Each lane has an independent bounded page and cursor. Alternate
+        // admission priority only after actual queue progress, so even a
+        // one-slot queue serves both new mail and a large repair range.
+        let ((visited, appended), repaired) = if state.recovery.append_first {
+            let append = self.enqueue_canonical_page(requests, &mut state.after_id);
+            let repair = self.enqueue_recovery_page(recovery_requests, &mut state.recovery);
+            (append, repair)
+        } else {
+            let repair = self.enqueue_recovery_page(recovery_requests, &mut state.recovery);
+            let append = self.enqueue_canonical_page(requests, &mut state.after_id);
+            (append, repair)
+        };
+        if state.tail_base_clock.is_some() {
+            state.tail_rows = state.tail_rows.saturating_add(visited);
+        }
+        if recovery_range.is_some() && (appended > 0 || repaired > 0) {
+            state.recovery.append_first = !state.recovery.append_first;
+        }
+        if state.recovery.active.is_none()
+            && state.recovery.pending.is_none()
+            && self.queue.is_empty()
+        {
+            state.recovery.rounds = 0;
         }
         Ok(true)
     }
+}
+
+#[cfg(feature = "hybrid")]
+fn semantic_history_requests(
+    rows: Vec<sqlmodel_core::Row>,
+) -> Result<Vec<EmbeddingRequest>, String> {
+    rows.into_iter()
+        .map(|row| {
+            Ok(EmbeddingRequest::new(
+                row.get_named::<i64>("id")
+                    .map_err(|error| error.to_string())?,
+                SearchDocKind::Message,
+                Some(
+                    row.get_named::<i64>("project_id")
+                        .map_err(|error| error.to_string())?,
+                ),
+                row.get_named::<String>("subject")
+                    .map_err(|error| error.to_string())?,
+                row.get_named::<String>("body_md")
+                    .map_err(|error| error.to_string())?,
+                ModelTier::Fast,
+            ))
+        })
+        .collect()
 }
 
 /// Observe the pathname's physical identity without opening the main database.
@@ -2419,9 +2886,17 @@ impl SemanticBridge {
 
     #[must_use]
     fn new_with_embedder(config: VectorIndexConfig, embedder: Arc<dyn Embedder>) -> Self {
+        Self::new_with_embedder_config(config, embedder, EmbeddingJobConfig::default())
+    }
+
+    #[must_use]
+    fn new_with_embedder_config(
+        config: VectorIndexConfig,
+        embedder: Arc<dyn Embedder>,
+        job_config: EmbeddingJobConfig,
+    ) -> Self {
         let index = Arc::new(RwLock::new(VectorIndex::new(config)));
         let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
-        let job_config = EmbeddingJobConfig::default();
         let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
         let runner = Arc::new(
             EmbeddingJobRunner::new(job_config, queue.clone(), embedder.clone(), index.clone())
@@ -2438,9 +2913,13 @@ impl SemanticBridge {
             index: index.clone(),
         });
         let refill_source = source.clone();
+        let recovery_source = source.clone();
         let refresh_worker = Arc::new(
             IndexRefreshWorker::new(worker_cfg, runner.clone())
-                .with_source_refill(move |shutdown| refill_source.refill(shutdown)),
+                .with_source_refill(move |shutdown| refill_source.refill(shutdown))
+                .with_source_failure_recovery(move |results| {
+                    recovery_source.record_failures(results);
+                }),
         );
         let worker = {
             let worker = refresh_worker.clone();
@@ -3932,21 +4411,16 @@ struct HybridExecutionPlan {
     governor: HybridBudgetGovernorState,
 }
 
-fn wall_clock_now_time() -> Time {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let nanos_u64 = u64::try_from(nanos).unwrap_or(u64::MAX);
-    Time::from_nanos(nanos_u64)
-}
-
 fn saturating_duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
+fn deadline_remaining_budget_ms(cx: &Cx) -> Option<u64> {
+    let budget = cx.budget();
     budget.deadline?;
-    let now = wall_clock_now_time();
+    // Deadlines belong to this caller's clock. Unix time makes every
+    // process-relative deadline appear expired and bypasses virtual clocks.
+    let now = cx.now();
     Some(
         budget
             .remaining_time(now)
@@ -3954,9 +4428,9 @@ fn deadline_remaining_budget_ms(budget: Budget) -> Option<u64> {
     )
 }
 
-fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
+pub(crate) fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
     let budget = cx.budget();
-    let deadline_remaining_ms = deadline_remaining_budget_ms(budget);
+    let deadline_remaining_ms = deadline_remaining_budget_ms(cx);
     let cost_remaining_ms = budget.remaining_cost();
 
     match (deadline_remaining_ms, cost_remaining_ms) {
@@ -3964,6 +4438,36 @@ fn request_budget_remaining_ms(cx: &Cx) -> Option<u64> {
         (Some(deadline), None) => Some(deadline),
         (None, Some(cost)) => Some(cost),
         (None, None) => None,
+    }
+}
+
+/// Foreground lexical work shares the task's original cancellation and budget.
+/// Native operations already in progress remain owned until they return.
+pub(crate) fn check_lexical_request(cx: &Cx) -> Result<(), String> {
+    if cx.checkpoint().is_err() {
+        return Err("lexical search request cancelled".to_string());
+    }
+    if request_budget_remaining_ms(cx) == Some(0) {
+        return Err("lexical search request budget exhausted".to_string());
+    }
+    Ok(())
+}
+
+fn lexical_failure<T>(cx: &Cx, error: DbError) -> Outcome<T, DbError> {
+    if check_lexical_request(cx).is_err() {
+        Outcome::Cancelled(cx.cancel_reason().unwrap_or_else(|| {
+            if deadline_remaining_budget_ms(cx) == Some(0) {
+                asupersync::CancelReason::deadline()
+                    .with_message("lexical search request deadline exhausted")
+            } else if cx.budget().remaining_cost() == Some(0) {
+                asupersync::CancelReason::cost_budget()
+                    .with_message("lexical search request cost budget exhausted")
+            } else {
+                asupersync::CancelReason::user("lexical search request cancelled")
+            }
+        }))
+    } else {
+        Outcome::Err(error)
     }
 }
 
@@ -4732,17 +5236,17 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     // canonical mailbox before ranking: rerank must receive the actual message
     // text, and missing/foreign/filter-mismatched rows must not occupy the fused
     // candidate budget. Never preserve unverified index-only hits here.
-    let lexical_results =
-        match canonicalize_message_results(cx, pool, query, lexical_results, false).await {
-            Outcome::Ok(results) => results,
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
+    let lexical_results = match canonicalize_message_results(cx, pool, query, lexical_results).await
+    {
+        Outcome::Ok(results) => results,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     let semantic_outcome = if let Some(proof) = semantic_proof {
         canonicalize_semantic_results(cx, pool, query, semantic_results, proof).await
     } else {
-        canonicalize_message_results(cx, pool, query, semantic_results, false).await
+        canonicalize_message_results(cx, pool, query, semantic_results).await
     };
     let semantic_results = match semantic_outcome {
         Outcome::Ok(results) => results,
@@ -5198,6 +5702,9 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    if let Err(error) = check_lexical_request(cx) {
+        return lexical_failure(cx, DbError::Sqlite(error));
+    }
     // Hints become filters before routing, caching and planning see the query.
     let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
     let query = hinted.as_ref().unwrap_or(query);
@@ -5276,13 +5783,12 @@ pub async fn execute_search(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = apply_cursor_window(raw_results, query);
         let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
@@ -5316,19 +5822,22 @@ pub async fn execute_search(
             || semantic_index_is_foreign_to_pool(pool))
     {
         let raw_results = match crate::search_v3::search_private_snapshot(
+            Some(cx),
             &lexical_backfill_database_url(pool),
             query,
         ) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(map_bridge_bootstrap_error(&error)),
+            Err(error) => return lexical_failure(cx, map_bridge_bootstrap_error(&error)),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(error) => return Outcome::Err(error),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        // Continuation follows the examined index page, including candidates
+        // that disappear or leave the query's scope before canonical hydration.
+        let next_cursor = compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
         let explain = query
             .explain
@@ -5338,7 +5847,11 @@ pub async fn execute_search(
             record_query("search_service_private_tantivy", latency_us);
         }
         global_metrics().search.record_v3_query(latency_us, false);
-        return finish_scoped_response(raw_results, query, options, assistance, explain);
+        let mut response = finish_scoped_response(raw_results, query, options, assistance, explain);
+        if let Outcome::Ok(ref mut response) = response {
+            response.next_cursor = next_cursor;
+        }
+        return response;
     }
 
     // Builds without Tantivy retain the GH#162 SQL fallback for a foreign
@@ -5358,13 +5871,12 @@ pub async fn execute_search(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        let raw_results =
-            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                Outcome::Ok(results) => results,
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
         let raw_results = apply_cursor_window(raw_results, query);
         let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
@@ -5388,7 +5900,7 @@ pub async fn execute_search(
     if matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
-    ) && let Err(err) = ensure_lexical_bridge_initialized(pool)
+    ) && let Err(err) = ensure_lexical_bridge_initialized(Some(cx), pool)
     {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
         record_legacy_error_metrics(
@@ -5396,7 +5908,7 @@ pub async fn execute_search(
             latency_us,
             options.track_telemetry,
         );
-        return Outcome::Err(err);
+        return lexical_failure(cx, err);
     }
 
     // Backfill can invalidate cached candidates after edits made by another
@@ -5421,20 +5933,21 @@ pub async fn execute_search(
 
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
-        let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        let candidates = match try_tantivy_search(pool, query) {
+        // Explicit and configured lexical modes share the canonical service
+        // contract. Rich index-only callers use TantivyBridge::search directly.
+        let candidates = match try_tantivy_search(cx, pool, query) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(error),
+            Err(error) => return lexical_failure(cx, error),
         };
         if let Some(mut raw_results) = candidates {
-            if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
+            if raw_results.is_empty() && pool.sqlite_path() != ":memory:" {
                 let sqlite_key = sqlite_key_for_pool(pool);
                 let backfill_ran = match has_run_lexical_backfill(&sqlite_key) {
                     Ok(v) => v,
                     Err(err) => return Outcome::Err(err),
                 };
                 if !backfill_ran {
-                    if let Err(err) = run_lexical_backfill_for_pool(pool) {
+                    if let Err(err) = run_lexical_backfill_for_pool(Some(cx), pool) {
                         let latency_us =
                             u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
                         record_legacy_error_metrics(
@@ -5442,24 +5955,27 @@ pub async fn execute_search(
                             latency_us,
                             options.track_telemetry,
                         );
-                        return Outcome::Err(err);
+                        return lexical_failure(cx, err);
                     }
-                    match try_tantivy_search(pool, query) {
+                    match try_tantivy_search(cx, pool, query) {
                         Ok(Some(rerun_results)) => raw_results = rerun_results,
                         Ok(None) => {}
-                        Err(error) => return Outcome::Err(error),
+                        Err(error) => return lexical_failure(cx, error),
                     }
                 }
             }
-            let raw_results =
-                match canonicalize_message_results(cx, pool, query, raw_results, explicit_lexical)
-                    .await
-                {
-                    Outcome::Ok(results) => results,
-                    Outcome::Err(err) => return Outcome::Err(err),
-                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-                };
+            // A full candidate page may hydrate to a short or empty page.
+            // Keep its continuation so a concurrent deletion or filter change
+            // cannot hide later matches by falsely reporting exhaustion.
+            let next_cursor =
+                compute_next_cursor(&raw_results, query.effective_limit(), query.ranking);
+            let raw_results = match canonicalize_message_results(cx, pool, query, raw_results).await
+            {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             let raw_results =
                 trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
             let explain = if query.explain {
@@ -5473,8 +5989,11 @@ pub async fn execute_search(
             }
             // Record V3 metrics
             global_metrics().search.record_v3_query(latency_us, false);
-            let resp =
+            let mut resp =
                 finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
+            if let Outcome::Ok(ref mut response) = resp {
+                response.next_cursor = next_cursor;
+            }
             if cache_allowed && let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
@@ -5567,9 +6086,11 @@ pub async fn execute_search(
         // asupersync, and this crate does not enable the proc-macro helpers that
         // would replace it. Keep the hybrid orchestration behavior intact while
         // running candidate retrieval directly in the current task.
-        let lexical_results = match try_tantivy_search(pool, &lexical_query) {
+        // Both sources are hydrated and authorized from this pool before
+        // fusion and reranking, so stored snippets and total counts are unused.
+        let lexical_results = match try_tantivy_search(cx, pool, &lexical_query) {
             Ok(results) => results,
-            Err(error) => return Outcome::Err(error),
+            Err(error) => return lexical_failure(cx, error),
         };
         #[cfg(feature = "hybrid")]
         let (semantic_results, semantic_proof, two_tier_telemetry) =
@@ -6119,6 +6640,186 @@ mod tests {
 
     static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[test]
+    fn gh382_expired_search_stops_before_bootstrap_and_preserves_cancellation() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        #[cfg(feature = "tantivy-engine")]
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "expired.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_request_with_budget(Budget::new().with_deadline(Time::ZERO));
+        let outcome = runtime.block_on(execute_search(
+            &cx,
+            &pool,
+            &SearchQuery::messages("commonmail", 1),
+            &SearchOptions::default(),
+        ));
+        assert!(matches!(outcome, Outcome::Cancelled(_)), "{outcome:?}");
+        assert!(!lexical_readiness(&pool).initialized);
+        assert!(!root.path().join("search_index").exists());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gh382_default_tool_search_hydrates_payloads_and_proves_actual_pool_readiness() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "readiness.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/gh382-search")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let body = format!("commonmail {} canonical tail", "payload ".repeat(1024));
+            let conn = crate::guard_db_conn(
+                crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+                "gh382 service fixture",
+            );
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(1,?,?,'commonmail',?,1000000)",
+                &[
+                    Value::BigInt(project_id),
+                    Value::BigInt(sender.id.unwrap()),
+                    Value::Text(body.clone()),
+                ],
+            )
+            .unwrap();
+            assert!(crate::queries::db_generation_id_conn(&conn).is_none());
+            let before = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(
+                crate::queries::db_generation_id_conn(&conn).is_none(),
+                "readiness observation must not mint a database identity"
+            );
+            assert!(before.compiled);
+            assert!(
+                !before.verified,
+                "bridge existence alone cannot certify this pool"
+            );
+            let query = SearchQuery {
+                limit: Some(1),
+                explain: true,
+                ..SearchQuery::messages("commonmail", project_id)
+            };
+            let options = SearchOptions {
+                surface: Some("search_messages"),
+                ..SearchOptions::default()
+            };
+            let result = execute_search(&cx, &pool, &query, &options)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(result.results.len(), 1);
+            let message = &result.results[0].result;
+            assert_eq!(message.id, 1);
+            assert_eq!(
+                message.body, body,
+                "canonical hydration must retain the full message"
+            );
+            assert_eq!(message.from_agent.as_deref(), Some("BlueLake"));
+            assert_eq!(message.project_id, Some(project_id));
+            let ready = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(ready.initialized && ready.available && ready.verified && !ready.backfilling);
+            assert!(!ready.catch_up_required);
+            assert_eq!(lexical_readiness(&pool), ready);
+
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(2,?,?,'newmail','append body',2000000)",
+                &[Value::BigInt(project_id), Value::BigInt(sender.id.unwrap())],
+            )
+            .unwrap();
+            let lagging = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(
+                lagging.available && lagging.catch_up_required && !lagging.verified,
+                "ordinary sends retain a usable generation without claiming current coverage"
+            );
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            refresh_lexical_index_cancellable(&pool, &stopped).unwrap();
+            let caught_up = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(caught_up.available && caught_up.verified && !caught_up.catch_up_required);
+
+            conn.execute_sync(
+                "UPDATE messages SET subject='rewrittenmail',body_md='new body' WHERE id=2",
+                &[],
+            )
+            .unwrap();
+            let rewritten = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(
+                !rewritten.available && !rewritten.verified && rewritten.catch_up_required,
+                "a known rewrite requires a new sealed proof"
+            );
+            refresh_lexical_index_cancellable(&pool, &stopped).unwrap();
+            let rebuilt = probe_lexical_readiness(&cx, &pool)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(rebuilt.available && rebuilt.verified && !rebuilt.catch_up_required);
+            let rewritten_results = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("rewrittenmail", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(rewritten_results.results[0].result.id, 2);
+            assert_eq!(rewritten_results.results[0].result.body, "new body");
+
+            let other_root = tempfile::tempdir().unwrap();
+            let other_pool = temp_file_pool(other_root.path(), "other.sqlite3");
+            assert!(
+                !lexical_readiness(&other_pool).verified,
+                "a process-global bridge cannot certify an unobserved serving pool"
+            );
+            crate::search_v3::reset_bridge_for_tests();
+            assert!(
+                !lexical_readiness(&pool).verified,
+                "a changed bridge invalidates the sampled proof"
+            );
+        });
+        reset_lexical_bootstrap_tracking();
+    }
+
     /// `AM_SEARCH_ENGINE_FOR_<TOOL>` and `AM_SEARCH_SEMANTIC_ENABLED` were
     /// parsed but never consulted: every query ran the global engine.
     #[test]
@@ -6222,6 +6923,11 @@ mod tests {
     }
 
     fn reset_lexical_bootstrap_tracking() {
+        #[cfg(feature = "tantivy-engine")]
+        lexical_readiness_sources()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         lexical_bootstrap_state()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6694,6 +7400,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture"])
             .env(CHILD, test_name)
+            .env("AM_SEARCH_ENGINE", "lexical")
             .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
             .output()
             .unwrap();
@@ -6985,7 +7692,7 @@ mod tests {
                     .len()
             };
             let epoch_before = global_search_cache().current_epoch();
-            ensure_lexical_bridge_initialized(&pool).unwrap();
+            ensure_lexical_bridge_initialized(None, &pool).unwrap();
             assert_eq!(indexed(), 0, "readiness indexes nothing");
             assert!(
                 global_search_cache().current_epoch() > epoch_before,
@@ -8054,7 +8761,7 @@ mod tests {
         let pool = DbPool::new(&config).expect("pool");
         let sqlite_key = sqlite_key_for_pool(&pool);
 
-        run_lexical_backfill_for_pool(&pool).expect("memory no-op");
+        run_lexical_backfill_for_pool(None, &pool).expect("memory no-op");
 
         assert!(!has_run_lexical_backfill(&sqlite_key).expect("backfill marker"));
     }
@@ -9086,99 +9793,359 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tantivy-engine")]
     #[test]
-    fn unresolved_inbox_results_require_recipient_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            direction: Some(Direction::Inbox),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 24,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_400),
-            thread_id: Some("br-240".to_string()),
-            topic: None,
-            from_agent: Some("RedPeak".to_string()),
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    #[allow(clippy::too_many_lines)]
+    fn lexical_service_rejects_deleted_candidates_and_hydrates_live_rows() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_service_rejects_deleted_candidates_and_hydrates_live_rows",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-authority.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            for (case, search_engine) in [
+                Some(SearchEngine::Lexical),
+                None,
+                Some(SearchEngine::Hybrid),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // Keep semantic retrieval scoped to this case even when a
+                // real embedder is available in the test environment.
+                let project = crate::queries::ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/lexical-authority-{case}"),
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let project_id = project.id.unwrap();
+                let sender = crate::queries::register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                let deleted_id = 2 * i64::try_from(case).unwrap() + 1;
+                let live_id = deleted_id + 1;
+                let token = format!("authorityboundary{case}");
+                let query = SearchQuery::messages(&token, project_id);
+                let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+                for (id, body) in [
+                    (deleted_id, "deleted-body-canary"),
+                    (live_id, "previous-body-canary"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO messages \
+                         (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (?, ?, ?, ?, ?, 1000000)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::BigInt(sender.id.unwrap()),
+                            Value::Text(token.clone()),
+                            Value::Text(format!("{token} {body}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                crate::close_db_conn(conn, "seed lexical authority regression");
+                ensure_lexical_bridge_initialized(Some(&cx), &pool).unwrap();
+                let candidates = try_tantivy_search(&cx, &pool, &query).unwrap().unwrap();
+                assert_eq!(candidates.len(), 2, "real index must contain both rows");
+                let live_score = candidates.iter().find(|hit| hit.id == live_id).unwrap().score;
+                let bridge = crate::search_v3::get_bridge().unwrap();
+                let indexed = bridge.search(&query);
+                assert_eq!(indexed.len(), 2);
+                assert!(indexed.iter().any(|hit| hit.body.contains("deleted-body-canary")));
+
+                // Commit the race only after execute_search has collected its
+                // actual Tantivy candidates. A pre-search deletion would let
+                // catch-up remove the ghost and miss the service defect.
+                let database_path = pool.sqlite_path().to_string();
+                let index_query = query.clone();
+                LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let conn = crate::DbConn::open_file(&database_path).unwrap();
+                        conn.execute_sync(
+                            "DELETE FROM messages WHERE id = ?",
+                            &[Value::BigInt(deleted_id)],
+                        )
+                        .unwrap();
+                        conn.execute_sync(
+                            "UPDATE messages SET body_md = 'authoritative current body' WHERE id = ?",
+                            &[Value::BigInt(live_id)],
+                        )
+                        .unwrap();
+                        crate::close_db_conn(conn, "commit lexical candidate race");
+                        assert!(
+                            bridge.search(&index_query).iter().any(|hit| hit.id == deleted_id),
+                            "standalone index-only retrieval retains the stale row at the hydration boundary"
+                        );
+                    }));
+                });
+                let options = SearchOptions {
+                    search_engine,
+                    ..Default::default()
+                };
+                let result = execute_search(&cx, &pool, &query, &options).await;
+                assert!(
+                    LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()),
+                    "search must execute the real candidate boundary for {search_engine:?}"
+                );
+                let response = result.into_result().unwrap();
+                assert_eq!(response.results.len(), 1, "engine {search_engine:?}");
+                let live = &response.results[0].result;
+                assert_eq!(live.id, live_id);
+                assert_eq!(live.body, "authoritative current body");
+                assert_eq!(live.title, token);
+                assert_eq!(live.from_agent.as_deref(), Some("BlueLake"));
+                assert_eq!(live.from_agent_id, sender.id);
+                if resolve_search_engine(&options) == SearchEngine::Lexical {
+                    assert_eq!(live.score, live_score, "canonical hydration preserves ranking");
+                }
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("deleted-body-canary"));
+                assert!(!wire.contains("previous-body-canary"));
+            }
+        });
     }
 
+    #[cfg(feature = "tantivy-engine")]
     #[test]
-    fn unresolved_outbox_results_require_sender_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            direction: Some(Direction::Outbox),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 25,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_500),
-            thread_id: Some("br-250".to_string()),
-            topic: None,
-            from_agent: None,
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    #[allow(clippy::too_many_lines)]
+    fn lexical_search_continues_after_candidates_disappear() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_search_continues_after_candidates_disappear",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-continuation.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let foreign = crate::queries::ensure_project(&cx, &pool, "/continuation-foreign")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            for (engine_case, search_engine) in
+                [Some(SearchEngine::Lexical), None].into_iter().enumerate()
+            {
+                for hide_entire_page in [false, true] {
+                    let token = format!("continuation{engine_case}{hide_entire_page}");
+                    let project = crate::queries::ensure_project(&cx, &pool, &format!("/{token}"))
+                        .await
+                        .into_result()
+                        .unwrap();
+                    let project_id = project.id.unwrap();
+                    let sender = crate::queries::register_agent(
+                        &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .unwrap();
+                    let first_id = 10 * i64::try_from(engine_case).unwrap()
+                        + if hide_entire_page { 6 } else { 1 };
+                    // Deletion leaves a partial final page. Moving the whole
+                    // first page leaves exactly one full page, followed by an
+                    // empty terminal page. Both must remain traversable.
+                    let count = if hide_entire_page { 4 } else { 5 };
+                    let conn = crate::guard_db_conn(
+                        crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+                        "seed lexical continuation regression",
+                    );
+                    for id in first_id..first_id + count {
+                        conn.execute_sync(
+                            "INSERT INTO messages \
+                             (id, project_id, sender_id, subject, body_md, created_ts) \
+                             VALUES (?, ?, ?, ?, ?, 1000000)",
+                            &[
+                                Value::BigInt(id),
+                                Value::BigInt(project_id),
+                                Value::BigInt(sender.id.unwrap()),
+                                Value::Text(token.clone()),
+                                Value::Text(format!("{token} canonical body")),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                    drop(conn);
+                    let mut query = SearchQuery {
+                        limit: Some(2),
+                        ..SearchQuery::messages(&token, project_id)
+                    };
+                    ensure_lexical_bridge_initialized(Some(&cx), &pool).unwrap();
+                    let candidates = try_tantivy_search(&cx, &pool, &query).unwrap().unwrap();
+                    assert_eq!(
+                        candidates.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+                        vec![first_id, first_id + 1],
+                        "the real index must select the rows changed at hydration"
+                    );
+                    let database_path = pool.sqlite_path().to_string();
+                    LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            let conn = crate::guard_db_conn(
+                                crate::DbConn::open_file(&database_path).unwrap(),
+                                "commit lexical continuation race",
+                            );
+                            if hide_entire_page {
+                                conn.execute_sync(
+                                    "UPDATE messages SET project_id = ? WHERE id IN (?, ?)",
+                                    &[
+                                        Value::BigInt(foreign),
+                                        Value::BigInt(first_id),
+                                        Value::BigInt(first_id + 1),
+                                    ],
+                                )
+                                .unwrap();
+                            } else {
+                                conn.execute_sync(
+                                    "DELETE FROM messages WHERE id = ?",
+                                    &[Value::BigInt(first_id)],
+                                )
+                                .unwrap();
+                            }
+                        }));
+                    });
+                    let options = SearchOptions {
+                        search_engine,
+                        ..Default::default()
+                    };
+                    let first = execute_search(&cx, &pool, &query, &options)
+                        .await
+                        .into_result()
+                        .unwrap();
+                    assert!(
+                        LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none())
+                    );
+                    assert_eq!(first.results.len(), usize::from(!hide_entire_page));
+                    assert!(
+                        first.next_cursor.is_some(),
+                        "a shortened or empty hydrated page must not claim exhaustion"
+                    );
+                    let mut ids: Vec<_> = first.results.iter().map(|hit| hit.result.id).collect();
+                    let mut cursor = first.next_cursor;
+                    let mut cursors = HashSet::new();
+                    let mut pages = 0;
+                    while let Some(next) = cursor {
+                        assert!(cursors.insert(next.clone()), "continuation must advance");
+                        assert!(pages < 4, "a finite corpus must reach its final page");
+                        query.cursor = Some(next);
+                        let page = execute_search(&cx, &pool, &query, &options)
+                            .await
+                            .into_result()
+                            .unwrap();
+                        for hit in page.results {
+                            assert_eq!(hit.result.project_id, Some(project_id));
+                            assert_eq!(hit.result.body, format!("{token} canonical body"));
+                            ids.push(hit.result.id);
+                        }
+                        cursor = page.next_cursor;
+                        pages += 1;
+                    }
+                    let hidden = if hide_entire_page { 2 } else { 1 };
+                    assert_eq!(
+                        ids,
+                        (first_id + hidden..first_id + count).collect::<Vec<_>>()
+                    );
+                }
+            }
+        });
     }
 
+    #[cfg(feature = "tantivy-engine")]
     #[test]
-    fn unresolved_agent_results_require_sender_or_recipient_metadata() {
-        let query = SearchQuery {
-            agent_name: Some("BlueLake".to_string()),
-            ..Default::default()
-        };
-        let result = SearchResult {
-            doc_kind: DocKind::Message,
-            id: 26,
-            project_id: Some(1),
-            title: "subject".to_string(),
-            body: String::new(),
-            score: Some(0.5),
-            importance: Some("normal".to_string()),
-            ack_required: Some(false),
-            created_ts: Some(2_600),
-            thread_id: Some("br-260".to_string()),
-            topic: None,
-            from_agent: None,
-            from_agent_id: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-        };
-        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    fn lexical_service_preserves_authoritative_read_errors() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::lexical_service_preserves_authoritative_read_errors",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "lexical-read-error.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let project = crate::queries::ensure_project(&cx, &pool, "/lexical-read-error")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message = crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap(),
+                "authorityreaderror",
+                "authorityreaderror unverified-body-canary",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message_id = message.id.unwrap();
+            let database_path = pool.sqlite_path().to_string();
+            LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let conn = crate::DbConn::open_file(&database_path).unwrap();
+                    conn.execute_sync(
+                        "UPDATE messages SET created_ts = 'invalid-canonical-timestamp' WHERE id = ?",
+                        &[Value::BigInt(message_id)],
+                    )
+                    .unwrap();
+                    crate::close_db_conn(conn, "commit lexical canonical read error");
+                }));
+            });
+            let result = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("authorityreaderror", project_id),
+                &SearchOptions {
+                    search_engine: Some(SearchEngine::Lexical),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(LEXICAL_CANDIDATE_TEST_HOOK.with(|hook| hook.borrow_mut().take().is_none()));
+            let canonical = crate::queries::get_messages_details_by_ids(
+                &cx,
+                &pool,
+                &[message_id],
+                Some(project_id),
+            )
+            .await;
+            match (result, canonical) {
+                (Outcome::Err(DbError::Sqlite(actual)), Outcome::Err(DbError::Sqlite(expected))) => {
+                    assert_eq!(actual, expected, "keep the authoritative error type and detail");
+                }
+                other => panic!("canonical read failure must not become an index hit or empty success: {other:?}"),
+            }
+        });
     }
 
     #[test]
@@ -9483,6 +10450,7 @@ mod tests {
             query_text: "form:BlueLake migration".to_string(),
             applied_filter_hints: Vec::new(),
             did_you_mean: vec![crate::query_assistance::DidYouMeanHint {
+                // ubs:ignore — public query-parser fixture text, not a credential.
                 token: "form:BlueLake".to_string(),
                 suggested_field: "from".to_string(),
                 value: "BlueLake".to_string(),
@@ -9942,6 +10910,27 @@ mod tests {
             assert_eq!(response.results[0].result.id, visible);
             assert_eq!(response.audit_summary.unwrap().denied_count, 1);
         });
+    }
+
+    #[test]
+    fn request_budget_remaining_ms_uses_the_callers_runtime_clock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let budget = Budget::new().with_timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(30),
+        );
+        let cx = runtime.request_cx_with_budget(budget);
+        let remaining = request_budget_remaining_ms(&cx).unwrap();
+        assert!(remaining > 0 && remaining <= 30_000);
+        assert!(check_lexical_request(&cx).is_ok());
+
+        let cost_limited = runtime.request_cx_with_budget(budget.with_cost_quota(7));
+        assert_eq!(request_budget_remaining_ms(&cost_limited), Some(7));
+        let exhausted = runtime.request_cx_with_budget(budget.with_cost_quota(0));
+        assert_eq!(request_budget_remaining_ms(&exhausted), Some(0));
+        assert!(check_lexical_request(&exhausted).is_err());
     }
 
     #[test]
@@ -10509,6 +11498,7 @@ mod tests {
     struct FixedSemanticTestEmbedder {
         info: ModelInfo,
         ready: std::sync::atomic::AtomicBool,
+        failing: std::sync::atomic::AtomicBool,
         model_changed: std::sync::atomic::AtomicBool,
         output_dimension: std::sync::atomic::AtomicUsize,
         on_first_embedding: Mutex<Option<(String, Vec<String>)>>,
@@ -10527,6 +11517,7 @@ mod tests {
                 )
                 .with_available(true),
                 ready: std::sync::atomic::AtomicBool::new(true),
+                failing: std::sync::atomic::AtomicBool::new(false),
                 model_changed: std::sync::atomic::AtomicBool::new(false),
                 output_dimension: std::sync::atomic::AtomicUsize::new(dimension),
                 on_first_embedding: Mutex::new(None),
@@ -10539,6 +11530,11 @@ mod tests {
         fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
             if !self.is_ready() {
                 return HashEmbedder::new().embed(text);
+            }
+            if self.failing.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(crate::search_error::SearchError::Timeout(
+                    "controlled embedding outage".to_string(),
+                ));
             }
             let first_embedding = self.on_first_embedding.lock().unwrap().take();
             if let Some((path, statements)) = first_embedding {
@@ -10625,7 +11621,19 @@ mod tests {
 
     #[cfg(feature = "hybrid")]
     fn manual_semantic_history_bridge(embedder: Arc<FixedSemanticTestEmbedder>) -> SemanticBridge {
-        let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
+        manual_semantic_history_bridge_config(embedder, EmbeddingJobConfig::default())
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn manual_semantic_history_bridge_config(
+        embedder: Arc<FixedSemanticTestEmbedder>,
+        config: EmbeddingJobConfig,
+    ) -> SemanticBridge {
+        let bridge = SemanticBridge::new_with_embedder_config(
+            VectorIndexConfig::default(),
+            embedder,
+            config,
+        );
         bridge.refresh_worker.shutdown();
         let worker = bridge.worker.lock().unwrap().take();
         if let Some(worker) = worker {
@@ -10636,6 +11644,343 @@ mod tests {
             .shutdown_flag()
             .store(false, std::sync::atomic::Ordering::Release);
         bridge
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn exhaust_semantic_history_embeddings(bridge: &SemanticBridge, expected: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while bridge.metrics_snapshot().total_failed < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the original fast retries did not reach their terminal failure"
+            );
+            let _ = bridge.refresh_worker.run_cycle();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(bridge.metrics_snapshot().total_failed, expected);
+        assert!(bridge.queue.is_empty());
+        assert!(bridge.index().is_empty());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_recovery_backoff_retains_late_failures_without_postponement() {
+        let now = std::time::Instant::now();
+        let mut recovery = SemanticRecovery::default();
+        recovery.record_failure(i64::MIN, now);
+        let first_deadline = now + Duration::from_secs(30);
+        assert_eq!(recovery.not_before, Some(first_deadline));
+        recovery.record_failure(i64::MAX, now + Duration::from_secs(29));
+        assert_eq!(recovery.not_before, Some(first_deadline));
+        assert!(
+            recovery
+                .ready_range(now + Duration::from_secs(29))
+                .is_none()
+        );
+        assert_eq!(
+            recovery.ready_range(first_deadline),
+            Some(SemanticRecoveryRange {
+                first: i64::MIN,
+                last: i64::MAX,
+                after: None,
+            })
+        );
+        recovery.active.as_mut().unwrap().after = Some(100);
+        let failed_again = first_deadline + Duration::from_secs(1);
+        recovery.record_failure(2, failed_again);
+        let second_deadline = failed_again + Duration::from_mins(1);
+        recovery.record_failure(
+            300,
+            second_deadline.checked_sub(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(recovery.not_before, Some(second_deadline));
+        assert_eq!(recovery.pending.unwrap().first, 2);
+        assert_eq!(recovery.active.unwrap().after, Some(100));
+        recovery.active = None;
+        assert_eq!(recovery.ready_range(second_deadline).unwrap().first, 2);
+
+        // Permanently failing documents are retried slowly, with finite state
+        // and a capped delay even after the round counter saturates.
+        for (rounds, seconds) in [(2, 120), (3, 240), (4, 480), (5, 900), (u32::MAX, 900)] {
+            recovery = SemanticRecovery {
+                rounds,
+                ..Default::default()
+            };
+            recovery.record_failure(-1, now);
+            let due = now + Duration::from_secs(seconds);
+            assert_eq!(recovery.not_before, Some(due));
+            assert_eq!(recovery.ready_range(due).unwrap().first, -1);
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovers_exhausted_embeddings_without_reembedding_healthy_mail() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "exhausted-history.sqlite3", 3);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .failing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        exhaust_semantic_history_embeddings(&bridge, 3);
+        assert_eq!(bridge.source.state.lock().unwrap().after_id, Some(3));
+        embedder
+            .failing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let batches = bridge.metrics_snapshot().total_batches;
+        for _ in 0..3 {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        }
+        assert_eq!(bridge.metrics_snapshot().total_batches, batches);
+
+        // The unchanged historical tail stays missing during the cooldown,
+        // while new canonical mail gets its own budget and is indexed at once.
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "exhausted history append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (4, 1, 1, 'new mail during recovery', 'canonical new body', 2)",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert!(bridge.index().contains(4, SearchDocKind::Message));
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 1);
+
+        // Advance only the recovery scheduler in this test. The real DB,
+        // source cursor, ordinary fast retry policy and worker path are intact.
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 3);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 4);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 4);
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].title, "Historical subject 1");
+        assert_eq!(results[3].body, "canonical new body");
+        let state = bridge.source.state.lock().unwrap();
+        assert_eq!(state.after_id, Some(4));
+        assert!(state.recovery.pending.is_none());
+        assert!(state.recovery.active.is_none());
+        assert_eq!(state.recovery.rounds, 0);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_preserves_cursors_under_backpressure_and_late_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-pressure.sqlite3", 80);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 16);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        for id in [1, 48] {
+            assert!(bridge.index_mut().remove(id, SearchDocKind::Message));
+            bridge.source.record_failures(&[JobResult::Failed {
+                doc_id: id,
+                doc_kind: SearchDocKind::Message,
+                error: "controlled exhausted job".to_string(),
+            }]);
+        }
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        for id in 1000..2000 {
+            assert!(bridge.queue.enqueue(EmbeddingRequest::new(
+                id,
+                SearchDocKind::Agent,
+                Some(1),
+                "other pending work",
+                "queue capacity control",
+                ModelTier::Fast,
+            )));
+        }
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery pressure append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (81, 1, 1, 'new mail behind pressure', 'canonical body', 2)",
+        )
+        .unwrap();
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        {
+            let state = bridge.source.state.lock().unwrap();
+            assert_eq!(state.after_id, Some(80));
+            assert_eq!(state.recovery.active.unwrap().after, None);
+        }
+        assert_eq!(bridge.queue.drain_batch(1000).len(), 1000);
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        {
+            let state = bridge.source.state.lock().unwrap();
+            assert_eq!(state.after_id, Some(81));
+            assert_eq!(state.recovery.active.unwrap().after, Some(16));
+        }
+        assert!(bridge.index().contains(1, SearchDocKind::Message));
+        assert!(bridge.index().contains(81, SearchDocKind::Message));
+        assert!(!bridge.index().contains(48, SearchDocKind::Message));
+
+        // A failure behind the active repair cursor belongs to the next pass;
+        // it must not disappear when this range reaches its upper bound.
+        assert!(bridge.index_mut().remove(2, SearchDocKind::Message));
+        bridge.source.record_failures(&[JobResult::Failed {
+            doc_id: 2,
+            doc_kind: SearchDocKind::Message,
+            error: "late failure behind repair cursor".to_string(),
+        }]);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        {
+            let mut state = bridge.source.state.lock().unwrap();
+            assert!(state.recovery.active.is_none());
+            assert_eq!(state.recovery.pending.unwrap().first, 2);
+            state.recovery.not_before = Some(std::time::Instant::now());
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 81);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 84);
+        assert_eq!(bridge.source.state.lock().unwrap().after_id, Some(81));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_and_append_are_fair_with_one_queue_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-fairness.sqlite3", 6);
+        let bridge = manual_semantic_history_bridge_config(
+            Arc::new(FixedSemanticTestEmbedder::new(4)),
+            EmbeddingJobConfig {
+                batch_size: 1,
+                backpressure_threshold: 1,
+                ..Default::default()
+            },
+        );
+        assert!(bridge.source.bind_pool(&pool));
+        for _ in 0..6 {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        for id in [1, 2] {
+            assert!(bridge.index_mut().remove(id, SearchDocKind::Message));
+            bridge.source.record_failures(&[JobResult::Failed {
+                doc_id: id,
+                doc_kind: SearchDocKind::Message,
+                error: "controlled exhausted job".to_string(),
+            }]);
+        }
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery fairness append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (7, 1, 1, 'fresh seven', 'canonical body', 2), \
+             (8, 1, 1, 'fresh eight', 'canonical body', 2)",
+        )
+        .unwrap();
+        for (indexed, absent) in [(1, 7), (7, 2), (2, 8), (8, 9)] {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+            assert!(bridge.index().contains(indexed, SearchDocKind::Message));
+            assert!(!bridge.index().contains(absent, SearchDocKind::Message));
+        }
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 8);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 10);
+        let state = bridge.source.state.lock().unwrap();
+        assert_eq!(state.after_id, Some(8));
+        assert!(state.recovery.active.is_none());
+        assert!(state.recovery.pending.is_none());
+        drop(state);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovery_stops_on_shutdown_and_retires_changed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "recovery-generation.sqlite3", 3);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .failing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        exhaust_semantic_history_embeddings(&bridge, 3);
+        bridge.source.state.lock().unwrap().recovery.not_before = Some(std::time::Instant::now());
+        bridge.refresh_worker.shutdown();
+        embedder
+            .failing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "recovery generation replacement",
+        );
+        conn.execute_raw("UPDATE messages SET body_md = 'replacement canonical body' WHERE id = 1")
+            .unwrap();
+        conn.execute_raw("DELETE FROM messages WHERE id = 2")
+            .unwrap();
+        conn.execute_raw(
+            "UPDATE db_identity SET generation_id = 'after-outage' WHERE singleton = 0",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(bridge.index().is_empty());
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .pending
+                .is_some()
+        );
+        bridge
+            .refresh_worker
+            .shutdown_flag()
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(!bridge.index().contains(2, SearchDocKind::Message));
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .pending
+                .is_none()
+        );
+        assert!(
+            bridge
+                .source
+                .state
+                .lock()
+                .unwrap()
+                .recovery
+                .active
+                .is_none()
+        );
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].body, "replacement canonical body");
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 2);
     }
 
     #[cfg(feature = "hybrid")]

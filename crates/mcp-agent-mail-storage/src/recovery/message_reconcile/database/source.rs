@@ -86,8 +86,11 @@ pub(super) fn prepare_message_classified(
 /// A retry must not reacquire the reader whose SQL operation just failed.
 /// The maintenance pool has one connection: returning an obsolete pager to it
 /// can turn the bounded retry lane into repeated reads of the same bad handle.
-/// Retire only failed source reads, not valid reads that expose conflicting
-/// durable metadata. Neither path mutates mailbox rows or relaxes validation.
+/// Retire failed source SQL, not valid reads that expose conflicting durable
+/// metadata. Callers never mutate mailbox rows or relax validation here. The
+/// checkpoint generation check may perform its existing `INSERT OR IGNORE`
+/// seed of an empty `db_identity` relation under promotion admission, after
+/// query-only/cancellation/pressure checks, and must reread the stored winner.
 pub(super) fn with_source_connection<T>(
     cx: &Cx,
     pool: &DbPool,
@@ -106,11 +109,12 @@ pub(super) fn with_source_connection<T>(
         }
     };
     // The synchronous driver/decoder may unwind instead of returning an SQL
-    // error. Keep that failure inside the read-only observation: the caller's
+    // error. Keep that failure inside the source observation: the caller's
     // bounded retry lane must retain the message ID, and the uncertain pager
-    // must never return to this one-slot pool. No archive publication or SQL
-    // mutation is included in this boundary. Do not copy the panic payload
-    // into the returned error; it may contain private source data.
+    // must never return to this one-slot pool. Only the checkpoint's admitted,
+    // idempotent identity initialization may write SQL here; archive publication
+    // and mailbox mutation remain outside the boundary. Do not copy the panic
+    // payload into the returned error; it may contain private source data.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
         .unwrap_or_else(|_| {
             Err(ReconcileFailure::source_unavailable(
@@ -593,6 +597,78 @@ ORDER BY row_kind, recipient_id";
                             .is_none()
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn durable_tui_metadata_recovers_db_only_threaded_compose_after_reopen() {
+        fixture(|_cx, pool, config| {
+            let writer = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let id = mcp_agent_mail_db::sync::dispatch_root_message(
+                &writer,
+                "BlueLake",
+                "TUI handoff",
+                "Keep this exact body.\n",
+                "high",
+                Some("conversation-root"),
+                &[
+                    ("GreenStone".to_string(), "to".to_string()),
+                    ("RedFox".to_string(), "bcc".to_string()),
+                    ("GoldLeaf".to_string(), "cc".to_string()),
+                ],
+            )
+            .unwrap();
+            writer
+                .execute_sync(
+                    "UPDATE message_recipients SET read_ts = 7, ack_ts = 11 \
+                     WHERE message_id = ? AND agent_id = 102",
+                    &[id.into()],
+                )
+                .unwrap();
+            drop(writer);
+
+            // The TUI reports success after the database commit and does not
+            // enqueue an archive bundle. Recover through a fresh file handle,
+            // without the original connection or any surviving message copy.
+            let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let prepared = read_source(id, |sql, params| {
+                reopened
+                    .query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
+            })
+            .unwrap();
+            drop(reopened);
+            assert!(prepared.archive_metadata_known);
+            assert_eq!(prepared.message["thread_id"], "conversation-root");
+            assert!(
+                !prepared
+                    .message
+                    .as_object()
+                    .unwrap()
+                    .contains_key("reply_to")
+            );
+            assert_exact_recovered_bundle(config, &prepared, None);
+
+            let verify = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let deliveries = verify
+                .query_sync(
+                    "SELECT agent_id, read_ts, ack_ts FROM message_recipients \
+                     WHERE message_id = ? ORDER BY agent_id",
+                    &[id.into()],
+                )
+                .unwrap();
+            assert_eq!(deliveries.len(), 3);
+            for delivery in deliveries {
+                let recipient = delivery.get_named::<i64>("agent_id").unwrap();
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("read_ts").unwrap(),
+                    (recipient == 102).then_some(7),
+                );
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    (recipient == 102).then_some(11),
+                );
             }
         });
     }

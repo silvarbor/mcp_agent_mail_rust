@@ -8,6 +8,10 @@ as the baseline for updates. Configure `origin` for the fork and `upstream`
 for the original repository. The quick-install commands below download upstream
 releases. Install a qualified fork build to use the fork's additions.
 
+The fork has one long-lived branch, `main`. `AGENTS.md` tells agents to mirror
+`main` to `master`. That serves upstream's old URLs and does not apply to the
+fork: do not create `master` here.
+
 The functional candidate adds optional display names, current profile labels
 alongside stable routing names, and offline message retention. It also carries
 mailbox correctness fixes that upstream has not supplied. Qualification is
@@ -15,23 +19,28 @@ pending. Keep performance experiments separate from this candidate.
 
 ### Updating from upstream
 
-1. Fetch both remotes and record the selected upstream commit.
-2. Inventory fork commits and uncommitted files. Classify each change as required
-   functionality, supplied upstream, optional work, or an obsolete repair.
-3. Create an integration branch from the selected upstream commit. Preserve the
-   published fork branches and outstanding work as references.
-4. Transplant the required changes. Record original commit IDs when splitting
-   mixed patches. Verify upstream replacements against the fork's behavior.
-5. Inspect dependency changes, macOS support and test fixtures before compiling.
+1. Fetch both remotes and pick one upstream commit. Upstream gains dozens of
+   commits a day, so fix the commit before starting and finish on it.
+2. Branch from the fork's `main` and merge that commit.
+3. Resolve each conflict by taking upstream's structure and keeping the fork's
+   behavior on top of it. Where upstream now supplies what the fork carried,
+   drop the fork's version.
+4. Compile every target with `-D warnings` before trusting the merge. The two
+   sides can disagree where Git reports no conflict.
+5. Inspect dependency changes, macOS support and test fixtures.
    Reuse a compatible cache and run local checks with `nice -n 19` and two build jobs.
 6. Verify workspace targets, production features, strict Clippy, formatting and
    the affected behavior. Check relabeling, stable identities, non-consuming reads,
    explicit receipts, retention recovery and message-ID preservation.
-7. Open a pull request against the fork's `main`. Explain retained changes,
-   upstream replacements and verification results. Account for the old candidate
-   before superseding its pull request.
+7. Follow "After an update from upstream" under "Continuous integration".
+8. Open a pull request against the fork's `main`. Explain how each conflict was
+   resolved, what upstream replaced, and the verification results.
 
-Preserve published history when integrating the replacement branch. Upstream
+Rebuilding the fork on a fresh upstream commit, by transplanting its changes one
+by one, is the exception. It was done once, in November 2026, to shed a fork
+history that could no longer be merged. Do not repeat it for a routine update.
+
+Preserve published history when integrating a branch. Upstream
 ancestry alone does not establish that a database-engine update works on macOS.
 
 ### Continuous integration
@@ -53,10 +62,12 @@ After an update from upstream:
 
 1. Write the new upstream commit to `.github/fork-ci/upstream-base`.
 2. Push that upstream commit plus the fork's `.github/` directory to a
-   `ci-baseline/` branch. Its run executes the whole suite on Linux and lists
-   the failed tests in its summary.
-3. Replace `.github/fork-ci/upstream-failures.txt` with the tests from that list
-   that also fail on the fork. Those failures are upstream's or the runner's.
+   `ci-baseline/` branch, and the updated fork to a second `ci-baseline/`
+   branch. Each run executes the whole suite on Linux and lists the failed
+   tests in its summary.
+3. A test that fails only on the updated fork is the update's to fix. Replace
+   `.github/fork-ci/upstream-failures.txt` with the tests that fail in both
+   runs. Those failures are upstream's or the runner's.
 4. Upstream does not build its tests on macOS, so that run has no macOS
    counterpart. When a test fails only in the macOS job, follow the procedure
    at the top of `.github/fork-ci/macos-failures.txt`.
@@ -377,9 +388,11 @@ Downloads the right binary for your platform, installs to `~/.local/bin`, option
 
 In both models, a missing checksum, SHA-256 implementation, signature witness, or required verifier executable—and any malformed or mismatched signature evidence—aborts the install.
 
-Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips the checksum and signature checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. **`--no-verify` allows unauthenticated downloaded binaries to execute during mandatory version probes before installation; malicious archive bytes can therefore run arbitrary code as the installer user.** Archive verification applies to downloaded release archives, not source builds. Every downloaded archive must contain the two expected flat, non-empty regular-file binaries and may also contain flat regular-file `README.md` and `LICENSE` entries; duplicate or other members are rejected. Both staged binaries and both installed binaries must report the exact requested version. Those member/version checks are mandatory even with `--no-verify`; the flag also does not disable the optional broader `--verify` post-install self-test. A failed archive download never silently changes into a source build. Explicit `--from-source` checks out the exact requested tag, obtains immutable sibling revisions from that tag's release workflow, builds with `cargo --locked`, and subjects the staged and installed pair to the same exact-version and byte-preserving transactional replacement gates.
+Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips the checksum and signature checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. **`--no-verify` allows unauthenticated downloaded binaries to execute during mandatory version probes before installation; malicious archive bytes can therefore run arbitrary code as the installer user.** Archive verification applies to downloaded release archives, not source builds. Every downloaded archive must contain the two expected flat, non-empty regular-file binaries and may also contain flat regular-file `README.md` and `LICENSE` entries; duplicate or other members are rejected. Both staged binaries and both installed binaries must report the exact requested version. Those member/version checks are mandatory even with `--no-verify`; the flag also does not disable the optional broader `--verify` post-install self-test. A failed archive download never silently changes into a source build. Explicit `--from-source` checks out the exact requested tag, uses its Cargo.lock for `cargo build --locked`, and subjects the staged and installed pair to the same exact-version and byte-preserving transactional replacement gates.
 
-A successful source install prints the path of a mode-private `source-receipt` retained inside its committed transaction-history directory. The hash-witnessed receipt binds the normalized release tag, the exact Agent Mail/frankensearch/fast_cmaes/beads_rust commits, and both installed binary SHA-256 digests. On current source, the Beads commit records an additional installer checkout; Agent Mail's Beads integration uses the installed external `br` CLI rather than embedding its Rust library. Release tags that predate the immutable dependency-pin record fail closed rather than building mutable sibling branches. Interrupted or rolled-back transactions retain their evidence under an explicitly non-committed history name and are never reported as installed source provenance.
+A successful source install prints the path of a mode-private `source-receipt` retained inside its committed transaction-history directory. The hash-witnessed receipt binds the normalized release tag, exact Agent Mail commit, Cargo.lock SHA-256, and both installed binary SHA-256 digests. Cargo resolves external dependencies from the tagged lockfile; the installer verifies that its digest stays unchanged through the locked build. Source installation does not fetch unused sibling repositories. Tags with external path dependencies are refused before compilation. Interrupted or rolled-back transactions retain their evidence under an explicitly non-committed history name and are never reported as installed source provenance.
+
+Source builds also require working Python 3 or Perl with `JSON::PP` to verify dependency metadata. Every local path dependency must resolve inside the tagged checkout; an external path or symlink escape is refused before compilation. Registry and Git dependencies remain governed by Cargo.lock.
 
 ### Windows One-Liner (PowerShell)
 
@@ -418,9 +431,9 @@ installed binary always matches the freshly-built artifact regardless of
 
 Requires Rust nightly (see `rust-toolchain.toml`). Current `main` records [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294` in `Cargo.toml` and `Cargo.lock`, aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This optional `hybrid` integration shares FastMCP's rustix 1.1.5 requirement and enables local Model2Vec and native reranking without FastEmbed or Tokio. Portable builds use the local Tantivy bridge for lexical Search V3 without enabling FrankenSearch integration.
 
-A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source.
+A manual build, source installation, and the release build recipes need no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Source-install receipts record that lockfile's digest alongside the exact source commit and binary pair.
 
-The mailbox uses registry FrankenSQLite `=0.4.13` through SQLModel 0.5.1 on Asupersync 0.5.0. SQLModel's pool and core are pinned to [revision `c9967106`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/c996710674d92c00d23f30fe17ecc5d9644818c7) for cancellation-safe waiter cleanup and cooperative acquisition deadlines; published 0.5.1 lacks this pool fix. Synchronous driver work must still yield for a deadline to interrupt it. No SQLModel sibling checkout is needed. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Beads discovery and queries use the installed `br` CLI; discovery runs its database-free config-path command, and Agent Mail no longer embeds a second storage engine. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results. If persisted tool metrics have already bloated your mailbox, stop the server and follow the [offline recovery procedure](docs/RECOVERY_RUNBOOK.md) before running `am doctor vacuum --yes`; upgrading does not compact existing pages.
+The mailbox uses FrankenSQLite `=0.4.13` through SQLModel 0.5.1 on Asupersync 0.5.0. Only `fsqlite-core` is patched to [revision `e7ffeff4`](https://github.com/Dicklesworthstone/frankensqlite/commit/e7ffeff4eb1eda0a4d62d00bbe778d6103058e7f) to keep archive headers and rows on one transaction and recover bounded zero-filled WAL certificate tails, including false EOF boundaries; its package version is 0.4.14, while the other 19 engine packages remain registry 0.4.13. SQLModel's pool and core are pinned to [revision `c9967106`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/c996710674d92c00d23f30fe17ecc5d9644818c7) for cancellation-safe waiter cleanup and cooperative acquisition deadlines; published 0.5.1 lacks this pool fix. Synchronous driver work must still yield for a deadline to interrupt it. No sibling checkout is needed for either patch. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Beads discovery and queries use the installed `br` CLI; discovery runs its database-free config-path command, and Agent Mail no longer embeds a second storage engine. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results. If persisted tool metrics have already bloated your mailbox, stop the server and follow the [offline recovery procedure](docs/RECOVERY_RUNBOOK.md) before running `am doctor vacuum --yes`; upgrading does not compact existing pages.
 
 ### Platforms
 
@@ -968,6 +981,21 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 
 **Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined/Log and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` to cycle Table/Graph/Matrix (sender × recipient heatmap); batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
 
+**Compose from any screen:** Press `Ctrl+N`, choose the project with the arrow
+keys, then use `Tab` to reach recipients and the remaining fields. Existing
+active agents are loaded from that project's live mailbox. A mailbox with more
+than one project requires an explicit choice. Select recipients with `Space`
+and cycle their To/Cc/Bcc role with `Ctrl+T`; the Acknowledgement field can
+request a receipt. `Ctrl+R` refreshes projects and recipients, and
+`Ctrl+Enter` sends.
+
+Loading and delivery run in the background. A failed send keeps the draft;
+retrying it unchanged reuses its delivery key to avoid duplicate mail. While
+sending, the form prevents edits and duplicate submissions. `Esc` dismisses a
+pending form while delivery continues. Changing project clears its recipients
+and thread, preserving the message text; refreshing the same project keeps
+selected unavailable recipients visible until you explicitly remove them.
+
 **Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
 
 **Themes:** 42 named palettes are in the `Ctrl+T`/`Shift+T` cycle (Cyberpunk Aurora, Darcula, Lumen Light, Nordic Frost, High Contrast, Dracula, Monokai, Nord, and more; see `NAMED_THEMES` in `crates/mcp-agent-mail-server/src/tui_theme.rs`). The five config-level themes are selectable through `TUI_THEME`. Accessibility support includes high-contrast mode and reduced motion.
@@ -1168,6 +1196,20 @@ messages, or more than 4 MiB of context; it never silently truncates those
 bounds. Resources without `context=true` keep their existing response formats.
 
 ### Complete Reservation Reads Through the Server
+
+Ordinary `resource://file_reservations/<slug>` pages include optional activity
+hints. Filesystem and Git enrichment share a 100 ms cooperative time budget;
+Git history is also capped at 1,000 commits per page and diffs are restricted
+to the reserved paths. `last_git_activity_ts` reports a recent touch found
+within `FILE_RESERVATION_ACTIVITY_GRACE_SECONDS`, not an exhaustive historical
+last-touch lookup. It is null if no recent touch was established. When the
+scan is incomplete, `stale_reasons` includes `git_activity_unknown`
+and `stale` remains false. Cancelling or abandoning a read stops its worker
+at the next checkpoint; a single filesystem or libgit2 call cannot be
+interrupted. Bounded reads always use libgit2, independently of the legacy
+`AM_GIT_LS_FILES_SHELL` and `AM_GIT_RESERVATION_ACTIVITY_SHELL` escape hatches
+for the single-pattern force-release probe. Snapshot modes omit activity
+enrichment entirely.
 
 Use `--server` to read reservations through the configured authenticated MCP
 endpoint while the server owns the mailbox:
@@ -2196,7 +2238,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Pinned Git dependencies.** Current `main` records optional FrankenSearch and patched FrankenSQLite at immutable Git revisions; the FastMCP 0.13.0 family comes from crates.io. Source builds require access to the selected Git sources as well as crates.io; use `cargo build --locked`. Earlier release tags may require sibling checkouts; `install.sh --from-source` provisions their recorded revisions.
+- **Pinned Git dependencies.** Current `main` records optional FrankenSearch and patched FrankenSQLite at immutable Git revisions; the FastMCP 0.13.0 family comes from crates.io. Source builds require access to the selected Git sources as well as crates.io; use `cargo build --locked`. Source installation supports tags whose dependencies are complete in Cargo.toml and Cargo.lock.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.

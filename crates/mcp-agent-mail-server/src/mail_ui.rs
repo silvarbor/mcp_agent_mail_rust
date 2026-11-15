@@ -69,17 +69,17 @@ pub fn dispatch(
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     // Standalone callers (including static export) retain a real 30-second
-    // budget. The live HTTP server calls `dispatch_with_cx` with its own
+    // budget. The live HTTP server calls `dispatch_live_with_cx` with its own
     // timeout-linked context so cancellation crosses the blocking boundary.
     let cx = crate::runtime_request_cx(Budget::with_deadline_secs(30));
     dispatch_with_cx(path, query, method, body, &cx)
 }
 
-/// Dispatch a mail UI request with the server-owned cancellation context.
+/// Dispatch a standalone mail UI request with the caller's cancellation context.
 ///
-/// HTTP blocking dispatch must use this entrypoint so a request timeout
-/// cancels in-flight database work instead of merely returning while a worker
-/// continues and possibly commits the abandoned request.
+/// Offline/static-export callers may construct a read pool or an archive
+/// snapshot. Live HTTP requests use [`dispatch_live_with_cx`] so initialization
+/// remains owned by server startup.
 pub fn dispatch_with_cx(
     path: &str,
     query: &str,
@@ -94,10 +94,10 @@ pub fn dispatch_with_cx(
         return render_archive_route(sub, query, method);
     }
 
-    // GH#184: when this dispatch runs inside a live server process, the
-    // server's pool for this database is already open — reuse it for BOTH
-    // reads and writes instead of bootstrapping a fresh observability pool
-    // per GET request. A second in-process `DbPool::new` on the live file
+    // GH#184: standalone consumers may share a process with an existing
+    // server pool — reuse it for BOTH reads and writes instead of
+    // bootstrapping a fresh observability pool per GET request. A second
+    // in-process `DbPool::new` on the live file
     // re-runs the entire startup init (integrity probes, WAL checkpoint,
     // recovery) and can block outright against the live pool's engine-level
     // coordination — exactly the wedge that took the whole HTTP surface
@@ -127,6 +127,48 @@ pub fn dispatch_with_cx(
         .as_ref()
         .map_or(live_pool, crate::ObservabilityDbPool::pool);
 
+    dispatch_database_route(sub, query, method, body, cx, read_pool, live_pool)
+}
+
+/// Dispatch against the initialized pool already owned by the live server.
+///
+/// A browser arriving during startup must not bootstrap a second pool, wait
+/// on the initialization gate, or reconstruct a private archive snapshot.
+/// Archive-only routes remain usable while SQLite is unavailable.
+pub fn dispatch_live_with_cx(
+    path: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+) -> Result<Option<String>, (u16, String)> {
+    let sub = path.strip_prefix("/mail").unwrap_or(path);
+    if sub.starts_with("/archive/") {
+        return render_archive_route(sub, query, method);
+    }
+
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+        .filter(DbPool::is_initialized);
+    let Some(pool) = pool else {
+        let detail = "Database is initializing or unavailable; retry shortly";
+        return if crate::HttpState::is_mail_json_route(path, method) {
+            json_detail_err(503, detail)
+        } else {
+            Err((503, detail.to_string()))
+        };
+    };
+    dispatch_database_route(sub, query, method, body, cx, &pool, &pool)
+}
+
+fn dispatch_database_route(
+    sub: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+    read_pool: &DbPool,
+    live_pool: &DbPool,
+) -> Result<Option<String>, (u16, String)> {
     match sub {
         // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
         "" | "/" | "/unified-inbox" => {
@@ -143,9 +185,9 @@ pub fn dispatch_with_cx(
         // Explicit projects list route (legacy Python: GET /mail/projects).
         "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
-            handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
+            handle_api_route(sub, query, method, body, cx, read_pool, live_pool)
         }
-        _ => dispatch_project_route(sub, method, body, cx, read_pool, &live_pool, query),
+        _ => dispatch_project_route(sub, method, body, cx, read_pool, live_pool, query),
     }
 }
 
@@ -176,6 +218,10 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
         .expect("test sqlite journal mode should initialize");
     let cfg = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        // All these database files have the same temporary parent. Default
+        // ephemeral rerouting hashes that parent, so it would give unrelated
+        // fixtures one shared archive despite their distinct database paths.
+        storage_root: Some(db_path.with_extension("archive")),
         ..DbPoolConfig::default()
     };
     get_or_create_pool(&cfg).expect("test pool should initialize")
@@ -184,6 +230,31 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
 #[cfg(test)]
 mod request_budget_tests {
     use super::*;
+
+    #[test]
+    fn initialized_test_pools_do_not_share_archive_authority() {
+        let ephemeral_base = tempfile::tempdir().expect("private ephemeral archive base");
+        let ephemeral_base_text = ephemeral_base.path().to_string_lossy();
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("AM_EPHEMERAL_MODE", "auto"),
+                ("ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE", "false"),
+                ("AM_EPHEMERAL_ROOT", ephemeral_base_text.as_ref()),
+            ],
+            |_| {
+                let runtime = message_fixture_runtime();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let _guard = Cx::set_current(Some(cx));
+                let first = initialized_test_pool("mail-ui-archive-isolation");
+                let second = initialized_test_pool("mail-ui-archive-isolation");
+                assert_ne!(
+                    first.storage_root(),
+                    second.storage_root(),
+                    "distinct test mailboxes must never reconcile through the same archive"
+                );
+            },
+        );
+    }
 
     #[test]
     fn mail_ui_request_budget_deadline_is_relative_to_now() {
@@ -241,9 +312,14 @@ mod request_budget_tests {
         .expect("completed write outcome must survive a concurrent cancellation");
         assert!(cx.is_cancel_requested());
 
-        let read_cx = Cx::for_testing();
-        let projects = block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
-            .expect("read back committed database row");
+        let read_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let projects = {
+            // The pool's timer also observes the ambient request. Read back
+            // through a fresh request, then restore the cancelled write context.
+            let _read_guard = Cx::set_current(Some(read_cx.clone()));
+            block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
+                .expect("read back committed database row")
+        };
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, project.id);
         assert_eq!(projects[0].human_key, "/mail-ui-ready-cancel");
@@ -307,6 +383,63 @@ mod request_budget_tests {
             result,
             Err((503, "Database operation did not complete".to_string()))
         );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_retryable_database_errors_return_503() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite(
+                "database initialization still in progress after 30s; \
+                 the mailbox is warming up or its archive reconcile is \
+                 slow — retry shortly (bounded init-gate wait, GH#245)"
+                    .to_string(),
+            ),
+            DbError::ResourceBusy("database is locked".to_string()),
+            DbError::PoolExhausted {
+                message: "pool acquisition timed out".to_string(),
+                pool_size: 1,
+                max_overflow: 0,
+            },
+            DbError::Sqlite("Too many open files (os error 24)".to_string()),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(
+                result,
+                Err((
+                    503,
+                    "Database temporarily unavailable; retry shortly".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_preserves_permanent_error_and_not_found_statuses() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite("database disk image is malformed".to_string()),
+            DbError::Schema("no such table: messages".to_string()),
+            DbError::Pool("permission denied: /private/mailbox.sqlite3".to_string()),
+            DbError::invalid("project", "invalid project key"),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(result, Err((500, "Internal server error".to_string())));
+        }
+        let missing: Result<(), _> = block_on_outcome(
+            &cx,
+            std::future::ready(asupersync::Outcome::Err(DbError::not_found(
+                "Project",
+                "private-project-key",
+            ))),
+        );
+        assert_eq!(missing, Err((404, "Not found".to_string())));
     }
 }
 
@@ -442,6 +575,16 @@ first body
                 .expect("archive file must not require a database")
                 .expect("archive file route must be handled");
                 assert_eq!(serde_json::from_str::<String>(&payload).unwrap(), content);
+                let live_payload = dispatch_live_with_cx(
+                    "/mail/archive/browser/demo/file",
+                    "path=notes.txt",
+                    "GET",
+                    "",
+                    &Cx::for_testing(),
+                )
+                .expect("live archive browsing must not require an initialized pool")
+                .expect("live archive file route must be handled");
+                assert_eq!(live_payload, payload);
 
                 for (path, query) in [
                     ("/mail/archive/guide", ""),
@@ -2130,6 +2273,10 @@ fn block_on_outcome<T>(
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
                 404
+            } else if e.is_retryable() {
+                // A bounded startup wait or busy pool is temporary, not a
+                // broken database. Keep internal diagnostics in the log.
+                503
             } else {
                 500
             };
@@ -2138,6 +2285,7 @@ fn block_on_outcome<T>(
                 status,
                 match status {
                     404 => "Not found".to_string(),
+                    503 => "Database temporarily unavailable; retry shortly".to_string(),
                     _ => "Internal server error".to_string(),
                 },
             ))
@@ -3866,6 +4014,7 @@ impl UnifiedMessageAggregate {
     }
 }
 
+#[cfg(test)]
 fn collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -3873,14 +4022,28 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    let mut messages = unified::collect(cx, pool, projects_rows, limit, filter_importance)?;
+    if limit == 0 || projects_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut messages =
+        unified::collect(cx, pool, projects_rows, limit, filter_importance)?.messages;
+    apply_unified_sender_labels(cx, pool, &mut messages)?;
+    Ok(messages)
+}
+
+/// Replace each sender's routing name with its display label where one is set.
+fn apply_unified_sender_labels(
+    cx: &Cx,
+    pool: &DbPool,
+    messages: &mut [UnifiedMessageAggregate],
+) -> Result<(), (u16, String)> {
     let labels = load_agent_labels(cx, pool, messages.iter().map(|message| message.sender_id))?;
-    for message in &mut messages {
+    for message in messages {
         if let Some(label) = labels.get(&message.sender_id) {
             message.sender_label.clone_from(label);
         }
     }
-    Ok(messages)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3991,26 +4154,23 @@ fn render_unified_inbox(
         .map(str::to_ascii_lowercase);
     let projects_rows = block_on_outcome(cx, queries::list_projects(cx, pool))?;
 
+    let mut page = unified::collect(
+        cx,
+        pool,
+        &projects_rows,
+        limit,
+        normalized_filter.as_deref(),
+    )?;
+    apply_unified_sender_labels(cx, pool, &mut page.messages)?;
     let mut projects = Vec::new();
     let mut total_agents: usize = 0;
     for p in &projects_rows {
         let pid = p.id.unwrap_or(0);
-        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        if agents_rows.is_empty() {
+        let agents = page.agents.remove(&pid).unwrap_or_default();
+        if agents.is_empty() {
             continue;
         }
-        total_agents += agents_rows.len();
-        let agents: Vec<UnifiedAgent> = agents_rows
-            .iter()
-            .map(|a| UnifiedAgent {
-                id: a.id.unwrap_or(0),
-                name: a.name.clone(),
-                label: format_agent_label(&a.name, a.display_name.as_deref()),
-                program: a.program.clone(),
-                model: a.model.clone(),
-                last_active: ts_display(a.last_active_ts),
-            })
-            .collect();
+        total_agents += agents.len();
         projects.push(UnifiedProject {
             id: pid,
             slug: p.slug.clone(),
@@ -4021,21 +4181,16 @@ fn render_unified_inbox(
         });
     }
 
-    let messages = collect_unified_message_aggregates(
-        cx,
-        pool,
-        &projects_rows,
-        limit,
-        normalized_filter.as_deref(),
-    )?
-    .into_iter()
-    .map(UnifiedMessageAggregate::into_view)
-    .map(|mut message| {
-        message.thread_url =
-            mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
-        message
-    })
-    .collect::<Vec<_>>();
+    let messages = page
+        .messages
+        .into_iter()
+        .map(UnifiedMessageAggregate::into_view)
+        .map(|mut message| {
+            message.thread_url =
+                mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
+            message
+        })
+        .collect::<Vec<_>>();
 
     let total_messages = messages.len();
     render(
@@ -6075,15 +6230,17 @@ fn render_api_unified_inbox(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
 
-    let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let messages = collect_unified_message_aggregates(
-        &cx,
-        &pool,
-        &projects,
-        limit,
-        normalized_filter.as_deref(),
-    )
-    .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
+    // Live refreshes normally request only messages. Global project inventory
+    // (including recovery orphan discovery) is independent of that bounded
+    // page and belongs only to callers that explicitly request navigation.
+    let projects = if include_projects {
+        block_on_outcome(cx, queries::list_projects(cx, pool))?
+    } else {
+        Vec::new()
+    };
+    let mut messages = unified::collect_messages(cx, pool, limit, normalized_filter.as_deref())
+        .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
+    apply_unified_sender_labels(cx, pool, &mut messages)?;
 
     let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
     if include_projects {

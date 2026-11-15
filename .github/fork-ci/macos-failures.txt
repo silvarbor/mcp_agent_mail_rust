@@ -3,16 +3,18 @@
 # addition to the tests in `upstream-failures.txt`.
 #
 # Upstream does not build its tests on macOS, so no upstream run can serve as
-# a macOS baseline. When a test fails only in the macOS job, build the upstream
+# a macOS baseline. When a test fails only in the macOS job, find the cause.
+# If it lies in code or scripts the fork has not changed, add the test here
+# with that cause. If that is not clear from the failure, build the upstream
 # commit in `upstream-base` plus the fork's macOS portability commit on a Mac,
-# without `-D warnings`, and run that test there. If it fails there too, add
-# it here. If it passes there, the failure is the fork's to fix. One test per
-# line: nextest binary id, a space, the test name.
+# without `-D warnings`, and run the test there: a failure there too puts it
+# on this list, a pass makes the failure the fork's to fix. After an update
+# from upstream, run the listed tests on a Mac and drop those that pass. One
+# test per line: nextest binary id, a space, the test name.
 #
-# Source: upstream 9ba8eede54a42f9adc1f34603f40244d09781fed plus fork commit
-# ee4b6f8e, macOS 27.2 on Apple Silicon, 15 November 2026. The same tests fail
-# on the fork on a GitHub-hosted macOS runner, run
-# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43657307449.
+# Source: the first four fail on upstream 9ba8eede plus fork commit ee4b6f8e
+# and still fail on the fork merged with upstream 9e9dbb89. The last two came
+# with upstream 9e9dbb89. All on macOS 27.2 on Apple Silicon, 15 November 2026.
 
 # Two of its 22 Python cases assume Linux: a file name with the byte 0xff,
 # which APFS refuses, and a repository created with `core.ignorecase` off.
@@ -22,3 +24,10 @@ mcp-agent-mail-guard tests::guard_commit_admission_runs_native_rendered_programs
 mcp-agent-mail-server tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes
 mcp-agent-mail-server tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness
 mcp-agent-mail-server tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes
+
+# Its fixture creates a file whose name is not UTF-8, which APFS refuses.
+mcp-agent-mail-tools resources::reservation_activity_tests::reservation_activity_does_not_follow_symlinks_or_lossy_names
+
+# Its shell suite passes every case and then exits nonzero: `scripts/e2e_lib.sh`
+# expands empty arrays under `set -u`, which the bash 3.2 of macOS rejects.
+mcp-agent-mail-cli::it integration_runs::reservation_parity_shell_suite_uses_cargo_built_binary

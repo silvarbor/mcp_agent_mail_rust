@@ -1736,7 +1736,7 @@ const STARTUP_PRIMARY_FAILURE_PRIORITY: &[&str] = &[
     "integrity",
     "port",
     "auth",
-    "http_path",
+    "http-path",
 ];
 
 fn startup_failure_priority(name: &str) -> usize {
@@ -3281,12 +3281,33 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
 /// even if earlier ones fail (so the user sees all problems at once).
 fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
     vec![
-        probe_database(config),
-        probe_db_lock(config),
-        probe_storage_root(config),
-        probe_integrity(config),
-        probe_fd_limit(config),
+        timed_startup_phase("database", || probe_database(config)),
+        timed_startup_phase("db-lock", || probe_db_lock(config)),
+        timed_startup_phase("storage", || probe_storage_root(config)),
+        timed_startup_phase("integrity", || probe_integrity(config)),
+        timed_startup_phase("fd-limit", || probe_fd_limit(config)),
     ]
+}
+
+/// Attribute startup wall time without changing the phase's return value or
+/// failure handling. A finish event means the call returned, not that it passed.
+/// A start with no finish also identifies a phase that stalls or panics.
+pub(crate) fn timed_startup_phase<T>(phase: &'static str, run: impl FnOnce() -> T) -> T {
+    tracing::info!(
+        target: "mcp_agent_mail_server::startup",
+        phase,
+        "startup_phase_started"
+    );
+    let started = std::time::Instant::now();
+    let result = run();
+    let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "mcp_agent_mail_server::startup",
+        phase,
+        duration_us,
+        "startup_phase_finished"
+    );
+    result
 }
 
 /// Best-effort rotation of old backup detritus in `storage_root`. Errors are
@@ -3321,7 +3342,7 @@ fn rotate_backups_best_effort(config: &Config) {
 #[must_use]
 pub fn run_startup_probes(config: &Config) -> StartupReport {
     let mut results = run_http_startup_preflight_probes(config).results;
-    results.push(probe_port(config));
+    results.push(timed_startup_phase("port", || probe_port(config)));
     StartupReport { results }
 }
 
@@ -3330,22 +3351,24 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
 /// Call this before deciding whether it is safe to tear down an existing server.
 #[must_use]
 pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
-    let existing_agent_mail_server = matches!(
-        check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
-        PortStatus::AgentMailServer
-    );
+    let existing_agent_mail_server = timed_startup_phase("listener-detection", || {
+        matches!(
+            check_port_status_at_mcp_path(&config.http_host, config.http_port, &config.http_path),
+            PortStatus::AgentMailServer
+        )
+    });
 
     // Best-effort housekeeping — rotate old backup detritus in `storage_root`,
     // but only when no Agent Mail server is already running. Running it during
     // a live server's steady state risks racing against an in-flight corrupt-
     // or reconstruct-backup write; we let the next cold start handle cleanup.
     if !existing_agent_mail_server {
-        rotate_backups_best_effort(config);
+        timed_startup_phase("backup-rotation", || rotate_backups_best_effort(config));
     }
     let mut results = vec![
-        probe_http_path(config),
-        probe_auth(config),
-        probe_database(config),
+        timed_startup_phase("http-path", || probe_http_path(config)),
+        timed_startup_phase("auth", || probe_auth(config)),
+        timed_startup_phase("database", || probe_database(config)),
     ];
     if existing_agent_mail_server {
         tracing::info!(
@@ -3354,13 +3377,15 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
             "HTTP preflight detected an existing Agent Mail listener; deferring db-lock and integrity probes until after port handoff"
         );
     } else {
-        results.push(probe_db_lock(config));
+        results.push(timed_startup_phase("db-lock", || probe_db_lock(config)));
     }
-    results.push(probe_storage_root(config));
+    results.push(timed_startup_phase("storage", || {
+        probe_storage_root(config)
+    }));
     if !existing_agent_mail_server {
-        results.push(probe_integrity(config));
+        results.push(timed_startup_phase("integrity", || probe_integrity(config)));
     }
-    results.push(probe_fd_limit(config));
+    results.push(timed_startup_phase("fd-limit", || probe_fd_limit(config)));
     StartupReport { results }
 }
 
@@ -3383,6 +3408,312 @@ pub fn run_stdio_startup_probes(config: &Config) -> StartupReport {
 mod tests {
     use super::*;
     use fs2::FileExt;
+
+    #[derive(Debug, Default)]
+    struct StartupPhaseEvent {
+        phase: String,
+        message: String,
+        duration_us: Option<u64>,
+    }
+
+    impl tracing::field::Visit for StartupPhaseEvent {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "phase" {
+                self.phase = value.to_owned();
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "duration_us" {
+                self.duration_us = Some(value);
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StartupPhaseCapture(std::sync::Arc<std::sync::Mutex<Vec<StartupPhaseEvent>>>);
+
+    impl tracing::Subscriber for StartupPhaseCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            // Production enables this crate's prefix through LOG_LEVEL.
+            // Opting in an arbitrary custom target here would hide a wiring bug.
+            metadata.target() == concat!(env!("CARGO_CRATE_NAME"), "::startup")
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = StartupPhaseEvent::default();
+            event.record(&mut fields);
+            self.0.lock().expect("startup phase events").push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    impl StartupPhaseCapture {
+        fn assert_phases(&self, expected: &[&str]) {
+            let events = self.0.lock().expect("startup phase events");
+            assert_eq!(events.len(), 2 * expected.len(), "{events:?}");
+            for (pair, phase) in events.as_chunks::<2>().0.iter().zip(expected) {
+                assert_eq!(&pair[0].phase, phase);
+                assert_eq!(&pair[1].phase, phase);
+                assert!(pair[0].message.contains("startup_phase_started"));
+                assert!(pair[0].duration_us.is_none());
+                assert!(pair[1].message.contains("startup_phase_finished"));
+                assert!(pair[1].duration_us.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn startup_phase_records_elapsed_work_and_preserves_failure() {
+        let dir = tempfile::tempdir().expect("private phase fixture");
+        let capture = StartupPhaseCapture::default();
+        let result = tracing::subscriber::with_default(capture.clone(), || {
+            timed_startup_phase("missing-file", || {
+                std::thread::sleep(Duration::from_millis(2));
+                std::fs::read(dir.path().join("missing"))
+            })
+        });
+        assert_eq!(
+            result.expect_err("original I/O failure").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        capture.assert_phases(&["missing-file"]);
+        let events = capture.0.lock().expect("startup phase events");
+        assert!(
+            events[1]
+                .duration_us
+                .is_some_and(|duration| duration >= 1_000),
+            "phase timing must include the work, even when it fails: {events:?}"
+        );
+    }
+
+    #[test]
+    fn startup_phase_events_cover_cold_start_after_a_probe_failure() {
+        let dir = tempfile::tempdir().expect("private startup fixture");
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = 0;
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
+        config.http_jwt_enabled = true;
+        config.http_jwt_secret = None;
+        config.http_jwt_jwks_url = None;
+        let capture = StartupPhaseCapture::default();
+        let report =
+            tracing::subscriber::with_default(capture.clone(), || run_startup_probes(&config));
+        assert_eq!(report.results.len(), 8);
+        assert!(
+            report
+                .failures()
+                .iter()
+                .any(|failure| failure.name == "auth")
+        );
+        capture.assert_phases(&[
+            "listener-detection",
+            "backup-rotation",
+            "http-path",
+            "auth",
+            "database",
+            "db-lock",
+            "storage",
+            "integrity",
+            "fd-limit",
+            "port",
+        ]);
+    }
+
+    fn persisted_startup_fixture(dir: &Path, message_count: i64) -> Config {
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = 0;
+        config.database_url = format!("sqlite:///{}", dir.join("storage.sqlite3").display());
+        config.storage_root = dir.join("archive");
+        config.boot_check_mode = "abort".into();
+        let archive = mcp_agent_mail_storage::ensure_archive(&config, "startup-timing")
+            .expect("initialize private Git archive");
+        std::fs::write(
+            archive.root.join("project.json"),
+            r#"{"slug":"startup-timing","human_key":"/startup-timing","created_at":0}"#,
+        )
+        .expect("project identity");
+        for name in ["BlueLake", "GreenCedar"] {
+            let agent_dir = archive.root.join("agents").join(name);
+            std::fs::create_dir_all(&agent_dir).expect("agent directory");
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::json!({"agent_name": name, "program": "test", "model": "test"})
+                    .to_string(),
+            )
+            .expect("agent profile");
+        }
+        let messages_dir = archive.root.join("messages/2026/11");
+        std::fs::create_dir_all(&messages_dir).expect("canonical messages directory");
+
+        // Canonical SQLite only constructs the retained fixture. The measured
+        // preparation below still executes the production FrankenSQLite path.
+        let db_path = dir.join("storage.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("fixture database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("full base mailbox schema");
+        conn.execute_raw(
+            "BEGIN; \
+             INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (1, 'startup-timing', '/startup-timing', 0); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 0, 0), \
+                    (2, 1, 'GreenCedar', 'test', 'test', 0, 0);",
+        )
+        .expect("fixture identities");
+        let body = "retained startup timing message ".repeat(16);
+        for id in 1..=message_count {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES ({id}, 1, 1, 'Startup timing', '{body}', 1793577600000000); \
+                 INSERT INTO message_recipients (message_id, agent_id) VALUES ({id}, 2);"
+            ))
+            .expect("persist message and recipient");
+            let metadata = serde_json::json!({
+                "id": id,
+                "from": "BlueLake",
+                "to": ["GreenCedar"],
+                "subject": "Startup timing",
+                "created_ts": "2026-11-02T00:00:00Z",
+                "importance": "normal"
+            });
+            std::fs::write(
+                messages_dir.join(format!("2026-11-02T00-00-00Z__startup-timing__{id}.md")),
+                format!("---json\n{metadata}\n---\n\n{body}\n"),
+            )
+            .expect("canonical archive message");
+        }
+        conn.execute_raw("COMMIT").expect("commit retained mailbox");
+        drop(conn);
+        commit_startup_fixture_archive(&config.storage_root);
+        config
+    }
+
+    fn commit_startup_fixture_archive(root: &Path) {
+        let repo = git2::Repository::open(root).expect("open fixture Git repo");
+        let mut index = repo.index().expect("fixture index");
+        index
+            .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage retained archive");
+        index.write().expect("persist fixture index");
+        let tree_id = index.write_tree().expect("archive tree");
+        let tree = repo.find_tree(tree_id).expect("find archive tree");
+        let parent = repo
+            .head()
+            .expect("initialized archive HEAD")
+            .peel_to_commit()
+            .expect("initial archive commit");
+        let signature = git2::Signature::now("Startup Fixture", "startup@example.invalid")
+            .expect("fixture Git signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Retained startup fixture",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit retained archive files");
+    }
+
+    #[test]
+    fn startup_phase_attribution_for_persisted_mailbox_sizes() {
+        const TEST: &str =
+            "startup_checks::tests::startup_phase_attribution_for_persisted_mailbox_sizes";
+        if crate::tests::run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        // This attributes the preparation window, not listener readiness or an
+        // incumbent-relative speedup. Fixture construction warms OS caches.
+        for message_count in [100_i64, 10_000] {
+            let dir = tempfile::tempdir().expect("private retained mailbox");
+            let config = persisted_startup_fixture(dir.path(), message_count);
+            let db_path = dir.path().join("storage.sqlite3");
+            let database_bytes = std::fs::metadata(&db_path).expect("fixture size").len();
+            let capture = StartupPhaseCapture::default();
+            let started = std::time::Instant::now();
+            let result = tracing::subscriber::with_default(capture.clone(), || {
+                crate::prepare_http_startup(&config)
+            });
+            let prepare_us = started.elapsed().as_micros();
+            for event in capture.0.lock().expect("phase measurements").iter() {
+                if let Some(duration_us) = event.duration_us {
+                    println!(
+                        "startup_size_attribution messages={message_count} database_bytes={database_bytes} prepare_us={prepare_us} phase={} duration_us={duration_us}",
+                        event.phase
+                    );
+                }
+            }
+            let _startup = result.expect("full retained-mail startup must succeed");
+            capture.assert_phases(&[
+                "listener-detection",
+                "backup-rotation",
+                "http-path",
+                "auth",
+                "database",
+                "db-lock",
+                "storage",
+                "integrity",
+                "fd-limit",
+                "port",
+                "archive-preflight",
+            ]);
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("runtime engine reads retained mailbox after preparation");
+            let rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS count, MAX(id) AS max_id, SUM(length(body_md)) AS body_bytes FROM messages",
+                    &[],
+                )
+                .expect("retained messages");
+            assert_eq!(rows[0].get_named::<i64>("count").unwrap(), message_count);
+            assert_eq!(rows[0].get_named::<i64>("max_id").unwrap(), message_count);
+            let body_bytes = i64::try_from("retained startup timing message ".len() * 16).unwrap();
+            assert_eq!(
+                rows[0].get_named::<i64>("body_bytes").unwrap(),
+                message_count * body_bytes
+            );
+            let recipients = conn
+                .query_sync("SELECT COUNT(*) AS count FROM message_recipients", &[])
+                .expect("retained recipients");
+            assert_eq!(
+                recipients[0].get_named::<i64>("count").unwrap(),
+                message_count
+            );
+            drop(conn);
+            let drift =
+                mcp_agent_mail_db::inspect_mailbox_archive_drift(&db_path, &config.storage_root);
+            assert_eq!(
+                drift.state,
+                mcp_agent_mail_db::MailboxArchiveDriftState::Aligned
+            );
+            assert_eq!(
+                i64::try_from(drift.archive_messages).unwrap(),
+                message_count
+            );
+        }
+    }
 
     fn sidecar_diagnosis_config(db: &Path) -> Config {
         let mut config = default_config();
@@ -3956,6 +4287,31 @@ mod tests {
             errors.contains("Secondary findings: 1 additional failing probe(s)."),
             "expected secondary summary in output:\n{errors}"
         );
+
+        let report = StartupReport {
+            results: vec![
+                ProbeResult::Fail(ProbeFailure {
+                    name: "fd-limit",
+                    problem: "descriptor limit too low".into(),
+                    fix: "Raise the descriptor limit.".into(),
+                }),
+                ProbeResult::Fail(ProbeFailure {
+                    name: "http-path",
+                    problem: "HTTP path must start with '/'".into(),
+                    fix: "Use /mcp/.".into(),
+                }),
+            ],
+        };
+        assert_eq!(
+            report.primary_failure().expect("primary HTTP issue").name,
+            "http-path",
+            "the named probe priority must apply regardless of report order"
+        );
+        assert!(
+            report
+                .format_errors()
+                .contains("Primary issue: [http-path]")
+        );
     }
 
     #[test]
@@ -3994,7 +4350,10 @@ mod tests {
         let mut config = default_config();
         config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
         config.storage_root = dir.path().join("storage");
-        let report = run_stdio_startup_probes(&config);
+        let capture = StartupPhaseCapture::default();
+        let report = tracing::subscriber::with_default(capture.clone(), || {
+            run_stdio_startup_probes(&config)
+        });
         assert_eq!(report.results.len(), 5);
         assert!(!report.results.iter().any(|result| matches!(
             result,
@@ -4013,6 +4372,7 @@ mod tests {
                     ..
                 })
         )));
+        capture.assert_phases(&["database", "db-lock", "storage", "integrity", "fd-limit"]);
     }
 
     #[test]
@@ -4091,6 +4451,7 @@ mod tests {
     #[test]
     fn run_http_startup_preflight_probes_skips_db_sensitive_checks_when_agent_mail_listener_exists()
     {
+        let dir = tempfile::tempdir().expect("private handoff fixture");
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("listener addr").port();
 
@@ -4125,8 +4486,13 @@ mod tests {
         let mut config = default_config();
         config.http_host = "127.0.0.1".into();
         config.http_port = port;
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
 
-        let report = run_http_startup_preflight_probes(&config);
+        let capture = StartupPhaseCapture::default();
+        let report = tracing::subscriber::with_default(capture.clone(), || {
+            run_http_startup_preflight_probes(&config)
+        });
         assert!(
             report.is_ok(),
             "preflight report should defer db-sensitive checks while an Agent Mail listener is present"
@@ -4147,6 +4513,14 @@ mod tests {
                     ..
                 })
         )));
+        capture.assert_phases(&[
+            "listener-detection",
+            "http-path",
+            "auth",
+            "database",
+            "storage",
+            "fd-limit",
+        ]);
 
         server_thread.join().expect("join test server");
     }

@@ -2481,9 +2481,8 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a078facda750bc751a1e8a52780df872bae2f2aa54ecb04e0f3e8664d72eb638"
+version = "0.4.14"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=e7ffeff4eb1eda0a4d62d00bbe778d6103058e7f#e7ffeff4eb1eda0a4d62d00bbe778d6103058e7f"
 dependencies = [
  "asupersync",
  "blake3",
@@ -5293,6 +5292,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "signal-hook 0.4.5",
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -5389,6 +5389,7 @@ dependencies = [
  "mcp-agent-mail-storage",
  "mcp-agent-mail-test-helpers",
  "proptest",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.1",
