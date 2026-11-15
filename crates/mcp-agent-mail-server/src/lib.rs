@@ -733,7 +733,13 @@ fn build_server_with_startup_workers(
         clusters::IDENTITY,
         DeregisterAgent,
     );
-    let server = add_tool(server, config, "whois", clusters::IDENTITY, Whois);
+    let server = add_tool(
+        server,
+        config,
+        "whois",
+        clusters::IDENTITY,
+        mcp_agent_mail_tools::recipient_addressing::WhoisByDisplayName(Whois),
+    );
     let server = add_tool(
         server,
         config,
@@ -760,14 +766,14 @@ fn build_server_with_startup_workers(
         config,
         "send_message",
         clusters::MESSAGING,
-        SendMessage,
+        mcp_agent_mail_tools::recipient_addressing::SelectorRecipients(SendMessage),
     );
     let server = add_tool(
         server,
         config,
         "reply_message",
         clusters::MESSAGING,
-        ReplyMessage,
+        mcp_agent_mail_tools::recipient_addressing::SelectorRecipients(ReplyMessage),
     );
     let server = add_tool(
         server,
