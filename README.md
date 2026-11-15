@@ -8,6 +8,10 @@ as the baseline for updates. Configure `origin` for the fork and `upstream`
 for the original repository. The quick-install commands below download upstream
 releases. Install a qualified fork build to use the fork's additions.
 
+The fork has one long-lived branch, `main`. `AGENTS.md` tells agents to mirror
+`main` to `master`. That serves upstream's old URLs and does not apply to the
+fork: do not create `master` here.
+
 The functional candidate adds optional display names, current profile labels
 alongside stable routing names, and offline message retention. It also carries
 mailbox correctness fixes that upstream has not supplied. Qualification is
