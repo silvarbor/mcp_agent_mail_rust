@@ -104,3 +104,18 @@ mcp-agent-mail-share crypto::tests::age_roundtrip_large_payload
 mcp-agent-mail-share crypto::tests::age_roundtrip_privacy_proof_bundle_preserves_redacted_replay_artifacts
 mcp-agent-mail-share crypto::tests::age_roundtrip_zip_bundle
 mcp-agent-mail-tools resources::resource_shape_tests::resources_refuse_incomplete_empty_archive_instead_of_serving_empty_mailbox
+
+# Kept by hand: keep this entry when regenerating the list above.
+#
+# Intermittent on both platforms, so the two baseline runs need not show it.
+# The test starts 16 and then 32 writers on one database and usually ends in
+# about 22 seconds. In run 43767180406 it reached the 240-second limit in both
+# attempts on macOS, on code that had passed in 23 seconds an hour earlier. On
+# a Mac, 2 of 8 rounds with `AM_TEST_WRITER_STORM_TRACE=1` timed out the same
+# way: after every other writer has finished, one writer's INSERT waits 20
+# seconds inside the database engine and returns "database is busy (snapshot
+# conflict on pages: 109)", attempt after attempt. The engine and the retry
+# wrapper are upstream's; the fork changes neither. Upstream records the same
+# timeout twice (upstream commit 30dbc925). Drop the entry when upstream has
+# fixed it.
+mcp-agent-mail-db queries::tests::autocommit_writer_storm_loses_no_rows_and_keeps_integrity
