@@ -17,6 +17,23 @@ alongside stable routing names, and offline message retention. It also carries
 mailbox correctness fixes that upstream has not supplied. Qualification is
 pending. Keep performance experiments separate from this candidate.
 
+### Addressing a recipient by display name
+
+`send_message` and `reply_message` accept recipient objects in `to`, `cc` and
+`bcc` next to the stable-address strings: `{"name": "BlueLake"}` or
+`{"display_name": "SPX Maintainer"}`. A display name selects the one active
+agent of the sender's project that carries it. The label is trimmed and compared
+without regard to case. A label that no active agent carries, or that several
+carry, fails the whole call before anything is written. `whois` takes
+`display_name` in place of `agent_name` and returns every active agent that
+carries the label.
+
+On the command line, `am mail send` takes `--to-display-name` and
+`--cc-display-name`, and `am mail reply` takes `--to-display-name`. Each flag may
+be repeated and takes one label whole, commas included.
+
+The contract is [`docs/SPEC-recipient-addressing.md`](docs/SPEC-recipient-addressing.md).
+
 ### Updating from upstream
 
 1. Fetch both remotes and pick one upstream commit. Upstream gains dozens of
