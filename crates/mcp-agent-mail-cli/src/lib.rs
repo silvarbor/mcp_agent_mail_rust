@@ -49949,6 +49949,10 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
                     loop {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
+                                // macOS hands the listener's non-blocking mode
+                                // to the accepted socket; the read timeout
+                                // needs a blocking one.
+                                stream.set_nonblocking(false).unwrap();
                                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                                 stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                                 let mut request = Vec::new();

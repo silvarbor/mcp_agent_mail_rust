@@ -1366,6 +1366,9 @@ pub(crate) mod tests {
                             Err(error) => panic!("accept failed: {error}"),
                         }
                     };
+                    // macOS hands the listener's non-blocking mode to the
+                    // accepted socket; the read timeout needs a blocking one.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                     let mut reader = std::io::BufReader::new(&mut stream);
                     let mut length = None;

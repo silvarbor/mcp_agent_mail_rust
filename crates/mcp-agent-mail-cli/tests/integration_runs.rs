@@ -6463,6 +6463,9 @@ impl ReservationReadPeer {
                     }
                     Err(error) => panic!("accept private peer request: {error}"), // ubs:ignore — private test server must fail on unexpected accept errors
                 };
+                // macOS hands the listener's non-blocking mode to the accepted
+                // socket; the read timeout needs a blocking one.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();

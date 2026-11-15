@@ -14,10 +14,6 @@
 # on the fork on a GitHub-hosted macOS runner, run
 # https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43657307449.
 
-# The test server reads from an accepted socket that inherits the listener's
-# non-blocking mode on macOS and gets `WouldBlock`.
-mcp-agent-mail-cli reservation_read::tests::health_probe_refuses_rejections_malformed_replies_and_identity_drift
-
 # Two of its 22 Python cases assume Linux: a file name with the byte 0xff,
 # which APFS refuses, and a repository created with `core.ignorecase` off.
 mcp-agent-mail-guard tests::guard_commit_admission_runs_native_rendered_programs_against_real_git
