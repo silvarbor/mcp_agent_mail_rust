@@ -6913,7 +6913,7 @@ mod tests {
                  (5,'other project','body','normal',100,8,2,'other'), \
                  (6,'invalid delivery project','body','normal',100,8,2,'other'), \
                  (7,'unrequested thread','body','normal',100,1,1,'outside'); \
-             INSERT INTO message_recipients VALUES (2,2,NULL),(3,2,7); \
+             INSERT INTO message_recipients (message_id, agent_id, read_ts) VALUES (2,2,NULL),(3,2,7); \
              INSERT INTO project_mailbox_deliveries VALUES \
                  (1,1,'to',100),(2,1,'cc',110),(3,1,'to',120),(4,1,'to',99), \
                  (5,2,'to',100),(6,1,'to',100),(7,1,'to',100); \

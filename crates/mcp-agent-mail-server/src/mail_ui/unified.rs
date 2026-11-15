@@ -601,7 +601,11 @@ fn current_viewers(
                 .map_err(database_error)?;
             let viewer = Viewer {
                 name: row.get_named("name").map_err(database_error)?,
-                display_name: row.get_named("display_name").map_err(database_error)?,
+                // A caller's profile row may predate display labels.
+                display_name: match row.get_by_name("display_name") {
+                    None | Some(Value::Null) => None,
+                    Some(_) => row.get_named("display_name").map_err(database_error)?,
+                },
                 inception: integer(row, "inception_ts")?,
                 retired: row
                     .get_named::<Option<i64>>("retired_at")
@@ -1645,7 +1649,7 @@ mod tests {
         conn.execute_raw("BEGIN").unwrap();
         for agent in 1000..1032 {
             conn.execute_raw(&format!(
-                "INSERT INTO agents VALUES({agent},1,'Viewer{agent}',0,NULL,'auto')"
+                "INSERT INTO agents(id,project_id,name,inception_ts,retired_at,contact_policy) VALUES({agent},1,'Viewer{agent}',0,NULL,'auto')"
             ))
             .unwrap();
         }
