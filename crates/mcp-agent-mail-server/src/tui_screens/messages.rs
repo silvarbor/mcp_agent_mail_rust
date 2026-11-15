@@ -5,7 +5,7 @@
 //! keyboard-first navigation.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListStat
 
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
-use mcp_agent_mail_db::sqlmodel_core::Value;
+use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
 
@@ -45,7 +45,10 @@ use crate::tui_persist::{
     ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
+    operator_tool_context,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -150,6 +153,51 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
 // Query presets — reusable filter shortcuts
 // ──────────────────────────────────────────────────────────────────────
 
+/// Structured filter a preset applies on top of the typed query.
+///
+/// Importance and acknowledgement are message columns, not words: a text
+/// search for "urgent" finds messages that mention the word, not urgent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MessageFilter {
+    /// Only messages of exactly this importance.
+    importance: Option<&'static str>,
+    /// Only messages that require acknowledgement.
+    ack_required: bool,
+}
+
+impl MessageFilter {
+    const NONE: Self = Self {
+        importance: None,
+        ack_required: false,
+    };
+
+    const fn is_active(self) -> bool {
+        self.importance.is_some() || self.ack_required
+    }
+
+    /// Live-event entries carry no importance or ack flag (they read as
+    /// normal / not required), so an active filter never admits them.
+    fn matches(self, entry: &MessageEntry) -> bool {
+        self.importance
+            .is_none_or(|level| entry.importance.eq_ignore_ascii_case(level))
+            && (!self.ack_required || entry.ack_required)
+    }
+
+    /// SQL predicates over the `messages` table, ANDed by the caller.
+    fn sql_predicates(self) -> (Vec<&'static str>, Vec<Value>) {
+        let mut predicates = Vec::new();
+        let mut params = Vec::new();
+        if let Some(level) = self.importance {
+            predicates.push("importance = ?");
+            params.push(Value::Text(level.to_string()));
+        }
+        if self.ack_required {
+            predicates.push("ack_required = 1");
+        }
+        (predicates, params)
+    }
+}
+
 /// A named query preset for quick search access.
 #[derive(Debug, Clone)]
 struct QueryPreset {
@@ -157,6 +205,8 @@ struct QueryPreset {
     label: &'static str,
     /// The query string to inject into the search bar.
     query: &'static str,
+    /// Structured filter applied with whatever the search bar holds.
+    filter: MessageFilter,
     /// Short description for help overlay (shown in preset picker).
     #[allow(dead_code)]
     description: &'static str,
@@ -167,31 +217,46 @@ const QUERY_PRESETS: &[QueryPreset] = &[
     QueryPreset {
         label: "All",
         query: "",
+        filter: MessageFilter::NONE,
         description: "Show all recent messages",
     },
     QueryPreset {
         label: "Urgent",
-        query: "urgent",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("urgent"),
+            ack_required: false,
+        },
         description: "Urgent importance messages",
     },
     QueryPreset {
         label: "High",
-        query: "high",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("high"),
+            ack_required: false,
+        },
         description: "High importance messages",
     },
     QueryPreset {
         label: "Ack",
-        query: "ack",
+        query: "",
+        filter: MessageFilter {
+            importance: None,
+            ack_required: true,
+        },
         description: "Messages requiring acknowledgement",
     },
     QueryPreset {
         label: "Error",
         query: "error",
+        filter: MessageFilter::NONE,
         description: "Messages containing error",
     },
     QueryPreset {
         label: "Plan",
         query: "plan",
+        filter: MessageFilter::NONE,
         description: "Planning and coordination messages",
     },
 ];
@@ -845,6 +910,197 @@ struct ComposePayload {
     ack_required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeAgentStatus {
+    Active,
+    Retired,
+    Deregistered,
+}
+
+#[derive(Debug)]
+struct ComposeAgent {
+    id: i64,
+    name: String,
+    status: ComposeAgentStatus,
+}
+
+impl ComposeAgent {
+    fn require_active(&self) -> Result<(), String> {
+        match self.status {
+            ComposeAgentStatus::Active => Ok(()),
+            ComposeAgentStatus::Retired => Err(format!(
+                "Agent '{}' is retired. Unretire this agent before sending new messages.",
+                self.name
+            )),
+            ComposeAgentStatus::Deregistered => Err(format!(
+                "Agent '{}' is deregistered and cannot send or receive new messages. Choose an active agent.",
+                self.name
+            )),
+        }
+    }
+}
+
+/// Resolve names like the backend: the first registered case-insensitive
+/// identity wins, even when a newer spelling is still active. Observe its
+/// lifecycle ledger in the same statement as the profile. Read-only legacy
+/// snapshots may predate the ledger and retirement column, so retain their
+/// task-description tombstones without attempting a migration here.
+fn query_compose_agents(
+    query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    project_slug: &str,
+    name: Option<&str>,
+) -> Result<Vec<ComposeAgent>, String> {
+    let (project, mut params) = synthetic_project_id(project_slug).map_or_else(
+        || {
+            (
+                "(SELECT id FROM projects WHERE slug = ? LIMIT 1)",
+                vec![Value::Text(project_slug.to_string())],
+            )
+        },
+        |project_id| ("?", vec![Value::BigInt(project_id)]),
+    );
+    let name_filter = name.map_or("", |name| {
+        params.push(Value::Text(name.to_string()));
+        " AND name = ? COLLATE NOCASE"
+    });
+    query_compose_agent_rows(
+        query,
+        &format!("project_id = {project}{name_filter}"),
+        &params,
+    )
+}
+
+/// A cross-project message lives in the recipient's project but retains the
+/// original sender's ID. Check that exact identity, never a local namesake.
+/// Bind the message scope and lifecycle read in one statement; backend reply
+/// routing still resolves the sender's home project and approved contact link.
+fn query_quick_reply_recipient(
+    query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    project_slug: &str,
+    message_id: i64,
+) -> Result<ComposeAgent, String> {
+    let mut params = vec![Value::BigInt(message_id)];
+    let project_filter = if let Some(project_id) = synthetic_project_id(project_slug) {
+        params.push(Value::BigInt(project_id));
+        params.push(Value::Text(project_slug.to_string()));
+        "m.project_id = ? AND NOT EXISTS \
+         (SELECT 1 FROM projects p WHERE p.id = m.project_id AND p.slug <> ?)"
+    } else {
+        params.push(Value::Text(project_slug.to_string()));
+        "m.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1)"
+    };
+    let source_filter = format!(
+        "id = (SELECT m.sender_id FROM messages m \
+               WHERE m.id = ? AND {project_filter} LIMIT 1)"
+    );
+    let sender = query_compose_agent_rows(query, &source_filter, &params)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "Message #{message_id} or its original sender is unavailable in project \
+                 '{project_slug}'. Reload the message before replying."
+            )
+        })?;
+    sender.require_active()?;
+    Ok(sender)
+}
+
+fn query_compose_agent_rows(
+    mut query: impl FnMut(&str, &[Value]) -> Result<Vec<Row>, SqlError>,
+    source_filter: &str,
+    params: &[Value],
+) -> Result<Vec<ComposeAgent>, String> {
+    let query_error = |error| format!("Failed to load agents for compose: {error}");
+    let columns: HashSet<String> = query("PRAGMA table_info(agents)", &[])
+        .map_err(query_error)?
+        .iter()
+        .map(|row| row.get_named::<String>("name"))
+        .collect::<Result<_, _>>()
+        .map_err(query_error)?;
+    let has_ledger = !query(
+        "SELECT 1 AS present FROM sqlite_master \
+         WHERE type = 'table' AND name = 'agent_deregistrations' LIMIT 1",
+        &[],
+    )
+    .map_err(query_error)?
+    .is_empty();
+    let mut source_columns = vec!["id", "name"];
+    let retired = if columns.contains("retired_at") {
+        source_columns.push("retired_at");
+        "a.retired_at"
+    } else {
+        "NULL"
+    };
+    let task = if columns.contains("task_description") {
+        source_columns.push("task_description");
+        "COALESCE(a.task_description, '')"
+    } else {
+        "''"
+    };
+    let (ledger_join, deregistered) = if has_ledger {
+        (
+            "LEFT JOIN agent_deregistrations d ON d.agent_id = a.id",
+            "d.agent_id",
+        )
+    } else {
+        ("", "NULL")
+    };
+    let source_projection = source_columns.join(", ");
+    let sql = format!(
+        "SELECT a.id AS id, a.name AS name, {retired} AS retired_at, \
+         {deregistered} AS deregistered_id, {task} AS task_description \
+         FROM (SELECT {source_projection} FROM agents \
+               WHERE {source_filter}) a \
+         {ledger_join} ORDER BY a.id ASC"
+    );
+    let rows = query(&sql, params).map_err(query_error)?;
+    let mut seen_names = HashSet::new();
+    let mut agents = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = row.get_named::<String>("name").map_err(query_error)?;
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let task = row
+            .get_named::<String>("task_description")
+            .map_err(query_error)?;
+        let status = if row.get_by_name("deregistered_id") != Some(&Value::Null)
+            || mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(&task)
+        {
+            ComposeAgentStatus::Deregistered
+        } else if row.get_by_name("retired_at") != Some(&Value::Null) {
+            ComposeAgentStatus::Retired
+        } else {
+            ComposeAgentStatus::Active
+        };
+        agents.push(ComposeAgent {
+            id: row.get_named("id").map_err(query_error)?,
+            name,
+            status,
+        });
+    }
+    Ok(agents)
+}
+
+fn active_compose_agent_names(agents: &[ComposeAgent]) -> Vec<String> {
+    let mut names: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.status == ComposeAgentStatus::Active)
+        .map(|agent| agent.name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+fn require_active_compose_recipient(agents: &[ComposeAgent], name: &str) -> Result<(), String> {
+    agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("Unknown recipient: {name}"))?
+        .require_active()
+}
+
 #[derive(Debug, Clone)]
 struct ComposeFormState {
     project_slug: String,
@@ -1108,6 +1364,8 @@ pub struct MessageBrowserScreen {
     selected_message_ids: SelectionState<i64>,
     /// Last search term that was actually executed.
     last_search: String,
+    /// Preset filter the current `results` were fetched under.
+    last_filter: MessageFilter,
     /// Ticks remaining before executing a search after input changes.
     debounce_remaining: u8,
     /// Whether we need to re-query.
@@ -1210,6 +1468,7 @@ impl MessageBrowserScreen {
             list_state: RefCell::new(VirtualizedListState::default()),
             selected_message_ids: SelectionState::new(),
             last_search: String::new(),
+            last_filter: MessageFilter::NONE,
             debounce_remaining: 0,
             search_dirty: true, // Initial load
             db_conn: None,
@@ -1357,30 +1616,51 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Err("Database connection unavailable".to_string());
         };
-        let (sql, params) = synthetic_project_id(project_slug).map_or_else(
-            || {
-                (
-                    "SELECT a.name AS name \
-                 FROM agents a \
-                 WHERE a.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1) \
-                 ORDER BY a.name",
-                    vec![Value::Text(project_slug.to_string())],
-                )
-            },
-            |project_id| {
-                (
-                    "SELECT name FROM agents WHERE project_id = ? ORDER BY name",
-                    vec![Value::BigInt(project_id)],
-                )
-            },
-        );
-        conn.query_sync(sql, &params)
-            .map_err(|err| format!("Failed to load agents for compose: {err}"))
-            .map(|rows| {
-                rows.into_iter()
-                    .filter_map(|row| row.get_named::<String>("name").ok())
-                    .collect()
-            })
+        query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            None,
+        )
+        .map(|agents| active_compose_agent_names(&agents))
+    }
+
+    fn live_compose_agents(
+        project_slug: &str,
+        name: Option<&str>,
+        state: Option<&TuiSharedState>,
+    ) -> Result<Vec<ComposeAgent>, String> {
+        let conn = Self::open_live_recipient_connection(state)?;
+        query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            name,
+        )
+    }
+
+    fn live_quick_reply_recipient(
+        context: &QuickReplyContext,
+        state: Option<&TuiSharedState>,
+    ) -> Result<ComposeAgent, String> {
+        let conn = Self::open_live_recipient_connection(state)?;
+        query_quick_reply_recipient(
+            |sql, params| conn.query_sync(sql, params),
+            &context.project_slug,
+            context.message_id,
+        )
+    }
+
+    fn open_live_recipient_connection(
+        state: Option<&TuiSharedState>,
+    ) -> Result<mcp_agent_mail_db::GuardedReadOnlyConn, String> {
+        let config = Self::runtime_config_from_state(state);
+        let sqlite_path = crate::resolve_server_database_url_sqlite_path(&config.database_url)
+            .ok_or_else(|| "Database connection unavailable".to_string())?;
+        crate::open_read_only_sync_db_connection_with_busy_timeout(
+            sqlite_path.to_string_lossy().as_ref(),
+            crate::INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS,
+            "message recipient lifecycle",
+        )
+        .map_err(|error| format!("Cannot verify current agent lifecycle: {error}"))
     }
 
     fn load_agent_labels_for_project(
@@ -1476,7 +1756,7 @@ impl MessageBrowserScreen {
         form.refresh_suggestions();
         if form.available_agents.is_empty() {
             form.errors.general = Some(
-                "No registered agents found in this project. Register agents before composing."
+                "No active agents found in this project. Register or unretire an agent before composing."
                     .to_string(),
             );
         }
@@ -1551,9 +1831,17 @@ impl MessageBrowserScreen {
     }
 
     fn open_quick_reply_modal_for_entry(&mut self, entry: &MessageEntry) -> Result<(), String> {
-        let Some(form) = QuickReplyFormState::from_entry(entry) else {
+        let Some(mut form) = QuickReplyFormState::from_entry(entry) else {
             return Err("Selected message is missing required reply context".to_string());
         };
+        if let Some(conn) = &self.db_conn {
+            form.errors.general = query_quick_reply_recipient(
+                |sql, params| conn.query_sync(sql, params),
+                &form.context.project_slug,
+                form.context.message_id,
+            )
+            .err();
+        }
         self.quick_reply_form = Some(form);
         self.compose_form = None;
         Ok(())
@@ -1598,50 +1886,53 @@ impl MessageBrowserScreen {
                 .ok_or_else(|| format!("Project not found: {project_slug}"))?
         };
 
-        let existing_sender = conn
-            .query_sync(
-                "SELECT id, inception_ts FROM agents WHERE project_id = ? AND name = ? LIMIT 1",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to check compose sender: {e}"))?
-            .into_iter()
-            .next();
+        let existing_sender = query_compose_agents(
+            |sql, params| conn.query_sync(sql, params),
+            project_slug,
+            Some(COMPOSE_SENDER_NAME),
+        )?
+        .into_iter()
+        .next();
         let now = unix_epoch_micros_now().unwrap_or(0);
-        let inception_ts = if let Some(row) = existing_sender {
-            let existing_inception = row.get_named::<i64>("inception_ts").unwrap_or(now);
-            conn.execute_sync(
-                "UPDATE agents SET last_active_ts = ? WHERE project_id = ? AND name = ?",
-                &[
-                    Value::BigInt(now),
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
-            existing_inception
-        } else {
-            conn.execute_sync(
-                "INSERT INTO agents \
-                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    Value::BigInt(project_id),
-                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
-                    Value::Text("am-tui".to_string()),
-                    Value::Text("human".to_string()),
-                    Value::Text("Human operator composing messages in TUI".to_string()),
-                    Value::BigInt(now),
-                    Value::BigInt(now),
-                    Value::Text("auto".to_string()),
-                    Value::Text("auto".to_string()),
-                ],
-            )
-            .map_err(|e| format!("Failed to create compose sender: {e}"))?;
-            now
-        };
+        if let Some(sender) = existing_sender {
+            sender.require_active()?;
+            let changed = conn
+                .execute_sync(
+                    "UPDATE agents SET last_active_ts = ? WHERE id = ? \
+                     AND retired_at IS NULL \
+                     AND id NOT IN (SELECT agent_id FROM agent_deregistrations) \
+                     AND substr(COALESCE(task_description, ''), 1, 14) <> '[DEREGISTERED '",
+                    &[Value::BigInt(now), Value::BigInt(sender.id)],
+                )
+                .map_err(|e| format!("Failed to update compose sender activity: {e}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "Agent '{}' changed lifecycle while composing. Refresh its status before sending.",
+                    sender.name
+                ));
+            }
+            // A heartbeat owns no profile fields. Replacing an existing
+            // profile here erased lifecycle state, operator settings and
+            // extensions even when the subsequent send was refused.
+            return Ok(());
+        }
+        conn.execute_sync(
+            "INSERT INTO agents \
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                Value::Text("am-tui".to_string()),
+                Value::Text("human".to_string()),
+                Value::Text("Human operator composing messages in TUI".to_string()),
+                Value::BigInt(now),
+                Value::BigInt(now),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .map_err(|e| format!("Failed to create compose sender: {e}"))?;
 
         let config = Self::runtime_config_from_state(state);
         if let Ok(Some(archive)) = mcp_agent_mail_storage::open_archive(&config, project_slug) {
@@ -1650,9 +1941,13 @@ impl MessageBrowserScreen {
                 "program": "am-tui",
                 "model": "human",
                 "task_description": "Human operator composing messages in TUI",
-                "inception_ts": micros_to_iso(inception_ts),
+                "inception_ts": micros_to_iso(now),
                 "last_active_ts": micros_to_iso(now),
                 "attachments_policy": "auto",
+                "contact_policy": "auto",
+                "reaper_exempt": false,
+                "retired_at": null,
+                "deregistered_at": null,
             });
             let _ = mcp_agent_mail_storage::write_agent_profile_with_config(
                 &archive,
@@ -1664,6 +1959,38 @@ impl MessageBrowserScreen {
     }
 
     fn submit_compose_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
+        let Some(project_slug) = self
+            .compose_form
+            .as_ref()
+            .map(|form| form.project_slug.clone())
+        else {
+            return Cmd::None;
+        };
+        // The browser can be showing a retained archive snapshot. New mail
+        // must consult the live mailbox before creating or touching its sender.
+        let refreshed = Self::live_compose_agents(&project_slug, None, state).and_then(|agents| {
+            let Some(form) = self.compose_form.as_mut() else {
+                return Ok(());
+            };
+            form.available_agents = active_compose_agent_names(&agents);
+            form.refresh_suggestions();
+            for name in parse_recipient_list(form.to_input.value())
+                .into_iter()
+                .chain(parse_recipient_list(form.cc_input.value()))
+            {
+                require_active_compose_recipient(&agents, &name)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = refreshed {
+            if let Some(form) = self.compose_form.as_mut() {
+                form.errors.general = Some(error.clone());
+            }
+            return Cmd::msg(MailScreenMsg::ActionExecute(
+                "compose_result:error".to_string(),
+                error,
+            ));
+        }
         let (payload, errors) = match self.compose_form.as_ref() {
             Some(form) => match validate_compose_form(form) {
                 Ok(payload) => (Some(payload), ComposeValidationErrors::default()),
@@ -1768,6 +2095,95 @@ impl MessageBrowserScreen {
         }
     }
 
+    /// Acknowledge (or mark read) each listed message for every one of its
+    /// recipients, as the operator.
+    fn receipt_for_recipients(&mut self, ids: &[i64], acknowledge: bool) -> Result<String, String> {
+        if ids.is_empty() {
+            return Err("no message selected".to_string());
+        }
+        let ctx = operator_tool_context();
+        let pool =
+            mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|error| error.to_string())?;
+        let conn = block_on(pool.acquire(ctx.cx()))
+            .into_result()
+            .map_err(|error| error.to_string())?;
+        // Resolve every action before writing any receipts. Displayed address
+        // strings may denote a project mailbox rather than an agent identity.
+        let mut actions = Vec::new();
+        for &id in ids {
+            let entry = self
+                .results
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("message #{id} is no longer listed"))?;
+            let project = entry.project_slug.clone();
+            let recipient_ids =
+                mcp_agent_mail_db::project_mailbox::receipt_agent_ids_from_conn(&*conn, id)
+                    .map_err(|error| format!("#{id}: {error}"))?;
+            let mut recipients = Vec::with_capacity(recipient_ids.len());
+            for recipient_id in recipient_ids {
+                let rows = conn
+                    .query_sync(
+                        "SELECT name FROM agents WHERE id = ?",
+                        &[Value::BigInt(recipient_id)],
+                    )
+                    .map_err(|error| format!("#{id}: {error}"))?;
+                let row = rows
+                    .first()
+                    .ok_or_else(|| format!("#{id}: recipient {recipient_id} is unavailable"))?;
+                recipients.push(
+                    row.get_named::<String>("name")
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            if project.is_empty() || recipients.is_empty() {
+                return Err(format!(
+                    "message #{id} has no recorded project or recipients"
+                ));
+            }
+            actions.push((id, project, recipients));
+        }
+        drop(conn);
+        let mut receipts = 0_usize;
+        for (id, project, recipients) in actions {
+            for agent in recipients {
+                let result = if acknowledge {
+                    block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                        None,
+                    ))
+                } else {
+                    block_on(mcp_agent_mail_tools::messaging::mark_message_read(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                    ))
+                };
+                result.map_err(|err| format!("#{id} for {agent}: {err}"))?;
+                receipts += 1;
+            }
+        }
+        // Re-query so the list shows the new read and ack state.
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+        let verb = if acknowledge {
+            "acknowledged"
+        } else {
+            "marked read"
+        };
+        Ok(match ids {
+            [id] => format!("#{id} {verb} for {receipts} recipient(s)"),
+            _ => format!(
+                "{} messages {verb} ({receipts} recipient receipts)",
+                ids.len()
+            ),
+        })
+    }
+
     fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
         let (body_md, errors) = match self.quick_reply_form.as_ref() {
             Some(form) => match validate_quick_reply_form(form) {
@@ -1794,7 +2210,9 @@ impl MessageBrowserScreen {
         };
 
         self.ensure_modal_db_conn(state);
-        if let Err(err) = self.ensure_compose_sender(&context.project_slug, state) {
+        let admission = Self::live_quick_reply_recipient(&context, state)
+            .and_then(|_| self.ensure_compose_sender(&context.project_slug, state));
+        if let Err(err) = admission {
             if let Some(form) = self.quick_reply_form.as_mut() {
                 form.errors.general = Some(err.clone());
             }
@@ -2853,6 +3271,7 @@ impl MessageBrowserScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let query = self.search_input.value().trim().to_string();
+        let filter = self.active_preset().filter;
         self.last_refresh = Some(Instant::now());
 
         // Determine if we should show project column (Global mode)
@@ -2867,11 +3286,12 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             let previous_results = self.results.clone();
             let previous_total = self.total_results;
-            let preserve_previous = self.can_preserve_previous_results_for_live_fallback(
-                &query,
-                show_project,
-                project_filter,
-            );
+            let preserve_previous = self.last_filter == filter
+                && self.can_preserve_previous_results_for_live_fallback(
+                    &query,
+                    show_project,
+                    project_filter,
+                );
             let mut results = Self::search_live_events(state, &query, show_project);
             if let Some(slug) = project_filter {
                 results.retain(|entry| entry.project_slug == slug);
@@ -2882,6 +3302,8 @@ impl MessageBrowserScreen {
             } else {
                 results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
             }
+            results.retain(|entry| filter.matches(entry));
+            self.last_filter = filter;
 
             // Apply system-message filter on the live-only fallback path too.
             let mut hidden = 0usize;
@@ -2929,24 +3351,35 @@ impl MessageBrowserScreen {
 
         let (mut results, total, method) = if query.is_empty() {
             self.last_search.clear();
-            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project);
+            let (r, t) =
+                fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project, filter);
             (r, t, SearchMethod::Recent)
         } else {
             self.last_search.clone_from(&query);
-            let (r, t, m) =
-                search_messages_unified(conn, &query, MAX_RESULTS, project_filter, show_project);
+            let (r, t, m) = search_messages_unified(
+                conn,
+                &query,
+                MAX_RESULTS,
+                project_filter,
+                show_project,
+                filter,
+            );
             (r, t, m)
         };
         self.search_method = method;
+        self.last_filter = filter;
 
         // Self-heal: if the DB query returned nothing but the poller knows
         // messages exist, the connection is likely stale or broken.  Drop it
         // so the next tick re-opens a fresh one (with schema guarantee).
         // Setting search_method=Live activates the tick handler's 5-second
         // retry loop which resets db_conn_attempted and search_dirty.
+        // A preset filter may legitimately match nothing, so it never
+        // counts as evidence of a broken connection.
         if results.is_empty()
             && total == 0
             && query.is_empty()
+            && !filter.is_active()
             && state
                 .db_stats_snapshot()
                 .is_some_and(|stats| stats.messages > 0)
@@ -2973,6 +3406,9 @@ impl MessageBrowserScreen {
                 if let Some(slug) = project_filter
                     && entry.project_slug != slug
                 {
+                    continue;
+                }
+                if !filter.matches(&entry) {
                     continue;
                 }
                 results.push(entry);
@@ -3425,8 +3861,9 @@ impl MailScreen for MessageBrowserScreen {
                             }
                             return Cmd::None;
                         }
-                        // Mark selected message for keyboard move.
-                        KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Mark (cut) selected message for keyboard move. Not
+                        // Ctrl+M: terminals send it as the same byte as Enter.
+                        KeyCode::Char('x') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.mark_selected_result_for_keyboard_move(state);
                             return Cmd::None;
                         }
@@ -3434,8 +3871,8 @@ impl MailScreen for MessageBrowserScreen {
                         KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
                             return self.execute_keyboard_move_to_selected_context(state);
                         }
-                        // Clear search
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear search (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.search_input.clear();
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
@@ -3489,45 +3926,18 @@ impl MailScreen for MessageBrowserScreen {
     }
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
-        match operation {
-            "batch_acknowledge" => {
+        let (name, id) = operation.split_once(':').unwrap_or((operation, ""));
+        let ids = match name {
+            "acknowledge" | "mark_read" => id.parse::<i64>().ok().into_iter().collect(),
+            "batch_acknowledge" | "batch_mark_read" => {
                 let ids = self.selected_message_ids_sorted();
                 self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "acknowledge".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
+                ids
             }
-            "batch_mark_read" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_read".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            "batch_mark_unread" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_unread".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            _ => Cmd::None,
-        }
+            _ => return Cmd::None,
+        };
+        let result = self.receipt_for_recipients(&ids, name.ends_with("acknowledge"));
+        operator_result(name, result)
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
@@ -3877,12 +4287,12 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Exit search / cancel move",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear search",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to current thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into current thread",
             },
             HelpEntry {
                 key: "p/P",
@@ -3924,7 +4334,13 @@ impl MailScreen for MessageBrowserScreen {
     fn consumes_text_input(&self) -> bool {
         self.compose_form.is_some()
             || self.quick_reply_form.is_some()
+            || self.preset_dialog_mode != PresetDialogMode::None
             || matches!(self.focus, Focus::SearchBar)
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` focuses this screen's search bar rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -4018,42 +4434,48 @@ impl MailScreen for MessageBrowserScreen {
 ///
 /// If `project_filter` is Some, only fetch messages from that project (Local mode).
 /// Otherwise, fetch from all projects (Global mode).
+/// `WHERE` clause (empty when unfiltered) and parameters for a project scope
+/// plus a preset filter. `None` when the project slug does not resolve.
+fn message_scope_where(
+    conn: &DbConn,
+    project_filter: Option<&str>,
+    filter: MessageFilter,
+) -> Option<(String, Vec<Value>)> {
+    let (mut predicates, mut params) = (Vec::new(), Vec::new());
+    if let Some(slug) = project_filter {
+        predicates.push("project_id = ?");
+        params.push(Value::BigInt(project_id_for_slug(conn, slug)?));
+    }
+    let (filter_predicates, filter_params) = filter.sql_predicates();
+    predicates.extend(filter_predicates);
+    params.extend(filter_params);
+    let clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", predicates.join(" AND "))
+    };
+    Some((clause, params))
+}
+
 fn fetch_recent_messages(
     conn: &DbConn,
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize) {
-    let (sql, params, total) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return (Vec::new(), 0);
-            };
-            (
-                format!(
-                    "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                     created_ts, sender_id, project_id, recipients_json \
-                     FROM messages \
-                     WHERE project_id = ? \
-                     ORDER BY created_ts DESC \
-                     LIMIT {limit}"
-                ),
-                vec![Value::BigInt(project_id)],
-                count_messages(conn, project_filter),
-            )
-        }
-        None => (
-            format!(
-                "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                 created_ts, sender_id, project_id, recipients_json \
-                 FROM messages \
-                 ORDER BY created_ts DESC \
-                 LIMIT {limit}"
-            ),
-            Vec::new(),
-            count_messages(conn, None),
-        ),
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return (Vec::new(), 0);
     };
+    let sql = format!(
+        "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
+         created_ts, sender_id, project_id, recipients_json \
+         FROM messages \
+         {where_clause}\
+         ORDER BY created_ts DESC \
+         LIMIT {limit}"
+    );
+    let total = count_messages(conn, project_filter, filter);
 
     let rows = query_raw_message_rows(conn, &sql, &params);
     let results = message_entries_from_rows(conn, rows, show_project);
@@ -4070,6 +4492,7 @@ fn search_messages_unified(
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
     let project_id = project_filter.and_then(|slug| project_id_for_slug(conn, slug));
     let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -4077,6 +4500,12 @@ fn search_messages_unified(
         doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
         project_id,
         limit: Some(limit),
+        importance: filter
+            .importance
+            .and_then(mcp_agent_mail_db::search_planner::Importance::parse)
+            .into_iter()
+            .collect(),
+        ack_required: filter.ack_required.then_some(true),
         ..Default::default()
     };
     // Messages screen expects newest-first ordering when scanning inbox content.
@@ -4637,21 +5066,13 @@ fn recipient_names_from_json(raw: &str) -> String {
 }
 
 /// Count total messages, optionally filtered by project.
-fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let (sql, params) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return 0;
-            };
-            (
-                "SELECT COUNT(*) AS c FROM messages WHERE project_id = ?",
-                vec![Value::BigInt(project_id)],
-            )
-        }
-        None => ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
+fn count_messages(conn: &DbConn, project_filter: Option<&str>, filter: MessageFilter) -> usize {
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return 0;
     };
+    let sql = format!("SELECT COUNT(*) AS c FROM messages {where_clause}");
 
-    match conn.query_sync(sql, &params) {
+    match conn.query_sync(&sql, &params) {
         Ok(rows) => rows
             .into_iter()
             .next()
@@ -6194,7 +6615,10 @@ fn parse_recipient_list(raw: &str) -> Vec<String> {
         if name.is_empty() {
             continue;
         }
-        if out.iter().all(|existing| existing != name) {
+        if out
+            .iter()
+            .all(|existing: &String| !existing.eq_ignore_ascii_case(name))
+        {
             out.push(name.to_string());
         }
     }
@@ -6235,14 +6659,23 @@ fn validate_compose_form(
     let mut errors = ComposeValidationErrors::default();
     let to = parse_recipient_list(form.to_input.value());
     let cc = parse_recipient_list(form.cc_input.value());
-    let known_agents: std::collections::HashSet<&str> =
-        form.available_agents.iter().map(String::as_str).collect();
+    let known_agents: HashSet<String> = form
+        .available_agents
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     if to.is_empty() {
         errors.to = Some("At least one recipient is required.".to_string());
-    } else if let Some(invalid) = to.iter().find(|name| !known_agents.contains(name.as_str())) {
+    } else if let Some(invalid) = to
+        .iter()
+        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
+    {
         errors.to = Some(format!("Unknown recipient: {invalid}"));
     }
-    if let Some(invalid) = cc.iter().find(|name| !known_agents.contains(name.as_str())) {
+    if let Some(invalid) = cc
+        .iter()
+        .find(|name| !known_agents.contains(&name.to_ascii_lowercase()))
+    {
         errors.cc = Some(format!("Unknown CC recipient: {invalid}"));
     }
 
@@ -6536,7 +6969,7 @@ mod tests {
     #[test]
     fn display_name_messages_keep_addresses_and_refresh_history_after_rename_and_clear() {
         let conn = display_name_messages_db();
-        let (entries, total) = fetch_recent_messages(&conn, 10, None, true);
+        let (entries, total) = fetch_recent_messages(&conn, 10, None, true, MessageFilter::NONE);
         assert_eq!(total, 3);
         let first = entries
             .iter()
@@ -6580,7 +7013,7 @@ mod tests {
             &[Value::Text("Officer Alpha".to_string()), Value::BigInt(1)],
         )
         .expect("rename presentation label");
-        let (renamed, _) = fetch_recent_messages(&conn, 10, None, true);
+        let (renamed, _) = fetch_recent_messages(&conn, 10, None, true, MessageFilter::NONE);
         let renamed_first = renamed
             .iter()
             .find(|entry| entry.id == 1)
@@ -6605,7 +7038,7 @@ mod tests {
 
         conn.execute_raw("UPDATE agents SET display_name = NULL WHERE id = 1")
             .expect("clear label");
-        let (cleared, _) = fetch_recent_messages(&conn, 10, None, true);
+        let (cleared, _) = fetch_recent_messages(&conn, 10, None, true, MessageFilter::NONE);
         let cleared_first = cleared
             .iter()
             .find(|entry| entry.id == 1)
@@ -6674,7 +7107,7 @@ mod tests {
             &[Value::Text("審査員 <b>Reviewer</b>".to_string())],
         )
         .expect("set literal label");
-        let (entries, _) = fetch_recent_messages(&conn, 10, None, true);
+        let (entries, _) = fetch_recent_messages(&conn, 10, None, true, MessageFilter::NONE);
         let first = entries
             .iter()
             .find(|entry| entry.id == 1)
@@ -6718,7 +7151,7 @@ mod tests {
             ))],
         )
         .expect("set long Unicode labels");
-        let (entries, _) = fetch_recent_messages(&conn, 10, None, true);
+        let (entries, _) = fetch_recent_messages(&conn, 10, None, true, MessageFilter::NONE);
         let first = entries.iter().find(|entry| entry.id == 1).expect("message");
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(60, 24, &mut pool);
@@ -7741,14 +8174,27 @@ first body
     }
 
     #[test]
-    fn ctrl_m_marks_selected_message_for_keyboard_move() {
+    fn capital_x_clears_the_search_from_the_result_list() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_input.set_value("deploy");
+        screen.focus = Focus::ResultList;
+        screen.search_dirty = false;
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.search_input.value(), "");
+        assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_message_for_keyboard_move() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
         screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
         screen.cursor = 0;
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()
@@ -7758,7 +8204,7 @@ first body
     }
 
     #[test]
-    fn ctrl_m_replaces_existing_keyboard_move_marker() {
+    fn ctrl_x_replaces_existing_keyboard_move_marker() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
@@ -7767,9 +8213,9 @@ first body
             test_message_entry(11, "thread-b", "Subject B"),
         ];
 
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         screen.cursor = 1;
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
 
         let marker = state
             .keyboard_move_snapshot()
@@ -8580,6 +9026,605 @@ first body
         assert_eq!(err, "Database connection unavailable");
     }
 
+    fn compose_lifecycle_fixture() -> (tempfile::TempDir, mcp_agent_mail_core::Config, DbConn) {
+        let dir = tempdir().expect("fixture directory");
+        let db_path = dir.path().join("compose-lifecycle.sqlite3");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.storage_root).expect("archive directory");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("real database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (77, 'proj', '/proj', 1), (88, 'other', '/other', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 77, 'BlueLake', 'test', 'test', 1, 1), \
+                    (2, 77, 'GreenStone', 'test', 'test', 1, 1), \
+                    (3, 77, 'bluelake', 'test', 'test', 2, 2), \
+                    (4, 88, 'BlueLake', 'test', 'test', 1, 1), \
+                    (5, 77, 'OldPine', 'test', 'test', 1, 1); \
+             UPDATE agents SET task_description = '[DEREGISTERED at 2026-08-24T00:00:00Z] legacy' \
+             WHERE id = 5; \
+             INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+             VALUES (41, 77, 1, 'history-41', 'Original subject', 'Original historical body', 1); \
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) \
+             VALUES (41, 2, 10, 11);",
+        )
+        .expect("populated lifecycle fixture");
+        (dir, config, conn)
+    }
+
+    fn compose_history_values(conn: &DbConn) -> Vec<Vec<Value>> {
+        [
+            "SELECT * FROM messages ORDER BY id",
+            "SELECT * FROM message_recipients ORDER BY message_id, agent_id",
+        ]
+        .into_iter()
+        .flat_map(|sql| conn.query_sync(sql, &[]).expect("retained transcript"))
+        .map(|row| row.values().cloned().collect())
+        .collect()
+    }
+
+    #[test]
+    fn compose_roster_canonicalizes_before_lifecycle_filtering_and_preserves_history() {
+        let (_dir, _config, conn) = compose_lifecycle_fixture();
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let names = |screen: &MessageBrowserScreen, project| {
+            screen
+                .load_agent_names_for_project(project)
+                .expect("roster")
+        };
+        assert_eq!(names(&screen, "proj"), ["BlueLake", "GreenStone"]);
+        assert_eq!(names(&screen, "other"), ["BlueLake"]);
+
+        for (change, expected) in [
+            (
+                "UPDATE agents SET retired_at = 20 WHERE id = 1",
+                vec!["GreenStone"],
+            ),
+            (
+                "UPDATE agents SET retired_at = NULL WHERE id = 1",
+                vec!["BlueLake", "GreenStone"],
+            ),
+            (
+                "INSERT INTO agent_deregistrations VALUES (1, 30)",
+                vec!["GreenStone"],
+            ),
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(change)
+                .expect("lifecycle transition");
+            assert_eq!(names(&screen, "proj"), expected);
+            assert_eq!(names(&screen, "other"), ["BlueLake"], "project boundary");
+            assert_eq!(
+                compose_history_values(screen.db_conn.as_ref().unwrap()),
+                history
+            );
+        }
+
+        let conn = screen.db_conn.as_ref().unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = OFF; DELETE FROM projects WHERE id = 77;")
+            .expect("orphaned imported project");
+        assert_eq!(names(&screen, "proj"), Vec::<String>::new());
+        assert_eq!(names(&screen, "[unknown-project-77]"), ["GreenStone"]);
+        let historical = screen
+            .fetch_message_entry_by_id(41, None)
+            .expect("historical message");
+        assert_eq!(historical.from_agent, "BlueLake");
+        assert_eq!(historical.body_md, "Original historical body");
+    }
+
+    #[test]
+    fn compose_roster_respects_legacy_deregistration_without_modifying_schema() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-compose.sqlite3");
+        let conn = DbConn::open_file(path.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT); \
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, task_description TEXT); \
+             INSERT INTO projects VALUES (1, 'legacy'); \
+             INSERT INTO agents VALUES (1, 1, 'OldPine', '[DEREGISTERED at 2026-08-24T00:00:00Z] old'), \
+                                       (2, 1, 'BlueLake', 'active task');",
+        ).unwrap();
+        let agents =
+            query_compose_agents(|sql, params| conn.query_sync(sql, params), "legacy", None)
+                .expect("legacy roster");
+        assert_eq!(active_compose_agent_names(&agents), ["BlueLake"]);
+        assert!(
+            require_active_compose_recipient(&agents, "OldPine")
+                .unwrap_err()
+                .contains("deregistered")
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM agent_deregistrations", &[])
+                .is_err()
+        );
+        assert!(
+            conn.query_sync("SELECT retired_at FROM agents", &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compose_submit_rechecks_live_lifecycle_and_preserves_draft_on_refusal_or_read_failure() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        let (stale_dir, _stale_config, stale_conn) = compose_lifecycle_fixture();
+        screen.db_conn = Some(stale_conn);
+        screen._db_snapshot_dir = Some(crate::SnapshotDirGuard {
+            path: stale_dir.keep(),
+        });
+        let mut form = ComposeFormState::new(
+            "proj".into(),
+            Some("BlueLake".into()),
+            vec!["BlueLake".into()],
+        );
+        form.cc_input.set_value("GreenStone");
+        form.subject_input.set_value("Keep this subject");
+        form.thread_id_input.set_value("draft-thread");
+        form.body_input
+            .set_text("Keep this complete\nmultiline draft.");
+        form.importance_idx = 2;
+        form.ack_required = true;
+        screen.compose_form = Some(form);
+        conn.execute_raw("UPDATE agents SET retired_at = 20 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            screen.load_agent_names_for_project("proj").unwrap(),
+            ["BlueLake", "GreenStone"]
+        );
+
+        let _ = screen.submit_compose_form(Some(&state));
+        let form = screen
+            .compose_form
+            .as_ref()
+            .expect("draft survives retirement");
+        assert!(form.errors.general.as_deref().unwrap().contains("retired"));
+        assert_eq!(form.available_agents, ["GreenStone"]);
+        assert_eq!(form.to_input.value(), "BlueLake");
+        assert_eq!(form.cc_input.value(), "GreenStone");
+        assert_eq!(form.subject_input.value(), "Keep this subject");
+        assert_eq!(form.thread_id_input.value(), "draft-thread");
+        assert_eq!(
+            form.body_input.text(),
+            "Keep this complete\nmultiline draft."
+        );
+        assert_eq!(form.importance(), "urgent");
+        assert!(form.ack_required);
+
+        conn.execute_raw(
+            "ALTER TABLE agent_deregistrations RENAME TO preserved_deregistrations; \
+             CREATE TABLE agent_deregistrations (unexpected TEXT);",
+        )
+        .unwrap();
+        let _ = screen.submit_compose_form(Some(&state));
+        let form = screen
+            .compose_form
+            .as_ref()
+            .expect("draft survives unavailable lifecycle");
+        assert!(
+            form.errors
+                .general
+                .as_deref()
+                .unwrap()
+                .contains("Failed to load agents")
+        );
+        assert_eq!(
+            form.body_input.text(),
+            "Keep this complete\nmultiline draft."
+        );
+        assert_eq!(form.available_agents, ["GreenStone"]);
+        assert_eq!(compose_history_values(&conn), history);
+        assert!(
+            conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quick_reply_refuses_deregistered_live_recipient_without_losing_transcript_or_draft() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let history = compose_history_values(&conn);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Keep my reply.");
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw("INSERT INTO agent_deregistrations VALUES (1, 30)")
+            .unwrap();
+
+        let _ = screen.submit_quick_reply_form(Some(&state));
+        let form = screen
+            .quick_reply_form
+            .as_ref()
+            .expect("reply draft retained");
+        assert!(
+            form.errors
+                .general
+                .as_deref()
+                .unwrap()
+                .contains("deregistered")
+        );
+        assert_eq!(form.body_input.text(), "Keep my reply.");
+        assert_eq!(form.context.to_agent, "BlueLake");
+        assert_eq!(form.context.original_sender_label, "BlueLake");
+        assert_eq!(form.context.original_body_md, "Original historical body");
+        assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+        assert_eq!(
+            compose_history_values(screen.db_conn.as_ref().unwrap()),
+            history
+        );
+        assert!(
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quick_reply_admission_follows_remote_sender_id_instead_of_local_namesake() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        conn.execute_raw(
+            "UPDATE messages SET sender_id = 4 WHERE id = 41; \
+             UPDATE agents SET retired_at = 20 WHERE id = 1; \
+             INSERT INTO agent_deregistrations VALUES (1, 30);",
+        )
+        .unwrap();
+        let history = compose_history_values(&conn);
+        let state = TuiSharedState::new(&config);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        let form = screen.quick_reply_form.as_mut().unwrap();
+        assert!(
+            form.errors.general.is_none(),
+            "inactive local namesake is unrelated"
+        );
+        assert_eq!(form.context.project_slug, "proj");
+        assert_eq!(form.context.to_agent, "BlueLake");
+        form.body_input.set_text("Reply to the remote sender.");
+        let context = form.context.clone();
+        assert_eq!(
+            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+                .unwrap()
+                .id,
+            4
+        );
+
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw(
+                "UPDATE agents SET name = 'LocalLake' WHERE id = 1; \
+             UPDATE agents SET name = 'LocalVariant' WHERE id = 3;",
+            )
+            .unwrap();
+        assert_eq!(
+            MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state))
+                .unwrap()
+                .id,
+            4,
+            "the remote sender need not be registered in the message's project"
+        );
+        screen
+            .db_conn
+            .as_ref()
+            .unwrap()
+            .execute_raw(
+                "UPDATE agents SET name = 'BlueLake', retired_at = NULL WHERE id = 1; \
+             DELETE FROM agent_deregistrations WHERE agent_id = 1;",
+            )
+            .unwrap();
+
+        for (transition, refusal) in [
+            (
+                "UPDATE agents SET retired_at = 20 WHERE id = 4",
+                Some("retired"),
+            ),
+            ("UPDATE agents SET retired_at = NULL WHERE id = 4", None),
+            (
+                "INSERT INTO agent_deregistrations VALUES (4, 30)",
+                Some("deregistered"),
+            ),
+            (
+                "DELETE FROM agent_deregistrations WHERE agent_id = 4; \
+                 UPDATE agents SET task_description = '[DEREGISTERED at 2026-08-24T00:00:00Z] legacy' WHERE id = 4",
+                Some("deregistered"),
+            ),
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(transition)
+                .unwrap();
+            let admission =
+                MessageBrowserScreen::live_quick_reply_recipient(&context, Some(&state));
+            if let Some(reason) = refusal {
+                assert!(admission.unwrap_err().contains(reason));
+                let _ = screen.submit_quick_reply_form(Some(&state));
+                let form = screen
+                    .quick_reply_form
+                    .as_ref()
+                    .expect("reply draft retained");
+                assert!(form.errors.general.as_deref().unwrap().contains(reason));
+                assert_eq!(form.body_input.text(), "Reply to the remote sender.");
+                assert_eq!(form.context.original_body_md, "Original historical body");
+                assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+            } else {
+                assert_eq!(
+                    admission.unwrap().id,
+                    4,
+                    "unretired remote sender is eligible"
+                );
+            }
+            let conn = screen.db_conn.as_ref().unwrap();
+            assert_eq!(compose_history_values(conn), history);
+            assert!(
+                conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_reply_refuses_missing_or_moved_live_message_and_preserves_draft() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let state = TuiSharedState::new(&config);
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+        let entry = screen.fetch_message_entry_by_id(41, None).unwrap();
+        screen.open_quick_reply_modal_for_entry(&entry).unwrap();
+        screen
+            .quick_reply_form
+            .as_mut()
+            .unwrap()
+            .body_input
+            .set_text("Keep this reply draft.");
+
+        for change in [
+            "UPDATE messages SET project_id = 88 WHERE id = 41",
+            "DELETE FROM message_recipients WHERE message_id = 41; DELETE FROM messages WHERE id = 41;",
+        ] {
+            screen
+                .db_conn
+                .as_ref()
+                .unwrap()
+                .execute_raw(change)
+                .unwrap();
+            let before = compose_history_values(screen.db_conn.as_ref().unwrap());
+            let _ = screen.submit_quick_reply_form(Some(&state));
+            let form = screen
+                .quick_reply_form
+                .as_ref()
+                .expect("reply draft retained");
+            let error = form.errors.general.as_deref().unwrap();
+            assert!(error.contains("Message #41"), "{error}");
+            assert!(error.contains("project 'proj'"), "{error}");
+            assert_eq!(form.body_input.text(), "Keep this reply draft.");
+            assert_eq!(form.context.original_sender_label, "BlueLake");
+            assert_eq!(form.context.original_body_md, "Original historical body");
+            assert_eq!(form.context.thread_id.as_deref(), Some("history-41"));
+            let conn = screen.db_conn.as_ref().unwrap();
+            assert_eq!(compose_history_values(conn), before);
+            assert!(
+                conn.query_sync("SELECT id FROM agents WHERE name = 'HumanOverseer'", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quick_reply_admission_preserves_orphan_scope_and_refuses_missing_sender() {
+        let (_dir, _config, conn) = compose_lifecycle_fixture();
+        let recipient = |project, message_id| {
+            query_quick_reply_recipient(
+                |sql, params| conn.query_sync(sql, params),
+                project,
+                message_id,
+            )
+        };
+        assert_eq!(recipient("proj", 41).unwrap().id, 1);
+        assert!(recipient("other", 41).unwrap_err().contains("unavailable"));
+        assert!(recipient("proj", 999).unwrap_err().contains("unavailable"));
+        assert!(
+            recipient("[unknown-project-77]", 41)
+                .unwrap_err()
+                .contains("unavailable")
+        );
+        conn.execute_raw("PRAGMA foreign_keys = OFF; DELETE FROM projects WHERE id = 77;")
+            .unwrap();
+        assert_eq!(recipient("[unknown-project-77]", 41).unwrap().id, 1);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (77, '[unknown-project-77]', '[unknown-project-77]', 1);",
+        )
+        .unwrap();
+        assert_eq!(recipient("[unknown-project-77]", 41).unwrap().id, 1);
+        conn.execute_raw("UPDATE messages SET sender_id = 999 WHERE id = 41")
+            .unwrap();
+        assert!(
+            recipient("[unknown-project-77]", 41)
+                .unwrap_err()
+                .contains("original sender")
+        );
+    }
+
+    fn commit_compose_profile_fixture(
+        repo: &git2::Repository,
+        relative: &Path,
+        bytes: &[u8],
+    ) -> git2::Oid {
+        let path = repo.workdir().unwrap().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(relative).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<_> = parent.iter().collect();
+        let signature =
+            git2::Signature::now("Lifecycle fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "retained operator profile",
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compose_sender_heartbeat_preserves_committed_profile_and_refuses_inactive_identity() {
+        let (_dir, config, conn) = compose_lifecycle_fixture();
+        let token = "synthetic-operator-registration-secret"; // ubs:ignore -- synthetic token confined to this cfg(test) temporary DB fixture; never a deployed credential.
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts, contact_policy, reaper_exempt, registration_token) \
+             VALUES (10, 77, 'HumanOverseer', 'retained-program', 'retained-model', \
+                     '[deregistered note] ordinary operator task', 1, 1, 'contacts_only', 1, ?)",
+            &[Value::Text(token.into())],
+        )
+        .unwrap();
+        let state = TuiSharedState::new(&config);
+        let screen = MessageBrowserScreen::new();
+        let repo = git2::Repository::init(&config.storage_root).unwrap();
+        let relative = Path::new("projects/proj/agents/HumanOverseer/profile.json");
+        let mut profile = serde_json::json!({
+            "name": "HumanOverseer",
+            "program": "retained-program",
+            "model": "retained-model",
+            "task_description": "[deregistered note] ordinary operator task",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "contact_policy": "contacts_only",
+            "reaper_exempt": true,
+            "extensions": {"keep": ["all", "operator", "metadata"]}
+        });
+        for (transition, retired, deregistered, refusal) in [
+            (None, false, false, None),
+            (
+                Some("UPDATE agents SET retired_at = 20 WHERE id = 10"),
+                true,
+                false,
+                Some("retired"),
+            ),
+            (
+                Some("UPDATE agents SET retired_at = NULL WHERE id = 10"),
+                false,
+                false,
+                None,
+            ),
+            (
+                Some("INSERT INTO agent_deregistrations VALUES (10, 30)"),
+                false,
+                true,
+                Some("deregistered"),
+            ),
+        ] {
+            if let Some(sql) = transition {
+                conn.execute_raw(sql).unwrap();
+            }
+            profile["retired_at"] = if retired {
+                serde_json::json!("2026-01-03T00:00:00Z")
+            } else {
+                serde_json::Value::Null
+            };
+            profile["deregistered_at"] = if deregistered {
+                serde_json::json!("2026-01-04T00:00:00Z")
+            } else {
+                serde_json::Value::Null
+            };
+            let bytes = serde_json::to_vec_pretty(&profile).unwrap();
+            let head = commit_compose_profile_fixture(&repo, relative, &bytes);
+            let profile_sql = "SELECT id, project_id, name, program, model, task_description, inception_ts, \
+                               attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at \
+                               FROM agents WHERE id = 10";
+            let before: Vec<_> = conn.query_sync(profile_sql, &[]).unwrap()[0]
+                .values()
+                .cloned()
+                .collect();
+            let previous_activity = conn
+                .query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                .unwrap()[0]
+                .get_named::<i64>("last_active_ts")
+                .unwrap();
+            let result = screen.ensure_compose_sender("proj", Some(&state));
+            if let Some(reason) = refusal {
+                assert!(result.unwrap_err().contains(reason));
+                assert_eq!(
+                    conn.query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("last_active_ts")
+                        .unwrap(),
+                    previous_activity
+                );
+            } else {
+                result.expect("active operator heartbeat");
+                assert!(
+                    conn.query_sync("SELECT last_active_ts FROM agents WHERE id = 10", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("last_active_ts")
+                        .unwrap()
+                        >= previous_activity
+                );
+            }
+            let after: Vec<_> = conn.query_sync(profile_sql, &[]).unwrap()[0]
+                .values()
+                .cloned()
+                .collect();
+            assert_eq!(before, after, "heartbeat owns only last_active_ts");
+            assert_eq!(
+                std::fs::read(config.storage_root.join(relative)).unwrap(),
+                bytes
+            );
+            assert_eq!(repo.head().unwrap().target(), Some(head));
+            let committed = repo
+                .find_commit(head)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(relative)
+                .unwrap()
+                .id();
+            assert_eq!(repo.find_blob(committed).unwrap().content(), bytes);
+            assert!(!String::from_utf8(bytes).unwrap().contains(token));
+        }
+    }
+
     #[test]
     fn load_agent_names_for_placeholder_project_keeps_orphaned_agents_visible() {
         let dir = tempdir().expect("tempdir");
@@ -8663,8 +9708,13 @@ first body
         )
         .expect("seed message");
 
-        let (entries, total) =
-            fetch_recent_messages(&conn, PAGE_SIZE, Some("[unknown-project-77]"), true);
+        let (entries, total) = fetch_recent_messages(
+            &conn,
+            PAGE_SIZE,
+            Some("[unknown-project-77]"),
+            true,
+            MessageFilter::NONE,
+        );
 
         assert_eq!(total, 1);
         assert_eq!(entries.len(), 1);
@@ -8813,11 +9863,88 @@ first body
     #[test]
     fn apply_preset_sets_query() {
         let mut screen = MessageBrowserScreen::new();
-        screen.apply_preset(1); // "Urgent"
-        assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        screen.apply_preset(4); // "Error" is a text preset
+        assert_eq!(screen.preset_index, 4);
+        assert_eq!(screen.search_input.value(), "error");
         assert!(screen.search_dirty);
         assert_eq!(screen.debounce_remaining, 0);
+    }
+
+    #[test]
+    fn importance_and_ack_presets_filter_columns_not_words() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(1); // "Urgent"
+        assert_eq!(screen.search_input.value(), "", "no word is injected");
+        let urgent = screen.active_preset().filter;
+        assert_eq!(urgent.importance, Some("urgent"));
+
+        let mut flagged = test_message_entry(1, "t", "deploy");
+        flagged.importance = "urgent".to_string();
+        // The old text preset matched this one and missed the one above.
+        let mentions_word = test_message_entry(2, "t", "urgent: please read");
+        let mut live = test_message_entry(-1, "t", "urgent");
+        live.importance = "normal".to_string();
+        assert!(urgent.matches(&flagged));
+        assert!(!urgent.matches(&mentions_word));
+        assert!(!urgent.matches(&live), "live entries carry no importance");
+
+        screen.apply_preset(3); // "Ack"
+        let ack = screen.active_preset().filter;
+        let mut needs_ack = test_message_entry(3, "t", "s");
+        needs_ack.ack_required = true;
+        assert!(ack.matches(&needs_ack));
+        assert!(!ack.matches(&flagged));
+
+        assert!(!MessageFilter::NONE.is_active());
+        assert!(MessageFilter::NONE.matches(&mentions_word));
+    }
+
+    #[test]
+    fn fetch_recent_messages_applies_the_preset_filter_to_rows_and_total() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+        conn.execute_raw("INSERT INTO projects (id, slug) VALUES (7, 'proj')")
+            .expect("seed project");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, subject TEXT, topic TEXT, body_md TEXT,
+                thread_id TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER,
+                sender_id INTEGER, project_id INTEGER, recipients_json TEXT
+            )",
+        )
+        .expect("create messages");
+        // Message 2 only mentions the word; message 4 is in another project.
+        for (id, subject, importance, ack, project) in [
+            (1, "deploy", "urgent", 0, 7),
+            (2, "urgent: please read", "normal", 0, 7),
+            (3, "review", "high", 1, 7),
+            (4, "elsewhere", "urgent", 1, 8),
+        ] {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, subject, body_md, thread_id, importance, \
+                 ack_required, created_ts, sender_id, project_id, recipients_json) \
+                 VALUES ({id}, '{subject}', 'b', 't', '{importance}', {ack}, {id}, 1, \
+                 {project}, '{{\"to\":[],\"cc\":[],\"bcc\":[]}}')"
+            ))
+            .expect("seed message");
+        }
+        let ids = |project: Option<&str>, filter: MessageFilter| {
+            let (entries, total) = fetch_recent_messages(&conn, PAGE_SIZE, project, true, filter);
+            let mut ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+            ids.sort_unstable();
+            (ids, total)
+        };
+        let urgent = QUERY_PRESETS[1].filter;
+        let ack = QUERY_PRESETS[3].filter;
+
+        assert_eq!(ids(None, MessageFilter::NONE), (vec![1, 2, 3, 4], 4));
+        assert_eq!(ids(None, urgent), (vec![1, 4], 2));
+        assert_eq!(ids(Some("proj"), urgent), (vec![1], 1));
+        assert_eq!(ids(None, ack), (vec![3, 4], 2));
+        assert_eq!(ids(Some("proj"), ack), (vec![3], 1));
     }
 
     #[test]
@@ -8837,7 +9964,8 @@ first body
         let p = Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')));
         screen.update(&p, &state);
         assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        assert_eq!(screen.active_preset().label, "Urgent");
+        assert_eq!(screen.active_preset().filter.importance, Some("urgent"));
     }
 
     #[test]
@@ -8852,18 +9980,15 @@ first body
     }
 
     #[test]
-    fn ctrl_c_resets_preset() {
+    fn capital_x_resets_preset() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.apply_preset(2);
         assert_eq!(screen.preset_index, 2);
 
-        let ctrl_c = Event::Key(ftui::KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: Modifiers::CTRL,
-            kind: KeyEventKind::Press,
-        });
-        screen.update(&ctrl_c, &state);
+        // X, not Ctrl+C: the shell owns Ctrl+C, so it never reaches a screen.
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('X')));
+        screen.update(&clear, &state);
         assert_eq!(screen.preset_index, 0);
         assert_eq!(screen.search_input.value(), "");
     }
@@ -9759,90 +10884,245 @@ first body
 
     // ── Batch operation tests (br-2bbt.10) ──────────────────────────
 
-    #[test]
-    fn batch_acknowledge_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(10, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(20, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(30, "thread-c", "Three"));
-        screen.selected_message_ids.select(10);
-        screen.selected_message_ids.select(30);
+    /// GreenCastle → BlueLake, cc RedFox, ack required; returns the message id.
+    fn send_to_bluelake_cc_redfox(project_key: &str, subject: &str) -> i64 {
+        let sent: serde_json::Value = serde_json::from_str(
+            &block_on(mcp_agent_mail_tools::messaging::send_message(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GreenCastle".to_string(),
+                vec!["BlueLake".to_string()],
+                subject.to_string(),
+                "body".to_string(),
+                Some(vec!["RedFox".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .expect("send_message"),
+        )
+        .expect("send_message JSON");
+        sent["deliveries"][0]["payload"]["id"]
+            .as_i64()
+            .expect("message id")
+    }
 
-        let cmd = screen.handle_action("batch_acknowledge", "batch:10,30");
-        // Should clear selection
-        assert!(screen.selected_message_ids.is_empty());
-        // Should return a batch of individual acknowledge commands
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 acknowledge actions");
-            }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+    /// `(agent, read, acked)` for each recipient of one message, from the mailbox.
+    fn recipient_receipts(id: i64) -> Vec<(String, bool, bool)> {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            let rows = conn
+                .query_sync(
+                    "SELECT a.name AS name, r.read_ts IS NOT NULL AS read, \
+                     r.ack_ts IS NOT NULL AS acked \
+                     FROM message_recipients r JOIN agents a ON a.id = r.agent_id \
+                     WHERE r.message_id = ? ORDER BY a.name",
+                    &[Value::BigInt(id)],
+                )
+                .expect("receipts");
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get_named::<String>("name").expect("name"),
+                        row.get_named::<i64>("read").expect("read") == 1,
+                        row.get_named::<i64>("acked").expect("acked") == 1,
+                    )
+                })
+                .collect()
+        })
     }
 
     #[test]
-    fn batch_mark_read_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(5, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(6, "thread-b", "Two"));
-        screen.selected_message_ids.select(5);
-        screen.selected_message_ids.select(6);
-
-        let cmd = screen.handle_action("batch_mark_read", "batch:5,6");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 mark_read actions");
+    fn action_menu_message_receipts_reach_the_mailbox() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let send = |subject: &str| send_to_bluelake_cc_redfox(project_key, subject);
+            let receipts = recipient_receipts;
+            let first = send("first");
+            let second = send("second");
+            let untouched = send("untouched");
+            let mut screen = MessageBrowserScreen::new();
+            for (id, subject) in [
+                (first, "first"),
+                (second, "second"),
+                (untouched, "untouched"),
+            ] {
+                screen.results.push(MessageEntry {
+                    to_agents: "BlueLake, RedFox".to_string(),
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "thread", subject)
+                });
             }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{first}"), ""));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "acknowledge"),
+                "{text}"
+            );
+            assert!(text.contains("2 recipient"), "{text}");
+            let acked: Vec<bool> = receipts(first).iter().map(|r| r.2).collect();
+            assert_eq!(acked, [true, true], "both recipients acknowledged");
+
+            screen.selected_message_ids.select(first);
+            screen.selected_message_ids.select(second);
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action("batch_mark_read", "batch:"));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "batch_mark_read"),
+                "{text}"
+            );
+            assert!(screen.selected_message_ids.is_empty());
+            for id in [first, second] {
+                let read: Vec<bool> = receipts(id).iter().map(|r| r.1).collect();
+                assert_eq!(read, [true, true], "#{id} read for both recipients");
+            }
+            assert_eq!(
+                receipts(second).iter().map(|r| r.2).collect::<Vec<_>>(),
+                [false, false],
+                "marking read does not acknowledge"
+            );
+            assert_eq!(
+                receipts(untouched),
+                [
+                    ("BlueLake".to_string(), false, false),
+                    ("RedFox".to_string(), false, false)
+                ],
+                "an unselected message is left alone"
+            );
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("mark_read:999999", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
     }
 
     #[test]
-    fn batch_mark_unread_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(7, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(8, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(9, "thread-c", "Three"));
-        screen.selected_message_ids.select(7);
-        screen.selected_message_ids.select(8);
-        screen.selected_message_ids.select(9);
-
-        let cmd = screen.handle_action("batch_mark_unread", "batch:7,8,9");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 3, "should dispatch 3 mark_unread actions");
+    fn action_menu_receipts_support_shared_only_and_mixed_deliveries() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            for mixed in [false, true] {
+                let mut to = vec![mcp_agent_mail_db::project_mailbox::project_mailbox_address(
+                    &slug,
+                )];
+                if mixed {
+                    to.push("BlueLake".to_string());
+                }
+                let sent: serde_json::Value = serde_json::from_str(
+                    &block_on(mcp_agent_mail_tools::messaging::send_message(
+                        &operator_tool_context(),
+                        project_key.to_string(),
+                        "GreenCastle".to_string(),
+                        to,
+                        "operator shared receipt".to_string(),
+                        "body".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(true),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                let id = sent["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+                let mut screen = MessageBrowserScreen::new();
+                screen.results.push(MessageEntry {
+                    to_agents: if mixed {
+                        format!("BlueLake, project:{slug}")
+                    } else {
+                        format!("project:{slug}")
+                    },
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "shared", "operator shared receipt")
+                });
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("mark_read:{id}"), ""));
+                assert_eq!(status, "ok", "{text}");
+                assert!(text.contains("2 recipient"), "{text}");
+                let shared_before = crate::tui_screens::with_operator_test_conn(|conn| {
+                    conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = ? ORDER BY agent_id",
+                        &[Value::BigInt(id)],
+                    ).unwrap().iter().map(|row| (
+                        row.get_named::<i64>("agent_id").unwrap(),
+                        row.get_named::<Option<i64>>("read_ts").unwrap(),
+                        row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    )).collect::<Vec<_>>()
+                });
+                assert_eq!(shared_before.len(), if mixed { 1 } else { 2 });
+                assert!(
+                    shared_before
+                        .iter()
+                        .all(|(_, read, ack)| read.is_some() && ack.is_none())
+                );
+                let (status, _, text) =
+                    expect_operator_result(screen.handle_action(&format!("acknowledge:{id}"), ""));
+                assert_eq!(status, "ok", "{text}");
+                let shared_after = crate::tui_screens::with_operator_test_conn(|conn| {
+                    conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = ? ORDER BY agent_id",
+                        &[Value::BigInt(id)],
+                    ).unwrap().iter().map(|row| (
+                        row.get_named::<i64>("agent_id").unwrap(),
+                        row.get_named::<Option<i64>>("read_ts").unwrap(),
+                        row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    )).collect::<Vec<_>>()
+                });
+                assert!(shared_after.iter().all(|(_, _, ack)| ack.is_some()));
+                assert_eq!(
+                    shared_after
+                        .iter()
+                        .map(|(agent, read, _)| (*agent, *read))
+                        .collect::<Vec<_>>(),
+                    shared_before
+                        .iter()
+                        .map(|(agent, read, _)| (*agent, *read))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    recipient_receipts(id),
+                    if mixed {
+                        vec![("BlueLake".to_string(), true, true)]
+                    } else {
+                        vec![]
+                    }
+                );
             }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+        });
     }
 
     #[test]
-    fn batch_acknowledge_with_empty_selection_returns_noop() {
+    fn batch_acknowledge_with_empty_selection_reports_it() {
         let mut screen = MessageBrowserScreen::new();
         let cmd = screen.handle_action("batch_acknowledge", "batch:");
-        // Cmd::batch with empty vec collapses to Cmd::None
-        assert!(
-            matches!(cmd, Cmd::None | Cmd::Batch(_)),
-            "empty selection should produce noop or empty batch"
+        let (status, op, text) = crate::tui_screens::expect_operator_result(cmd);
+        assert_eq!(
+            (status.as_str(), op.as_str()),
+            ("error", "batch_acknowledge")
         );
+        assert_eq!(text, "no message selected");
     }
 
     #[test]

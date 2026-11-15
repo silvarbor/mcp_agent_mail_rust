@@ -15,11 +15,19 @@
 //! All downstream subsystems (liveness, conflict, routing, calibration)
 //! are built on top of these two primitives.
 
+use mcp_agent_mail_db::models::{
+    ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+    ATC_POPULATION_MAX_PROJECT_BYTES,
+};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
+
+#[path = "atc_outcomes.rs"]
+mod outcomes;
+use outcomes::{BoundedOutcomes, OutcomeEvidence, latest_outcome};
 
 fn u64_to_f64(value: u64) -> f64 {
     #[allow(clippy::cast_precision_loss)]
@@ -129,6 +137,11 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     ///
     /// `prior` must be a valid probability distribution (non-negative, sums to ~1).
     /// `loss_entries` are `(action, state, cost)` triples.
+    ///
+    /// # Panics
+    /// Panics on an empty action/state domain, duplicate prior states, or loss
+    /// entries outside the prior's state domain. These are caller invariants
+    /// for the typed decision policy, not values decoded from an MCP request.
     pub fn new(prior: &[(S, f64)], loss_entries: &[(A, S, f64)], alpha: f64) -> Self {
         let mut actions = Vec::new();
         let mut action_index = HashMap::new();
@@ -162,6 +175,7 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
                 .copied()
                 .expect("DecisionCore action index must exist");
             let state_idx = state_index.get(&state).copied().unwrap_or_else(|| {
+                // ubs:ignore rust.ownership.panic-macro -- intentional constructor invariant; loss states must belong to the supplied prior.
                 panic!("DecisionCore loss entry references unknown state: {state:?}")
             });
             loss_matrix[action_idx * state_count + state_idx] = cost;
@@ -327,15 +341,19 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     }
 
     /// Update a single loss entry while keeping the dense matrix coherent.
+    ///
+    /// # Panics
+    /// Panics if the action or state is outside this policy's fixed domain.
+    /// Callers update entries enumerated from that domain.
     pub fn set_loss_entry(&mut self, action: A, state: S, cost: f64) {
-        let action_idx =
-            self.action_index.get(&action).copied().unwrap_or_else(|| {
-                panic!("DecisionCore unknown action in set_loss_entry: {action:?}")
-            });
-        let state_idx =
-            self.state_index.get(&state).copied().unwrap_or_else(|| {
-                panic!("DecisionCore unknown state in set_loss_entry: {state:?}")
-            });
+        let action_idx = self.action_index.get(&action).copied().unwrap_or_else(|| {
+            // ubs:ignore rust.ownership.panic-macro -- intentional fixed-domain API invariant, not a request-selected action.
+            panic!("DecisionCore unknown action in set_loss_entry: {action:?}")
+        });
+        let state_idx = self.state_index.get(&state).copied().unwrap_or_else(|| {
+            // ubs:ignore rust.ownership.panic-macro -- intentional fixed-domain API invariant, not a request-selected state.
+            panic!("DecisionCore unknown state in set_loss_entry: {state:?}")
+        });
         let offset = self.loss_offset(action_idx, state_idx);
         self.loss_matrix[offset] = cost;
     }
@@ -1806,6 +1824,23 @@ pub const ATC_AGENT_NAME: &str = "AirTrafficControl";
 // Conflict Detector (Track 3)
 // ──────────────────────────────────────────────────────────────────────
 
+// The population limit also bounds total retained conflict edges, and therefore
+// nonempty projects. Bound detail within an edge as well: a single long-lived
+// holder/blocker pair must not retain every path it has ever contested.
+const MAX_CONFLICT_PATTERNS_PER_EDGE: usize = 32;
+const MAX_CONFLICT_PATTERN_BYTES_PER_EDGE: usize = 4_096;
+const MAX_CONFLICT_PROJECT_BYTES: usize = 4_096;
+// Match the agent identity byte limit in mcp_agent_mail_core::models.
+const MAX_CONFLICT_AGENT_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAdmission {
+    Unchanged,
+    Updated,
+    Added,
+    Refused,
+}
+
 /// A hard conflict edge: agent `holder` has an exclusive reservation
 /// overlapping with agent `blocked`.
 #[derive(Debug, Clone)]
@@ -1831,6 +1866,10 @@ pub struct ProjectConflictGraph {
 }
 
 impl ProjectConflictGraph {
+    fn edge_count(&self) -> usize {
+        self.hard_edges.values().map(Vec::len).sum()
+    }
+
     fn patterns_overlap(left: &str, right: &str) -> bool {
         let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
         let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
@@ -1852,25 +1891,48 @@ impl ProjectConflictGraph {
         requested_path: &str,
         holder_path_pattern: &str,
         since: i64,
-    ) -> bool {
+        can_add_edge: bool,
+    ) -> ConflictAdmission {
         if holder.is_empty() || blocked.is_empty() || holder == blocked {
-            return false;
+            return ConflictAdmission::Unchanged;
+        }
+        if holder.len() > MAX_CONFLICT_AGENT_BYTES || blocked.len() > MAX_CONFLICT_AGENT_BYTES {
+            return ConflictAdmission::Refused;
         }
 
-        let edges = self.hard_edges.entry(holder.to_string()).or_default();
-        if let Some(edge) = edges.iter_mut().find(|edge| edge.blocked == blocked) {
-            let mut changed = false;
-            for pattern in [requested_path, holder_path_pattern] {
-                if !pattern.is_empty()
-                    && !edge
-                        .contested_patterns
-                        .iter()
-                        .any(|existing| existing == pattern)
-                {
-                    edge.contested_patterns.push(pattern.to_string());
-                    changed = true;
-                }
+        let patterns = [requested_path, holder_path_pattern];
+        if let Some(edge) = self
+            .hard_edges
+            .get_mut(holder)
+            .and_then(|edges| edges.iter_mut().find(|edge| edge.blocked == blocked))
+        {
+            let missing: Vec<&str> = patterns
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, pattern)| {
+                    (!pattern.is_empty()
+                        && (index == 0 || pattern != requested_path)
+                        && !edge
+                            .contested_patterns
+                            .iter()
+                            .any(|existing| existing == pattern))
+                    .then_some(pattern)
+                })
+                .collect();
+            let retained_bytes: usize = edge.contested_patterns.iter().map(String::len).sum();
+            let added_bytes = missing.iter().fold(0_usize, |bytes, pattern| {
+                bytes.saturating_add(pattern.len())
+            });
+            if edge.contested_patterns.len() + missing.len() > MAX_CONFLICT_PATTERNS_PER_EDGE
+                || retained_bytes.saturating_add(added_bytes) > MAX_CONFLICT_PATTERN_BYTES_PER_EDGE
+            {
+                // Refuse the whole observation; never partially overwrite or
+                // evict retained evidence to make new detail appear complete.
+                return ConflictAdmission::Refused;
             }
+            let mut changed = !missing.is_empty();
+            edge.contested_patterns
+                .extend(missing.into_iter().map(str::to_string));
             if since > 0 && (edge.since == 0 || since < edge.since) {
                 edge.since = since;
                 changed = true;
@@ -1880,25 +1942,47 @@ impl ProjectConflictGraph {
                 edge.contested_patterns.dedup();
                 self.bump_generation();
             }
-            return changed;
+            return if changed {
+                ConflictAdmission::Updated
+            } else {
+                ConflictAdmission::Unchanged
+            };
         }
 
+        if !can_add_edge {
+            return ConflictAdmission::Refused;
+        }
+
+        let pattern_bytes =
+            requested_path
+                .len()
+                .saturating_add(if holder_path_pattern == requested_path {
+                    0
+                } else {
+                    holder_path_pattern.len()
+                });
+        if pattern_bytes > MAX_CONFLICT_PATTERN_BYTES_PER_EDGE {
+            return ConflictAdmission::Refused;
+        }
         let mut contested_patterns = Vec::new();
-        for pattern in [requested_path, holder_path_pattern] {
+        for pattern in patterns {
             if !pattern.is_empty() {
                 contested_patterns.push(pattern.to_string());
             }
         }
         contested_patterns.sort();
         contested_patterns.dedup();
-        edges.push(HardEdge {
-            holder: holder.to_string(),
-            blocked: blocked.to_string(),
-            contested_patterns,
-            since,
-        });
+        self.hard_edges
+            .entry(holder.to_string())
+            .or_default()
+            .push(HardEdge {
+                holder: holder.to_string(),
+                blocked: blocked.to_string(),
+                contested_patterns,
+                since,
+            });
         self.bump_generation();
-        true
+        ConflictAdmission::Added
     }
 
     fn clear_blocked_conflicts_for_grant(
@@ -3292,6 +3376,11 @@ pub struct AtcConfig {
     pub cusum_delta: f64,
     /// Evidence ledger ring buffer capacity.
     pub ledger_capacity: usize,
+    /// Maximum retained liveness identities and total conflict edges (which
+    /// also bounds nonempty conflict projects). Existing evidence is never
+    /// evicted for new arrivals. Refusals leave the corresponding coverage
+    /// incomplete until the engine is reset.
+    pub max_tracked_agents: usize,
     /// Tick budget (microseconds) — warn if exceeded.
     pub tick_budget_micros: u64,
     /// Suspicion k-factor for rhythm-based detection.
@@ -3311,6 +3400,7 @@ impl Default for AtcConfig {
             cusum_threshold: 5.0,
             cusum_delta: 0.1,
             ledger_capacity: 1000,
+            max_tracked_agents: mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_DEFAULT,
             tick_budget_micros: 5_000,
             suspicion_k: 3.0,
         }
@@ -3351,6 +3441,22 @@ pub struct AtcStageTimings {
 pub struct AtcKernelTelemetry {
     pub due_agents: usize,
     pub scheduled_agents: usize,
+    pub tracked_agents: usize,
+    pub max_tracked_agents: usize,
+    /// Refused identity-count or metadata-byte admissions, not distinct agents.
+    pub agent_capacity_refusals: u64,
+    /// Latches after the first refusal; resetting the engine clears it.
+    pub agent_coverage_incomplete: bool,
+    pub conflict_projects: usize,
+    pub conflict_edges: usize,
+    pub max_conflict_edges: usize,
+    pub max_conflict_patterns_per_edge: usize,
+    pub max_conflict_pattern_bytes_per_edge: usize,
+    /// Refused conflict observations, not a count of distinct identities.
+    pub conflict_capacity_refusals: u64,
+    /// Latches on any refused conflict identity, edge, or pattern detail.
+    /// Expiring retained edges cannot prove that omitted evidence expired.
+    pub conflict_coverage_incomplete: bool,
     pub next_due_micros: Option<i64>,
     pub dirty_agents: usize,
     pub dirty_projects: usize,
@@ -3583,6 +3689,7 @@ impl AtcLivenessPolicyArtifact {
         &self,
         posterior: &[(LivenessState, f64)],
         release_guard_active: bool,
+        mandatory_release_guard: bool,
     ) -> (LivenessAction, f64, f64) {
         let mut best_action = LivenessAction::DeclareAlive;
         let mut best_loss = f64::INFINITY;
@@ -3592,8 +3699,7 @@ impl AtcLivenessPolicyArtifact {
             LivenessAction::Suspect,
             LivenessAction::ReleaseReservations,
         ] {
-            if release_guard_active
-                && self.release_guard_enabled
+            if (mandatory_release_guard || (release_guard_active && self.release_guard_enabled))
                 && action == LivenessAction::ReleaseReservations
             {
                 continue;
@@ -3962,6 +4068,10 @@ pub struct AtcEngine {
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
+    /// Saturating count of identity or metadata admissions refused at capacity.
+    /// A nonzero count permanently marks liveness coverage as incomplete;
+    /// forgetting the refused identities must not restore release authority.
+    agent_capacity_refusals: u64,
     /// Cached deterministic agent ordering for summary rendering.
     sorted_agent_names: Vec<String>,
     /// Whether the cached agent ordering must be rebuilt.
@@ -3972,9 +4082,13 @@ pub struct AtcEngine {
     dirty_agents: BTreeSet<String>,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
+    /// Total edges across all projects, bounded by `max_tracked_agents`.
+    conflict_edge_count: usize,
+    /// Saturating refusal count; latches incomplete coverage until reset.
+    conflict_capacity_refusals: u64,
     /// Projects whose conflict state has changed since the last cached render.
     dirty_projects: HashSet<String>,
-    /// Monotone communication/session synthesis for operator summaries.
+    /// Lifetime communication totals with bounded recent entity detail.
     session_summary: SessionSummary,
     /// Cross-thread participation graph for communication-aware coordination.
     thread_participation: ThreadParticipationGraph,
@@ -4031,16 +4145,19 @@ pub struct AtcEngine {
     agent_intervention_counts: HashMap<String, u64>,
     /// Cached state from the previous snapshot for delta computation.
     prev_snapshot_state: PrevSnapshotState,
-    /// Recent reservation lifecycle events for expiry sweep correlation (br-bn0vb.10).
+    /// Recent reservation lifecycle outcomes for expiry sweep correlation
+    /// (br-bn0vb.10). Paths are not retained: outcome correlation only needs the
+    /// scoped identity, event kind, and timestamp.
     /// Ring buffer bounded to MAX_RESERVATION_EVENT_LOG entries.
     reservation_event_log: VecDeque<ReservationEvent>,
-    /// Per-agent last-outcome index. Survives ring buffer eviction so the
-    /// sweep can always find the most recent non-Granted outcome even after
-    /// a flood of events from other agents pushes the original event out.
-    reservation_last_outcome: HashMap<String, (ReservationEventKind, i64)>,
+    /// Bounded per-project, per-agent outcomes that survive event-ring eviction.
+    /// Under index pressure, its timestamp floor also invalidates older ring
+    /// evidence so forgetting a newer outcome cannot invent a successful one.
+    reservation_last_outcome: BoundedOutcomes<(String, String), ReservationEventKind>,
 }
 
 const MAX_RESERVATION_EVENT_LOG: usize = 512;
+const MAX_RESERVATION_OUTCOME_IDENTITIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 // `atc.rs` re-exports this module with `pub use engine::*` from a `pub mod atc`,
@@ -4050,10 +4167,7 @@ const MAX_RESERVATION_EVENT_LOG: usize = 512;
 pub(crate) struct ReservationEvent {
     pub kind: ReservationEventKind,
     pub agent: String,
-    #[allow(dead_code)]
     pub project: String,
-    #[allow(dead_code)]
-    pub paths: Vec<String>,
     pub timestamp_micros: i64,
 }
 
@@ -4104,7 +4218,10 @@ impl AtcEngine {
 
     /// Create a new ATC engine with the given configuration.
     #[must_use]
-    pub fn new(config: AtcConfig) -> Self {
+    pub fn new(mut config: AtcConfig) -> Self {
+        config.max_tracked_agents = config
+            .max_tracked_agents
+            .clamp(1, mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX);
         let calibration = CalibrationGuard::new(config.safe_mode_recovery_count);
         let eprocess = EProcessMonitor::new(0.85, config.eprocess_alert_threshold);
         let cusum = CusumDetector::new(0.15, config.cusum_threshold, config.cusum_delta);
@@ -4153,11 +4270,14 @@ impl AtcEngine {
             liveness_core,
             conflict_core: default_conflict_core(),
             agents: HashMap::new(),
+            agent_capacity_refusals: 0,
             sorted_agent_names: Vec::new(),
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
             dirty_agents: BTreeSet::new(),
             conflict_graphs: HashMap::new(),
+            conflict_edge_count: 0,
+            conflict_capacity_refusals: 0,
             dirty_projects: HashSet::new(),
             session_summary: SessionSummary::default(),
             thread_participation: ThreadParticipationGraph::default(),
@@ -4191,7 +4311,7 @@ impl AtcEngine {
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
             reservation_event_log: VecDeque::new(),
-            reservation_last_outcome: HashMap::new(),
+            reservation_last_outcome: BoundedOutcomes::new(MAX_RESERVATION_OUTCOME_IDENTITIES),
         }
     }
 
@@ -4386,19 +4506,19 @@ impl AtcEngine {
             kind: ReservationEventKind::Granted,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
         if !exclusive || paths.is_empty() {
             return;
         }
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_released(
@@ -4417,16 +4537,16 @@ impl AtcEngine {
             kind: ReservationEventKind::Released,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_renewed(
@@ -4445,17 +4565,17 @@ impl AtcEngine {
             kind: ReservationEventKind::Renewed,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
         if !paths.is_empty() {
-            let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+            let Some(graph) = self.conflict_graphs.get_mut(project) else {
+                return;
+            };
+            let before = graph.edge_count();
             let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-            if cleared > 0 {
-                self.dirty_projects.insert(project.to_string());
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-            }
+            let removed_edges = before.saturating_sub(graph.edge_count());
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+            self.finish_conflict_resolution(project, cleared, timestamp_micros);
         }
     }
 
@@ -4475,61 +4595,148 @@ impl AtcEngine {
             kind: ReservationEventKind::ForceReleased,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
-    pub(crate) fn note_reservation_conflicts(
+    pub(crate) fn note_reservation_conflicts<T: AsRef<str>>(
         &mut self,
         requester: &str,
         project: &str,
-        conflicts: &[(String, String, String)],
+        conflicts: &[(T, T, T)],
         timestamp_micros: i64,
     ) {
         if requester.is_empty() || conflicts.is_empty() {
             return;
         }
-        let conflict_paths: Vec<String> = conflicts
-            .iter()
-            .map(|(_, requested_path, _)| requested_path.clone())
-            .collect();
+        if requester.len() > MAX_CONFLICT_AGENT_BYTES || project.len() > MAX_CONFLICT_PROJECT_BYTES
+        {
+            self.note_conflict_capacity_refusals(conflicts.len());
+            // Do not clone an oversized identity into the outcome ring/index.
+            // Its missing newer conflict must not expose older successful
+            // evidence from either view as the apparent latest observation.
+            self.reservation_last_outcome
+                .forget_through(timestamp_micros);
+            return;
+        }
         self.push_reservation_event(ReservationEvent {
             kind: ReservationEventKind::Conflicted,
             agent: requester.to_string(),
             project: project.to_string(),
-            paths: conflict_paths,
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
-        let mut added = false;
+        let mut changed = false;
+        let mut refused = 0_usize;
         for (holder, requested_path, holder_path_pattern) in conflicts {
-            added |= graph.record_blocking_conflict(
-                holder,
-                requester,
-                requested_path,
-                holder_path_pattern,
-                timestamp_micros,
-            );
+            let holder = holder.as_ref();
+            if holder.is_empty() || holder == requester {
+                continue;
+            }
+            let can_add_edge = self.conflict_edge_count < self.config.max_tracked_agents;
+            let admission = if let Some(graph) = self.conflict_graphs.get_mut(project) {
+                graph.record_blocking_conflict(
+                    holder,
+                    requester,
+                    requested_path.as_ref(),
+                    holder_path_pattern.as_ref(),
+                    timestamp_micros,
+                    can_add_edge,
+                )
+            } else if can_add_edge {
+                let mut graph = ProjectConflictGraph::default();
+                let admission = graph.record_blocking_conflict(
+                    holder,
+                    requester,
+                    requested_path.as_ref(),
+                    holder_path_pattern.as_ref(),
+                    timestamp_micros,
+                    true,
+                );
+                // Never allocate empty project/cache identities for invalid or
+                // refused observations. Nonempty projects cannot exceed edges.
+                if admission == ConflictAdmission::Added {
+                    self.conflict_graphs.insert(project.to_string(), graph);
+                }
+                admission
+            } else {
+                ConflictAdmission::Refused
+            };
+            match admission {
+                ConflictAdmission::Added => {
+                    self.conflict_edge_count += 1;
+                    changed = true;
+                }
+                ConflictAdmission::Updated => changed = true,
+                ConflictAdmission::Refused => refused = refused.saturating_add(1),
+                ConflictAdmission::Unchanged => {}
+            }
         }
-        if added {
+        self.note_conflict_capacity_refusals(refused);
+        if changed {
             self.dirty_projects.insert(project.to_string());
             self.session_summary
                 .absorb(&SynthesisEvent::ConflictDetected { timestamp_micros });
         }
     }
 
+    fn note_conflict_capacity_refusals(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.conflict_capacity_refusals == 0 {
+            self.mark_agents_dirty();
+        }
+        self.conflict_capacity_refusals = self
+            .conflict_capacity_refusals
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+
+    fn finish_conflict_resolution(&mut self, project: &str, cleared: usize, timestamp_micros: i64) {
+        if self
+            .conflict_graphs
+            .get(project)
+            .is_some_and(|graph| graph.hard_edges.is_empty())
+        {
+            // Project identities must live only as long as their conflicts.
+            // Keeping empty graphs also grows the deadlock cache and makes
+            // every future tick revisit all historical reservation projects.
+            self.conflict_graphs.remove(project);
+            self.dirty_projects.remove(project);
+            if let Some(cached) = self.deadlock_cache.remove(project) {
+                self.deadlock_cycle_total = self
+                    .deadlock_cycle_total
+                    .saturating_sub(cached.cycles.len());
+            }
+        } else if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+        }
+        if cleared > 0 {
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+        }
+    }
+
     fn push_reservation_event(&mut self, event: ReservationEvent) {
-        if !matches!(event.kind, ReservationEventKind::Granted) {
-            self.reservation_last_outcome
-                .insert(event.agent.clone(), (event.kind, event.timestamp_micros));
+        if event.kind != ReservationEventKind::Granted
+            && !event.project.trim().is_empty()
+            && !event.agent.trim().is_empty()
+        {
+            self.reservation_last_outcome.observe(
+                (
+                    event.project.trim().to_string(),
+                    event.agent.to_ascii_lowercase(),
+                ),
+                event.kind,
+                event.timestamp_micros,
+            );
         }
         if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
             self.reservation_event_log.pop_front();
@@ -4540,36 +4747,40 @@ impl AtcEngine {
     pub(crate) fn reservation_outcome_for_agent(
         &self,
         agent: &str,
+        project: &str,
         since_micros: i64,
     ) -> Option<ReservationEventKind> {
-        for event in self.reservation_event_log.iter().rev() {
-            if event.timestamp_micros < since_micros {
-                // Don't break — clock skew between agents can produce
-                // out-of-order timestamps in the ring buffer.
-                continue;
-            }
-            if event.agent.eq_ignore_ascii_case(agent) {
-                match event.kind {
-                    ReservationEventKind::Released => return Some(ReservationEventKind::Released),
-                    ReservationEventKind::ForceReleased => {
-                        return Some(ReservationEventKind::ForceReleased);
-                    }
-                    ReservationEventKind::Conflicted => {
-                        return Some(ReservationEventKind::Conflicted);
-                    }
-                    ReservationEventKind::Renewed => return Some(ReservationEventKind::Renewed),
-                    ReservationEventKind::Granted => {}
-                }
-            }
+        let project = project.trim();
+        if project.is_empty() || agent.trim().is_empty() {
+            return None;
         }
-        // Fallback: if the ring buffer evicted the event, consult the
-        // per-agent last-outcome cache (survives eviction).
-        for (cached_agent, (kind, ts)) in &self.reservation_last_outcome {
-            if cached_agent.eq_ignore_ascii_case(agent) && *ts >= since_micros {
-                return Some(*kind);
-            }
-        }
-        None
+        // Agent names are only unique within a project. Both the ring and its
+        // eviction fallback must carry that scope; an unrelated project's
+        // release is not evidence that this intervention succeeded. The index's
+        // forgetting floor applies to both lanes: an older ring entry must not
+        // become ground truth after a newer indexed outcome was discarded.
+        let recent = self.reservation_event_log.iter().filter_map(|event| {
+            (event.timestamp_micros >= since_micros
+                && self
+                    .reservation_last_outcome
+                    .retains_timestamp(event.timestamp_micros)
+                && event.kind != ReservationEventKind::Granted
+                && event.agent.eq_ignore_ascii_case(agent)
+                && crate::atc_project_keys_match(&event.project, project))
+            .then_some(OutcomeEvidence::observed(
+                event.timestamp_micros,
+                event.kind,
+            ))
+        });
+        let retained = self.reservation_last_outcome.iter().filter_map(
+            |((cached_project, cached_agent), evidence)| {
+                (evidence.timestamp_micros >= since_micros
+                    && cached_agent.eq_ignore_ascii_case(agent)
+                    && crate::atc_project_keys_match(cached_project, project))
+                .then_some(evidence)
+            },
+        );
+        latest_outcome(recent.chain(retained))
     }
 
     fn note_atc_intervention(&mut self, timestamp_micros: i64) {
@@ -4663,6 +4874,15 @@ impl AtcEngine {
     }
 
     fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
+        // Arrival time is not event time. An observation at or before the
+        // intervention cannot be evidence about that intervention's outcome.
+        if self
+            .pending_liveness_feedback
+            .get(agent)
+            .is_none_or(|pending| timestamp_micros <= pending.issued_at_micros)
+        {
+            return;
+        }
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
@@ -4733,44 +4953,49 @@ impl AtcEngine {
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.prune_stale_edges(cutoff));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: now_micros,
-                    });
-            }
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed);
+            self.finish_conflict_resolution(&project, removed, now_micros);
         }
     }
 
     fn prune_agent_from_conflict_graphs(&mut self, agent_name: &str) {
         let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        let timestamp_micros = mcp_agent_mail_core::timestamps::now_micros();
         for project in dirty_projects {
             let removed = self
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.remove_agent(agent_name));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                // Also note conflict resolved so UI updates
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: mcp_agent_mail_core::timestamps::now_micros(),
-                    });
-            }
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed);
+            self.finish_conflict_resolution(&project, removed, timestamp_micros);
+        }
+    }
+
+    fn capacity_guard_reason(&self) -> Option<&'static str> {
+        if self.agent_capacity_refusals > 0 {
+            Some("agent_capacity")
+        } else if self.conflict_capacity_refusals > 0 {
+            Some("conflict_capacity")
+        } else {
+            None
         }
     }
 
     fn current_release_guard_reason(&self) -> Option<String> {
-        if self.policy_bundle.validate().is_err() {
-            Some("policy_bundle_invalid".to_string())
-        } else if self.calibration.is_safe_mode() {
-            Some("calibration_safe_mode".to_string())
-        } else if self.slow_controller.probe_budget_fraction < 0.2 {
-            Some("budget_pressure".to_string())
-        } else {
-            None
-        }
+        self.capacity_guard_reason().map_or_else(
+            || {
+                if self.policy_bundle.validate().is_err() {
+                    Some("policy_bundle_invalid".to_string())
+                } else if self.calibration.is_safe_mode() {
+                    Some("calibration_safe_mode".to_string())
+                } else if self.slow_controller.probe_budget_fraction < 0.2 {
+                    Some("budget_pressure".to_string())
+                } else {
+                    None
+                }
+            },
+            |reason| Some(reason.to_string()),
+        )
     }
 
     fn mark_agents_dirty(&mut self) {
@@ -4842,13 +5067,15 @@ impl AtcEngine {
     }
 
     fn compact_liveness_schedule_if_needed(&mut self) {
-        let live_scheduled = self.scheduled_agent_count();
-        let max_heap_entries = live_scheduled.saturating_mul(4).max(64);
+        // This check runs for every activity and hydration reschedule while the
+        // engine mutex is held. Use tracked population as an O(1) upper bound
+        // instead of scanning the whole roster just to decide whether to rebuild.
+        let max_heap_entries = self.agents.len().saturating_mul(4).max(64);
         if self.liveness_schedule.len() <= max_heap_entries {
             return;
         }
 
-        let mut rebuilt = BinaryHeap::new();
+        let mut rebuilt = Vec::with_capacity(self.agents.len());
         for entry in self.agents.values() {
             if entry.next_review_micros == i64::MAX {
                 continue;
@@ -4859,7 +5086,8 @@ impl AtcEngine {
                 agent: entry.name.clone(),
             }));
         }
-        self.liveness_schedule = rebuilt;
+        // Heapify once instead of performing one logarithmic push per live entry.
+        self.liveness_schedule = BinaryHeap::from(rebuilt);
     }
 
     fn effective_threshold(base_k: f64, adaptive_k: Option<f64>, fallback_active: bool) -> f64 {
@@ -5043,10 +5271,24 @@ impl AtcEngine {
         from == ATC_AGENT_NAME || to.iter().any(|t| t == ATC_AGENT_NAME)
     }
 
-    /// Register a new agent for liveness tracking.
-    pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) {
-        if name == ATC_AGENT_NAME {
-            return; // self-exclusion
+    /// Register or update an agent for liveness tracking.
+    ///
+    /// Returns whether the identity is tracked. At capacity, existing agents
+    /// retain their state and feedback; new identities are refused without
+    /// allocating a liveness entry or scheduling work. Refusals latch incomplete
+    /// coverage until an engine reset, normally with a larger population limit.
+    /// Metadata byte limits also apply to existing-agent updates: retain the
+    /// last valid state and fail closed instead of truncating routing identity.
+    pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) -> bool {
+        if name.len() > ATC_POPULATION_MAX_NAME_BYTES
+            || program.len() > ATC_POPULATION_MAX_PROGRAM_BYTES
+            || project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES)
+        {
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
+            return false;
+        }
+        if name.trim().is_empty() || name == ATC_AGENT_NAME {
+            return false;
         }
         let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
         if let Some(entry) = self.agents.get_mut(name) {
@@ -5058,7 +5300,7 @@ impl AtcEngine {
                 // identical snapshot. Treat that as a true no-op: allocating
                 // replacement Strings and pushing another scheduler heap item
                 // every minute created needless long-running daemon churn.
-                return;
+                return true;
             }
             if project_changed {
                 entry.project_key = project_key.map(ToOwned::to_owned);
@@ -5075,6 +5317,10 @@ impl AtcEngine {
             }
             entry.core.sync_policy_from(&self.liveness_core);
         } else {
+            if self.agents.len() >= self.config.max_tracked_agents {
+                self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
+                return false;
+            }
             self.agents.insert(
                 name.to_string(),
                 AgentLivenessEntry {
@@ -5104,6 +5350,22 @@ impl AtcEngine {
             mcp_agent_mail_core::timestamps::now_micros(),
             incumbent_k,
         );
+        true
+    }
+
+    /// Called while the global engine lock is held, after admission succeeds.
+    /// Keep ENGINE -> THRESHOLDS ordering so a reset cannot interleave admission
+    /// and adaptive-state creation, and refused identities allocate no state.
+    fn ensure_adaptive_threshold(&self, name: &str) {
+        if let Some(thresholds) = ATC_THRESHOLDS.get()
+            && let Ok(mut thresholds) = thresholds.lock()
+            && !thresholds.contains_key(name)
+        {
+            thresholds.insert(
+                name.to_string(),
+                AdaptiveThreshold::new(self.config.suspicion_k),
+            );
+        }
     }
 
     /// Process an agent activity signal (message, reservation, commit).
@@ -5113,7 +5375,23 @@ impl AtcEngine {
         project_key: Option<&str>,
         timestamp_micros: i64,
     ) {
-        if agent == ATC_AGENT_NAME {
+        if agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
+            return;
+        }
+        let Some(entry) = self.agents.get(agent) else {
+            return;
+        };
+        // AgentRhythm keeps its timestamp monotonic, but stale observations
+        // previously still consumed feedback, changed project attribution,
+        // resurrected dead agents, and churned the scheduler.
+        if timestamp_micros <= entry.rhythm.last_activity_ts {
+            return;
+        }
+        if project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES) {
+            // A newer signal with unretainable routing metadata is incomplete
+            // evidence. Do not replace the project, consume pending feedback,
+            // or resurrect the agent from a partially accepted observation.
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
             return;
         }
         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
@@ -5153,6 +5431,9 @@ impl AtcEngine {
     pub(crate) fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
         let fallback_reason = self.current_release_guard_reason();
         let fallback_active = fallback_reason.is_some();
+        // Incomplete population or conflict coverage is an authority boundary,
+        // independent of whether a policy opts into the ordinary fallback guard.
+        let mandatory_release_guard = self.capacity_guard_reason().is_some();
         let incumbent_policy = self.incumbent_policy.clone();
         let candidate_policy = self.shadow_policy.candidate.clone();
         let due_agents = self.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
@@ -5202,7 +5483,11 @@ impl AtcEngine {
 
                     let (incumbent_action, incumbent_loss, runner_up_loss) = if incumbent_suspicious
                     {
-                        incumbent_policy.choose_action(entry.core.posterior(), fallback_active)
+                        incumbent_policy.choose_action(
+                            entry.core.posterior(),
+                            fallback_active,
+                            mandatory_release_guard,
+                        )
                     } else {
                         (
                             LivenessAction::DeclareAlive,
@@ -5218,8 +5503,11 @@ impl AtcEngine {
                         (LivenessAction::DeclareAlive, incumbent_loss),
                         |candidate| {
                             if candidate_suspicious {
-                                let (action, loss, _) = candidate
-                                    .choose_action(entry.core.posterior(), fallback_active);
+                                let (action, loss, _) = candidate.choose_action(
+                                    entry.core.posterior(),
+                                    fallback_active,
+                                    mandatory_release_guard,
+                                );
                                 (action, loss)
                             } else {
                                 (
@@ -5331,7 +5619,10 @@ impl AtcEngine {
         evaluation
     }
 
-    /// Check for deadlock cycles in all project conflict graphs.
+    /// Check for observed deadlock cycles in retained project conflict graphs.
+    /// After a capacity refusal this is partial evidence: an empty result is not
+    /// proof that no cycle exists. Summary completeness and the mandatory release
+    /// guard remain conservative until the engine is reset.
     #[must_use]
     pub fn detect_deadlocks(&mut self) -> Vec<(String, Vec<Vec<String>>)> {
         if self.deadlock_cache.is_empty() {
@@ -5383,6 +5674,28 @@ impl AtcEngine {
     ) -> AtcSummarySnapshot {
         self.snapshot_seq = self.snapshot_seq.saturating_add(1);
 
+        // Admission can change between ticks. Publish live coverage even when
+        // the remaining telemetry came from the previous tick (or startup).
+        let coverage_reason = self.capacity_guard_reason();
+        let coverage_incomplete = coverage_reason.is_some();
+        let mut kernel = kernel.clone();
+        kernel.tracked_agents = self.agents.len();
+        kernel.max_tracked_agents = self.config.max_tracked_agents;
+        kernel.agent_capacity_refusals = self.agent_capacity_refusals;
+        kernel.agent_coverage_incomplete = self.agent_capacity_refusals > 0;
+        kernel.conflict_projects = self.conflict_graphs.len();
+        kernel.conflict_edges = self.conflict_edge_count;
+        kernel.max_conflict_edges = self.config.max_tracked_agents;
+        kernel.max_conflict_patterns_per_edge = MAX_CONFLICT_PATTERNS_PER_EDGE;
+        kernel.max_conflict_pattern_bytes_per_edge = MAX_CONFLICT_PATTERN_BYTES_PER_EDGE;
+        kernel.conflict_capacity_refusals = self.conflict_capacity_refusals;
+        kernel.conflict_coverage_incomplete = self.conflict_capacity_refusals > 0;
+        let mut policy = policy.clone();
+        if let Some(reason) = coverage_reason {
+            policy.fallback_active = true;
+            policy.fallback_reason = Some(reason.to_string());
+        }
+
         // ── agent snapshots (deterministic order) ────────────────────
         let mut agent_states = Vec::with_capacity(self.agents.len());
         let agent_names: Vec<String> = self.sorted_agent_names().to_vec();
@@ -5407,7 +5720,9 @@ impl AtcEngine {
         let safe_mode = self.is_safe_mode();
         let execution_posture = if safe_mode {
             ExecutionPosture::SafeMode
-        } else if self.eprocess.miscalibrated() || self.slow_controller.probe_budget_fraction < 0.5
+        } else if coverage_incomplete
+            || self.eprocess.miscalibrated()
+            || self.slow_controller.probe_budget_fraction < 0.5
         {
             ExecutionPosture::Cautious
         } else {
@@ -5480,7 +5795,11 @@ impl AtcEngine {
         AtcSummarySnapshot {
             snapshot_seq: self.snapshot_seq,
             generated_at_micros: now_micros,
-            completeness: SnapshotCompleteness::Full,
+            completeness: if coverage_incomplete {
+                SnapshotCompleteness::Partial
+            } else {
+                SnapshotCompleteness::Full
+            },
             enabled: self.enabled(),
             safe_mode,
             execution_posture,
@@ -5505,9 +5824,9 @@ impl AtcEngine {
             delta,
             recent_decisions: self.ledger.recent(16).cloned().collect(),
             stage_timings: stage_timings.clone(),
-            kernel: kernel.clone(),
+            kernel,
             budget: budget.clone(),
-            policy: policy.clone(),
+            policy,
         }
     }
 
@@ -6191,6 +6510,17 @@ impl AtcEngine {
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
             scheduled_agents: self.scheduled_agent_count(),
+            tracked_agents: self.agents.len(),
+            max_tracked_agents: self.config.max_tracked_agents,
+            agent_capacity_refusals: self.agent_capacity_refusals,
+            agent_coverage_incomplete: self.agent_capacity_refusals > 0,
+            conflict_projects: self.conflict_graphs.len(),
+            conflict_edges: self.conflict_edge_count,
+            max_conflict_edges: self.config.max_tracked_agents,
+            max_conflict_patterns_per_edge: MAX_CONFLICT_PATTERNS_PER_EDGE,
+            max_conflict_pattern_bytes_per_edge: MAX_CONFLICT_PATTERN_BYTES_PER_EDGE,
+            conflict_capacity_refusals: self.conflict_capacity_refusals,
+            conflict_coverage_incomplete: self.conflict_capacity_refusals > 0,
             next_due_micros,
             dirty_agents: self.dirty_agents.len(),
             dirty_projects: self.dirty_projects.len(),
@@ -6385,6 +6715,438 @@ mod engine_tests {
     }
 
     #[test]
+    fn liveness_capacity_clamps_explicit_configuration() {
+        assert_eq!(
+            AtcConfig::default().max_tracked_agents,
+            mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_DEFAULT
+        );
+        for (requested, expected) in [
+            (0, 1),
+            (3, 3),
+            (
+                usize::MAX,
+                mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX,
+            ),
+        ] {
+            let engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: requested,
+                ..AtcConfig::default()
+            });
+            assert_eq!(engine.config.max_tracked_agents, expected);
+            assert_eq!(engine.agent_capacity_refusals, 0);
+            assert!(engine.agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn liveness_capacity_preserves_tracked_agents_and_unresolved_feedback() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        assert!(engine.register_agent("BlueFox", "claude-code", Some("/old")));
+        assert!(engine.register_agent("RedHawk", "codex-cli", None));
+        engine.observe_activity("BlueFox", None, 5_000_000);
+        engine.record_pending_liveness_feedback(
+            "BlueFox",
+            LivenessAction::Suspect,
+            2.0,
+            10_000_000,
+        );
+        let scheduled = engine.liveness_schedule.len();
+        let dirty = engine.dirty_agents.len();
+        let ledger_id = engine.ledger.latest_id();
+        let cached_names = engine.sorted_agent_names().to_vec();
+
+        for index in 0..1_000 {
+            assert!(!engine.register_agent(&format!("Overflow{index}"), "unknown-tool", None));
+        }
+        assert_eq!(engine.agents.len(), 2);
+        assert_eq!(engine.agent_capacity_refusals, 1_000);
+        assert_eq!(engine.liveness_schedule.len(), scheduled);
+        assert_eq!(engine.dirty_agents.len(), dirty);
+        assert_eq!(engine.sorted_agent_names(), cached_names);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.ledger.latest_id(), ledger_id);
+        assert_eq!(engine.resolved_experience_count, 0);
+        assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
+        assert_eq!(engine.agent_liveness("RedHawk"), Some(LivenessState::Alive));
+
+        assert!(engine.register_agent("BlueFox", "codex-cli", Some("/new")));
+        engine.observe_activity("BlueFox", Some("/new"), 6_000_000);
+        let entry = engine
+            .agents
+            .get("BlueFox")
+            .expect("active identity retained");
+        assert_eq!(entry.program, "codex-cli");
+        assert_eq!(entry.project_key.as_deref(), Some("/new"));
+        assert_eq!(entry.rhythm.last_activity_ts, 6_000_000);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.agent_capacity_refusals, 1_000);
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("agent_capacity")
+        );
+    }
+
+    #[test]
+    fn liveness_capacity_refusals_saturate_and_exclude_invalid_identities() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            assert!(!engine.register_agent(name, "unknown-tool", None));
+        }
+        assert_eq!(engine.agent_capacity_refusals, 0);
+        assert!(engine.agents.is_empty());
+        assert!(engine.register_agent("Retained", "claude-code", None));
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            assert!(!engine.register_agent(name, "unknown-tool", None));
+        }
+        assert_eq!(engine.agent_capacity_refusals, 0);
+
+        engine.agent_capacity_refusals = u64::MAX - 1;
+        assert!(!engine.register_agent("Refused", "unknown-tool", None));
+        assert!(!engine.register_agent("AlsoRefused", "unknown-tool", None));
+        assert_eq!(engine.agent_capacity_refusals, u64::MAX);
+        assert!(engine.register_agent("Retained", "codex-cli", None));
+        assert_eq!(engine.agents.len(), 1);
+    }
+
+    #[test]
+    fn liveness_metadata_bounds_preserve_existing_state_and_feedback() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let mut engine = AtcEngine::new_for_testing();
+        let name = "N".repeat(ATC_POPULATION_MAX_NAME_BYTES);
+        let program = "é".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES / 2);
+        let project = "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2);
+        assert!(engine.register_agent(&name, &program, Some(&project)));
+        engine.observe_activity(&name, Some(&project), 5_000_000);
+        engine.record_pending_liveness_feedback(&name, LivenessAction::Suspect, 2.0, 10_000_000);
+        let schedule_version = engine.agents[&name].schedule_version;
+        let schedule_len = engine.liveness_schedule.len();
+        let posterior = engine.agents[&name].core.posterior().to_vec();
+
+        assert!(!engine.register_agent(&format!("{name}x"), "codex-cli", None));
+        assert!(!engine.register_agent(&name, &format!("{program}x"), Some("/changed")));
+        assert!(!engine.register_agent(&name, "codex-cli", Some(&format!("{project}x"))));
+        engine.observe_activity(&name, Some(&format!("x\0{project}")), 11_000_000);
+        let oversized_program = format!("x\0{program}");
+        for index in 0..1_000 {
+            assert!(!engine.register_agent(
+                &format!("Overflow{index}"),
+                &oversized_program,
+                Some("/new"),
+            ));
+        }
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.agent_capacity_refusals, 1_004);
+        assert_eq!(engine.liveness_schedule.len(), schedule_len);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.resolved_experience_count, 0);
+        let retained = &engine.agents[&name];
+        assert_eq!(retained.name, name);
+        assert_eq!(retained.program, program);
+        assert_eq!(retained.project_key.as_deref(), Some(project.as_str()));
+        assert_eq!(retained.rhythm.last_activity_ts, 5_000_000);
+        assert_eq!(retained.schedule_version, schedule_version);
+        assert_eq!(retained.core.posterior(), posterior);
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("agent_capacity")
+        );
+
+        assert!(engine.register_agent(&name, "codex-cli", Some("/valid-update")));
+        engine.observe_activity(&name, None, 12_000_000);
+        assert_eq!(engine.agents[&name].program, "codex-cli");
+        assert_eq!(
+            engine.agents[&name].project_key.as_deref(),
+            Some("/valid-update")
+        );
+        assert_eq!(engine.agents[&name].rhythm.last_activity_ts, 12_000_000);
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(
+            engine.agent_capacity_refusals, 1_004,
+            "a subsequent valid update cannot certify refused evidence"
+        );
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn incomplete_coverage_blocks_release_even_if_policy_disables_guard() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
+            let mut engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: 1,
+                ..AtcConfig::default()
+            });
+            assert!(engine.register_agent("StillTracked", "claude-code", None));
+            for index in 1..=9 {
+                engine.observe_activity("StillTracked", None, index * 60_000_000);
+            }
+            engine.incumbent_policy.release_guard_enabled = false;
+            engine.incumbent_policy.artifact_hash = engine.incumbent_policy.compute_artifact_hash();
+            if let Some(candidate) = engine.shadow_policy.candidate.as_mut() {
+                candidate.release_guard_enabled = false;
+                candidate.artifact_hash = candidate.compute_artifact_hash();
+            }
+            engine.policy_bundle = AtcLivenessPolicyBundle::from_live_policies(
+                &engine.incumbent_policy,
+                engine.shadow_policy.candidate.as_ref(),
+                engine.policy_revision,
+            );
+            assert!(engine.policy_bundle.validate().is_ok());
+            let entry = engine.agents.get_mut("StillTracked").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+            assert_eq!(
+                engine
+                    .incumbent_policy
+                    .choose_action(entry.core.posterior(), true, false)
+                    .0,
+                LivenessAction::ReleaseReservations,
+                "control: the valid policy ignores its optional release guard"
+            );
+            let expected_reason = if conflict_limited {
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "retained",
+                    &[("Holder", "src/a.rs", "src/a.rs")],
+                    1,
+                );
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "refused",
+                    &[("Holder", "src/b.rs", "src/b.rs")],
+                    1,
+                );
+                "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine.register_agent(
+                    "StillTracked",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    None,
+                ));
+                "agent_capacity"
+            } else {
+                assert!(!engine.register_agent("Untracked", "codex-cli", None));
+                "agent_capacity"
+            };
+            assert_eq!(engine.resolved_experience_count, 0);
+            assert!(engine.pending_liveness_feedback.is_empty());
+
+            let report = engine.run_tick(9 * 60_000_000 + 600_000_000);
+            assert!(report.summary.kernel.due_agents > 0);
+            assert!(
+                !report
+                    .actions
+                    .iter()
+                    .any(|action| { matches!(action, AtcTickAction::ReleaseReservations { .. }) })
+            );
+            assert!(
+                !report
+                    .effects
+                    .iter()
+                    .any(|effect| { effect.kind == "release_reservations_requested" })
+            );
+            assert_ne!(
+                engine.agent_liveness("StillTracked"),
+                Some(LivenessState::Dead)
+            );
+            assert!(
+                engine
+                    .pending_liveness_feedback
+                    .values()
+                    .all(|pending| { pending.action != LivenessAction::ReleaseReservations })
+            );
+            assert_eq!(engine.resolved_experience_count, 0);
+            assert_eq!(report.summary.completeness, SnapshotCompleteness::Partial);
+            assert_eq!(report.summary.execution_posture, ExecutionPosture::Cautious);
+            assert_eq!(report.summary.kernel.tracked_agents, 1);
+            assert_eq!(report.summary.kernel.max_tracked_agents, 1);
+            assert_eq!(
+                report.summary.kernel.agent_coverage_incomplete,
+                !conflict_limited
+            );
+            assert_eq!(
+                report.summary.kernel.conflict_coverage_incomplete,
+                conflict_limited
+            );
+            if conflict_limited {
+                // Expiry erases every retained edge, but cannot certify that the
+                // refused edge expired or authorize release from an empty graph.
+                assert_eq!(report.summary.kernel.conflict_edges, 0);
+                assert_eq!(report.summary.deadlock_cycles, 0);
+                assert_eq!(report.summary.kernel.conflict_capacity_refusals, 1);
+            } else {
+                assert_eq!(report.summary.kernel.agent_capacity_refusals, 1);
+            }
+            assert!(report.summary.policy.fallback_active);
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some(expected_reason)
+            );
+            assert!(
+                report
+                    .summary
+                    .recent_decisions
+                    .iter()
+                    .any(|record| { record.fallback_reason.as_deref() == Some(expected_reason) })
+            );
+        }
+    }
+
+    #[test]
+    fn release_capacity_admission_rechecks_previously_planned_effects() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
+            let mut engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: 1,
+                ..AtcConfig::default()
+            });
+            assert!(engine.register_agent("ReleaseTarget", "claude-code", Some("/project")));
+            for index in 1..=9 {
+                engine.observe_activity("ReleaseTarget", None, index * 60_000_000);
+            }
+            let entry = engine.agents.get_mut("ReleaseTarget").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+            let prior_report = engine.run_tick(9 * 60_000_000 + 600_000_000);
+            assert!(prior_report.effects.iter().any(|effect| {
+                effect.kind == "release_reservations_requested" && effect.agent == "ReleaseTarget"
+            }));
+            assert_eq!(prior_report.summary.kernel.agent_capacity_refusals, 0);
+
+            let engine_lock = Mutex::new(engine);
+            assert_eq!(
+                release_capacity_admission_from_engine(Some(&engine_lock)),
+                Ok(())
+            );
+            assert!(engine_lock.try_lock().is_ok(), "admission releases ENGINE");
+            let expected_reason = if conflict_limited {
+                let mut engine = engine_lock.lock().unwrap();
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "retained",
+                    &[("Holder", "src/a.rs", "src/a.rs")],
+                    1,
+                );
+                assert_eq!(engine.conflict_capacity_refusals, 0);
+                drop(engine);
+                assert_eq!(
+                    release_capacity_admission_from_engine(Some(&engine_lock)),
+                    Ok(())
+                );
+                engine_lock.lock().unwrap().note_reservation_conflicts(
+                    "Waiter",
+                    "refused",
+                    &[("Holder", "src/b.rs", "src/b.rs")],
+                    1,
+                );
+                "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine_lock.lock().unwrap().register_agent(
+                    "ReleaseTarget",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    Some("/project"),
+                ));
+                "agent_capacity"
+            } else {
+                assert!(!engine_lock.lock().unwrap().register_agent(
+                    "LaterArrival",
+                    "codex-cli",
+                    None
+                ));
+                "agent_capacity"
+            };
+            assert_eq!(
+                release_capacity_admission_from_engine(Some(&engine_lock)),
+                Err(expected_reason)
+            );
+            assert!(engine_lock.try_lock().is_ok(), "refusal releases ENGINE");
+            assert!(prior_report.actions.iter().any(|action| {
+            matches!(action, AtcTickAction::ReleaseReservations { agent } if agent == "ReleaseTarget")
+        }), "the stale report is still a release intent, not the admission authority");
+        }
+    }
+
+    #[test]
+    fn release_capacity_admission_fails_closed_without_usable_engine_state() {
+        assert_eq!(
+            release_capacity_admission_from_engine(None),
+            Err("agent_coverage_unavailable")
+        );
+        let disabled = Mutex::new(AtcEngine::new(AtcConfig {
+            enabled: false,
+            ..AtcConfig::default()
+        }));
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&disabled)),
+            Err("agent_coverage_unavailable")
+        );
+        assert!(disabled.try_lock().is_ok());
+
+        let poisoned = Mutex::new(AtcEngine::new_for_testing());
+        let result = std::panic::catch_unwind(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate interrupted engine mutation");
+        });
+        assert!(result.is_err());
+        assert!(poisoned.is_poisoned());
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&poisoned)),
+            Err("agent_coverage_unavailable")
+        );
+        assert!(
+            poisoned.is_poisoned(),
+            "admission cannot repair unknown state"
+        );
+    }
+
+    #[test]
+    fn release_capacity_admission_distinguishes_full_capacity_from_refusal() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        assert!(engine.register_agent("Tracked", "claude-code", None));
+        assert_eq!(engine.agents.len(), engine.config.max_tracked_agents);
+        assert_eq!(engine.agent_capacity_refusals, 0);
+        engine.slow_controller.probe_budget_fraction = 0.1;
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("budget_pressure")
+        );
+        let engine_lock = Mutex::new(engine);
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&engine_lock)),
+            Ok(())
+        );
+        assert!(engine_lock.try_lock().is_ok());
+    }
+
+    #[test]
     fn engine_excludes_atc_from_registration() {
         let mut engine = AtcEngine::new_for_testing();
         engine.register_agent(ATC_AGENT_NAME, "mcp-agent-mail", None);
@@ -6559,6 +7321,523 @@ mod engine_tests {
         assert_eq!(deadlocks[0].1[0].len(), 2);
     }
 
+    fn note_test_conflict_cycle(
+        engine: &mut AtcEngine,
+        project: &str,
+        first: &str,
+        second: &str,
+        timestamp_micros: i64,
+    ) {
+        for (requester, holder) in [(first, second), (second, first)] {
+            engine.note_reservation_conflicts(
+                requester,
+                project,
+                &[(
+                    holder.to_string(),
+                    "src/lib.rs".to_string(),
+                    "src/lib.rs".to_string(),
+                )],
+                timestamp_micros,
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_admission_bounds_projects_and_edges_without_evicting_cycles() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 3,
+            ..AtcConfig::default()
+        });
+        note_test_conflict_cycle(&mut engine, "retained", "BlueFox", "RedOwl", 10);
+        engine.note_reservation_conflicts(
+            "OtherWaiter",
+            "other",
+            &[("OtherHolder", "src/a.rs", "src/a.rs")],
+            10,
+        );
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        assert_eq!(engine.conflict_edge_count, 3);
+
+        for index in 0..128 {
+            engine.note_reservation_conflicts(
+                "NewWaiter",
+                &format!("refused-{index}"),
+                &[("NewHolder", "new.rs", "new.rs")],
+                20,
+            );
+        }
+        engine.note_reservation_conflicts(
+            "NewWaiter",
+            "retained",
+            &[("NewHolder", "new.rs", "new.rs")],
+            20,
+        );
+        // Full edge capacity still permits new detail on an existing edge.
+        engine.note_reservation_conflicts(
+            "BlueFox",
+            "retained",
+            &[("RedOwl", "src/extra.rs", "src/extra.rs")],
+            20,
+        );
+        engine.note_reservation_conflicts(
+            "BlueFox",
+            "invalid",
+            &[
+                ("BlueFox", "ignored", "ignored"),
+                ("", "ignored", "ignored"),
+            ],
+            20,
+        );
+
+        assert_eq!(engine.conflict_capacity_refusals, 129);
+        assert_eq!(engine.conflict_edge_count, 3);
+        assert_eq!(engine.conflict_graphs.len(), 2);
+        assert_eq!(engine.deadlock_cache.len(), 2);
+        assert!(
+            !engine.conflict_graphs["retained"]
+                .hard_edges
+                .contains_key("NewHolder")
+        );
+        assert_eq!(
+            engine.conflict_graphs["retained"].hard_edges["RedOwl"][0].contested_patterns,
+            ["src/extra.rs", "src/lib.rs"],
+        );
+        let cycles = engine.detect_deadlocks();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].0, "retained");
+        assert_eq!(cycles[0].1[0], ["BlueFox", "RedOwl"]);
+
+        // Admission happens between ticks; stale kernel telemetry must not
+        // publish complete coverage or hide the reason for restricted authority.
+        let snapshot = engine.build_summary_snapshot_with(
+            20,
+            &AtcStageTimings::default(),
+            &AtcKernelTelemetry::default(),
+            &AtcBudgetTelemetry::default(),
+            &AtcPolicyTelemetry::default(),
+        );
+        assert_eq!(snapshot.completeness, SnapshotCompleteness::Partial);
+        assert_eq!(snapshot.execution_posture, ExecutionPosture::Cautious);
+        assert_eq!(snapshot.kernel.conflict_projects, 2);
+        assert_eq!(snapshot.kernel.conflict_edges, 3);
+        assert_eq!(snapshot.kernel.max_conflict_edges, 3);
+        assert_eq!(snapshot.kernel.conflict_capacity_refusals, 129);
+        assert!(snapshot.kernel.conflict_coverage_incomplete);
+        assert!(!snapshot.kernel.agent_coverage_incomplete);
+        assert_eq!(
+            snapshot.policy.fallback_reason.as_deref(),
+            Some("conflict_capacity")
+        );
+        let report = engine.run_tick(20);
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert_eq!(report.summary.completeness, SnapshotCompleteness::Partial);
+        assert!(report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("Deadlock in retained") && message.contains("conflict_capacity")
+        )));
+        assert!(
+            !report
+                .effects
+                .iter()
+                .any(|effect| effect.kind == "release_reservations_requested")
+        );
+
+        engine.conflict_capacity_refusals = u64::MAX - 1;
+        for _ in 0..2 {
+            engine.note_reservation_conflicts(
+                "NewWaiter",
+                "refused",
+                &[("NewHolder", "new.rs", "new.rs")],
+                30,
+            );
+        }
+        assert_eq!(engine.conflict_capacity_refusals, u64::MAX);
+        assert_eq!(engine.conflict_edge_count, 3);
+    }
+
+    #[test]
+    fn conflict_detail_capacity_keeps_existing_patterns_and_reuses_released_space() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        for index in 0..MAX_CONFLICT_PATTERNS_PER_EDGE {
+            let path = format!("src/file-{index}.rs");
+            engine.note_reservation_conflicts(
+                "Waiter",
+                "project",
+                &[("Holder", path.as_str(), path.as_str())],
+                10,
+            );
+        }
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "extra.rs", "src/file-0.rs")],
+            20,
+        );
+        // Already known detail and an earlier observation remain admissible at
+        // both the edge and pattern limits; refusal cannot erase the old edge.
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "src/file-0.rs", "src/file-0.rs")],
+            5,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(
+            edge.contested_patterns.len(),
+            MAX_CONFLICT_PATTERNS_PER_EDGE
+        );
+        assert_eq!(edge.since, 5);
+        assert!(
+            !edge
+                .contested_patterns
+                .iter()
+                .any(|path| path == "extra.rs")
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(engine.conflict_edge_count, 1);
+
+        engine.note_reservation_released("Holder", &["src/file-0.rs".to_string()], "project", 30);
+        assert_eq!(engine.conflict_edge_count, 1);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "extra.rs", "extra.rs")],
+            40,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(
+            edge.contested_patterns.len(),
+            MAX_CONFLICT_PATTERNS_PER_EDGE
+        );
+        assert!(
+            edge.contested_patterns
+                .iter()
+                .any(|path| path == "extra.rs")
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+    }
+
+    #[test]
+    fn conflict_detail_bytes_are_bounded_without_truncation_or_partial_updates() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        let first = "a".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2);
+        let second = "b".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", first.as_str(), second.as_str())],
+            10,
+        );
+        engine.note_reservation_conflicts("Waiter", "project", &[("Holder", "c", "d")], 20);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", first.as_str(), second.as_str())],
+            5,
+        );
+        let oversized = "é".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2 + 1);
+        engine.note_reservation_conflicts(
+            "OtherWaiter",
+            "oversized",
+            &[("OtherHolder", oversized.as_str(), oversized.as_str())],
+            20,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(edge.contested_patterns, [first, second]);
+        assert_eq!(edge.since, 5);
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert_eq!(engine.conflict_capacity_refusals, 2);
+        // Rejected detail still contributes the real scoped conflict outcome.
+        assert_eq!(
+            engine.reservation_outcome_for_agent("OtherWaiter", "oversized", 0),
+            Some(ReservationEventKind::Conflicted),
+        );
+    }
+
+    #[test]
+    fn conflict_identity_byte_limits_refuse_without_aliasing_or_restoring_stale_outcomes() {
+        let mut engine = AtcEngine::new_for_testing();
+        let project = "p".repeat(MAX_CONFLICT_PROJECT_BYTES);
+        let requester = "w".repeat(MAX_CONFLICT_AGENT_BYTES);
+        let holder = "h".repeat(MAX_CONFLICT_AGENT_BYTES);
+        engine.note_reservation_conflicts(
+            &requester,
+            &project,
+            &[(holder.as_str(), "src/a.rs", "src/a.rs")],
+            1,
+        );
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_capacity_refusals, 0);
+        engine.note_reservation_conflicts(
+            &requester,
+            &project,
+            &[(format!("{holder}x").as_str(), "src/b.rs", "src/b.rs")],
+            2,
+        );
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_graphs[&project].hard_edges.len(), 1);
+
+        engine.note_reservation_released("KnownAgent", &["src/a.rs".to_string()], "known", 10);
+        for (oversized_requester, oversized_project, timestamp) in [
+            (format!("{requester}x"), project.clone(), 20),
+            (requester.clone(), format!("{project}x"), 30),
+        ] {
+            engine.note_reservation_conflicts(
+                &oversized_requester,
+                &oversized_project,
+                &[(holder.as_str(), "src/b.rs", "src/b.rs")],
+                timestamp,
+            );
+            assert!(
+                !engine
+                    .reservation_event_log
+                    .iter()
+                    .any(|event| event.timestamp_micros == timestamp)
+            );
+        }
+        assert_eq!(engine.conflict_capacity_refusals, 3);
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("KnownAgent", "known", 0),
+            None
+        );
+        engine.note_reservation_released("KnownAgent", &["src/a.rs".to_string()], "known", 31);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("KnownAgent", "known", 0),
+            Some(ReservationEventKind::Released),
+        );
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+    }
+
+    #[test]
+    fn expired_conflicts_free_admission_without_restoring_complete_coverage() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        note_test_conflict_cycle(&mut engine, "expired", "BlueFox", "RedOwl", 1);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        engine.note_reservation_conflicts(
+            "NewWaiter",
+            "new",
+            &[("NewHolder", "new.rs", "new.rs")],
+            2,
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+
+        let now = engine.conflict_edge_ttl_micros() + 2;
+        engine.prune_stale_conflicts(now);
+        assert_eq!(engine.conflict_edge_count, 0);
+        assert!(engine.conflict_graphs.is_empty());
+        assert!(engine.deadlock_cache.is_empty());
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.detect_deadlocks(), []);
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+
+        note_test_conflict_cycle(&mut engine, "new", "NewHolder", "NewWaiter", now);
+        assert_eq!(engine.conflict_edge_count, 2);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&Mutex::new(engine))),
+            Err("conflict_capacity"),
+        );
+        let reset = Mutex::new(AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        }));
+        assert_eq!(release_capacity_admission_from_engine(Some(&reset)), Ok(()));
+    }
+
+    #[test]
+    fn conflict_project_churn_retains_only_active_projects() {
+        let mut engine = AtcEngine::new_for_testing();
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", 1);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        let paths = ["src/lib.rs".to_string()];
+
+        for index in 0_i64..4_096 {
+            let project = format!("completed-project-{index}");
+            let timestamp = index + 2;
+            match index % 5 {
+                0 => engine.note_reservation_granted("BlueFox", &paths, true, &project, timestamp),
+                1 => engine.note_reservation_released("BlueFox", &paths, &project, timestamp),
+                2 => engine.note_reservation_renewed("BlueFox", &paths, &project, timestamp),
+                3 => engine.note_reservation_force_released("BlueFox", &paths, &project, timestamp),
+                _ => engine.note_reservation_conflicts(
+                    "BlueFox",
+                    &project,
+                    &[("BlueFox".to_string(), paths[0].clone(), paths[0].clone())],
+                    timestamp,
+                ),
+            }
+        }
+
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert!(engine.conflict_graphs.contains_key("active-project"));
+        assert_eq!(engine.deadlock_cache.len(), 1);
+        assert!(engine.dirty_projects.is_empty());
+        let deadlocks = engine.detect_deadlocks();
+        assert_eq!(deadlocks.len(), 1);
+        assert_eq!(deadlocks[0].0, "active-project");
+        assert_eq!(engine.deadlock_cycle_total, 1);
+    }
+
+    #[test]
+    fn conflict_project_resolution_retires_all_reservation_paths() {
+        for kind in [
+            ReservationEventKind::Granted,
+            ReservationEventKind::Renewed,
+            ReservationEventKind::Released,
+            ReservationEventKind::ForceReleased,
+        ] {
+            let mut engine = AtcEngine::new_for_testing();
+            for project in ["resolved-project", "active-project"] {
+                note_test_conflict_cycle(&mut engine, project, "BlueFox", "RedOwl", 1);
+            }
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            assert_eq!(engine.conflict_edge_count, 4);
+            let paths = ["src/lib.rs".to_string()];
+
+            for agent in ["BlueFox", "RedOwl"] {
+                match kind {
+                    ReservationEventKind::Granted => {
+                        engine.note_reservation_granted(agent, &paths, true, "resolved-project", 2);
+                    }
+                    ReservationEventKind::Renewed => {
+                        engine.note_reservation_renewed(agent, &paths, "resolved-project", 2);
+                    }
+                    ReservationEventKind::Released => {
+                        engine.note_reservation_released(agent, &paths, "resolved-project", 2);
+                    }
+                    ReservationEventKind::ForceReleased => {
+                        engine.note_reservation_force_released(
+                            agent,
+                            &paths,
+                            "resolved-project",
+                            2,
+                        );
+                    }
+                    ReservationEventKind::Conflicted => unreachable!("resolution paths only"),
+                }
+                if agent == "BlueFox" {
+                    assert_eq!(
+                        engine.conflict_graphs["resolved-project"].hard_edges.len(),
+                        1
+                    );
+                    assert!(engine.dirty_projects.contains("resolved-project"));
+                    assert_eq!(engine.conflict_edge_count, 3);
+                }
+            }
+
+            assert!(!engine.conflict_graphs.contains_key("resolved-project"));
+            assert!(!engine.deadlock_cache.contains_key("resolved-project"));
+            assert!(engine.dirty_projects.is_empty());
+            assert_eq!(engine.deadlock_cycle_total, 1);
+            assert_eq!(engine.conflict_edge_count, 2);
+            let remaining = engine.detect_deadlocks();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, "active-project");
+
+            // A new graph restarts its generation. An old cache entry must not
+            // hide a new cycle when the same project encounters contention again.
+            note_test_conflict_cycle(&mut engine, "resolved-project", "BlueFox", "RedOwl", 3);
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            assert_eq!(engine.conflict_edge_count, 4);
+        }
+    }
+
+    #[test]
+    fn conflict_project_expiry_retires_cache_before_next_tick() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now = engine.conflict_edge_ttl_micros() + 2;
+        note_test_conflict_cycle(&mut engine, "expired-project", "BlueFox", "RedOwl", 1);
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+
+        engine.prune_stale_conflicts(now);
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        assert_eq!(engine.conflict_edge_count, 2);
+        let report = engine.run_tick(now);
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert!(report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("Deadlock in active-project")
+        )));
+        assert!(!report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("expired-project")
+        )));
+
+        let report = engine.run_tick(now + engine.conflict_edge_ttl_micros() + 1);
+        assert_eq!(report.summary.deadlock_cycles, 0);
+        assert!(engine.conflict_graphs.is_empty());
+        assert!(engine.deadlock_cache.is_empty());
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.conflict_edge_count, 0);
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_preserves_other_cycles() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("DeadConflictHolder", "claude-code", Some("expired-project"));
+        // Keep this fixture independent of the process-global population prior.
+        engine.agents.get_mut("DeadConflictHolder").unwrap().rhythm = AgentRhythm::new(60.0);
+        for index in 0..10 {
+            engine.observe_activity("DeadConflictHolder", None, index * 60_000_000);
+        }
+        let entry = engine.agents.get_mut("DeadConflictHolder").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        let now = 9 * 60_000_000 + 600_000_000;
+        note_test_conflict_cycle(
+            &mut engine,
+            "expired-project",
+            "DeadConflictHolder",
+            "BlockedAgent",
+            now - 1,
+        );
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now - 1);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+
+        let evaluation = engine.evaluate_liveness(now);
+        assert!(evaluation.actions.iter().any(|(agent, action)| {
+            agent == "DeadConflictHolder" && *action == LivenessAction::ReleaseReservations
+        }));
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        assert_eq!(engine.conflict_edge_count, 2);
+        let remaining = engine.detect_deadlocks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "active-project");
+    }
+
     #[test]
     fn is_self_event_filters_correctly() {
         assert!(AtcEngine::is_self_event(ATC_AGENT_NAME, &[]));
@@ -6627,6 +7906,70 @@ mod engine_tests {
     }
 
     #[test]
+    fn stale_activity_is_a_complete_noop_for_liveness_state() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Phoenix", "claude-code", Some("/current"));
+        engine.observe_activity("Phoenix", Some("/current"), 5_000_000);
+        {
+            let entry = engine.agents.get_mut("Phoenix").unwrap();
+            entry.state = LivenessState::Dead;
+            entry.suspect_since = 6_000_000;
+            entry.probe_sent_at = 7_000_000;
+            entry.sprt_log_lr = 5.0;
+        }
+        engine.schedule_entry_for_push("Phoenix", i64::MAX);
+        engine.record_pending_liveness_feedback("Phoenix", LivenessAction::Suspect, 2.0, 8_000_000);
+        let before = engine.agents["Phoenix"].clone();
+        let heap = engine.liveness_schedule.clone().into_sorted_vec();
+
+        for timestamp in [i64::MIN, -1, 0, 4_000_000, 5_000_000] {
+            engine.observe_activity("Phoenix", Some("/stale"), timestamp);
+        }
+
+        let after = &engine.agents["Phoenix"];
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.project_key, before.project_key);
+        assert_eq!(
+            after.rhythm.last_activity_ts,
+            before.rhythm.last_activity_ts
+        );
+        assert_eq!(after.schedule_version, before.schedule_version);
+        assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
+        assert!(engine.pending_liveness_feedback.contains_key("Phoenix"));
+        assert_eq!(engine.resolved_experience_count, 0);
+    }
+
+    #[test]
+    fn pre_intervention_activity_does_not_consume_future_feedback() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("FeedbackAgent", "codex-cli", None);
+        engine.observe_activity("FeedbackAgent", None, 1_000_000);
+        engine.record_pending_liveness_feedback(
+            "FeedbackAgent",
+            LivenessAction::Suspect,
+            2.0,
+            4_000_000,
+        );
+
+        engine.observe_activity("FeedbackAgent", None, 3_000_000);
+        engine.observe_activity("FeedbackAgent", None, 4_000_000);
+        assert!(
+            engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
+        assert_eq!(engine.resolved_experience_count, 0);
+
+        engine.observe_activity("FeedbackAgent", None, 4_000_001);
+        assert!(
+            !engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
+        assert_eq!(engine.resolved_experience_count, 1);
+    }
+
+    #[test]
     fn evaluate_liveness_skips_dead_agents() {
         let mut engine = AtcEngine::new_for_testing();
         engine.register_agent("Zombie", "claude-code", None);
@@ -6681,13 +8024,72 @@ mod engine_tests {
 // Session Synthesizer (Track 7)
 // ──────────────────────────────────────────────────────────────────────
 
-/// Monotonically-growing session summary.
+// These are observation budgets, not limits on mailbox identities or threads.
+// Never retain arbitrary lifetime traffic in the daemon's in-memory summaries.
+const MAX_SESSION_AGENTS: usize = 1024;
+const MAX_SESSION_THREADS: usize = 4096;
+const MAX_OBSERVATION_KEY_BYTES: usize = 512;
+
+/// One recency entry per retained key, including under repeated observations.
+/// Unlike an append-only access queue, hot keys cannot grow this index forever.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ObservationRecency {
+    order: BTreeMap<u64, String>,
+    by_key: HashMap<String, u64>,
+    sequence: u64,
+}
+
+impl ObservationRecency {
+    fn touch(&mut self, key: &str, capacity: usize) -> Option<String> {
+        let retained_key = self
+            .by_key
+            .get(key)
+            .and_then(|previous| self.order.remove(previous));
+        if self.sequence == u64::MAX {
+            // Keep relative order even after sequence exhaustion. The index is
+            // bounded, so rebasing never reintroduces lifetime-sized work.
+            self.sequence = 0;
+            for (_, retained) in std::mem::take(&mut self.order) {
+                self.sequence += 1;
+                if let Some(sequence) = self.by_key.get_mut(&retained) {
+                    *sequence = self.sequence;
+                }
+                self.order.insert(self.sequence, retained);
+            }
+        }
+        self.sequence += 1;
+        if let Some(sequence) = self.by_key.get_mut(key) {
+            *sequence = self.sequence;
+        } else {
+            self.by_key.insert(key.to_owned(), self.sequence);
+        }
+        self.order.insert(
+            self.sequence,
+            retained_key.unwrap_or_else(|| key.to_owned()),
+        );
+        if self.by_key.len() > capacity
+            && let Some((_, evicted)) = self.order.pop_first()
+        {
+            self.by_key.remove(&evicted);
+            Some(evicted)
+        } else {
+            None
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(sequence) = self.by_key.remove(key) {
+            self.order.remove(&sequence);
+        }
+    }
+}
+
+/// Lifetime event totals with bounded, recently observed entity detail.
 ///
-/// Every field only increases — counters increment, sets grow, timestamps
-/// advance.  This guarantees two consecutive reads always see the same or
-/// more information (no regressions).
-///
-/// NOT a pure join-semilattice (counters use increment, not max).
+/// Counters and timestamps never regress. Agent/thread sets and their counters
+/// describe at most the most recently observed 1,024 agents and 4,096 threads;
+/// an evicted entity starts fresh if observed again. The durable mailbox keeps
+/// the complete history. Eviction is visible in the rendered summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSummary {
     // ── Monotone Counters (increment only) ──
@@ -6704,9 +8106,14 @@ pub struct SessionSummary {
     pub conflicts_resolved: u64,
     pub atc_interventions: u64,
 
-    // ── Sets (union only) ──
+    // ── Bounded recent entity detail ──
     pub active_agents: HashSet<String>,
     pub active_threads: HashSet<String>,
+    pub evicted_agent_details: u64,
+    pub evicted_thread_details: u64,
+    pub skipped_detail_observations: u64,
+    agent_recency: ObservationRecency,
+    thread_recency: ObservationRecency,
 
     // ── Timestamps (max only) ──
     /// First event ever absorbed (set once, never changes).
@@ -6816,7 +8223,35 @@ impl SynthesisEvent {
 }
 
 impl SessionSummary {
-    /// Absorb a single event.  O(1) per event.
+    fn observe_agent(&mut self, agent: &str) -> bool {
+        if agent.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_detail_observations = self.skipped_detail_observations.saturating_add(1);
+            return false;
+        }
+        if let Some(evicted) = self.agent_recency.touch(agent, MAX_SESSION_AGENTS) {
+            self.active_agents.remove(&evicted);
+            self.agent_message_counts.remove(&evicted);
+            self.evicted_agent_details = self.evicted_agent_details.saturating_add(1);
+        }
+        self.active_agents.insert(agent.to_owned());
+        true
+    }
+
+    fn observe_thread(&mut self, thread: &str) -> bool {
+        if thread.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_detail_observations = self.skipped_detail_observations.saturating_add(1);
+            return false;
+        }
+        if let Some(evicted) = self.thread_recency.touch(thread, MAX_SESSION_THREADS) {
+            self.active_threads.remove(&evicted);
+            self.thread_message_counts.remove(&evicted);
+            self.evicted_thread_details = self.evicted_thread_details.saturating_add(1);
+        }
+        self.active_threads.insert(thread.to_owned());
+        true
+    }
+
+    /// Absorb an event in O(log budget) per observed agent/thread.
     pub fn absorb(&mut self, event: &SynthesisEvent) {
         let ts = event.timestamp_micros();
         self.last_event_ts = self.last_event_ts.max(ts);
@@ -6833,47 +8268,51 @@ impl SessionSummary {
                 ..
             } => {
                 self.messages_sent += 1;
-                self.active_agents.insert(from.clone());
                 for recipient in to {
-                    self.active_agents.insert(recipient.clone());
+                    self.observe_agent(recipient);
                 }
-                *self.agent_message_counts.entry(from.clone()).or_insert(0) += 1;
-                if let Some(tid) = thread_id {
-                    self.active_threads.insert(tid.clone());
+                // Observe the sender last so even an oversized recipient list
+                // cannot leave a counter whose identity was just evicted.
+                if self.observe_agent(from) {
+                    *self.agent_message_counts.entry(from.clone()).or_insert(0) += 1;
+                }
+                if let Some(tid) = thread_id
+                    && self.observe_thread(tid)
+                {
                     *self.thread_message_counts.entry(tid.clone()).or_insert(0) += 1;
                 }
             }
             SynthesisEvent::MessageReceived { agent, .. } => {
                 self.messages_received += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotAcquired { agent, .. } => {
                 self.build_slots_acquired += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotRenewed { agent, .. } => {
                 self.build_slots_renewed += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::BuildSlotReleased { agent, .. } => {
                 self.build_slots_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationGranted { agent, .. } => {
                 self.reservations_granted += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationReleased { agent, .. } => {
                 self.reservations_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationRenewed { agent, .. } => {
                 self.reservations_renewed += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ReservationForceReleased { agent, .. } => {
                 self.reservations_force_released += 1;
-                self.active_agents.insert(agent.clone());
+                self.observe_agent(agent);
             }
             SynthesisEvent::ConflictDetected { .. } => {
                 self.conflicts_detected += 1;
@@ -6903,7 +8342,7 @@ impl SessionSummary {
         let mut lines = Vec::new();
 
         lines.push(format!(
-            "Messages: {} sent, {} received across {} threads",
+            "Messages: {} sent, {} received; {} retained threads",
             self.messages_sent,
             self.messages_received,
             self.active_threads.len(),
@@ -6915,7 +8354,7 @@ impl SessionSummary {
             .iter()
             .map(|(a, c)| (a.as_str(), *c))
             .collect();
-        agent_counts.sort_by_key(|entry| Reverse(entry.1));
+        agent_counts.sort_by_key(|entry| (Reverse(entry.1), entry.0));
         if !agent_counts.is_empty() {
             let top: Vec<String> = agent_counts
                 .iter()
@@ -6931,7 +8370,7 @@ impl SessionSummary {
             .iter()
             .map(|(t, c)| (t.as_str(), *c))
             .collect();
-        thread_counts.sort_by_key(|entry| Reverse(entry.1));
+        thread_counts.sort_by_key(|entry| (Reverse(entry.1), entry.0));
         if !thread_counts.is_empty() {
             let top: Vec<String> = thread_counts
                 .iter()
@@ -6976,12 +8415,28 @@ impl SessionSummary {
             lines.push(format!("ATC interventions: {}", self.atc_interventions));
         }
 
-        lines.push(format!("Active agents: {}", self.active_agents.len()));
+        lines.push(format!(
+            "Recent agents retained: {}",
+            self.active_agents.len()
+        ));
+        if self.evicted_agent_details > 0
+            || self.evicted_thread_details > 0
+            || self.skipped_detail_observations > 0
+        {
+            lines.push(format!(
+                "Detail window: {} agent evictions, {} thread evictions, {} oversized observations skipped; lifetime event totals preserved",
+                self.evicted_agent_details,
+                self.evicted_thread_details,
+                self.skipped_detail_observations,
+            ));
+        }
 
         lines.join("\n")
     }
 
-    /// Check monotonicity: every field in `self` is >= `previous`.
+    /// Check counters and pre-eviction entity detail for monotonicity.
+    /// Tests that cross a detail budget separately assert lifetime totals and
+    /// recent-window semantics; detail sets cannot remain monotone after eviction.
     #[cfg(test)]
     fn is_monotone_vs(&self, previous: &Self) -> bool {
         self.messages_sent >= previous.messages_sent
@@ -7061,6 +8516,125 @@ mod synthesis_tests {
         assert_eq!(summary.active_threads.len(), 2);
         assert_eq!(summary.first_event_ts, 1_000_000);
         assert_eq!(summary.last_event_ts, 3_000_000);
+    }
+
+    #[test]
+    fn observation_churn_preserves_lifetime_totals_and_recent_detail() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("LiveAgent", "codex-cli", Some("/project"));
+        engine.observe_activity("LiveAgent", Some("/project"), 1);
+        let events = MAX_SESSION_THREADS + MAX_SESSION_AGENTS;
+        for index in 0..events {
+            let agent = format!("Agent{index}");
+            let thread = format!("thread-{index}");
+            let timestamp = i64::try_from(index).unwrap() + 1;
+            engine.note_message_sent(&agent, &["Anchor".to_owned()], Some(&thread), timestamp);
+            engine.note_message_sent("Anchor", &[], Some("hot-thread"), timestamp);
+        }
+
+        let summary = &mut engine.session_summary;
+        assert_eq!(summary.messages_sent, u64::try_from(events * 2).unwrap());
+        assert_eq!(summary.first_event_ts, 1);
+        assert_eq!(summary.last_event_ts, i64::try_from(events).unwrap());
+        assert_eq!(summary.active_agents.len(), MAX_SESSION_AGENTS);
+        assert_eq!(summary.active_threads.len(), MAX_SESSION_THREADS);
+        assert_eq!(
+            summary.agent_message_counts.get("Anchor"),
+            Some(&u64::try_from(events).unwrap())
+        );
+        assert_eq!(
+            summary.thread_message_counts.get("hot-thread"),
+            Some(&u64::try_from(events).unwrap())
+        );
+        assert!(!summary.active_agents.contains("Agent0"));
+        assert!(!summary.agent_message_counts.contains_key("Agent0"));
+        assert!(!summary.active_threads.contains("thread-0"));
+        assert!(!summary.thread_message_counts.contains_key("thread-0"));
+        assert!(
+            summary
+                .active_agents
+                .contains(&format!("Agent{}", events - 1))
+        );
+        assert!(summary.evicted_agent_details > 0);
+        assert!(summary.evicted_thread_details > 0);
+        assert!(
+            summary
+                .formatted()
+                .contains("lifetime event totals preserved")
+        );
+        assert_eq!(
+            summary.agent_recency.by_key.len(),
+            summary.active_agents.len()
+        );
+        assert_eq!(
+            summary.agent_recency.order.len(),
+            summary.active_agents.len()
+        );
+        assert_eq!(
+            summary.thread_recency.by_key.len(),
+            summary.active_threads.len()
+        );
+        assert_eq!(
+            summary.thread_recency.order.len(),
+            summary.active_threads.len()
+        );
+        assert!(
+            summary
+                .agent_message_counts
+                .keys()
+                .all(|name| summary.active_agents.contains(name))
+        );
+        assert!(
+            summary
+                .thread_message_counts
+                .keys()
+                .all(|name| summary.active_threads.contains(name))
+        );
+
+        // Observational eviction must never evict liveness/authorization state.
+        assert_eq!(
+            engine.agent_liveness("LiveAgent"),
+            Some(LivenessState::Alive)
+        );
+        assert!(engine.thread_participation.participation_count() <= MAX_PARTICIPATION_EDGES);
+        assert!(engine.thread_participation.evicted_participations() > 0);
+    }
+
+    #[test]
+    fn detail_eviction_restarts_entity_counts_without_resetting_totals() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&msg_sent("Returning", &[], None, 1));
+        for index in 0..MAX_SESSION_AGENTS {
+            summary.absorb(&msg_sent(&format!("Agent{index}"), &[], None, 2));
+        }
+        assert!(!summary.agent_message_counts.contains_key("Returning"));
+        summary.absorb(&msg_sent("Returning", &[], None, 3));
+        assert_eq!(summary.agent_message_counts.get("Returning"), Some(&1));
+        assert_eq!(
+            summary.messages_sent,
+            u64::try_from(MAX_SESSION_AGENTS + 2).unwrap()
+        );
+        assert_eq!(summary.active_agents.len(), MAX_SESSION_AGENTS);
+    }
+
+    #[test]
+    fn oversized_detail_is_omitted_without_aliasing_or_losing_events() {
+        let mut summary = SessionSummary::default();
+        let oversized = "x".repeat(MAX_OBSERVATION_KEY_BYTES + 1);
+        summary.absorb(&msg_sent(&oversized, &["Recipient"], Some(&oversized), 1));
+        assert_eq!(summary.messages_sent, 1);
+        assert_eq!(
+            summary.active_agents,
+            HashSet::from(["Recipient".to_owned()])
+        );
+        assert!(summary.agent_message_counts.is_empty());
+        assert!(summary.active_threads.is_empty());
+        assert_eq!(summary.skipped_detail_observations, 2);
+        assert!(
+            summary
+                .render()
+                .contains("2 oversized observations skipped")
+        );
     }
 
     #[test]
@@ -7153,7 +8727,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Released));
     }
 
@@ -7177,7 +8751,7 @@ mod synthesis_tests {
             )],
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("RedHawk", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("RedHawk", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Conflicted));
     }
 
@@ -7191,7 +8765,7 @@ mod synthesis_tests {
             "proj-alpha",
             1_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, None);
     }
 
@@ -7204,7 +8778,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::ForceReleased));
     }
 
@@ -7217,7 +8791,7 @@ mod synthesis_tests {
             "proj-alpha",
             2_000_000,
         );
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 1_000_000);
         assert_eq!(outcome, Some(ReservationEventKind::Renewed));
     }
 
@@ -7260,7 +8834,7 @@ mod synthesis_tests {
         );
         // Query since t=3_000_000.
         // Reverse iteration: RedHawk@1M (ts < 3M → break). Never reaches BlueLake@5M.
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 3_000_000);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 3_000_000);
         assert_eq!(
             outcome,
             Some(ReservationEventKind::Released),
@@ -7291,11 +8865,228 @@ mod synthesis_tests {
         }
         // BlueLake's event is evicted from the ring buffer, but the
         // per-agent last-outcome cache preserves it.
-        let outcome = engine.reservation_outcome_for_agent("BlueLake", 0);
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", "proj-alpha", 0);
         assert_eq!(
             outcome,
             Some(ReservationEventKind::ForceReleased),
             "per-agent outcome cache must survive ring buffer eviction"
+        );
+    }
+
+    #[test]
+    fn reservation_outcomes_are_project_scoped_before_and_after_eviction() {
+        let mut engine = AtcEngine::new_for_testing();
+        let paths = ["src/**".to_string()];
+        engine.note_reservation_released("BlueLake", &paths, "/project/alpha", 5_000_000);
+        engine.note_reservation_force_released("BlueLake", &paths, "/project/beta", 6_000_000);
+
+        for evict in [false, true] {
+            if evict {
+                for i in 0..MAX_RESERVATION_EVENT_LOG {
+                    engine.note_reservation_granted(
+                        "FloodAgent",
+                        &paths,
+                        false,
+                        "/project/other",
+                        7_000_000 + i64::try_from(i).unwrap(),
+                    );
+                }
+                assert!(
+                    engine
+                        .reservation_event_log
+                        .iter()
+                        .all(|event| { event.kind == ReservationEventKind::Granted })
+                );
+            }
+            assert_eq!(
+                engine.reservation_outcome_for_agent("bluelake", "/project/alpha", 4_000_000),
+                Some(ReservationEventKind::Released),
+                "another project's newer outcome must not replace this project's evidence"
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/beta", 4_000_000),
+                Some(ReservationEventKind::ForceReleased)
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/unknown", 0),
+                None
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "", 0),
+                None
+            );
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 5_000_001),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_outcomes_do_not_merge_project_paths_with_colliding_slugs() {
+        let mut engine = AtcEngine::new_for_testing();
+        let first = "/tmp/atc-alpha/beta";
+        let second = "/tmp/atc/alpha-beta";
+        assert_eq!(
+            mcp_agent_mail_db::queries::generate_slug(first),
+            mcp_agent_mail_db::queries::generate_slug(second)
+        );
+        engine.note_reservation_released("BlueLake", &[], first, 1_000_000);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", first, 0),
+            Some(ReservationEventKind::Released)
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", second, 0),
+            None,
+            "display slug equality must not merge two full project identities"
+        );
+    }
+
+    #[test]
+    fn reservation_outcomes_keep_newest_evidence_when_events_arrive_out_of_order() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 5_000_000);
+        engine.note_reservation_renewed("bluelake", &[], "/project/alpha", 2_000_000);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released),
+            "arrival order must not overwrite a newer observation"
+        );
+        for i in 0..MAX_RESERVATION_EVENT_LOG {
+            engine.note_reservation_granted(
+                "FloodAgent",
+                &[],
+                false,
+                "/project/alpha",
+                6_000_000 + i64::try_from(i).unwrap(),
+            );
+        }
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BLUELAKE", "/project/alpha", 4_000_000),
+            Some(ReservationEventKind::Released),
+            "eviction fallback must preserve the newest scoped observation"
+        );
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
+    }
+
+    #[test]
+    fn reservation_outcome_pressure_cannot_restore_older_ring_success() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.reservation_last_outcome = BoundedOutcomes::new(1);
+        let mut observe = |kind, agent: &str, timestamp_micros| {
+            engine.push_reservation_event(ReservationEvent {
+                kind,
+                agent: agent.to_string(),
+                project: "/project/alpha".to_string(),
+                timestamp_micros,
+            });
+        };
+        observe(ReservationEventKind::Released, "BlueLake", 10);
+        observe(ReservationEventKind::Conflicted, "BlueLake", 20);
+        observe(ReservationEventKind::Renewed, "OtherAgent", 30);
+        // An older positive outcome remains in the ring, while the newer
+        // contradictory outcome has been evicted from the bounded index.
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            None
+        );
+        engine.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Released,
+            agent: "BlueLake".to_string(),
+            project: "/project/alpha".to_string(),
+            timestamp_micros: 20,
+        });
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            None,
+            "out-of-order evidence at the forgetting floor stays inconclusive"
+        );
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 40);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released),
+            "strictly newer evidence can resolve an experience again"
+        );
+    }
+
+    #[test]
+    fn reservation_outcome_timestamp_disagreement_survives_ring_eviction() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 10);
+        engine.note_reservation_renewed("bluelake", &[], "/project/alpha", 10);
+        for evict in [false, true] {
+            if evict {
+                for timestamp in 0..MAX_RESERVATION_EVENT_LOG {
+                    engine.note_reservation_granted(
+                        "OtherAgent",
+                        &[],
+                        false,
+                        "/project/other",
+                        20 + i64::try_from(timestamp).unwrap(),
+                    );
+                }
+            }
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BLUELAKE", "/project/alpha", 0),
+                None,
+                "the clock cannot order different outcomes at the same timestamp"
+            );
+        }
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 11);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released)
+        );
+    }
+
+    #[test]
+    fn reservation_outcome_alias_disagreement_is_not_hash_iteration_dependent() {
+        let mut engine = AtcEngine::new_for_testing();
+        let project = "/tmp/atc-outcome-alias";
+        let slug = mcp_agent_mail_db::queries::generate_slug(project);
+        engine.note_reservation_released("BlueLake", &[], project, 10);
+        engine.note_reservation_renewed("BlueLake", &[], &slug, 10);
+        for query in [project, slug.as_str()] {
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", query, 0),
+                None,
+                "conflicting human-key/slug evidence must remain ambiguous"
+            );
+        }
+        engine.note_reservation_released("BlueLake", &[], project, 11);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", &slug, 0),
+            Some(ReservationEventKind::Released)
+        );
+    }
+
+    #[test]
+    fn invalid_reservation_outcome_identities_do_not_consume_retention() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.reservation_last_outcome = BoundedOutcomes::new(1);
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 10);
+        for (agent, project) in [("", "/project/alpha"), ("BlueLake", "   ")] {
+            engine.push_reservation_event(ReservationEvent {
+                kind: ReservationEventKind::Conflicted,
+                agent: agent.to_string(),
+                project: project.to_string(),
+                timestamp_micros: 20,
+            });
+        }
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released)
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("", "/project/alpha", 0),
+            None
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "", 0),
+            None
         );
     }
 
@@ -7614,14 +9405,30 @@ mod load_routing_tests {
 // Predictive Coordination Intelligence (Track 12)
 // ──────────────────────────────────────────────────────────────────────
 
-/// Thread participation graph — tracks which agents are active in which
-/// threads.  Agents sharing multiple threads are at higher conflict risk.
+const MAX_PARTICIPATION_AGENTS: usize = 1024;
+const MAX_PARTICIPATION_THREADS: usize = 1024;
+const MAX_PARTICIPATION_EDGES: usize = 4096;
+const MAX_PARTICIPANTS_PER_THREAD: usize = 128;
+
+/// Recent thread participation, bounded independently of daemon uptime.
+///
+/// Retains at most 1,024 agents, 1,024 threads, and 4,096 unique participation
+/// edges, with at most 128 recently observed participants per thread. Repeated
+/// observations refresh recency; pressure evicts the oldest detail from both
+/// indexes. This observational graph never grants lifecycle/release authority.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadParticipationGraph {
-    /// `thread_id` → set of participating agent names.
-    thread_agents: HashMap<String, HashSet<String>>,
+    /// `thread_id` → participating agent names and their observation sequence.
+    thread_agents: HashMap<String, HashMap<String, u64>>,
     /// `agent` → set of `thread_id` values they are active in.
     agent_threads: HashMap<String, HashSet<String>>,
+    agent_recency: ObservationRecency,
+    thread_recency: ObservationRecency,
+    /// One entry per edge; repeated participation replaces the old entry.
+    edge_recency: BTreeMap<u64, (String, String)>,
+    sequence: u64,
+    evicted_participations: u64,
+    skipped_participations: u64,
 }
 
 impl ThreadParticipationGraph {
@@ -7630,14 +9437,121 @@ impl ThreadParticipationGraph {
         if agent == ATC_AGENT_NAME {
             return;
         }
-        self.thread_agents
-            .entry(thread_id.to_string())
-            .or_default()
-            .insert(agent.to_string());
-        self.agent_threads
-            .entry(agent.to_string())
-            .or_default()
-            .insert(thread_id.to_string());
+        if agent.len() > MAX_OBSERVATION_KEY_BYTES || thread_id.len() > MAX_OBSERVATION_KEY_BYTES {
+            self.skipped_participations = self.skipped_participations.saturating_add(1);
+            return;
+        }
+        if self.sequence == u64::MAX {
+            self.sequence = 0;
+            for (_, (retained_agent, retained_thread)) in std::mem::take(&mut self.edge_recency) {
+                self.sequence += 1;
+                if let Some(agents) = self.thread_agents.get_mut(&retained_thread)
+                    && let Some(sequence) = agents.get_mut(&retained_agent)
+                {
+                    *sequence = self.sequence;
+                }
+                self.edge_recency
+                    .insert(self.sequence, (retained_agent, retained_thread));
+            }
+        }
+        self.sequence += 1;
+        let retained_edge = if let Some(previous) = self
+            .thread_agents
+            .get_mut(thread_id)
+            .and_then(|agents| agents.get_mut(agent))
+        {
+            let old_sequence = std::mem::replace(previous, self.sequence);
+            self.edge_recency.remove(&old_sequence)
+        } else {
+            self.thread_agents
+                .entry(thread_id.to_owned())
+                .or_default()
+                .insert(agent.to_owned(), self.sequence);
+            self.agent_threads
+                .entry(agent.to_owned())
+                .or_default()
+                .insert(thread_id.to_owned());
+            None
+        };
+        self.edge_recency.insert(
+            self.sequence,
+            retained_edge.unwrap_or_else(|| (agent.to_owned(), thread_id.to_owned())),
+        );
+        self.enforce_participation_budgets(agent, thread_id);
+    }
+
+    fn enforce_participation_budgets(&mut self, agent: &str, thread_id: &str) {
+        if let Some(evicted) = self.agent_recency.touch(agent, MAX_PARTICIPATION_AGENTS) {
+            let threads: Vec<String> = self
+                .agent_threads
+                .get(&evicted)
+                .into_iter()
+                .flat_map(|threads| threads.iter().cloned())
+                .collect();
+            for thread in threads {
+                self.evict_participation(&evicted, &thread);
+            }
+        }
+        if let Some(evicted) = self
+            .thread_recency
+            .touch(thread_id, MAX_PARTICIPATION_THREADS)
+        {
+            let agents: Vec<String> = self
+                .thread_agents
+                .get(&evicted)
+                .into_iter()
+                .flat_map(|agents| agents.keys().cloned())
+                .collect();
+            for agent in agents {
+                self.evict_participation(&agent, &evicted);
+            }
+        }
+        let oldest_participant = self.thread_agents.get(thread_id).and_then(|agents| {
+            if agents.len() <= MAX_PARTICIPANTS_PER_THREAD {
+                return None;
+            }
+            agents
+                .iter()
+                .min_by(|(left_name, left_order), (right_name, right_order)| {
+                    left_order
+                        .cmp(right_order)
+                        .then_with(|| left_name.cmp(right_name))
+                })
+                .map(|(name, _)| name.clone())
+        });
+        if let Some(oldest) = oldest_participant {
+            self.evict_participation(&oldest, thread_id);
+        }
+        if self.edge_recency.len() > MAX_PARTICIPATION_EDGES
+            && let Some((oldest_agent, oldest_thread)) = self
+                .edge_recency
+                .first_key_value()
+                .map(|(_, edge)| edge.clone())
+        {
+            self.evict_participation(&oldest_agent, &oldest_thread);
+        }
+    }
+
+    fn evict_participation(&mut self, agent: &str, thread: &str) {
+        let Some(agents) = self.thread_agents.get_mut(thread) else {
+            return;
+        };
+        let Some(sequence) = agents.remove(agent) else {
+            return;
+        };
+        self.edge_recency.remove(&sequence);
+        if agents.is_empty() {
+            self.thread_agents.remove(thread);
+            self.thread_recency.remove(thread);
+        }
+        if let Some(threads) = self.agent_threads.get_mut(agent) {
+            threads.remove(thread);
+            if threads.is_empty() {
+                self.agent_threads.remove(agent);
+                self.agent_recency.remove(agent);
+            }
+        }
+        self.evicted_participations = self.evicted_participations.saturating_add(1);
     }
 
     /// Count how many threads two agents share.
@@ -7652,22 +9566,59 @@ impl ThreadParticipationGraph {
         threads_a.intersection(threads_b).count()
     }
 
-    /// Find all agent pairs that share >= `min_shared` threads.
-    /// These pairs are at elevated conflict risk.
+    /// Find retained agent pairs that share at least `min_shared` threads.
+    ///
+    /// Enumerate pairs inside each retained thread, never every pair in the
+    /// lifetime roster. For a positive threshold, work is at most
+    /// edges × (participants-per-thread - 1)/2 pair observations, and disjoint
+    /// single-participant threads do no pair work. A zero threshold preserves
+    /// the explicit request for every retained pair, including no overlap.
     #[must_use]
     pub fn high_risk_pairs(&self, min_shared: usize) -> Vec<(String, String, usize)> {
-        let agents: Vec<&str> = self.agent_threads.keys().map(String::as_str).collect();
-        let mut pairs = Vec::new();
-        for i in 0..agents.len() {
-            for j in (i + 1)..agents.len() {
-                let count = self.shared_thread_count(agents[i], agents[j]);
-                if count >= min_shared {
-                    pairs.push((agents[i].to_string(), agents[j].to_string(), count));
+        self.high_risk_pairs_with_work(min_shared).0
+    }
+
+    fn high_risk_pairs_with_work(
+        &self,
+        min_shared: usize,
+    ) -> (Vec<(String, String, usize)>, usize) {
+        let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut pair_observations = 0;
+        for agents in self.thread_agents.values() {
+            let mut agents: Vec<&str> = agents.keys().map(String::as_str).collect();
+            agents.sort_unstable();
+            for (index, &left) in agents.iter().enumerate() {
+                for &right in &agents[index + 1..] {
+                    *counts.entry((left, right)).or_default() += 1;
+                    pair_observations += 1;
                 }
             }
         }
-        pairs.sort_by_key(|pair| Reverse(pair.2));
-        pairs
+        if min_shared == 0 {
+            // Preserve the caller's explicit zero-overlap query. Only this
+            // branch needs all pairs, bounded by the retained agent budget.
+            let mut agents: Vec<&str> = self.agent_threads.keys().map(String::as_str).collect();
+            agents.sort_unstable();
+            for (index, &left) in agents.iter().enumerate() {
+                for &right in &agents[index + 1..] {
+                    counts.entry((left, right)).or_default();
+                    pair_observations += 1;
+                }
+            }
+        }
+        let mut pairs: Vec<_> = counts
+            .into_iter()
+            .filter(|(_, count)| *count >= min_shared)
+            .map(|((left, right), count)| (left.to_owned(), right.to_owned(), count))
+            .collect();
+        pairs.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        (pairs, pair_observations)
     }
 
     /// Number of tracked agents.
@@ -7680,6 +9631,24 @@ impl ThreadParticipationGraph {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.thread_agents.len()
+    }
+
+    /// Number of retained unique agent/thread edges.
+    #[must_use]
+    pub fn participation_count(&self) -> usize {
+        self.edge_recency.len()
+    }
+
+    /// Lifetime edges evicted by the recent-detail budgets.
+    #[must_use]
+    pub const fn evicted_participations(&self) -> u64 {
+        self.evicted_participations
+    }
+
+    /// Oversized observations omitted without truncating or aliasing identity.
+    #[must_use]
+    pub const fn skipped_participations(&self) -> u64 {
+        self.skipped_participations
     }
 }
 
@@ -7726,6 +9695,177 @@ pub fn rank_probe_targets<S: BuildHasher>(
 #[cfg(test)]
 mod predictive_tests {
     use super::*;
+
+    fn assert_consistent_participation_indexes(graph: &ThreadParticipationGraph) {
+        let forward: usize = graph.thread_agents.values().map(HashMap::len).sum();
+        let reverse: usize = graph.agent_threads.values().map(HashSet::len).sum();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, graph.participation_count());
+        assert!(forward <= MAX_PARTICIPATION_EDGES);
+        assert!(graph.agent_count() <= MAX_PARTICIPATION_AGENTS);
+        assert!(graph.thread_count() <= MAX_PARTICIPATION_THREADS);
+        assert_eq!(graph.agent_recency.order.len(), graph.agent_count());
+        assert_eq!(graph.agent_recency.by_key.len(), graph.agent_count());
+        assert_eq!(graph.thread_recency.order.len(), graph.thread_count());
+        assert_eq!(graph.thread_recency.by_key.len(), graph.thread_count());
+        for (thread, agents) in &graph.thread_agents {
+            assert!(!agents.is_empty());
+            assert!(agents.len() <= MAX_PARTICIPANTS_PER_THREAD);
+            for (agent, sequence) in agents {
+                assert!(graph.agent_threads[agent].contains(thread));
+                assert_eq!(
+                    graph.edge_recency.get(sequence),
+                    Some(&(agent.clone(), thread.clone()))
+                );
+            }
+        }
+        for (agent, threads) in &graph.agent_threads {
+            assert!(!threads.is_empty());
+            for thread in threads {
+                assert!(graph.thread_agents[thread].contains_key(agent));
+            }
+        }
+    }
+
+    #[test]
+    fn participation_churn_retains_recent_intersections_and_no_orphan_edges() {
+        let mut graph = ThreadParticipationGraph::default();
+        for index in 0..MAX_PARTICIPATION_THREADS * 2 {
+            graph.record_participation(&format!("Old{index}"), &format!("thread-{index}"));
+            for thread in ["hot-1", "hot-2"] {
+                graph.record_participation("RecentA", thread);
+                graph.record_participation("RecentB", thread);
+            }
+        }
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.shared_thread_count("RecentA", "RecentB"), 2);
+        assert_eq!(
+            graph.high_risk_pairs(2),
+            vec![("RecentA".into(), "RecentB".into(), 2)]
+        );
+        assert!(!graph.agent_threads.contains_key("Old0"));
+        assert!(!graph.thread_agents.contains_key("thread-0"));
+        assert!(graph.evicted_participations() > 0);
+
+        // Repeated activity refreshes one entry rather than accumulating access
+        // records. This was a separate lifetime-growth trap for queue-based LRU.
+        let before = graph.participation_count();
+        for _ in 0..10_000 {
+            graph.record_participation("RecentA", "hot-1");
+        }
+        assert_eq!(graph.participation_count(), before);
+        assert_consistent_participation_indexes(&graph);
+    }
+
+    #[test]
+    fn participation_edge_and_fanout_budgets_bound_actual_pair_work() {
+        let mut graph = ThreadParticipationGraph::default();
+        let participants = MAX_PARTICIPANTS_PER_THREAD;
+        let threads = MAX_PARTICIPATION_EDGES / participants * 2;
+        for thread in 0..threads {
+            for agent in 0..participants {
+                graph
+                    .record_participation(&format!("Agent{agent:02}"), &format!("thread-{thread}"));
+            }
+        }
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.participation_count(), MAX_PARTICIPATION_EDGES);
+        assert!(!graph.thread_agents.contains_key("thread-0"));
+        let retained_threads = MAX_PARTICIPATION_EDGES / participants;
+        assert_eq!(
+            graph.shared_thread_count("Agent00", "Agent01"),
+            retained_threads
+        );
+        let (pairs, observed) = graph.high_risk_pairs_with_work(retained_threads);
+        assert_eq!(pairs.len(), participants * (participants - 1) / 2);
+        assert!(pairs.iter().all(|(_, _, count)| *count == retained_threads));
+        assert_eq!(observed, MAX_PARTICIPATION_EDGES * (participants - 1) / 2);
+
+        for agent in 0..participants * 3 {
+            graph.record_participation(&format!("Wide{agent:02}"), "wide-thread");
+        }
+        assert_eq!(graph.thread_agents["wide-thread"].len(), participants);
+        assert!(!graph.agent_threads.contains_key("Wide00"));
+        assert_consistent_participation_indexes(&graph);
+        let (_, observed) = graph.high_risk_pairs_with_work(1);
+        assert!(observed <= MAX_PARTICIPATION_EDGES * (participants - 1) / 2);
+    }
+
+    #[test]
+    fn disjoint_threads_do_not_compare_the_whole_roster() {
+        let mut graph = ThreadParticipationGraph::default();
+        for index in 0..MAX_PARTICIPATION_AGENTS {
+            graph.record_participation(&format!("Agent{index}"), &format!("thread-{index}"));
+        }
+        let (pairs, observed) = graph.high_risk_pairs_with_work(1);
+        assert_eq!(pairs, Vec::<(String, String, usize)>::new());
+        assert_eq!(observed, 0);
+        assert_consistent_participation_indexes(&graph);
+    }
+
+    #[test]
+    fn zero_overlap_query_preserves_all_retained_pairs() {
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("A", "shared");
+        graph.record_participation("B", "shared");
+        graph.record_participation("C", "separate");
+        assert_eq!(
+            graph.high_risk_pairs(0),
+            vec![
+                ("A".into(), "B".into(), 1),
+                ("A".into(), "C".into(), 0),
+                ("B".into(), "C".into(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn observation_sequence_rebase_preserves_recent_keys_and_edges() {
+        let mut recency = ObservationRecency::default();
+        recency.touch("old", 2);
+        recency.touch("hot", 2);
+        recency.sequence = u64::MAX;
+        assert_eq!(recency.touch("hot", 2), None);
+        assert_eq!(recency.touch("new", 2), Some("old".to_owned()));
+        assert_eq!(recency.order.len(), 2);
+        assert_eq!(recency.by_key.len(), 2);
+
+        let mut graph = ThreadParticipationGraph::default();
+        graph.record_participation("Old", "shared");
+        graph.record_participation("Hot", "shared");
+        graph.sequence = u64::MAX;
+        graph.record_participation("Hot", "shared");
+        graph.record_participation("New", "shared");
+        assert_consistent_participation_indexes(&graph);
+        assert_eq!(graph.shared_thread_count("Old", "Hot"), 1);
+        assert_eq!(graph.participation_count(), 3);
+        assert_eq!(
+            graph
+                .edge_recency
+                .first_key_value()
+                .map(|(_, (name, _))| name.as_str()),
+            Some("Old")
+        );
+        assert_eq!(
+            graph
+                .edge_recency
+                .last_key_value()
+                .map(|(_, (name, _))| name.as_str()),
+            Some("New")
+        );
+    }
+
+    #[test]
+    fn oversized_participation_keeps_both_indexes_empty() {
+        let mut graph = ThreadParticipationGraph::default();
+        let oversized = "x".repeat(MAX_OBSERVATION_KEY_BYTES + 1);
+        graph.record_participation(&oversized, "thread");
+        graph.record_participation("Agent", &oversized);
+        assert_eq!(graph.skipped_participations(), 2);
+        assert_eq!(graph.agent_count(), 0);
+        assert_eq!(graph.thread_count(), 0);
+        assert_consistent_participation_indexes(&graph);
+    }
 
     #[test]
     fn empty_graph() {
@@ -9431,6 +11571,7 @@ impl AtcEngine {
             cusum_threshold: config.atc_cusum_threshold,
             cusum_delta: config.atc_cusum_delta,
             ledger_capacity: config.atc_ledger_capacity,
+            max_tracked_agents: mcp_agent_mail_core::config::atc_population_limit(),
             tick_budget_micros: 5_000,
             suspicion_k: config.atc_suspicion_k,
         }
@@ -9488,6 +11629,34 @@ pub fn atc_enabled() -> bool {
         .is_some_and(|e| e.enabled())
 }
 
+/// Recheck mandatory coverage before admitting a queued reservation release.
+///
+/// A capacity refusal completed before this check invalidates release authority
+/// even if the effect was planned earlier. The engine lock is released before
+/// runtime work begins. Optional policy fallback remains a planning decision;
+/// unavailable or incomplete agent/conflict coverage always refuses execution
+/// admission, independently of the policy's optional fallback guard.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
+    release_capacity_admission_from_engine(ATC_ENGINE.get())
+}
+
+fn release_capacity_admission_from_engine(
+    engine_lock: Option<&Mutex<AtcEngine>>,
+) -> Result<(), &'static str> {
+    let engine_lock = engine_lock.ok_or("agent_coverage_unavailable")?;
+    let engine = engine_lock
+        .lock()
+        .map_err(|_| "agent_coverage_unavailable")?;
+    if !engine.enabled() {
+        return Err("agent_coverage_unavailable");
+    }
+    if let Some(reason) = engine.capacity_guard_reason() {
+        return Err(reason);
+    }
+    Ok(())
+}
+
 /// Record an agent registration in the ATC.
 pub fn atc_register_agent(name: &str, program: &str) {
     atc_register_agent_with_project(name, program, None);
@@ -9504,15 +11673,8 @@ pub fn atc_register_agent_with_project(name: &str, program: &str, project_key: O
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
-    e.register_agent(name, program, project_key);
-    drop(e);
-
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut t) = thresholds.lock()
-    {
-        t.entry(name.to_string())
-            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    if e.register_agent(name, program, project_key) {
+        e.ensure_adaptive_threshold(name);
     }
 }
 
@@ -9527,7 +11689,7 @@ pub fn atc_observe_activity_with_project(
     project_key: Option<&str>,
     timestamp_micros: i64,
 ) {
-    if agent.trim().is_empty() {
+    if agent.trim().is_empty() || agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
         return;
     }
     let Some(engine) = ATC_ENGINE.get() else {
@@ -9539,26 +11701,15 @@ pub fn atc_observe_activity_with_project(
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
     if !e.agents.contains_key(agent) {
         // Tool-call activity frequently arrives after ATC startup for agents
         // that were registered in a previous process lifetime. Auto-register
         // unknown agents so liveness tracking can start from the first signal.
-        e.register_agent(agent, "unknown-tool", project_key);
+        if !e.register_agent(agent, "unknown-tool", project_key) {
+            return;
+        }
     }
-    drop(e);
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut t) = thresholds.lock()
-    {
-        t.entry(agent.to_string())
-            .or_insert_with(|| AdaptiveThreshold::new(base_k));
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
-        return;
-    };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
+    e.ensure_adaptive_threshold(agent);
     e.observe_activity(agent, project_key, timestamp_micros);
 }
 
@@ -9584,7 +11735,6 @@ pub fn atc_sync_agent_snapshot(
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
     let program = if program.trim().is_empty() {
         "unknown-tool"
     } else {
@@ -9604,16 +11754,12 @@ pub fn atc_sync_agent_snapshot(
         return;
     }
     let prior_last_activity = prior.map_or(0, |(prior_ts, _, _)| prior_ts);
-    e.register_agent(name, program, project_key);
+    if !e.register_agent(name, program, project_key) {
+        return;
+    }
+    e.ensure_adaptive_threshold(name);
     if last_activity_ts > prior_last_activity {
         e.observe_activity(name, project_key, last_activity_ts);
-    }
-    drop(e);
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut thresholds) = thresholds.lock()
-        && !thresholds.contains_key(name)
-    {
-        thresholds.insert(name.to_string(), AdaptiveThreshold::new(base_k));
     }
 }
 
@@ -9964,16 +12110,6 @@ pub fn atc_note_reservation_conflicts(
     if !e.enabled() {
         return;
     }
-    let conflicts: Vec<(String, String, String)> = conflicts
-        .iter()
-        .map(|conflict| {
-            (
-                conflict.holder.clone(),
-                conflict.requested_path.clone(),
-                conflict.holder_path_pattern.clone(),
-            )
-        })
-        .collect();
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -9989,6 +12125,18 @@ pub fn atc_note_reservation_conflicts(
         );
         return;
     }
+    // Borrow input detail so rejected oversized patterns are never cloned on
+    // their way to bounded admission. Shadow mode allocates no projection.
+    let conflicts: Vec<(&str, &str, &str)> = conflicts
+        .iter()
+        .map(|conflict| {
+            (
+                conflict.holder.as_str(),
+                conflict.requested_path.as_str(),
+                conflict.holder_path_pattern.as_str(),
+            )
+        })
+        .collect();
     e.note_reservation_conflicts(requester, project, &conflicts, timestamp_micros);
 }
 
@@ -10180,17 +12328,18 @@ pub fn atc_note_build_slot_released(agent: &str, slot: &str, project: &str, time
     e.note_build_slot_released(agent, timestamp_micros);
 }
 
-/// Query the engine's reservation event log for the most recent outcome affecting `agent`
-/// since `since_micros`. Returns None if no relevant event found.
+/// Query the engine's reservation event log for the most recent outcome affecting
+/// `agent` in `project` since `since_micros`. Returns None without scoped evidence.
 #[must_use]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn atc_reservation_outcome_for_agent(
     agent: &str,
+    project: &str,
     since_micros: i64,
 ) -> Option<ReservationEventKind> {
     let engine_lock = ATC_ENGINE.get()?;
     let engine = engine_lock.lock().ok()?;
-    engine.reservation_outcome_for_agent(agent, since_micros)
+    engine.reservation_outcome_for_agent(agent, project, since_micros)
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {
@@ -10305,7 +12454,10 @@ pub fn atc_record_outcome(
     if let Some(engine_lock) = ATC_ENGINE.get()
         && let Ok(mut engine) = engine_lock.lock()
     {
-        engine.eprocess.update(correct, subsystem, agent);
+        // Outcomes for unknown/refused identities still inform aggregate safety,
+        // but cannot bypass population admission by allocating per-agent state.
+        let tracked_agent = agent.filter(|name| engine.agents.contains_key(*name));
+        engine.eprocess.update(correct, subsystem, tracked_agent);
         let now = mcp_agent_mail_core::timestamps::now_micros();
         engine.cusum.update(!correct, now);
 
@@ -10363,12 +12515,12 @@ pub fn atc_record_outcome(
         adaptive.record_outcome(correct);
     }
 
-    // Feed liveness tuner (regret → PID → loss matrix feedback loop)
+    // Match tick/activity feedback's ENGINE -> TUNER lock order.
+    // Never wait for ENGINE while holding TUNER: that deadlocks with ticks.
     if subsystem == AtcSubsystem::Liveness
+        && let Some(engine_lock) = ATC_ENGINE.get()
         && let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
-        && let Ok(mut tuner) = tuner_lock.lock()
     {
-        let regret = (predicted_loss - actual_loss).abs();
         let action = if correct {
             LivenessAction::DeclareAlive
         } else {
@@ -10379,13 +12531,17 @@ pub fn atc_record_outcome(
         } else {
             LivenessState::Dead
         };
-        tuner.record_outcome(action, state, regret);
-
-        if let Some(engine_lock) = ATC_ENGINE.get()
-            && let Ok(mut engine) = engine_lock.lock()
-            && tuner.maybe_update(&mut engine.liveness_core)
+        if let Ok(mut engine) = engine_lock.lock()
+            && engine.enabled()
         {
-            engine.propagate_liveness_policy();
+            let changed = tuner_lock.lock().is_ok_and(|mut tuner| {
+                tuner.record_outcome(action, state, (predicted_loss - actual_loss).abs());
+                tuner.maybe_update(&mut engine.liveness_core)
+            });
+            // Do not hold the tuner lock during policy fan-out.
+            if changed {
+                engine.propagate_liveness_policy();
+            }
         }
     }
 
@@ -10462,15 +12618,17 @@ impl ExecutionPosture {
     }
 }
 
-/// How complete the snapshot is. A `Full` snapshot reads all maintained
-/// statistics; `Partial` indicates some subsystem locks were contended;
+/// How complete the snapshot is.
+///
+/// A `Full` snapshot reads all maintained
+/// statistics; `Partial` indicates unavailable data or incomplete agent/conflict coverage;
 /// `Fallback` means only cached/stale data was available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotCompleteness {
     /// All subsystem data was freshly read.
     Full,
-    /// Some subsystem data was unavailable; snapshot is best-effort.
+    /// Some subsystem data, agent identities, or conflict evidence could not be retained.
     Partial,
     /// Only cached/stale data was used (lock contention or startup).
     Fallback,
@@ -10539,6 +12697,8 @@ pub struct AtcSummarySnapshot {
 
     // ── agent liveness (operator-facing, deterministic order) ────────
     pub tracked_agents: Vec<AgentStateSnapshot>,
+    /// Observed cycles in retained conflict evidence. If conflict coverage is
+    /// incomplete, zero does not certify that the full population is deadlock-free.
     pub deadlock_cycles: usize,
 
     // ── learning state (machine-facing) ──────────────────────────────
@@ -11059,6 +13219,114 @@ mod alien_enhancement_tests {
     }
 
     #[test]
+    fn liveness_capacity_uses_the_population_limit_override() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_LIMIT", "7")],
+            || {
+                let config = mcp_agent_mail_core::Config::default();
+                assert_eq!(AtcEngine::config_from_env(&config).max_tracked_agents, 7);
+            },
+        );
+    }
+
+    #[test]
+    fn global_liveness_capacity_bounds_all_admission_paths_and_thresholds() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        *engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 3,
+            ..AtcConfig::default()
+        });
+
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            atc_register_agent(name, "claude-code");
+            atc_observe_activity(name, 1_000_000);
+            atc_sync_agent_snapshot(name, "claude-code", None, 1_000_000);
+        }
+        let initial = atc_summary().expect("initial summary");
+        assert!(initial.tracked_agents.is_empty());
+        assert_eq!(initial.kernel.max_tracked_agents, 3);
+        assert_eq!(initial.kernel.agent_capacity_refusals, 0);
+        assert_eq!(initial.completeness, SnapshotCompleteness::Full);
+        assert!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().is_empty());
+
+        atc_register_agent("Registered", "claude-code");
+        atc_observe_activity("Observed", 1_000_000);
+        atc_sync_agent_snapshot("Synced", "codex-cli", Some("/project"), 1_000_000);
+        assert_eq!(
+            atc_summary().unwrap().completeness,
+            SnapshotCompleteness::Full
+        );
+        for index in 0..128 {
+            let refused = format!("Refused{index}");
+            atc_register_agent(&refused, "claude-code");
+            atc_observe_activity(&refused, 2_000_000);
+            atc_sync_agent_snapshot(&refused, "codex-cli", None, 2_000_000);
+        }
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            atc_register_agent(name, "claude-code");
+            atc_observe_activity(name, 2_000_000);
+            atc_sync_agent_snapshot(name, "claude-code", None, 2_000_000);
+        }
+        atc_observe_activity("InvalidTimestamp", 0);
+        atc_sync_agent_snapshot("Registered", "codex-cli", Some("/new"), 3_000_000);
+        atc_observe_activity("Observed", 4_000_000);
+        atc_register_agent("Synced", "claude-code");
+
+        let summary = atc_summary().expect("live summary before any tick");
+        assert_eq!(summary.completeness, SnapshotCompleteness::Partial);
+        assert_eq!(summary.execution_posture, ExecutionPosture::Cautious);
+        assert_eq!(summary.kernel.tracked_agents, 3);
+        assert_eq!(summary.kernel.max_tracked_agents, 3);
+        assert_eq!(summary.kernel.agent_capacity_refusals, 384);
+        assert!(summary.kernel.agent_coverage_incomplete);
+        assert!(summary.policy.fallback_active);
+        assert_eq!(
+            summary.policy.fallback_reason.as_deref(),
+            Some("agent_capacity")
+        );
+        {
+            let engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(engine.agents.len(), 3);
+            assert_eq!(engine.agents["Registered"].program, "codex-cli");
+            assert_eq!(
+                engine.agents["Registered"].rhythm.last_activity_ts,
+                3_000_000
+            );
+            assert_eq!(engine.agents["Observed"].rhythm.last_activity_ts, 4_000_000);
+            assert_eq!(engine.agents["Synced"].program, "claude-code");
+            assert!(engine.pending_liveness_feedback.is_empty());
+            assert_eq!(engine.resolved_experience_count, 0);
+            let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+            assert_eq!(thresholds.len(), 3);
+            assert!(
+                engine
+                    .agents
+                    .keys()
+                    .all(|name| thresholds.contains_key(name))
+            );
+        }
+
+        reset_global_atc_state_for_test(&config);
+        let reset = atc_summary().expect("reset summary");
+        assert_eq!(reset.completeness, SnapshotCompleteness::Full);
+        assert!(!reset.kernel.agent_coverage_incomplete);
+        assert_eq!(reset.kernel.agent_capacity_refusals, 0);
+        assert!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn global_atc_init_and_query() {
         let _guard = GLOBAL_ATC_TEST_LOCK
             .lock()
@@ -11528,6 +13796,48 @@ mod alien_enhancement_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn unknown_outcome_identities_do_not_grow_per_agent_calibration() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        reset_global_atc_state_for_test(&config);
+        atc_register_agent("Tracked", "codex-cli");
+        atc_record_outcome(AtcSubsystem::Liveness, Some("Tracked"), 1.0, 100.0, false);
+        for index in 0..1_000 {
+            atc_record_outcome(
+                AtcSubsystem::Liveness,
+                Some(&format!("Untracked{index}")),
+                1.0,
+                100.0,
+                false,
+            );
+        }
+        atc_record_outcome(
+            AtcSubsystem::Liveness,
+            Some(&"x".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1)),
+            1.0,
+            100.0,
+            false,
+        );
+        let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.eprocess.per_agent.len(), 1);
+        assert!(engine.eprocess.per_agent.contains_key("Tracked"));
+        assert_eq!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().len(), 1);
+        assert!(engine.eprocess.miscalibrated());
+        assert!(
+            engine.calibration.is_safe_mode(),
+            "refused per-agent detail must not discard aggregate safety evidence"
+        );
+        drop(engine);
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
@@ -12037,6 +14347,39 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn schedule_compaction_keeps_large_population_bounded_without_roster_scans() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("HeapAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+
+        let bound = POPULATION * 4;
+        for generation in 1_i64..=8 {
+            for index in 0..POPULATION {
+                let agent = format!("HeapAgent{index:04}");
+                engine.schedule_entry_for_push(&agent, 1_000_000 + generation);
+                assert!(engine.liveness_schedule.len() <= bound);
+            }
+        }
+
+        // Force one final rebuild and verify exactly one current entry survives
+        // for each live scheduled agent.
+        while engine.liveness_schedule.len() <= bound {
+            engine.liveness_schedule.push(Reverse(ScheduledAgentReview {
+                review_at_micros: 1,
+                schedule_version: 0,
+                agent: "obsolete".to_string(),
+            }));
+        }
+        engine.compact_liveness_schedule_if_needed();
+        assert_eq!(engine.liveness_schedule.len(), POPULATION);
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
     }
 
     #[test]

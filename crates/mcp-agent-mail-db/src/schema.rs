@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS messages (
     archive_metadata_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
+CREATE INDEX IF NOT EXISTS idx_messages_project_thread_activity ON messages(project_id, thread_id, created_ts, id);
 CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic);
@@ -111,6 +112,33 @@ CREATE INDEX IF NOT EXISTS idx_message_recipients_agent ON message_recipients(ag
 CREATE INDEX IF NOT EXISTS idx_message_recipients_agent_message ON message_recipients(agent_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_mr_agent_ack ON message_recipients(agent_id, ack_ts);
 CREATE INDEX IF NOT EXISTS idx_mr_ack_message ON message_recipients(ack_ts, message_id);
+
+-- Project-addressed shared mailbox deliveries (GH#282). A message sent to the
+-- `project:<slug>` recipient is stored ONCE, with exactly one delivery row
+-- here, instead of a message_recipients row per agent. Every active agent of
+-- the project other than the sender reads it from its inbox. `kind` is the
+-- address slot the sender used (to or cc). This is not broadcast: nothing is
+-- fanned out per agent at send time or at registration time.
+CREATE TABLE IF NOT EXISTS project_mailbox_deliveries (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    kind TEXT NOT NULL DEFAULT 'to',
+    delivered_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_mailbox_deliveries_project_ts ON project_mailbox_deliveries(project_id, delivered_ts);
+
+-- Per-agent read and acknowledgement state for project mailbox deliveries
+-- (GH#282). Rows are created lazily, only when an agent marks a project
+-- message read or acknowledges it, so reading the shared mailbox never
+-- materializes per-agent delivery rows and never touches another agent.
+CREATE TABLE IF NOT EXISTS project_mailbox_receipts (
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    read_ts INTEGER,
+    ack_ts INTEGER,
+    PRIMARY KEY(message_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_mailbox_receipts_agent ON project_mailbox_receipts(agent_id, message_id);
 
 -- File reservations table
 CREATE TABLE IF NOT EXISTS file_reservations (
@@ -582,6 +610,293 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
              FROM messages AS m WHERE m.id = NEW.message_id; \
          END";
 
+const PROJECT_EVENT_SCOPE_MIGRATION: &str = "v33_project_scoped_inbox_delivery_events";
+
+// Both predicates below are migration history, not the evolving read policy.
+// In particular, changing visible_to_viewer_sql! must never change an applied
+// v34 checksum. A policy change needs its own checked trigger replacement.
+macro_rules! cursor_delete_trigger_sql {
+    ($visibility:expr) => {
+        concat!(
+            "CREATE TRIGGER IF NOT EXISTS trg_inbox_delivery_cursor_delete ",
+            "AFTER DELETE ON inbox_delivery_events BEGIN ",
+                "INSERT INTO inbox_delivery_cursor_state ",
+                    "(project_id, scope, scope_id, tail_seq, pruned_through_seq) ",
+                "VALUES (OLD.project_id, CASE WHEN OLD.agent_id IS NULL THEN 'project' ELSE 'agent' END, ",
+                        "COALESCE(OLD.agent_id, OLD.project_id), OLD.seq, ",
+                        "CASE WHEN OLD.agent_id IS NULL THEN 0 ELSE OLD.seq END) ",
+                "ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET ",
+                    "tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq), ",
+                    "pruned_through_seq = MAX(inbox_delivery_cursor_state.pruned_through_seq, excluded.pruned_through_seq); ",
+                "INSERT INTO inbox_delivery_cursor_state ",
+                    "(project_id, scope, scope_id, tail_seq, pruned_through_seq) ",
+                "SELECT OLD.project_id, 'agent', viewer.id, OLD.seq, OLD.seq ",
+                "FROM agents AS viewer ",
+                "JOIN messages AS m ON m.id = OLD.message_id ",
+                "JOIN project_mailbox_deliveries AS d ON d.message_id = m.id ",
+                "WHERE OLD.agent_id IS NULL AND OLD.kind = 'project' AND ",
+                $visibility,
+                " ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET ",
+                    "tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq), ",
+                    "pruned_through_seq = MAX(inbox_delivery_cursor_state.pruned_through_seq, excluded.pruned_through_seq); ",
+            "END"
+        )
+    };
+}
+
+const V34_CURSOR_DELETE_TRIGGER_SQL: &str = cursor_delete_trigger_sql!(
+    "d.project_id = viewer.project_id \
+     AND m.project_id = d.project_id \
+     AND m.sender_id <> viewer.id \
+     AND viewer.retired_at IS NULL \
+     AND viewer.inception_ts <= m.created_ts \
+     AND LOWER(COALESCE(viewer.contact_policy, 'auto')) <> 'block_all' \
+     AND NOT EXISTS (SELECT 1 FROM message_recipients direct \
+                     WHERE direct.message_id = d.message_id AND direct.agent_id = viewer.id)"
+);
+
+const SHARED_CURSOR_LIFECYCLE_MIGRATION: &str = "v35_replace_shared_cursor_delete_lifecycle";
+const V35_CURSOR_DELETE_TRIGGER_SQL: &str = cursor_delete_trigger_sql!(
+    "d.project_id = viewer.project_id \
+     AND m.project_id = d.project_id \
+     AND m.sender_id <> viewer.id \
+     AND viewer.retired_at IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM agent_deregistrations lifecycle WHERE lifecycle.agent_id = viewer.id) \
+     AND viewer.inception_ts <= m.created_ts \
+     AND LOWER(COALESCE(viewer.contact_policy, 'auto')) <> 'block_all' \
+     AND NOT EXISTS (SELECT 1 FROM message_recipients direct \
+                     WHERE direct.message_id = d.message_id AND direct.agent_id = viewer.id)"
+);
+const SHARED_CURSOR_LIFECYCLE_STATEMENTS: &[&str] = &[
+    "DROP TRIGGER trg_inbox_delivery_cursor_delete",
+    V35_CURSOR_DELETE_TRIGGER_SQL,
+];
+
+// One atomic migration, including its ledger entry. Keep the historical v25
+// and v32 SQL/checksums intact. Project events have no recipient agent; NULL
+// expresses that without inventing an agent or weakening direct-event FKs.
+// Copy seq verbatim and retain sqlite_sequence even when retention removed
+// the newest (or every) event, so an issued cursor can never be reused.
+pub(crate) const PROJECT_EVENT_SCOPE_STATEMENTS: &[&str] = &[
+    "CREATE TABLE inbox_delivery_events_v33 (\
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,\
+        project_id INTEGER NOT NULL REFERENCES projects(id),\
+        agent_id INTEGER REFERENCES agents(id),\
+        message_id INTEGER NOT NULL REFERENCES messages(id),\
+        kind TEXT NOT NULL,\
+        delivered_ts INTEGER NOT NULL,\
+        UNIQUE(agent_id, message_id),\
+        CHECK ((kind = 'project' AND agent_id IS NULL) OR \
+               (kind <> 'project' AND agent_id IS NOT NULL))\
+    )",
+    "INSERT INTO inbox_delivery_events_v33 \
+        (seq, project_id, agent_id, message_id, kind, delivered_ts) \
+     SELECT seq, project_id, \
+            CASE WHEN kind = 'project' AND agent_id = 0 THEN NULL ELSE agent_id END, \
+            message_id, kind, delivered_ts FROM inbox_delivery_events ORDER BY seq",
+    "INSERT INTO sqlite_sequence (name, seq) \
+     SELECT 'inbox_delivery_events_v33', seq FROM sqlite_sequence \
+     WHERE name = 'inbox_delivery_events' \
+       AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'inbox_delivery_events_v33')",
+    "UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE(\
+        (SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0)) \
+     WHERE name = 'inbox_delivery_events_v33'",
+    "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
+    "DROP TRIGGER IF EXISTS trg_messages_cascade_project_mailbox",
+    "DROP TABLE inbox_delivery_events",
+    "ALTER TABLE inbox_delivery_events_v33 RENAME TO inbox_delivery_events",
+    "CREATE INDEX idx_inbox_delivery_events_agent_seq ON inbox_delivery_events(agent_id, seq)",
+    "CREATE UNIQUE INDEX idx_inbox_delivery_events_project_message \
+     ON inbox_delivery_events(project_id, message_id) WHERE agent_id IS NULL",
+    TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL,
+    "CREATE TRIGGER trg_messages_cascade_project_mailbox \
+     AFTER DELETE ON messages BEGIN \
+         DELETE FROM project_mailbox_receipts WHERE message_id = OLD.id; \
+         DELETE FROM project_mailbox_deliveries WHERE message_id = OLD.id; \
+         DELETE FROM inbox_delivery_events WHERE message_id = OLD.id AND agent_id IS NULL; \
+     END",
+];
+
+const V28_AGENT_DEREGISTRATION_BACKFILL: &str = "v28_backfill_agent_deregistrations";
+
+// This definition has already been recorded in migration ledgers. Keep its
+// exact bytes so existing mailboxes still pass checksum validation. The
+// compatibility execution below fixes LIKE's case folding for pending upgrades
+// without rewriting any already-applied ledger or deregistration evidence.
+const V28_AGENT_DEREGISTRATION_BACKFILL_SQL: &str = "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+     SELECT id, last_active_ts FROM agents \
+     WHERE task_description LIKE '[DEREGISTERED %'";
+
+const V28_AGENT_DEREGISTRATION_BACKFILL_EXACT_SQL: &str = "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
+     SELECT id, last_active_ts FROM agents \
+     WHERE substr(task_description, 1, 14) = '[DEREGISTERED ' COLLATE BINARY";
+
+fn migration_execution_sql(migration: &Migration) -> &str {
+    // Restrict compatibility execution to the exact historical definition;
+    // an unrelated or edited migration must retain ordinary drift detection.
+    if migration.id == V28_AGENT_DEREGISTRATION_BACKFILL
+        && migration.up == V28_AGENT_DEREGISTRATION_BACKFILL_SQL
+    {
+        V28_AGENT_DEREGISTRATION_BACKFILL_EXACT_SQL
+    } else {
+        &migration.up
+    }
+}
+
+/// Physical statements of an authored migration. Table rebuilds and owned
+/// trigger replacements run as a unit; their complete SQL remains covered by
+/// the migration checksum. The frozen v28 backfill uses the same exact-prefix
+/// compatibility execution for runtime upgrades and canonical reconstruction.
+/// Callers own the surrounding migration transaction.
+pub(crate) fn migration_sql_statements(migration: &Migration) -> Vec<&str> {
+    if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
+        PROJECT_EVENT_SCOPE_STATEMENTS.to_vec()
+    } else if migration.id == SHARED_CURSOR_LIFECYCLE_MIGRATION {
+        SHARED_CURSOR_LIFECYCLE_STATEMENTS.to_vec()
+    } else {
+        vec![migration_execution_sql(migration)]
+    }
+}
+
+fn is_owned_cursor_delete_trigger_sql(sql: &str) -> bool {
+    [V34_CURSOR_DELETE_TRIGGER_SQL, V35_CURSOR_DELETE_TRIGGER_SQL]
+        .into_iter()
+        .any(|authored| {
+            sql == authored
+                || sql.strip_prefix("CREATE TRIGGER ")
+                    == authored.strip_prefix("CREATE TRIGGER IF NOT EXISTS ")
+        })
+}
+
+/// Recognize only the exact owned versions. SQLite may remove IF NOT EXISTS
+/// from its stored creation prefix; whitespace and literal changes elsewhere
+/// can alter visibility and must not be accepted as equivalent.
+fn owned_cursor_delete_trigger(rows: &[sqlmodel_core::Row]) -> Result<Option<String>, SqlError> {
+    let mut found = None;
+    for row in rows {
+        let name = row.get_named::<String>("name")?;
+        if !name.eq_ignore_ascii_case("trg_inbox_delivery_cursor_delete") {
+            continue;
+        }
+        let sql = row.get_named::<String>("sql")?;
+        if found.is_some()
+            || name != "trg_inbox_delivery_cursor_delete"
+            || row.get_named::<String>("type")? != "trigger"
+            || row.get_named::<String>("tbl_name")? != "inbox_delivery_events"
+            || !is_owned_cursor_delete_trigger_sql(&sql)
+        {
+            return Err(SqlError::Custom(
+                "refuses unsupported definition of trg_inbox_delivery_cursor_delete; preserve or migrate this schema before retrying"
+                    .to_string(),
+            ));
+        }
+        found = Some(sql);
+    }
+    Ok(found)
+}
+
+/// Shared preflight for runtime upgrades and canonical reconstruction. All
+/// destructive statements remain inside the caller's migration transaction.
+pub(crate) fn validate_multi_statement_migration_schema(
+    migration: &Migration,
+    rows: &[sqlmodel_core::Row],
+) -> Result<(), SqlError> {
+    if migration.id == SHARED_CURSOR_LIFECYCLE_MIGRATION {
+        if migration.up != SHARED_CURSOR_LIFECYCLE_STATEMENTS.join(";\n") {
+            return Err(SqlError::Custom(
+                "shared cursor lifecycle migration definition differs from its checked statements"
+                    .to_string(),
+            ));
+        }
+        if owned_cursor_delete_trigger(rows)?.is_none() {
+            return Err(SqlError::Custom(
+                "shared cursor lifecycle migration requires the existing owned cursor-delete trigger"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    } else {
+        validate_project_event_rebuild_schema(migration, rows)
+    }
+}
+
+/// Inspect the complete persistent schema, including references from views,
+/// triggers on other tables, and child foreign keys, before the v33 rebuild.
+pub(crate) const PROJECT_EVENT_SCHEMA_SQL: &str =
+    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL";
+
+/// A rebuild must not silently discard custom columns, indexes or triggers,
+/// or temporarily invalidate an unrecognized view/foreign-key dependency.
+/// Refuse those schemas before any DDL; the surrounding migration transaction
+/// keeps the old ledger usable and leaves its migration record pending.
+pub(crate) fn validate_project_event_rebuild_schema(
+    migration: &Migration,
+    rows: &[sqlmodel_core::Row],
+) -> Result<(), SqlError> {
+    fn normalized(sql: &str) -> String {
+        sql.split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .replace(" if not exists ", " ")
+            .trim_end_matches(';')
+            .to_string()
+    }
+    if migration.id != PROJECT_EVENT_SCOPE_MIGRATION {
+        return Ok(());
+    }
+    let authored = schema_migrations();
+    let mut found_table = false;
+    for row in rows {
+        let kind = row.get_named::<String>("type")?;
+        let name = row.get_named::<String>("name")?;
+        let table = row.get_named::<String>("tbl_name")?;
+        let sql = row.get_named::<String>("sql")?;
+        if !sql.to_ascii_lowercase().contains("inbox_delivery_events")
+            && !table.eq_ignore_ascii_case("inbox_delivery_events")
+            && !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "inbox_delivery_events"
+                    | "idx_inbox_delivery_events_agent_seq"
+                    | "trg_inbox_delivery_events_recipient_insert"
+                    | "trg_messages_cascade_project_mailbox"
+            )
+        {
+            continue;
+        }
+        let expected_id = match (kind.as_str(), name.as_str()) {
+            ("table", "inbox_delivery_events") => {
+                found_table = true;
+                "v25_create_inbox_delivery_events"
+            }
+            ("index", "idx_inbox_delivery_events_agent_seq") => {
+                "v25_idx_inbox_delivery_events_agent_seq"
+            }
+            ("trigger", "trg_inbox_delivery_events_recipient_insert") => {
+                "v25_trg_inbox_delivery_events_recipient_insert"
+            }
+            ("trigger", "trg_messages_cascade_project_mailbox") => {
+                "v32_trg_messages_cascade_project_mailbox"
+            }
+            _ => "",
+        };
+        if !authored.iter().any(|expected| {
+            expected.id == expected_id && normalized(&expected.up) == normalized(&sql)
+        }) {
+            return Err(SqlError::Custom(format!(
+                "project event migration refuses unsupported {kind} {name}; \
+                 preserve or migrate this custom schema before retrying"
+            )));
+        }
+    }
+    if !found_table {
+        return Err(SqlError::Custom(
+            "project event migration requires the existing inbox_delivery_events table".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // This exact statement (including its comment and whitespace) was already
 // recorded with a checksum before v30. The latest bootstrap DDL may evolve;
 // an applied migration may not. Fresh and existing ledgers both add the new
@@ -607,6 +922,8 @@ CREATE TABLE IF NOT EXISTS messages (
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
 /// `DbConn::execute_sync`, which only executes the first
 /// prepared statement). Triggers are included as single `CREATE TRIGGER ... END;` statements.
+/// Multi-statement rebuilds and replacements execute through
+/// [`migration_sql_statements`] in the same transaction as their ledger entry.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn schema_migrations() -> Vec<Migration> {
@@ -2398,12 +2715,9 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
     migrations.push(Migration::new(
-        "v28_backfill_agent_deregistrations".to_string(),
+        V28_AGENT_DEREGISTRATION_BACKFILL.to_string(),
         "GH#255: recognize Python deregistration tombstones during upgrade".to_string(),
-        "INSERT OR IGNORE INTO agent_deregistrations (agent_id, deregistered_at) \
-         SELECT id, last_active_ts FROM agents \
-         WHERE task_description LIKE '[DEREGISTERED %'"
-            .to_string(),
+        V28_AGENT_DEREGISTRATION_BACKFILL_SQL.to_string(),
         String::new(),
     ));
 
@@ -2478,6 +2792,118 @@ pub fn schema_migrations() -> Vec<Migration> {
         "rewrite pre-v30 messages rows as full records".to_string(),
         "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NULL"
             .to_string(),
+        String::new(),
+    ));
+
+    // ── v32: project-addressed shared mailboxes (GH#282) ──────────────
+    //
+    // The delivery and receipt tables themselves come from the static DDL
+    // above (generated v1 IDs). Removing a message must not leave a delivery
+    // that resurrects an empty row in every agent's inbox, a receipt that
+    // would claim a later message reusing the id was already read, or the
+    // delivery's cursor event (historically agent_id 0; v33 repairs that
+    // representation without changing this already-recorded migration).
+    migrations.push(Migration::new(
+        "v32_trg_messages_cascade_project_mailbox".to_string(),
+        "GH#282: cascade-delete project mailbox delivery and receipts with their message"
+            .to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_cascade_project_mailbox \
+         AFTER DELETE ON messages \
+         BEGIN \
+             DELETE FROM project_mailbox_receipts WHERE message_id = OLD.id; \
+             DELETE FROM project_mailbox_deliveries WHERE message_id = OLD.id; \
+             DELETE FROM inbox_delivery_events WHERE message_id = OLD.id AND agent_id = 0; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        PROJECT_EVENT_SCOPE_MIGRATION.to_string(),
+        "br-kp1in.39: represent project cursor events without an agent foreign-key violation"
+            .to_string(),
+        PROJECT_EVENT_SCOPE_STATEMENTS.join(";\n"),
+        String::new(),
+    ));
+
+    // Event sequences are global, while retained history is recipient-scoped.
+    // Keep issued tails and observed losses independently of retained events.
+    // These durable observations deliberately have no live-row foreign keys:
+    // removing identity metadata must not erase a monitor's cursor history.
+    migrations.push(Migration::new(
+        "v34_create_inbox_delivery_cursor_state".to_string(),
+        "retain recipient delivery tails and loss watermarks across retention".to_string(),
+        "CREATE TABLE IF NOT EXISTS inbox_delivery_cursor_state (\
+            project_id INTEGER NOT NULL,\
+            scope TEXT NOT NULL CHECK (scope IN ('agent', 'project')),\
+            scope_id INTEGER NOT NULL,\
+            tail_seq INTEGER NOT NULL CHECK (tail_seq >= 0),\
+            pruned_through_seq INTEGER NOT NULL CHECK (pruned_through_seq >= 0 AND pruned_through_seq <= tail_seq),\
+            PRIMARY KEY (project_id, scope, scope_id),\
+            CHECK (scope = 'agent' OR (scope = 'project' AND scope_id = project_id))\
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_backfill_inbox_delivery_cursor_state".to_string(),
+        "preserve issued pre-upgrade cursors without inventing recipient history loss".to_string(),
+        // Before v34, retention did not record who lost an event. The global
+        // AUTOINCREMENT ceiling still bounds every issued cursor, even after
+        // complete pruning. Seed existing scopes at that known ceiling, with
+        // no invented loss. Fresh scopes continue tracking their exact tails.
+        "INSERT OR IGNORE INTO inbox_delivery_cursor_state \
+            (project_id, scope, scope_id, tail_seq, pruned_through_seq) \
+         SELECT a.project_id, 'agent', a.id, \
+                COALESCE((SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0), 0 \
+         FROM agents a \
+         UNION ALL \
+         SELECT p.id, 'project', p.id, \
+                COALESCE((SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0), 0 \
+         FROM projects p"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_inbox_delivery_cursor_insert".to_string(),
+        "advance the durable delivery tail in the event insertion transaction".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_inbox_delivery_cursor_insert \
+         AFTER INSERT ON inbox_delivery_events BEGIN \
+             INSERT INTO inbox_delivery_cursor_state \
+                 (project_id, scope, scope_id, tail_seq, pruned_through_seq) \
+             VALUES (NEW.project_id, CASE WHEN NEW.agent_id IS NULL THEN 'project' ELSE 'agent' END, \
+                     COALESCE(NEW.agent_id, NEW.project_id), NEW.seq, 0) \
+             ON CONFLICT (project_id, scope, scope_id) DO UPDATE SET \
+                 tail_seq = MAX(inbox_delivery_cursor_state.tail_seq, excluded.tail_seq); \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_inbox_delivery_cursor_delete".to_string(),
+        "record lost deliveries only for their direct or visible shared recipients".to_string(),
+        V34_CURSOR_DELETE_TRIGGER_SQL.to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v34_trg_messages_cascade_inbox_delivery_events".to_string(),
+        "record cursor loss before deleting message visibility authority".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_cascade_inbox_delivery_events \
+         BEFORE DELETE ON messages BEGIN \
+             DELETE FROM inbox_delivery_events WHERE message_id = OLD.id; \
+         END"
+        .to_string(),
+        String::new(),
+    ));
+
+    // The v34 trigger embedded the then-current visibility predicate. Keep
+    // that ledger definition immutable and replace only a recognized owned
+    // trigger in one transaction with this new checksum. Direct loss remains
+    // historical; shared loss excludes authoritative deregistrations.
+    migrations.push(Migration::new(
+        SHARED_CURSOR_LIFECYCLE_MIGRATION.to_string(),
+        "exclude deregistered viewers from shared cursor loss accounting".to_string(),
+        SHARED_CURSOR_LIFECYCLE_STATEMENTS.join(";\n"),
         String::new(),
     ));
 
@@ -3169,6 +3595,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "messages",
         "message_recipients",
         "inbox_delivery_events",
+        "inbox_delivery_cursor_state",
         "message_delivery_signal_receipts",
         "file_reservations",
         "file_reservation_releases",
@@ -3181,6 +3608,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "idx_messages_ack_required_id",
         "idx_mr_ack_message",
         "idx_inbox_delivery_events_agent_seq",
+        "idx_inbox_delivery_events_project_message",
         "idx_message_delivery_signal_receipts_message",
         "idx_file_reservations_released_expires_id",
         "idx_file_reservation_releases_ts",
@@ -3188,6 +3616,9 @@ pub async fn validate_startup_schema_gate<C: Connection>(
     const REQUIRED_TRIGGERS: &[&str] = &[
         "trg_messages_default_recipients_json",
         "trg_inbox_delivery_events_recipient_insert",
+        "trg_inbox_delivery_cursor_insert",
+        "trg_inbox_delivery_cursor_delete",
+        "trg_messages_cascade_inbox_delivery_events",
     ];
     const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
     const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
@@ -3250,6 +3681,16 @@ pub async fn validate_startup_schema_gate<C: Connection>(
                 "message_id",
                 "kind",
                 "delivered_ts",
+            ],
+        ),
+        (
+            "inbox_delivery_cursor_state",
+            &[
+                "project_id",
+                "scope",
+                "scope_id",
+                "tail_seq",
+                "pruned_through_seq",
             ],
         ),
         (
@@ -3424,6 +3865,9 @@ pub async fn validate_startup_schema_gate<C: Connection>(
     if problems.is_empty() {
         Outcome::Ok(())
     } else {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
         Outcome::Err(format_schema_gate_failure(&problems))
     }
 }
@@ -3733,16 +4177,21 @@ async fn query_text_pairs<C: Connection>(
     second: &str,
 ) -> Outcome<Vec<(String, String)>, SqlError> {
     match conn.query(cx, sql, &[]).await {
-        Outcome::Ok(rows) => Outcome::Ok(
-            rows.iter()
-                .filter_map(|row| {
-                    Some((
-                        row.get_named::<String>(first).ok()?,
-                        row.get_named::<String>(second).ok()?,
+        Outcome::Ok(rows) => {
+            let pairs = rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.get_named::<String>(first)?,
+                        row.get_named::<String>(second)?,
                     ))
                 })
-                .collect(),
-        ),
+                .collect::<Result<Vec<_>, SqlError>>();
+            match pairs {
+                Ok(pairs) => Outcome::Ok(pairs),
+                Err(error) => Outcome::Err(error),
+            }
+        }
         Outcome::Err(err) => Outcome::Err(err),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -3765,11 +4214,56 @@ async fn execute_statements<C: Connection>(
     Outcome::Ok(())
 }
 
+async fn execute_checked_multi_statement_migration<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migration: &Migration,
+) -> Outcome<(), SqlError> {
+    let rows = match conn.query(cx, PROJECT_EVENT_SCHEMA_SQL, &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if let Err(error) = validate_multi_statement_migration_schema(migration, &rows) {
+        return Outcome::Err(error);
+    }
+    let statements = migration_sql_statements(migration)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    execute_statements(cx, conn, &statements).await
+}
+
+async fn v15_owned_cursor_delete_trigger<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Option<String>, SqlError> {
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             WHERE LOWER(name) = 'trg_inbox_delivery_cursor_delete'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match owned_cursor_delete_trigger(&rows) {
+        Ok(sql) => Outcome::Ok(sql),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
 ) -> Outcome<(), SqlError> {
-    const DROP_TRIGGERS: [&str; 12] = [
+    const DROP_TRIGGERS: [&str; 11] = [
         "DROP TRIGGER IF EXISTS fts_messages_ai",
         "DROP TRIGGER IF EXISTS fts_messages_ad",
         "DROP TRIGGER IF EXISTS fts_messages_au",
@@ -3785,7 +4279,6 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         // have run on a historical database).
         "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
         "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
-        "DROP TABLE IF EXISTS messages_v15_rebuild",
     ];
     const V15_INDEXES: [&str; 8] = [
         "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts)",
@@ -3798,12 +4291,6 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id)",
     ];
 
-    let drops = DROP_TRIGGERS.map(String::from);
-    match execute_statements(cx, conn, &drops).await {
-        Outcome::Ok(()) => {}
-        other => return other,
-    }
-
     // On a legacy (Python-shaped) mailbox the base pass defers this migration
     // to the canonical pass, after later migrations have already added
     // columns, indexes and triggers to `messages` and recorded them as
@@ -3812,25 +4299,80 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     // the lexical-clock triggers), leaving a mailbox the startup schema gate
     // refuses. Carry every later column that has an authored definition, and
     // every index and trigger still on the table, across the rebuild.
-    let later_columns: Vec<(String, String)> =
-        match query_text_pairs(cx, conn, "PRAGMA table_info(messages)", "name", "name").await {
-            Outcome::Ok(columns) => columns
-                .into_iter()
-                .map(|(name, _)| name)
-                .filter(|name| {
-                    !V15_MESSAGES_COLUMNS
-                        .iter()
-                        .any(|known| known.eq_ignore_ascii_case(name))
-                })
-                .filter_map(|name| {
-                    authored_messages_column_definition(&name).map(|definition| (name, definition))
-                })
-                .collect(),
-            Outcome::Err(err) => return Outcome::Err(err),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    let columns = match conn.query(cx, "PRAGMA table_xinfo(messages)", &[]).await {
+        Outcome::Ok(columns) => columns,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut later_columns = Vec::new();
+    for column in columns {
+        let name = match column.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(error) => return Outcome::Err(error),
         };
-    let dependents = match query_text_pairs(
+        // SQLite's seventh table_xinfo value is `hidden`. The runtime
+        // adapter currently labels it `_c6`; decode its required position
+        // strictly on both engines rather than defaulting missing metadata.
+        let hidden = match column.get_as::<i64>(6) {
+            Ok(hidden) => hidden,
+            Err(error) => return Outcome::Err(error),
+        };
+        if hidden != 0 {
+            return Outcome::Err(SqlError::Custom(format!(
+                "v15 rebuild refuses unsupported generated or hidden messages column {name}; preserve or migrate this schema before retrying"
+            )));
+        }
+        if V15_MESSAGES_COLUMNS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let Some(definition) = authored_messages_column_definition(&name) else {
+            return Outcome::Err(SqlError::Custom(format!(
+                "v15 rebuild refuses unsupported messages column {name}; preserve or migrate this schema before retrying"
+            )));
+        };
+        later_columns.push((name, definition));
+    }
+    let external_cursor_delete = match v15_owned_cursor_delete_trigger(cx, conn).await {
+        Outcome::Ok(sql) => sql,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match conn
+        .query(
+            cx,
+            "SELECT name FROM sqlite_master WHERE LOWER(name) = 'messages_v15_rebuild'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) if rows.is_empty() => {}
+        Outcome::Ok(_) => {
+            return Outcome::Err(SqlError::Custom(
+                "v15 rebuild refuses an occupied messages_v15_rebuild slot; preserve this schema before retrying"
+                    .to_string(),
+            ));
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    let mut drops = DROP_TRIGGERS.map(String::from).to_vec();
+    if external_cursor_delete.is_some() {
+        // This trigger lives on another table and references messages. Remove
+        // only its verified authored definition during the DROP/RENAME gap.
+        drops.push("DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string());
+    }
+    match execute_statements(cx, conn, &drops).await {
+        Outcome::Ok(()) => {}
+        other => return other,
+    }
+    let mut dependents = match query_text_pairs(
         cx,
         conn,
         "SELECT name, sql FROM sqlite_master \
@@ -3846,6 +4388,9 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    if let Some(sql) = external_cursor_delete {
+        dependents.push(("trg_inbox_delivery_cursor_delete".to_string(), sql));
+    }
 
     let carried = later_columns
         .iter()
@@ -4247,6 +4792,35 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
 
+        // The pending list was read before this write lock. Another startup
+        // may already have completed the rebuild; trust its checked ledger
+        // record, not a guess based on the new table's appearance. In
+        // particular, preserve custom indexes added after the winner finished.
+        if matches!(
+            migration.id.as_str(),
+            PROJECT_EVENT_SCOPE_MIGRATION | SHARED_CURSOR_LIFECYCLE_MIGRATION
+        ) {
+            match migration_set_is_complete(cx, conn, std::slice::from_ref(migration)).await {
+                Outcome::Ok(false) => {}
+                Outcome::Ok(true) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Ok(());
+                }
+                Outcome::Err(error) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(reason) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Panicked(payload);
+                }
+            }
+        }
+
         let already_satisfied =
             match migration_preflight_already_satisfied(cx, conn, migration).await {
                 Outcome::Ok(value) => value,
@@ -4286,8 +4860,16 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                     execute_v10a_dedup_agents_case_insensitive(cx, conn).await
                 } else if migration.id == "v15_add_recipients_json_to_messages" {
                     execute_v15_add_recipients_json_to_messages(cx, conn).await
+                } else if matches!(
+                    migration.id.as_str(),
+                    PROJECT_EVENT_SCOPE_MIGRATION | SHARED_CURSOR_LIFECYCLE_MIGRATION
+                ) {
+                    execute_checked_multi_statement_migration(cx, conn, migration).await
                 } else {
-                    match conn.execute(cx, &migration.up, &[]).await {
+                    match conn
+                        .execute(cx, migration_execution_sql(migration), &[])
+                        .await
+                    {
                         Outcome::Ok(_) => Outcome::Ok(()),
                         Outcome::Err(err) => Outcome::Err(err),
                         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
@@ -4757,6 +5339,852 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    #[test]
+    fn shared_cursor_lifecycle_keeps_historical_v34_checksums() {
+        // Calculated from the exact bc7ab35 migration SQL, before the shared
+        // read predicate acquired its authoritative deregistration exclusion.
+        for (id, checksum) in [
+            ("v34_create_inbox_delivery_cursor_state", "236c995455fdac96"),
+            (
+                "v34_backfill_inbox_delivery_cursor_state",
+                "61c34eed4bef065c",
+            ),
+            ("v34_trg_inbox_delivery_cursor_insert", "620ea5a3cb5245e3"),
+            ("v34_trg_inbox_delivery_cursor_delete", "ae4b27dd0ac6c7dd"),
+            (
+                "v34_trg_messages_cascade_inbox_delivery_events",
+                "a5a4337178368795",
+            ),
+        ] {
+            let migration = schema_migrations()
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap();
+            assert_eq!(migration.checksum(), checksum, "{id}");
+        }
+        // Keep read and persisted deletion policy aligned without making the
+        // applied v35 SQL depend on an evolving macro again.
+        assert_eq!(
+            V35_CURSOR_DELETE_TRIGGER_SQL,
+            cursor_delete_trigger_sql!(crate::project_mailbox::visible_to_viewer_sql!())
+        );
+    }
+
+    async fn seed_shared_cursor_lifecycle<C: Connection>(cx: &Cx, conn: &C) -> Migration {
+        let statements = [
+            "CREATE TABLE projects(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, retired_at INTEGER, inception_ts INTEGER, contact_policy TEXT, task_description TEXT)",
+            "CREATE TABLE agent_deregistrations(agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, created_ts INTEGER)",
+            "CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER)",
+            "CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY, project_id INTEGER)",
+            "CREATE TABLE inbox_delivery_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER, agent_id INTEGER, message_id INTEGER, kind TEXT)",
+            "CREATE INDEX operator_event_kind ON inbox_delivery_events(kind)",
+        ]
+        .map(String::from);
+        execute_statements(cx, conn, &statements)
+            .await
+            .into_result()
+            .unwrap();
+        init_migrations_table(cx, conn).await.into_result().unwrap();
+        let historical = schema_migrations_base()
+            .into_iter()
+            .filter(|m| m.id.starts_with("v34_"))
+            .collect();
+        run_specific_migrations(cx, conn, historical)
+            .await
+            .into_result()
+            .unwrap();
+        let rows = [
+            "INSERT INTO projects VALUES(1),(2)",
+            "INSERT INTO agents VALUES(1,1,NULL,0,'auto','sender'),(2,1,NULL,0,'auto','active'),(3,1,NULL,0,'auto','ordinary description'),(4,1,1,0,'auto','retired'),(5,1,NULL,0,'block_all','blocked'),(6,1,NULL,1000,'auto','new viewer'),(7,2,NULL,0,'auto','foreign project')",
+            "INSERT INTO agent_deregistrations VALUES(3,50)",
+            "INSERT INTO messages VALUES(1,1,1,100),(2,1,1,200),(3,1,1,300)",
+            "INSERT INTO project_mailbox_deliveries VALUES(1,1),(2,1)",
+            "INSERT INTO message_recipients VALUES(3,3)",
+            "INSERT INTO inbox_delivery_events VALUES(100,1,NULL,1,'project'),(101,1,NULL,2,'project'),(102,1,3,3,'to')",
+            "DELETE FROM inbox_delivery_events WHERE seq=100",
+        ]
+        .map(String::from);
+        execute_statements(cx, conn, &rows)
+            .await
+            .into_result()
+            .unwrap();
+        schema_migrations_base()
+            .into_iter()
+            .find(|m| m.id == SHARED_CURSOR_LIFECYCLE_MIGRATION)
+            .expect("lifecycle upgrade must run in the runtime migration lane")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_shared_cursor_lifecycle_upgrade<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        already_new: bool,
+    ) {
+        let migration = seed_shared_cursor_lifecycle(cx, conn).await;
+        if already_new {
+            execute_statements(
+                cx,
+                conn,
+                &SHARED_CURSOR_LIFECYCLE_STATEMENTS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .into_result()
+            .unwrap();
+        }
+        assert!(
+            v15_owned_cursor_delete_trigger(cx, conn)
+                .await
+                .into_result()
+                .unwrap()
+                .is_some()
+        );
+        let ledger_sql = format!(
+            "SELECT id,description,applied_at,checksum FROM {MIGRATIONS_TABLE_NAME} WHERE id <> '{SHARED_CURSOR_LIFECYCLE_MIGRATION}' ORDER BY id"
+        );
+        let historical = v15_fixture_rows(conn, &ledger_sql);
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_lifecycle_ledger BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+                 WHEN NEW.id = '{SHARED_CURSOR_LIFECYCLE_MIGRATION}' BEGIN \
+                 SELECT RAISE(ABORT, 'lifecycle ledger failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let before = v15_fixture_snapshot(conn);
+        let error = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect_err("trigger replacement and ledger must roll back together");
+        assert!(
+            error.to_string().contains("lifecycle ledger failure"),
+            "{error}"
+        );
+        assert_eq!(v15_fixture_snapshot(conn), before);
+        conn.execute(cx, "DROP TRIGGER reject_lifecycle_ledger", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration.clone()])
+                .await
+                .into_result()
+                .unwrap(),
+            [SHARED_CURSOR_LIFECYCLE_MIGRATION.to_string()]
+        );
+        assert_eq!(v15_fixture_rows(conn, &ledger_sql), historical);
+        let installed = v15_owned_cursor_delete_trigger(cx, conn)
+            .await
+            .into_result()
+            .unwrap()
+            .unwrap();
+        assert!(
+            installed == V35_CURSOR_DELETE_TRIGGER_SQL
+                || installed.strip_prefix("CREATE TRIGGER ")
+                    == V35_CURSOR_DELETE_TRIGGER_SQL.strip_prefix("CREATE TRIGGER IF NOT EXISTS ")
+        );
+
+        conn.execute(cx, "DELETE FROM inbox_delivery_events WHERE seq=101", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT scope_id,pruned_through_seq FROM inbox_delivery_cursor_state WHERE scope='agent' ORDER BY scope_id", &[])
+                .unwrap().iter().map(|row| (row.get_as::<i64>(0).unwrap(), row.get_as::<i64>(1).unwrap())).collect::<Vec<_>>(),
+            [(2, 101), (3, 100)]
+        );
+        // An authoritative lifecycle row excludes shared loss even when the
+        // description lacks a tombstone. Preserve historical/direct loss.
+        conn.execute(cx, "DELETE FROM inbox_delivery_events WHERE seq=102", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT pruned_through_seq FROM inbox_delivery_cursor_state WHERE scope='agent' AND scope_id=3", &[])
+                .unwrap()[0].get_as::<i64>(0).unwrap(),
+            102
+        );
+        let unchanged = v15_fixture_snapshot(conn);
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration.clone()])
+                .await
+                .into_result()
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(v15_fixture_snapshot(conn), unchanged);
+
+        // A second startup may have observed Pending before the first one
+        // finished. Its under-lock ledger check must preserve subsequent
+        // operator changes, while still rejecting a changed applied checksum.
+        execute_statements(cx, conn, &[
+            "DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string(),
+            "CREATE TRIGGER trg_inbox_delivery_cursor_delete AFTER DELETE ON inbox_delivery_events BEGIN SELECT 1; END".to_string(),
+        ]).await.into_result().unwrap();
+        let custom = v15_fixture_snapshot(conn);
+        run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(v15_fixture_snapshot(conn), custom);
+        let mut changed = migration;
+        changed.up.push_str(" -- changed after application");
+        let error = run_single_migration_with_lock_retry(cx, conn, &changed)
+            .await
+            .into_result()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after application"),
+            "{error}"
+        );
+        assert_eq!(v15_fixture_snapshot(conn), custom);
+    }
+
+    #[test]
+    fn shared_cursor_lifecycle_upgrade_rolls_back_and_preserves_history_on_both_engines() {
+        for already_new in [false, true] {
+            block_on(|cx| async move {
+                let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+                assert_shared_cursor_lifecycle_upgrade(&cx, &canonical, already_new).await;
+                let runtime = DbConn::open_memory().unwrap();
+                assert_shared_cursor_lifecycle_upgrade(&cx, &runtime, already_new).await;
+            });
+        }
+    }
+
+    async fn assert_shared_cursor_lifecycle_refusal<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        replacement: Option<&str>,
+    ) {
+        let migration = seed_shared_cursor_lifecycle(cx, conn).await;
+        conn.execute(cx, "DROP TRIGGER trg_inbox_delivery_cursor_delete", &[])
+            .await
+            .into_result()
+            .unwrap();
+        if let Some(sql) = replacement {
+            conn.execute(cx, sql, &[]).await.into_result().unwrap();
+        }
+        let before = v15_fixture_snapshot(conn);
+        run_specific_migrations(cx, conn, vec![migration])
+            .await
+            .into_result()
+            .expect_err("missing or unknown trigger authority must refuse before DDL");
+        assert_eq!(v15_fixture_snapshot(conn), before);
+    }
+
+    #[test]
+    fn shared_cursor_lifecycle_refuses_missing_or_custom_owned_names() {
+        for replacement in [
+            None,
+            Some(V34_CURSOR_DELETE_TRIGGER_SQL.replace("'block_all'", "'BLOCK_ALL'")),
+            Some(V35_CURSOR_DELETE_TRIGGER_SQL.replace("lifecycle.agent_id = viewer.id", "lifecycle.agent_id <> viewer.id")),
+            Some("CREATE TRIGGER trg_inbox_delivery_cursor_delete AFTER DELETE ON messages BEGIN SELECT 1; END".to_string()),
+            Some("CREATE TABLE trg_inbox_delivery_cursor_delete(payload TEXT)".to_string()),
+        ] {
+            let replacement = replacement.as_deref();
+            block_on(|cx| async move {
+                let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+                assert_shared_cursor_lifecycle_refusal(&cx, &canonical, replacement).await;
+                let runtime = DbConn::open_memory().unwrap();
+                assert_shared_cursor_lifecycle_refusal(&cx, &runtime, replacement).await;
+            });
+        }
+    }
+
+    async fn assert_project_thread_index_upgrade<C: Connection>(cx: &Cx, conn: &C) {
+        conn.execute(
+            cx,
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             thread_id TEXT, created_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        conn.execute(
+            cx,
+            "INSERT INTO messages VALUES (1, 1, NULL, 10), (2, 1, '1', 20), (3, 2, '1', 30)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        init_migrations_table(cx, conn).await.into_result().unwrap();
+        let migration = schema_migrations_base()
+            .into_iter()
+            .find(|migration| {
+                migration.id == "v1_create_index_idx_messages_project_thread_activity"
+            })
+            .expect("conversation index runs on the runtime migration lane");
+        for _ in 0..2 {
+            run_specific_migrations(cx, conn, vec![migration.clone()])
+                .await
+                .into_result()
+                .unwrap();
+        }
+        let rows = conn
+            .query(
+                cx,
+                "SELECT id, project_id, thread_id, created_ts FROM messages ORDER BY id",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        let retained = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_as::<i64>(0).unwrap(),
+                    row.get_as::<i64>(1).unwrap(),
+                    row.get_as::<Option<String>>(2).unwrap(),
+                    row.get_as::<i64>(3).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            [
+                (1, 1, None, 10),
+                (2, 1, Some("1".into()), 20),
+                (3, 2, Some("1".into()), 30)
+            ]
+        );
+        let columns = conn
+            .query(
+                cx,
+                "PRAGMA index_info(idx_messages_project_thread_activity)",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .map(|row| row.get_as::<String>(2).unwrap())
+                .collect::<Vec<_>>(),
+            ["project_id", "thread_id", "created_ts", "id"]
+        );
+        let ledger = conn
+            .query(
+                cx,
+                &format!("SELECT COUNT(*) FROM {MIGRATIONS_TABLE_NAME} WHERE id = ?"),
+                &[Value::Text(migration.id)],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn project_thread_index_upgrades_existing_mailboxes_idempotently_on_both_engines() {
+        block_on(|cx| async move {
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            assert_project_thread_index_upgrade(&cx, &canonical).await;
+            let runtime = DbConn::open_memory().unwrap();
+            assert_project_thread_index_upgrade(&cx, &runtime).await;
+        });
+    }
+
+    async fn seed_legacy_project_events<C: Connection>(cx: &Cx, conn: &C) -> Migration {
+        init_migrations_table(cx, conn)
+            .await
+            .into_result()
+            .expect("initialize migration ledger");
+        let mut migrations = schema_migrations_base();
+        let position = migrations
+            .iter()
+            .position(|migration| migration.id == PROJECT_EVENT_SCOPE_MIGRATION)
+            .expect("v33 migration");
+        let migration = migrations.remove(position);
+        migrations.retain(|migration| {
+            !migration.id.starts_with("v34_") && migration.id != SHARED_CURSOR_LIFECYCLE_MIGRATION
+        });
+        run_specific_migrations(cx, conn, migrations)
+            .await
+            .into_result()
+            .expect("apply historical base migrations");
+        let statements = [
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'events','/events',1)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1),(2,1,'RedStone','test','test',1,1)",
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'direct','body',10),(2,1,1,'shared','body',20),\
+                   (3,1,1,'pruned','body',30),(4,1,1,'next','body',40)",
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(1,2,'to')",
+            "UPDATE inbox_delivery_events SET seq = 41 WHERE message_id = 1",
+            "INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,2,'project',20),(700,1,0,3,'project',30)",
+            "DELETE FROM inbox_delivery_events WHERE seq = 700",
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(2,1,'to',20),(4,1,'to',40)",
+        ].map(str::to_string);
+        execute_statements(cx, conn, &statements)
+            .await
+            .into_result()
+            .expect("seed genuine legacy sentinel events and pruned high-water mark");
+        migration
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_project_events_upgrade<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        prune_all: bool,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        if prune_all {
+            conn.execute(cx, "DELETE FROM inbox_delivery_events", &[])
+                .await
+                .into_result()
+                .expect("prune entire ledger");
+        }
+        let applied = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect("atomically upgrade project events");
+        assert_eq!(applied, vec![PROJECT_EVENT_SCOPE_MIGRATION.to_string()]);
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration])
+                .await
+                .into_result()
+                .expect("idempotent restart migration"),
+            Vec::<String>::new()
+        );
+        let cursor_migrations: Vec<_> = schema_migrations_base()
+            .into_iter()
+            .filter(|migration| {
+                migration.id.starts_with("v34_")
+                    || migration.id == SHARED_CURSOR_LIFECYCLE_MIGRATION
+            })
+            .collect();
+        run_specific_migrations(cx, conn, cursor_migrations.clone())
+            .await
+            .into_result()
+            .expect("upgrade durable cursor state after the historical event rebuild");
+        assert_eq!(
+            run_specific_migrations(cx, conn, cursor_migrations)
+                .await
+                .into_result()
+                .expect("cursor state migration is idempotent"),
+            Vec::<String>::new()
+        );
+        let upgraded_tail = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(700), 10)
+            .expect("an issued cursor remains valid even when its old event was pruned");
+        assert_eq!(upgraded_tail.tail_cursor, 700);
+        assert_eq!(
+            upgraded_tail.events,
+            [] as [crate::sync::InboxDeliveryEvent; 0]
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT seq, agent_id FROM inbox_delivery_events ORDER BY seq",
+                &[],
+            )
+            .expect("migrated events");
+        if prune_all {
+            assert_eq!(rows.len(), 0);
+        } else {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 41);
+            assert_eq!(
+                rows[0].get_named::<Option<i64>>("agent_id").unwrap(),
+                Some(2)
+            );
+            assert_eq!(rows[1].get_named::<i64>("seq").unwrap(), 42);
+            assert_eq!(rows[1].get_named::<Option<i64>>("agent_id").unwrap(), None);
+            let page = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(41), 10)
+                .expect("resume an issued pre-upgrade cursor");
+            assert_eq!(
+                page.events
+                    .iter()
+                    .map(|event| event.seq)
+                    .collect::<Vec<_>>(),
+                vec![42]
+            );
+        }
+        let floor = conn
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                &[],
+            )
+            .expect("read retained sequence floor");
+        assert_eq!(floor[0].get_named::<i64>("seq").unwrap(), 700);
+        let parameters = [Value::BigInt(1), Value::BigInt(4), Value::BigInt(40)];
+        for _ in 0..2 {
+            conn.execute(
+                cx,
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &parameters,
+            )
+            .await
+            .into_result()
+            .expect("append and replay project delivery");
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id = 4",
+                &[],
+            )
+            .expect("project replay is deduplicated despite NULL agent");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get_named::<i64>("seq").unwrap() > 700);
+        conn.execute(
+            cx,
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(3,2,'cc')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("recipient trigger survives rebuild");
+        let page = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(700), 10)
+            .expect("new direct and shared delivery events");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| (event.message_id, event.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, "project"), (3, "cc")]
+        );
+        conn.execute(cx, "DELETE FROM messages WHERE id = 4", &[])
+            .await
+            .into_result()
+            .expect("delete project message");
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id = 4",
+                &[]
+            )
+            .unwrap()
+            .len(),
+            0,
+            "updated cascade removes the NULL-scoped event"
+        );
+    }
+
+    #[test]
+    fn project_event_scope_upgrade_canonical_preserves_cursors_and_foreign_keys() {
+        for prune_all in [false, true] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical database");
+            let conn_ref = &conn;
+            block_on(|cx| async move {
+                assert_project_events_upgrade(&cx, conn_ref, prune_all).await;
+            });
+            assert_eq!(
+                conn.query_sync("PRAGMA foreign_key_check", &[])
+                    .unwrap()
+                    .len(),
+                0
+            );
+            conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+            let error = conn.execute_raw(
+                "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) \
+                 VALUES(1,999,2,'to',20)"
+            ).expect_err("direct delivery still requires a real agent");
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("foreign key")
+            );
+            for values in ["(1,NULL,2,'to',20)", "(1,2,2,'project',20)"] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) VALUES{values}"
+                )).expect_err("scope CHECK rejects ambiguous project/direct ownership");
+            }
+        }
+    }
+
+    #[test]
+    fn project_event_scope_upgrade_runtime_survives_reopen_and_empty_ledger() {
+        for prune_all in [false, true] {
+            let directory = tempfile::tempdir().expect("test directory");
+            let path = directory.path().join("events.sqlite3");
+            let conn = DbConn::open_file(path.display().to_string()).expect("runtime database");
+            let conn_ref = &conn;
+            block_on(|cx| async move {
+                assert_project_events_upgrade(&cx, conn_ref, prune_all).await;
+            });
+            drop(conn);
+            let reopened =
+                DbConn::open_file(path.display().to_string()).expect("reopen runtime database");
+            // The shared event for message 4 was deleted after v34, so
+            // cursor 700 missed it even if older direct events still survive.
+            let expired =
+                crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
+                    .expect_err("cursor before pruned cascade deletion is expired");
+            let after_cursor = match expired {
+                crate::sync::InboxDeliveryEventError::CursorExpired {
+                    after: 700,
+                    oldest_available,
+                } => oldest_available.saturating_sub(1),
+                other => panic!("expected CursorExpired, got {other:?}"),
+            };
+            let page = crate::sync::inbox_delivery_events_from_conn(
+                &reopened,
+                1,
+                2,
+                Some(after_cursor),
+                10,
+            )
+            .expect("persisted cursor works after reopen");
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].message_id, 3);
+            assert!(page.events[0].seq > 700);
+            reopened
+                .execute_sync(
+                    "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(5,1,1,'after restart','body',50)",
+                    &[],
+                )
+                .expect("persist a new message after restart");
+            reopened.execute_sync(
+                "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+                 VALUES(5,1,'to',50)",
+                &[],
+            )
+            .unwrap();
+            for _ in 0..2 {
+                reopened
+                    .execute_sync(
+                        crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                        &[Value::BigInt(1), Value::BigInt(5), Value::BigInt(50)],
+                    )
+                    .expect("insert and replay a project event after restart");
+            }
+            let next = crate::sync::inbox_delivery_events_from_conn(
+                &reopened,
+                1,
+                2,
+                Some(page.next_cursor),
+                10,
+            )
+            .expect("continue the saved cursor with a newly inserted event");
+            assert_eq!(next.events.len(), 1);
+            assert_eq!(next.events[0].message_id, 5);
+            assert!(next.events[0].seq > page.next_cursor);
+        }
+    }
+
+    async fn assert_project_event_rebuild_rollback<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_migration_record BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+             BEGIN SELECT RAISE(ABORT, 'injected ledger write failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("inject failure after all rebuild DDL");
+        let error = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect_err("ledger failure rolls back complete rebuild");
+        assert!(
+            error.to_string().contains("injected ledger write failure"),
+            "{error}"
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT seq,agent_id FROM inbox_delivery_events ORDER BY seq",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].get_named::<i64>("seq").unwrap(), 42);
+        assert_eq!(rows[1].get_named::<i64>("agent_id").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                &[]
+            )
+            .unwrap()[0]
+                .get_named::<i64>("seq")
+                .unwrap(),
+            700
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'inbox_delivery_events_v33'",
+                &[]
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        conn.execute(cx, "DROP TRIGGER reject_migration_record", &[])
+            .await
+            .into_result()
+            .expect("remove injected failure");
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration])
+                .await
+                .into_result()
+                .expect("failed migration remains retryable"),
+            vec![PROJECT_EVENT_SCOPE_MIGRATION.to_string()]
+        );
+    }
+
+    #[test]
+    fn project_event_scope_rebuild_and_ledger_rollback_together() {
+        let canonical = crate::CanonicalDbConn::open_memory().expect("canonical database");
+        block_on(|cx| async move {
+            assert_project_event_rebuild_rollback(&cx, &canonical).await;
+        });
+        let directory = tempfile::tempdir().expect("test directory");
+        let runtime = DbConn::open_file(
+            directory
+                .path()
+                .join("rollback.sqlite3")
+                .display()
+                .to_string(),
+        )
+        .expect("runtime database");
+        block_on(|cx| async move {
+            assert_project_event_rebuild_rollback(&cx, &runtime).await;
+        });
+    }
+
+    async fn assert_project_event_stale_pending<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .unwrap();
+        conn.execute(
+            cx,
+            "CREATE INDEX operator_event_kind ON inbox_delivery_events(kind)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        // Simulate a second initializer that observed Pending before the
+        // winner acquired its transaction, without relying on scheduling.
+        run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect("the under-lock ledger witness wins over a stale pending observation");
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'operator_event_kind'",
+                &[],
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let mut drifted = migration;
+        drifted.up.push_str(" -- changed after application");
+        let error = run_single_migration_with_lock_retry(cx, conn, &drifted)
+            .await
+            .into_result()
+            .expect_err("an applied record must still reject checksum drift under the lock");
+        assert!(
+            error.to_string().contains("changed after application"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn project_event_scope_stale_pending_checks_the_locked_ledger() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_project_event_stale_pending(&cx, &canonical).await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let runtime =
+            DbConn::open_file(directory.path().join("stale.sqlite3").display().to_string())
+                .unwrap();
+        block_on(|cx| async move {
+            assert_project_event_stale_pending(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn project_event_scope_refuses_custom_dependencies_without_dropping_them() {
+        for custom in [
+            "CREATE INDEX custom_event_time ON inbox_delivery_events(delivered_ts)",
+            "CREATE TRIGGER custom_event_delete AFTER DELETE ON inbox_delivery_events BEGIN SELECT 1; END",
+            "CREATE VIEW custom_events AS SELECT seq FROM inbox_delivery_events",
+            "CREATE TABLE custom_child(event_seq INTEGER REFERENCES inbox_delivery_events(seq))",
+            "ALTER TABLE inbox_delivery_events ADD COLUMN custom_payload TEXT",
+            "DROP TRIGGER trg_inbox_delivery_events_recipient_insert; \
+             CREATE TRIGGER trg_inbox_delivery_events_recipient_insert \
+             AFTER INSERT ON message_recipients BEGIN SELECT 1; END",
+            "DROP TRIGGER trg_messages_cascade_project_mailbox; \
+             CREATE TRIGGER trg_messages_cascade_project_mailbox \
+             AFTER DELETE ON messages BEGIN SELECT 1; END",
+        ] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical database");
+            block_on(|cx| async move {
+                let migration = seed_legacy_project_events(&cx, &conn).await;
+                conn.execute_raw(custom)
+                    .expect("install custom schema dependency");
+                let snapshot = || {
+                    conn.query_sync(
+                        "SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+                        &[],
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<String>("name").unwrap(),
+                            row.get_named::<String>("sql").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                };
+                let before = snapshot();
+                let error = run_specific_migrations(&cx, &conn, vec![migration])
+                    .await
+                    .into_result()
+                    .expect_err("custom schema needs explicit migration");
+                assert!(
+                    error.to_string().contains("refuses unsupported"),
+                    "{custom}: {error}"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "custom schema must remain intact: {custom}"
+                );
+                assert_eq!(
+                    conn.query_sync(
+                        "SELECT agent_id FROM inbox_delivery_events WHERE seq = 42",
+                        &[]
+                    )
+                    .unwrap()[0]
+                        .get_named::<i64>("agent_id")
+                        .unwrap(),
+                    0
+                );
+            });
+        }
     }
 
     #[test]
@@ -5403,6 +6831,378 @@ mod tests {
         assert!(lost.is_empty(), "the v15 rebuild dropped {lost:?}");
     }
 
+    async fn seed_v15_owned_trigger_fixture<C: Connection>(cx: &Cx, conn: &C) {
+        let pragmas = PRAGMA_DB_INIT_SQL
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        execute_statements(cx, conn, &pragmas)
+            .await
+            .into_result()
+            .expect("apply the actual runtime/canonical-follow-up startup policy");
+        let foreign_keys = conn
+            .query(cx, "PRAGMA foreign_keys", &[])
+            .await
+            .into_result()
+            .unwrap();
+        assert_eq!(foreign_keys.len(), 1);
+        assert_eq!(foreign_keys[0].get_as::<i64>(0).unwrap(), 0);
+        conn.execute(
+            cx,
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, \
+                sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, \
+                body_md TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'normal', \
+                ack_required INTEGER NOT NULL DEFAULT 0, created_ts INTEGER NOT NULL, \
+                attachments TEXT NOT NULL DEFAULT '[]')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("create legacy messages without recipients_json");
+        migrate_to_latest_base(cx, conn)
+            .await
+            .into_result()
+            .expect("install real base migrations including v34 cursor authority");
+        let statements = [
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'v15','/v15',0)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts,contact_policy) \
+             VALUES(1,1,'Sender','test','test',0,0,'auto'),\
+                   (2,1,'Viewer','test','test',0,0,'auto'),\
+                   (3,1,'Blocked','test','test',0,0,'block_all')",
+            "INSERT INTO messages(id,project_id,sender_id,thread_id,subject,body_md,importance,ack_required,created_ts,attachments,topic,archive_metadata_json) \
+             VALUES(1,1,1,'direct','direct subject','direct body','high',1,100,'[]','Release','{}'),\
+                   (2,1,1,'shared','shared subject','shared body','normal',0,200,'[]','Release','{\"reply_to\":1}')",
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(1,2,'to')",
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES(2,1,'to',200)",
+            "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) VALUES(1,NULL,2,'project',200)",
+            "CREATE TABLE v15_custom_audit(message_id INTEGER, body TEXT)",
+            "CREATE INDEX v15_custom_subject ON messages(subject)",
+            "CREATE TRIGGER v15_custom_message_update AFTER UPDATE ON messages BEGIN \
+             INSERT INTO v15_custom_audit(message_id,body) VALUES(NEW.id,NEW.body_md); END",
+        ]
+        .map(String::from);
+        execute_statements(cx, conn, &statements)
+            .await
+            .into_result()
+            .expect("seed rows, later-column data, custom index and trigger");
+    }
+
+    fn v15_fixture_rows<C: crate::pool::SyncQuery>(conn: &C, sql: &str) -> Vec<Vec<Value>> {
+        conn.query_sync(sql, &[])
+            .unwrap_or_else(|error| panic!("snapshot query {sql}: {error}"))
+            .iter()
+            .map(|row| row.values().cloned().collect())
+            .collect()
+    }
+
+    fn v15_fixture_snapshot<C: crate::pool::SyncQuery>(conn: &C) -> Vec<(String, Vec<Vec<Value>>)> {
+        let mut snapshot = vec![(
+            "sqlite_master".to_string(),
+            v15_fixture_rows(
+                conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
+            ),
+        )];
+        for row in conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                &[],
+            )
+            .expect("enumerate every persisted fixture table")
+        {
+            let table = row.get_named::<String>("name").unwrap();
+            let quoted = table.replace('"', "\"\"");
+            let mut rows = v15_fixture_rows(conn, &format!("SELECT * FROM \"{quoted}\""));
+            rows.sort_by_cached_key(|row| format!("{row:?}"));
+            snapshot.push((table, rows));
+        }
+        snapshot
+    }
+
+    async fn assert_v15_owned_trigger_rollback_and_retry<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        seed_v15_owned_trigger_fixture(cx, conn).await;
+        assert!(
+            conn.query_sync("PRAGMA table_xinfo(messages)", &[])
+                .unwrap()
+                .iter()
+                .all(|row| row.get_named::<String>("name").unwrap() != "recipients_json")
+        );
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+            .unwrap();
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_v15_ledger BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+                 WHEN NEW.id = 'v15_add_recipients_json_to_messages' BEGIN \
+                 SELECT RAISE(ABORT, 'v15 ledger failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let before_failure = v15_fixture_snapshot(conn);
+        let error = run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect_err("ledger failure must follow the real table and trigger rebuild");
+        assert!(error.to_string().contains("v15 ledger failure"), "{error}");
+        assert_eq!(
+            v15_fixture_snapshot(conn),
+            before_failure,
+            "complete schema and data roll back"
+        );
+        conn.execute(cx, "DROP TRIGGER reject_v15_ledger", &[])
+            .await
+            .into_result()
+            .unwrap();
+
+        const MESSAGE_DATA: &str = "SELECT id,project_id,sender_id,thread_id,subject,body_md,importance,ack_required,created_ts,attachments,topic,archive_metadata_json FROM messages ORDER BY id";
+        const OBJECTS: &str = "SELECT type,name,tbl_name,sql FROM sqlite_master \
+             WHERE type IN ('index','trigger') AND sql IS NOT NULL \
+             AND name NOT IN ('trg_inbox_stats_insert','trg_inbox_stats_mark_read','trg_inbox_stats_ack') \
+             ORDER BY type,name";
+        let messages = v15_fixture_rows(conn, MESSAGE_DATA);
+        let objects = v15_fixture_rows(conn, OBJECTS);
+        let children: Vec<_> = v15_fixture_snapshot(conn)
+            .into_iter()
+            .filter(|(table, _)| {
+                table != "sqlite_master" && table != "messages" && table != MIGRATIONS_TABLE_NAME
+            })
+            .collect();
+        run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect("the original pending v15 migration must genuinely retry");
+        assert_eq!(v15_fixture_rows(conn, MESSAGE_DATA), messages);
+        assert_eq!(
+            v15_fixture_rows(conn, OBJECTS),
+            objects,
+            "every other index/trigger retains its exact SQL"
+        );
+        let after_children: Vec<_> = v15_fixture_snapshot(conn)
+            .into_iter()
+            .filter(|(table, _)| {
+                table != "sqlite_master" && table != "messages" && table != MIGRATIONS_TABLE_NAME
+            })
+            .collect();
+        assert_eq!(
+            after_children, children,
+            "all other persisted rows survive the rebuild"
+        );
+        let migrated = conn
+            .query_sync(
+                "SELECT recipients_json FROM messages WHERE topic='release' ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            migrated.len(),
+            2,
+            "the authored NOCASE topic definition survives"
+        );
+        assert!(
+            migrated
+                .iter()
+                .all(|row| row.get_named::<String>("recipients_json").unwrap() == "{}")
+        );
+        assert_v15_restored_trigger_effects(cx, conn).await;
+    }
+
+    async fn assert_v15_restored_trigger_effects<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let shared_seq = conn
+            .query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id=2 AND agent_id IS NULL",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named::<i64>("seq")
+            .unwrap();
+        conn.execute(
+            cx,
+            "DELETE FROM inbox_delivery_events WHERE message_id=2",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("exercise the restored external cursor-delete trigger");
+        let loss = conn
+            .query_sync(
+                "SELECT pruned_through_seq FROM inbox_delivery_cursor_state \
+                 WHERE project_id=1 AND scope='agent' AND scope_id=2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            loss[0].get_named::<i64>("pruned_through_seq").unwrap(),
+            shared_seq
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT scope_id FROM inbox_delivery_cursor_state \
+                 WHERE project_id=1 AND scope='agent' AND scope_id=3",
+                &[],
+            )
+            .unwrap()
+            .is_empty(),
+            "the authored trigger must keep blocked viewers excluded"
+        );
+        conn.execute(
+            cx,
+            "UPDATE messages SET body_md='updated after rebuild' WHERE id=1",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let audit = conn
+            .query_sync("SELECT message_id,body FROM v15_custom_audit", &[])
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].get_named::<i64>("message_id").unwrap(), 1);
+        assert_eq!(
+            audit[0].get_named::<String>("body").unwrap(),
+            "updated after rebuild"
+        );
+    }
+
+    #[test]
+    fn v15_owned_external_cursor_trigger_survives_canonical_and_runtime_rollback_retry() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_v15_owned_trigger_rollback_and_retry(&cx, &canonical).await;
+        });
+        let runtime = DbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_v15_owned_trigger_rollback_and_retry(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn v15_foreign_key_enforced_rebuild_refuses_and_preserves_complete_state() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            seed_v15_owned_trigger_fixture(&cx, &canonical).await;
+            canonical
+                .execute(&cx, "PRAGMA foreign_keys = ON", &[])
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                canonical.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            let before = v15_fixture_snapshot(&canonical);
+            let migration = schema_migrations()
+                .into_iter()
+                .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+                .unwrap();
+            let error = run_single_migration_with_lock_retry(&cx, &canonical, &migration)
+                .await
+                .into_result()
+                .expect_err("an FK-enforced rebuild must retain its real refusal");
+            assert!(
+                error.to_string().contains("FOREIGN KEY constraint failed"),
+                "{error}"
+            );
+            assert_eq!(v15_fixture_snapshot(&canonical), before);
+            assert_eq!(
+                canonical.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "migration must never disable enforcement to bypass a refusal"
+            );
+        });
+    }
+
+    async fn assert_v15_unsupported_schema_is_retained<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        mutations: &[String],
+        expected: &str,
+    ) {
+        seed_v15_owned_trigger_fixture(cx, conn).await;
+        execute_statements(cx, conn, mutations)
+            .await
+            .into_result()
+            .unwrap();
+        let before = v15_fixture_snapshot(conn);
+        let migration = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v15_add_recipients_json_to_messages")
+            .unwrap();
+        let error = run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect_err("unknown authority must refuse before destructive DDL");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(
+            v15_fixture_snapshot(conn),
+            before,
+            "unknown schema and every populated row remain authoritative"
+        );
+    }
+
+    #[test]
+    fn v15_refuses_unknown_columns_trigger_definitions_and_occupied_rebuild_slots() {
+        let authored = schema_migrations()
+            .into_iter()
+            .find(|migration| migration.id == "v34_trg_inbox_delivery_cursor_delete")
+            .unwrap()
+            .up;
+        for (mutations, expected) in [
+            (
+                vec![
+                    "ALTER TABLE messages ADD COLUMN custom_payload TEXT".to_string(),
+                    "UPDATE messages SET custom_payload='retained custom data'".to_string(),
+                ],
+                "unsupported messages column custom_payload",
+            ),
+            (
+                vec!["ALTER TABLE messages ADD COLUMN custom_projection TEXT GENERATED ALWAYS AS (subject || body_md) VIRTUAL".to_string()],
+                "unsupported generated or hidden messages column custom_projection",
+            ),
+            (
+                vec![
+                    "DROP TRIGGER trg_inbox_delivery_cursor_delete".to_string(),
+                    authored.replace("'block_all'", "'BLOCK_ALL'"),
+                ],
+                "unsupported definition of trg_inbox_delivery_cursor_delete",
+            ),
+            (
+                vec![
+                    "CREATE TABLE messages_v15_rebuild(payload BLOB)".to_string(),
+                    "INSERT INTO messages_v15_rebuild VALUES(X'00FF01')".to_string(),
+                ],
+                "occupied messages_v15_rebuild slot",
+            ),
+        ] {
+            let mutations = mutations.as_slice();
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            block_on(|cx| async move {
+                assert_v15_unsupported_schema_is_retained(&cx, &canonical, mutations, expected).await;
+            });
+            let runtime = DbConn::open_memory().unwrap();
+            block_on(|cx| async move {
+                assert_v15_unsupported_schema_is_retained(&cx, &runtime, mutations, expected).await;
+            });
+        }
+    }
+
     #[test]
     fn archive_metadata_upgrade_preserves_the_complete_pre_v30_migration_ledger() {
         const V30: &str = "v30_add_archive_metadata_json_to_messages";
@@ -5492,6 +7292,16 @@ mod tests {
     /// trailing fields from the schema. Handles the small fixture below only:
     /// a single leaf root page and no overflow.
     fn messages_record_field_counts(path: &str) -> Vec<(i64, usize)> {
+        messages_record_layout(path)
+            .into_iter()
+            .map(|(rowid, fields, _ipk_serial_type)| (rowid, fields))
+            .collect()
+    }
+
+    /// Like [`messages_record_field_counts`], plus the serial type stored in
+    /// the INTEGER PRIMARY KEY slot (field 0): SQLite writes NULL (0) there,
+    /// FrankenSQLite 0.3.x wrote the rowid (an integer serial type).
+    fn messages_record_layout(path: &str) -> Vec<(i64, usize, u64)> {
         fn varint(bytes: &[u8], at: &mut usize) -> u64 {
             let mut value = 0_u64;
             for i in 0..9 {
@@ -5545,11 +7355,15 @@ mod tests {
             let header_start = at;
             let header_size = usize::try_from(varint(page, &mut at)).unwrap();
             let mut fields = 0;
+            let mut ipk_serial_type = 0;
             while at < header_start + header_size {
-                varint(page, &mut at);
+                let serial_type = varint(page, &mut at);
+                if fields == 0 {
+                    ipk_serial_type = serial_type;
+                }
                 fields += 1;
             }
-            counts.push((rowid, fields));
+            counts.push((rowid, fields, ipk_serial_type));
         }
         counts.sort_unstable();
         counts
@@ -5740,6 +7554,225 @@ mod tests {
         );
     }
 
+    const MESSAGES_SNAPSHOT_SQL: &str = "SELECT id, project_id, sender_id, thread_id, topic, \
+        subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, \
+        archive_metadata_json FROM messages ORDER BY id";
+
+    /// Every row as Debug strings of the decoded values, so a shifted decode
+    /// shows up as a value diff instead of a type error. Integer widths are
+    /// unified: the two drivers report the same SQLite integer as `Int` or
+    /// `BigInt`.
+    fn messages_snapshot(rows: &[sqlmodel_core::Row]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| {
+                row.values()
+                    .map(|value| match value {
+                        Value::TinyInt(v) => format!("Integer({v})"),
+                        Value::SmallInt(v) => format!("Integer({v})"),
+                        Value::Int(v) => format!("Integer({v})"),
+                        Value::BigInt(v) => format!("Integer({v})"),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn canonical_messages_snapshot(path: &str) -> Vec<Vec<String>> {
+        let conn = crate::CanonicalDbConn::open_file(path).expect("open canonical reader");
+        let rows = conn
+            .query_sync(MESSAGES_SNAPSHOT_SQL, &[])
+            .expect("C SQLite reads messages");
+        crate::queries::close_canonical_db_conn(conn, "legacy slot oracle");
+        messages_snapshot(&rows)
+    }
+
+    /// Read through the runtime engine from a copy, so the probed file keeps
+    /// no runtime-engine sidecars.
+    fn runtime_messages_snapshot(path: &str, label: &str) -> Vec<Vec<String>> {
+        let copy = format!("{path}.{label}");
+        std::fs::copy(path, &copy).expect("copy for the runtime read");
+        let conn = DbConn::open_file(&copy).expect("open runtime engine");
+        let rows = conn
+            .query_sync(MESSAGES_SNAPSHOT_SQL, &[])
+            .expect("runtime engine reads messages");
+        messages_snapshot(&rows)
+    }
+
+    /// br-2hpuk, the live failure mode. FrankenSQLite 0.3.x (am <= v0.3.36)
+    /// stored each row's rowid in the INTEGER PRIMARY KEY slot, where SQLite
+    /// stores NULL. After v30's ADD COLUMN those 12-field records are short,
+    /// and FrankenSQLite 0.4.4 decoded them as a legacy layout without the
+    /// slot: every column shifted by one, so inboxes and search came back
+    /// empty. The fixture writes that layout with C SQLite (`id` declared as a
+    /// plain INTEGER while the rows go in, then retyped through
+    /// writable_schema, like the upstream engine oracle) and compares the
+    /// runtime engine with C SQLite on the same file twice: after v30 alone,
+    /// which needs the engine's short-record decoder fix (FrankenSQLite
+    /// a2398978a, released in 0.4.8), and after v31, which rewrites every row
+    /// as a full canonical record.
+    #[test]
+    fn v30_legacy_rowid_slot_records_read_correctly_before_and_after_v31() {
+        const V30: &str = "v30_add_archive_metadata_json_to_messages";
+        const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
+        const IPK: &str = "id INTEGER PRIMARY KEY AUTOINCREMENT,";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("legacy_rowid_slot.sqlite3")
+            .display()
+            .to_string();
+        let set_messages_sql = |conn: &crate::CanonicalDbConn, sql: &str| {
+            conn.execute_raw(&format!(
+                "PRAGMA writable_schema = ON; \
+                 UPDATE sqlite_master SET sql = '{}' WHERE type = 'table' AND name = 'messages'; \
+                 PRAGMA writable_schema = OFF",
+                sql.replace('\'', "''")
+            ))
+            .expect("rewrite the stored messages DDL");
+        };
+        let original_sql = {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("open canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    init_migrations_table(&cx, conn)
+                        .await
+                        .into_result()
+                        .expect("initialize migration ledger");
+                    let pre_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V30 && m.id != V31)
+                        .collect::<Vec<_>>();
+                    run_specific_migrations(&cx, conn, pre_v30)
+                        .await
+                        .into_result()
+                        .expect("apply the pre-v30 ledger");
+                }
+            });
+            let sql = canonical
+                .query_sync(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                    &[],
+                )
+                .expect("read messages DDL")[0]
+                .get_named::<String>("sql")
+                .unwrap();
+            assert!(sql.contains(IPK), "unexpected messages DDL: {sql}");
+            set_messages_sql(&canonical, &sql.replace(IPK, "id INTEGER,"));
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+            sql
+        };
+        {
+            // A fresh connection loads the retyped schema, so `id` is stored
+            // in the record like the legacy engine stored it. While `id` is not
+            // the key, child tables' foreign keys have no parent key to check.
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            canonical
+                .execute_raw(
+                    "PRAGMA foreign_keys = OFF; \
+                     INSERT INTO projects(id,slug,human_key,created_at) VALUES(7,'p','/p',1); \
+                     INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                     VALUES(11,7,'IcyBay','test','test',1,1); \
+                     INSERT INTO messages(rowid,id,project_id,sender_id,thread_id,topic,subject,\
+                     body_md,importance,ack_required,created_ts,recipients_json,attachments) VALUES \
+                     (42900,42900,7,11,'t-1',NULL,'first subject','first body','high',1,100,\
+                     '{\"to\":[\"ChartreuseCarp\"]}','[]'), \
+                     (42901,42901,7,11,NULL,'release','second subject','second body','normal',0,\
+                     200,'{}','[]')",
+                )
+                .expect("seed legacy-layout rows");
+            set_messages_sql(&canonical, &original_sql);
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            let check = canonical
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check");
+            assert_eq!(
+                check[0].get_as::<String>(0).unwrap(),
+                "ok",
+                "C SQLite accepts the legacy layout, as on the live mailbox"
+            );
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let through_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V31)
+                        .collect::<Vec<_>>();
+                    let applied = run_specific_migrations(&cx, conn, through_v30)
+                        .await
+                        .into_result()
+                        .expect("upgrade through v30");
+                    assert_eq!(applied, vec![V30.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        let layout = messages_record_layout(&path);
+        assert_eq!(
+            layout
+                .iter()
+                .map(|(rowid, fields, _)| (*rowid, *fields))
+                .collect::<Vec<_>>(),
+            vec![(42900, 12), (42901, 12)],
+            "v30 leaves the legacy records short"
+        );
+        assert!(
+            layout.iter().all(|(_, _, ipk)| *ipk != 0),
+            "the fixture must store the rowid in the INTEGER PRIMARY KEY slot: {layout:?}"
+        );
+
+        let expected = canonical_messages_snapshot(&path);
+        assert_eq!(expected.len(), 2);
+        assert!(
+            expected[0].iter().any(|v| v.contains("first subject"))
+                && expected[0].iter().any(|v| v.contains("ChartreuseCarp"))
+                && expected[1].iter().any(|v| v.contains("release")),
+            "C SQLite oracle: {expected:?}"
+        );
+        assert_eq!(
+            runtime_messages_snapshot(&path, "after-v30"),
+            expected,
+            "the runtime engine must decode short legacy records like C SQLite"
+        );
+
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let applied = run_specific_migrations(&cx, conn, schema_migrations())
+                        .await
+                        .into_result()
+                        .expect("upgrade through v31");
+                    assert_eq!(applied, vec![V31.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        assert_eq!(
+            messages_record_layout(&path),
+            vec![(42900, 13, 0), (42901, 13, 0)],
+            "v31 stores every legacy row as a full canonical record"
+        );
+        assert_eq!(
+            canonical_messages_snapshot(&path),
+            expected,
+            "v31 must not change any value"
+        );
+        assert_eq!(
+            runtime_messages_snapshot(&path, "after-v31"),
+            expected,
+            "the runtime engine reads v31-materialized rows like C SQLite"
+        );
+    }
     #[test]
     fn archive_metadata_migration_preserves_unknown_legacy_lineage_and_known_values() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5971,19 +8004,17 @@ mod tests {
         conn.execute_raw(&deferred)
             .expect("deferring base DDL initializes a legacy database");
 
-        // The column migrations run first and the deferred index migrations follow.
-        for migration in schema_migrations_base() {
-            if let Err(error) = conn.execute_raw(&migration.up) {
-                let text = error.to_string().to_ascii_lowercase();
-                assert!(
-                    text.contains("already exists")
-                        || text.contains("duplicate column name")
-                        || text.contains("duplicate trigger name"),
-                    "migration {} failed: {text}",
-                    migration.id
-                );
+        // Exercise the production executor, including atomic multi-step
+        // rebuilds: column migrations precede their deferred indexes.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("migrate the legacy schema with deferred indexes");
             }
-        }
+        });
         let indexes = conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \
@@ -6108,7 +8139,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
                 project_id INTEGER NOT NULL,\
                 name TEXT NOT NULL,\
-                task_description TEXT NOT NULL,\
+                task_description TEXT COLLATE NOCASE NOT NULL,\
                 last_active_ts INTEGER NOT NULL\
             )",
         )
@@ -6117,9 +8148,34 @@ mod tests {
             "INSERT INTO agents \
              (project_id, name, task_description, last_active_ts) VALUES \
              (7, 'BlueLake', '[DEREGISTERED 2026-08-24T03:22:36Z] completed', 424242),\
-             (7, 'GreenCastle', 'active', 434343)",
+             (7, 'GreenCastle', 'active', 434343),\
+             (7, 'LowerCase', '[deregistered note] ordinary work', 444444),\
+             (7, 'MixedCase', '[Deregistered deployment] ordinary work', 454545),\
+             (7, 'LeadingSpace', ' [DEREGISTERED 2026-08-24T03:22:36Z] quoted', 464646),\
+             (7, 'NoSeparator', '[DEREGISTERED] ordinary work', 474747),\
+             (7, 'PythonAt', '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 484848),\
+             (7, 'NamespaceOnly', '[DEREGISTERED ', 494949),\
+             (7, 'EmbeddedMarker', 'note [DEREGISTERED 2026-08-24T03:22:36Z] quoted', 505050),\
+             (7, 'TabSeparator', '[DEREGISTERED\t2026-08-24T03:22:36Z] ordinary work', 515151)",
         )
         .expect("insert legacy lifecycle witnesses");
+        conn.execute_raw(
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY REFERENCES agents(id), deregistered_at INTEGER NOT NULL); \
+             INSERT INTO agent_deregistrations VALUES (2, 999999); \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER REFERENCES agents(id), body_md TEXT); \
+             INSERT INTO messages VALUES (41, 3, 'Retain historical mail'); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             INSERT INTO message_recipients VALUES (41, 2, 12, 13);",
+        )
+        .expect("seed independent lifecycle and message history");
+        let source_sql =
+            "SELECT id, project_id, name, task_description, last_active_ts FROM agents ORDER BY id";
+        let source_before = conn
+            .query_sync(source_sql, &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values().cloned().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
 
         block_on({
             let conn = &conn;
@@ -6137,6 +8193,17 @@ mod tests {
                         .into_result()
                         .expect("apply lifecycle migration");
                 }
+                let lifecycle = schema_migrations_base()
+                    .into_iter()
+                    .filter(|migration| migration.id.starts_with("v28_"))
+                    .collect();
+                assert_eq!(
+                    run_specific_migrations(&cx, conn, lifecycle)
+                        .await
+                        .into_result()
+                        .expect("already-applied lifecycle migrations remain compatible"),
+                    Vec::<String>::new()
+                );
             }
         });
 
@@ -6161,12 +8228,174 @@ mod tests {
             ledger[0].get_named::<i64>("deregistered_at").unwrap(),
             424_242
         );
+        let all_ledger = conn
+            .query_sync(
+                "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                &[],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.get_as::<i64>(0).unwrap(), row.get_as::<i64>(1).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_ledger,
+            [(1, 424_242), (2, 999_999), (7, 484_848), (8, 494_949)]
+        );
+        assert_eq!(
+            conn.query_sync(source_sql, &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            source_before,
+            "migration must not rewrite agent descriptions or activity"
+        );
+        let history = conn.query_sync(
+            "SELECT m.sender_id, m.body_md, r.agent_id, r.read_ts, r.ack_ts FROM messages m JOIN message_recipients r ON r.message_id = m.id WHERE m.id = 41",
+            &[],
+        ).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].get_as::<i64>(0).unwrap(), 3);
+        assert_eq!(
+            history[0].get_as::<String>(1).unwrap(),
+            "Retain historical mail"
+        );
+        assert_eq!(history[0].get_as::<i64>(2).unwrap(), 2);
+        assert_eq!(history[0].get_as::<i64>(3).unwrap(), 12);
+        assert_eq!(history[0].get_as::<i64>(4).unwrap(), 13);
         let indexes = conn
             .query_sync("PRAGMA index_list(agents)", &[])
             .expect("inspect agent indexes");
         assert!(indexes.iter().any(|row| {
             row.get_named::<String>("name").ok().as_deref() == Some("idx_agents_project_active")
         }));
+    }
+
+    #[test]
+    fn lifecycle_backfill_preserves_applied_checksums_and_refuses_drift() {
+        // Independently calculated from the exact historical v28 statement,
+        // before adding its case-sensitive compatibility execution.
+        const OLD_CHECKSUM: &str = "59728dee81d3969a";
+        let conn = crate::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, task_description TEXT, last_active_ts INTEGER); \
+             INSERT INTO agents VALUES (1, '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 100), \
+                                       (2, '[deregistered note] ordinary work', 200); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER); \
+             INSERT INTO agent_deregistrations VALUES (1, 100), (2, 200);",
+        )
+        .unwrap();
+        block_on(|cx| async move {
+            init_migrations_table(&cx, &conn)
+                .await
+                .into_result()
+                .unwrap();
+            let migration = schema_migrations_base()
+                .into_iter()
+                .find(|migration| migration.id == V28_AGENT_DEREGISTRATION_BACKFILL)
+                .unwrap();
+            assert_eq!(migration.checksum(), OLD_CHECKSUM);
+            conn.execute_sync(
+                &format!("INSERT INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at, checksum) VALUES (?, 'historical lifecycle upgrade', 123, ?)"),
+                &[Value::Text(migration.id.clone()), Value::Text(OLD_CHECKSUM.into())],
+            ).unwrap();
+            assert_eq!(
+                run_specific_migrations(&cx, &conn, vec![migration.clone()])
+                    .await
+                    .into_result()
+                    .unwrap(),
+                Vec::<String>::new()
+            );
+            assert!(
+                migration_set_is_complete(&cx, &conn, std::slice::from_ref(&migration))
+                    .await
+                    .into_result()
+                    .unwrap()
+            );
+            let history = conn
+                .query_sync(
+                    &format!(
+                        "SELECT description, applied_at, checksum FROM {MIGRATIONS_TABLE_NAME}"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(
+                history[0].get_as::<String>(0).unwrap(),
+                "historical lifecycle upgrade"
+            );
+            assert_eq!(history[0].get_as::<i64>(1).unwrap(), 123);
+            assert_eq!(history[0].get_as::<String>(2).unwrap(), OLD_CHECKSUM);
+            // Existing ledger entries cannot be attributed safely to a past
+            // LIKE backfill. Preserve even this ambiguous historical witness.
+            let ledger = conn
+                .query_sync(
+                    "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                ledger
+                    .iter()
+                    .map(|row| (row.get_as::<i64>(0).unwrap(), row.get_as::<i64>(1).unwrap()))
+                    .collect::<Vec<_>>(),
+                [(1, 100), (2, 200)]
+            );
+
+            conn.execute_raw(&format!(
+                "UPDATE {MIGRATIONS_TABLE_NAME} SET checksum = 'unexpected-checksum'"
+            ))
+            .unwrap();
+            let pending = Migration::new(
+                "pending-after-v28",
+                "must not run",
+                "CREATE TABLE forbidden_lifecycle_upgrade (id INTEGER)",
+                "",
+            );
+            let error = run_specific_migrations(&cx, &conn, vec![pending, migration])
+                .await
+                .into_result()
+                .expect_err("historical compatibility must not accept arbitrary checksum drift");
+            assert!(error.to_string().contains("changed after application"));
+            assert!(
+                conn.query_sync(
+                    "SELECT name FROM sqlite_master WHERE name = 'forbidden_lifecycle_upgrade'",
+                    &[]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_backfill_reconstruction_uses_exact_tombstones() {
+        let conn = crate::CanonicalDbConn::open_memory().unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, task_description TEXT COLLATE NOCASE, last_active_ts INTEGER); \
+             INSERT INTO agents VALUES (1, '[DEREGISTERED at 2026-08-24T03:22:36Z] completed', 100), \
+                                       (2, '[deregistered note] ordinary work', 200), \
+                                       (3, '[Deregistered deployment] ordinary work', 300); \
+             CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER);",
+        )
+        .unwrap();
+        let migration = schema_migrations_base()
+            .into_iter()
+            .find(|migration| migration.id == V28_AGENT_DEREGISTRATION_BACKFILL)
+            .unwrap();
+        for sql in migration_sql_statements(&migration) {
+            conn.execute_raw(sql).unwrap();
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_as::<i64>(0).unwrap(), 1);
+        assert_eq!(rows[0].get_as::<i64>(1).unwrap(), 100);
     }
 
     #[test]

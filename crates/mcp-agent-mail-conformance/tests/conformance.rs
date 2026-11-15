@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 ///
@@ -49,8 +49,7 @@ const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
 /// `Config::from_env()` calls to avoid flakey cross-test races.
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 fn crate_root() -> PathBuf {
@@ -598,6 +597,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
+        crate::settle_shared_storage();
         let mut previous = Vec::new();
         for (key, value) in vars {
             let old = std::env::var(*key).ok();
@@ -643,6 +643,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(v) => unsafe {
@@ -1199,6 +1200,15 @@ struct FixtureEnv {
     tokens: BTreeMap<String, String>,
 }
 
+impl Drop for FixtureEnv {
+    // Fields drop in declaration order, so `tmp` would be removed before
+    // `_env_guard` drains; drain first so queued archive writes still find
+    // their directory (br-odkc4).
+    fn drop(&mut self) {
+        crate::drain_shared_storage();
+    }
+}
+
 fn init_fixture_repo(repo_dir: &Path) {
     std::fs::create_dir_all(repo_dir)
         .unwrap_or_else(|e| panic!("create fixture repo dir {}: {e}", repo_dir.display()));
@@ -1361,6 +1371,8 @@ fn insert_test_message(
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
 fn setup_fixture_env() -> FixtureEnv {
     let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let default_config = mcp_agent_mail_core::Config::default();
+    let default_http_port = default_config.http_port.to_string();
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
@@ -1374,13 +1386,20 @@ fn setup_fixture_env() -> FixtureEnv {
     // Also explicitly disable tool filtering (otherwise tools may not be registered).
     let env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", &db_url),
+        ("HTTP_HOST", &default_config.http_host),
+        ("HTTP_PORT", &default_http_port),
         ("WORKTREES_ENABLED", "1"),
+        // The captured identity fixtures use directory routing, independently
+        // of the operator's project identity configuration.
+        ("PROJECT_IDENTITY_MODE", "dir"),
         ("STORAGE_ROOT", storage_root_str),
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
         ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        // The fixture switch is honored only inside a declared test harness.
+        ("AM_TEST_MODE", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
@@ -2226,10 +2245,14 @@ fn run_fixtures_against_rust_server_router() {
 
     // --- Notification signal assertions (tool flow) ---
     let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
-    let notif_db_path = notif_tmp.path().join("db.sqlite3");
+    let notif_root = notif_tmp
+        .path()
+        .canonicalize()
+        .expect("canonical notification root");
+    let notif_db_path = notif_root.join("db.sqlite3");
     let notif_db_url = format!("sqlite://{}", notif_db_path.display());
-    let notif_storage_root = notif_tmp.path().join("archive");
-    let notif_signals_dir = notif_tmp.path().join("signals");
+    let notif_storage_root = notif_root.join("archive");
+    let notif_signals_dir = notif_root.join("signals");
     let _env_guard = EnvVarGuard::set(&[
         ("DATABASE_URL", notif_db_url.as_str()),
         (
@@ -2254,8 +2277,10 @@ fn run_fixtures_against_rust_server_router() {
 
     let project_dir = notif_tmp.path().join("project");
     std::fs::create_dir_all(&project_dir).expect("create notification project dir");
+    let project_dir = project_dir
+        .canonicalize()
+        .expect("canonical notification project dir");
     let project_key = project_dir.to_string_lossy().to_string();
-    let project_slug = mcp_agent_mail_core::compute_project_slug(&project_key);
 
     let ensure_params = CallToolParams {
         name: "ensure_project".to_string(),
@@ -2272,6 +2297,12 @@ fn run_fixtures_against_rust_server_router() {
     .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
     req_id += 1;
     assert!(!ensure_result.is_error, "ensure_project returned error");
+
+    let project_response = decode_json_from_tool_content(&ensure_result.content)
+        .expect("decode ensured notification project");
+    let project_slug = project_response["slug"]
+        .as_str()
+        .expect("ensured notification project slug");
 
     for name in ["BoldCastle", "CalmRiver", "QuietMeadow", "SilverPeak"] {
         let register_params = CallToolParams {
@@ -2338,7 +2369,7 @@ fn run_fixtures_against_rust_server_router() {
 
     let signal_root = notif_signals_dir
         .join("projects")
-        .join(&project_slug)
+        .join(project_slug)
         .join("agents");
     let to_signal = signal_root.join("CalmRiver.signal");
     let cc_signal = signal_root.join("QuietMeadow.signal");
@@ -4084,7 +4115,7 @@ fn toon_format_resolution_json_fallback() {
     assert_eq!(
         json.get("status").and_then(|v| v.as_str()),
         Some("ok"),
-        "health_check must return status=ok"
+        "health_check must return status=ok: {json}"
     );
 }
 
@@ -4116,6 +4147,13 @@ fn llm_mode_parameter_accepted_by_tools() {
         ("TOON_TRU_BIN", ""),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+        // The conformance fixture switch, as the fixture runner sets it.
+        ("LLM_ENABLED", "1"),
+        ("LLM_DEFAULT_MODEL", "conformance-stub"),
+        ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        ("AM_TEST_MODE", "1"),
+        // The product bus (summarize_thread_product) is gated on worktrees.
+        ("WORKTREES_ENABLED", "1"),
     ]);
     initialize_runtime_mailbox(&db_url);
 
@@ -4176,6 +4214,16 @@ fn llm_mode_parameter_accepted_by_tools() {
         "Testing llm_mode=false parameter.",
         Some("llm-test-thread"),
     );
+    insert_test_message(
+        &cx,
+        &pool,
+        project_id,
+        "GreenCastle",
+        "BlueLake",
+        "LLM mode second thread",
+        "A second thread for the multi-thread digest.",
+        Some("llm-test-thread-2"),
+    );
 
     // summarize_thread with llm_mode=false should succeed (no LLM call attempted).
     let params = CallToolParams {
@@ -4207,6 +4255,10 @@ fn llm_mode_parameter_accepted_by_tools() {
         Some("llm-test-thread"),
         "thread_id should match"
     );
+    // br-kp1in.21 negative: the fixture switch is on, but llm_mode=false never
+    // reaches it, so the heuristic summary carries neither marker nor canned text.
+    assert!(json.get("llm_stub").is_none(), "{json}");
+    assert!(!json.to_string().contains(LLM_FIXTURE_KEY_POINT), "{json}");
 
     // macro_prepare_thread with llm_mode=false should succeed.
     let params = CallToolParams {
@@ -4223,16 +4275,130 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = fastmcp_core::block_on(router.handle_tools_call(
-        &McpContext::new(cx, req_id),
+        &McpContext::new(cx.clone(), req_id),
         params,
         SessionState::new(),
         None,
         None,
     ));
+    req_id += 1;
     let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
     assert!(
         !call_result.is_error,
         "macro_prepare_thread should succeed with llm_mode=false: {:?}",
         call_result.content
     );
+    let json = decode_json_from_tool_content(&call_result.content)
+        .expect("macro_prepare_thread should return JSON");
+    assert!(json["thread"].get("llm_stub").is_none(), "{json}");
+
+    // br-kp1in.21: every response refined with the fixture's canned text says
+    // so, on each LLM-refined path, next to the canned text itself.
+    let call = |name: &str, arguments: Value, id: u64| -> Value {
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &McpContext::new(cx.clone(), id),
+            CallToolParams {
+                name: name.to_string(),
+                arguments: Some(arguments),
+                meta: None,
+            },
+            SessionState::new(),
+            None,
+            None,
+        ));
+        let call_result = result.unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert!(
+            !call_result.is_error,
+            "{name} returned an error: {:?}",
+            call_result.content
+        );
+        decode_json_from_tool_content(&call_result.content)
+            .unwrap_or_else(|e| panic!("{name} should return JSON: {e}"))
+    };
+
+    let single = call(
+        "summarize_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "thread_id": "llm-test-thread",
+            "llm_mode": true
+        }),
+        req_id,
+    );
+    assert!(
+        single.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{single}"
+    );
+    assert_eq!(single["llm_stub"], Value::Bool(true), "{single}");
+
+    let multi = call(
+        "summarize_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "thread_id": "llm-test-thread,llm-test-thread-2",
+            "llm_mode": true
+        }),
+        req_id + 1,
+    );
+    assert!(
+        multi.to_string().contains(LLM_FIXTURE_DIGEST_KEY_POINT),
+        "{multi}"
+    );
+    assert_eq!(multi["llm_stub"], Value::Bool(true), "{multi}");
+
+    let prepared = call(
+        "macro_prepare_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "agent_name": "GreenCastle",
+            "thread_id": "llm-test-thread",
+            "program": "test",
+            "model": "test-model",
+            "register_if_missing": false,
+            "llm_mode": true
+        }),
+        req_id + 2,
+    );
+    assert!(
+        prepared.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{prepared}"
+    );
+    assert_eq!(
+        prepared["thread"]["llm_stub"],
+        Value::Bool(true),
+        "{prepared}"
+    );
+
+    let product_key = "0123456789abcdef0123";
+    call(
+        "ensure_product",
+        serde_json::json!({ "product_key": product_key, "name": "LlmStubBus" }),
+        req_id + 3,
+    );
+    call(
+        "products_link",
+        serde_json::json!({ "product_key": product_key, "project_key": project_key.as_str() }),
+        req_id + 4,
+    );
+    let product = call(
+        "summarize_thread_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "thread_id": "llm-test-thread",
+            "llm_mode": true
+        }),
+        req_id + 5,
+    );
+    assert!(
+        product.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{product}"
+    );
+    assert_eq!(product["llm_stub"], Value::Bool(true), "{product}");
 }
+
+/// Key points that only the conformance fixture completion produces
+/// (`mcp_agent_mail_tools::llm`'s fixture text for single-thread summaries and
+/// multi-thread digests).
+const LLM_FIXTURE_KEY_POINT: &str = "API migration planned for next sprint";
+const LLM_FIXTURE_DIGEST_KEY_POINT: &str =
+    "API schema and DB migration are the two main workstreams";

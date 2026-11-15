@@ -30,8 +30,10 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_storage::recovery::{active_reservations, reservation_reconcile};
 use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
+    check_reservation_parity_with_sync_query,
 };
 use serde::Serialize;
 use std::fs;
@@ -331,24 +333,15 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         // An active live-probe failure outranks any cached-report advice.
         live
     } else if total_findings.unwrap_or(0) == 0 {
-        if report_path.is_none() {
-            "am doctor".to_string()
-        } else {
+        if report_usable {
             "am doctor health".to_string()
+        } else {
+            // No usable report says what is broken: the next step is the
+            // read-only scan of every registered FM.
+            TRIAGE_SCAN_COMMAND.to_string()
         }
     } else {
-        let has_p0 = findings
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("P0"))
-            })
-            .unwrap_or(false);
-        if has_p0 {
-            "am doctor --fix --yes".to_string()
-        } else {
-            "am doctor --dry-run --fix".to_string()
-        }
+        triage_findings_command(&findings)
     };
 
     let actions_planned: Vec<serde_json::Value> = findings
@@ -387,7 +380,7 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                     Some(serde_json::json!({
                         "id": id,
                         "severity": severity,
-                        "fix_command": format!("am doctor --fix --only {} --yes", id),
+                        "fix_command": fixers::fix_only_command(id),
                         "explain_command": format!("am doctor explain {}", id),
                     }))
                 })
@@ -423,15 +416,41 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
     if !report_available && let Some(map) = envelope.as_object_mut() {
         map.insert(
             "report_note".to_string(),
-            serde_json::Value::String(
+            serde_json::Value::String(format!(
                 "No doctor report exists yet for this target — the finding count is unknown, \
-                 not zero. Run `am doctor` (or `am doctor --json`) to produce one."
-                    .to_string(),
-            ),
+                 not zero. A report is written only by a fix that changed something; run \
+                 `{TRIAGE_SCAN_COMMAND}` to scan every registered failure mode read-only."
+            )),
         );
     }
 
     Ok(envelope)
+}
+
+/// The read-only scan of every registered FM: triage's next step whenever no
+/// usable report names what is broken.
+const TRIAGE_SCAN_COMMAND: &str = "am doctor fix --list --json";
+
+/// Triage's next step for findings carried by a stored report: apply the
+/// first P0 FM's fix, else rehearse the first FM's fix. A report that names
+/// no finding (per-FM run envelopes carry only counts) sends the agent back
+/// to the scan, which re-detects from current state.
+fn triage_findings_command(findings: &serde_json::Value) -> String {
+    fn id_of(finding: &serde_json::Value) -> Option<&str> {
+        finding.get("id").and_then(serde_json::Value::as_str)
+    }
+    let findings = findings.as_array().map_or(&[][..], Vec::as_slice);
+    let p0 = findings
+        .iter()
+        .filter(|f| f.get("severity").and_then(serde_json::Value::as_str) == Some("P0"))
+        .find_map(id_of);
+    if let Some(id) = p0 {
+        fixers::fix_only_command(id)
+    } else if let Some(id) = findings.iter().find_map(id_of) {
+        format!("am doctor fix --only {id} --dry-run")
+    } else {
+        TRIAGE_SCAN_COMMAND.to_string()
+    }
 }
 
 /// A small archive-only parity discrepancy is operational debt, not evidence
@@ -439,6 +458,106 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
 /// Keep the threshold deliberately tight: larger drift, parse failures, and
 /// any mismatch to reservation semantics remain unhealthy and retain exit 1.
 const COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD: usize = 3;
+
+/// How recently the mailbox owner's reservation reconciler must have finished
+/// a pass, and republished a release, for health to call its drift converging.
+const RESERVATION_RECONCILE_PROGRESS_WINDOW_US: i64 = 10 * 60 * 1_000_000;
+
+/// Whether reservation drift is the background reconcilers' work in progress
+/// (br-kp1in.19). `Ok(note)` only when every drift item belongs either to a row
+/// released in `SQLite` whose artifact still reads active (owned by
+/// `reservation_reconcile`) or to a valid active row missing its live-generation
+/// artifact (owned by `active_reservations`), and each needed reconciler has
+/// both run and republished within the window. A reconciler that is absent,
+/// idle, or running without repairing anything keeps health failing;
+/// `Err(Some(note))` says which, for drift it would otherwise own.
+fn reservation_parity_reconciling(
+    report: &ReservationParityReport,
+    release_progress: Option<&reservation_reconcile::ReservationReconcileProgress>,
+    active_progress: Option<&active_reservations::ActiveReservationProgress>,
+    now_us: i64,
+) -> Result<String, Option<String>> {
+    let drift = &report.drift;
+    if drift.total() == 0
+        || drift
+            .release_pending_mismatches
+            .saturating_add(drift.active_pending_rows)
+            != drift.total()
+    {
+        return Err(None);
+    }
+    let fix = fixers::fix_only_command("fm-db-state-files-reservation-db-archive-parity");
+    // A time further in the future than clock skew explains is not evidence
+    // of recent progress (the clock moved back since it was written).
+    let recent = |ts_us: i64| {
+        ts_us <= now_us.saturating_add(reservation_reconcile::PROGRESS_CLOCK_SKEW_US)
+            && now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US
+    };
+    let window_min = RESERVATION_RECONCILE_PROGRESS_WINDOW_US / 60_000_000;
+    let mut converging_notes = Vec::new();
+
+    if drift.release_pending_rows > 0 {
+        let rows = drift.release_pending_rows;
+        let Some(progress) = release_progress.filter(|progress| recent(progress.pass_us)) else {
+            return Err(Some(format!(
+                "reservation_parity: {rows} released reservation(s) await the background \
+                 reconciler, which has not run in the last {window_min} min (is the server up?); \
+                 next: {fix}"
+            )));
+        };
+        match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+            Some(last_repair_us) => converging_notes.push(format!(
+                "reconciling {rows} released reservation(s); the background reconciler (pid {}) \
+                 last republished one {}s ago",
+                progress.pid,
+                now_us.saturating_sub(last_repair_us) / 1_000_000
+            )),
+            None => {
+                return Err(Some(format!(
+                    "reservation_parity: the background reconciler (pid {}) is running but has not \
+                     republished any of {rows} pending release(s) in the last {window_min} min; \
+                     next: {fix}",
+                    progress.pid
+                )));
+            }
+        }
+    }
+
+    if drift.active_pending_rows > 0 {
+        let rows = drift.active_pending_rows;
+        let Some(progress) = active_progress.filter(|progress| recent(progress.pass_us)) else {
+            return Err(Some(format!(
+                "reservation_parity: {rows} active reservation(s) missing archive artifact(s) \
+                 await the background reconciler, which has not run in the last {window_min} min \
+                 (is the server up?); next: {fix}"
+            )));
+        };
+        match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+            Some(last_repair_us) => converging_notes.push(format!(
+                "reconciling {rows} active reservation(s) missing archive artifact(s); the \
+                 background reconciler (pid {}) last republished one {}s ago",
+                progress.pid,
+                now_us.saturating_sub(last_repair_us) / 1_000_000
+            )),
+            None => {
+                return Err(Some(format!(
+                    "reservation_parity: the background reconciler (pid {}) is running but has not \
+                     republished any of {rows} missing active reservation artifact(s) in the last \
+                     {window_min} min; next: {fix}",
+                    progress.pid
+                )));
+            }
+        }
+    }
+
+    if converging_notes.is_empty() {
+        return Err(None);
+    }
+    Ok(format!(
+        "warn: reservation parity: {}",
+        converging_notes.join("; ")
+    ))
+}
 
 fn reservation_parity_is_cosmetic(report: &ReservationParityReport) -> bool {
     let drift = &report.drift;
@@ -522,6 +641,139 @@ struct DoctorLiveProbeTarget {
     database_url: String,
     storage_root: PathBuf,
     source: &'static str,
+    /// The live server's integrity-guard state, when it advertises one.
+    integrity_guard_enabled: Option<bool>,
+}
+
+/// A proactive backup older than this, while the live owner has run past
+/// [`PROACTIVE_BACKUP_GRACE_SECS`], means its refreshes are failing: a running
+/// integrity guard refreshes the backup once it is an hour old, retrying at
+/// most six hours apart after failures.
+const STALE_PROACTIVE_BACKUP_SECS: u64 = 24 * 60 * 60;
+/// Owner uptime after which the integrity guard has had cycles to refresh.
+const PROACTIVE_BACKUP_GRACE_SECS: u64 = 2 * 60 * 60;
+
+/// `(status, detail)` for the live mailbox's proactive `.bak` (br-31eew).
+///
+/// `guard_attested` is false when the server did not report whether its
+/// integrity guard runs and `guard_enabled` is the CLI's own setting; a stale
+/// backup is then only a warning. `backup_age_secs` is `None` when no backup
+/// exists; `standalone` is false when the backup carries `-wal`/`-shm`/sidecar
+/// companions, which block every refresh.
+fn proactive_backup_health(
+    guard_enabled: bool,
+    guard_attested: bool,
+    backup_age_secs: Option<u64>,
+    owner_age_secs: Option<u64>,
+    standalone: bool,
+) -> (&'static str, String) {
+    let hours = |secs: u64| format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60);
+    let unattested = if guard_attested {
+        ""
+    } else {
+        " (the server did not report whether its integrity guard runs)"
+    };
+    if !guard_enabled {
+        return (
+            "ok",
+            format!("the integrity guard is off, so no proactive backup is expected{unattested}"),
+        );
+    }
+    let settled = owner_age_secs.is_some_and(|age| age >= PROACTIVE_BACKUP_GRACE_SECS);
+    let companions = if standalone {
+        ""
+    } else {
+        "; the backup has -wal/-shm or other companion files, which block every refresh"
+    };
+    match backup_age_secs {
+        None if settled => (
+            "warn",
+            format!(
+                "no proactive backup after {} of server uptime; check the server log for 'proactive backup refresh failed'",
+                hours(owner_age_secs.unwrap_or_default())
+            ),
+        ),
+        None => ("ok", "no proactive backup yet".to_string()),
+        Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => {
+            let detail = format!(
+                "proactive backup is {} old although the server has run {}: refreshes are failing{companions}; check the server log for 'proactive backup refresh failed'",
+                hours(age),
+                hours(owner_age_secs.unwrap_or_default())
+            );
+            if guard_attested {
+                ("fail", detail)
+            } else {
+                ("warn", format!("{detail}{unattested}"))
+            }
+        }
+        Some(age) => ("ok", format!("age {}{companions}", hours(age))),
+    }
+}
+
+/// `(status, detail)` for verified-snapshot metadata and periodic backup
+/// retention (GH#355). Unrecognized metadata makes every verified backup
+/// fail and parks rotation, and a footprint at the producer's limit pauses
+/// automatic backups: both leave the mailbox without a fresh restore point,
+/// so they fail. Legacy metadata is replaced by the next verified backup.
+fn backup_retention_health(
+    metadata_path: &Path,
+    metadata: &mcp_agent_mail_db::snapshot::SnapshotMetadataState,
+    footprint: &mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint,
+    periodic_reclamation: bool,
+) -> (&'static str, String) {
+    use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+
+    let mut status = "ok";
+    let mut problems = Vec::new();
+    let label = match metadata {
+        SnapshotMetadataState::Absent => "none",
+        SnapshotMetadataState::Current => "current",
+        SnapshotMetadataState::Legacy => {
+            status = "warn";
+            problems.push(format!(
+                "{} is an unversioned record written by v0.3.13-v0.3.30; the next verified backup keeps it as a .legacy-<sha256>.json sibling and replaces it",
+                metadata_path.display()
+            ));
+            "legacy"
+        }
+        SnapshotMetadataState::Unrecognized(reason) => {
+            status = "fail";
+            problems.push(format!(
+                "verified backups cannot replace {} and rotation keeps every backup generation while it is there ({reason}); next: move that file aside, keeping it as evidence, so the next verified backup records fresh metadata",
+                metadata_path.display()
+            ));
+            "unrecognized"
+        }
+    };
+    if footprint.publication_refused() {
+        status = "fail";
+        let remedy = if !periodic_reclamation {
+            "automatic deletion is off (AM_BACKUP_ROTATION_DELETE=false, or a platform without it), so old timestamped .bak files must be removed by hand"
+        } else if *metadata == SnapshotMetadataState::Current {
+            "retention deletes the superseded generations it can prove came from this mailbox, a bounded batch per backup attempt; if backup_images stops falling, stop the server and remove the remaining old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        } else {
+            "retention deletes nothing until a verified backup records current metadata, and the server makes only one verified repair backup while over the limit; if snapshot_metadata is still not current after the next backup attempt, stop the server and remove old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        };
+        problems.push(format!(
+            "automatic backups are paused: {} backup images and {} retained (plus {} for the next backup) are at the limit of {} images or {}; {remedy}",
+            footprint.images,
+            crate::format_bytes(footprint.retained_bytes),
+            crate::format_bytes(footprint.projected_bytes),
+            footprint.image_limit,
+            crate::format_bytes(footprint.byte_limit),
+        ));
+    }
+    let mut detail = format!(
+        "snapshot_metadata={label} backup_images={}/{} retained={}",
+        footprint.images,
+        footprint.image_limit,
+        crate::format_bytes(footprint.retained_bytes),
+    );
+    for problem in problems {
+        detail.push_str("; ");
+        detail.push_str(&problem);
+    }
+    (status, detail)
 }
 
 /// Read-only retention footprint for the same mailbox selected by the health
@@ -532,18 +784,54 @@ struct DoctorLiveProbeTarget {
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]) so
 /// the MCP `health_check` `retention` block and this `am doctor health`
 /// surface consume ONE implementation (GH#210).
-fn doctor_retention_resident_stats(
+struct DoctorRetentionHealth {
+    stats: mcp_agent_mail_db::recovery_retention::RetentionResidentStats,
+    staging: mcp_agent_mail_db::recovery_retention::staging::AutomaticBackupStagingAssessment,
+}
+
+fn doctor_retention_health(
     probe_target: &DoctorLiveProbeTarget,
-) -> Result<mcp_agent_mail_db::recovery_retention::RetentionResidentStats, String> {
+) -> Result<Option<DoctorRetentionHealth>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&probe_target.database_url) {
+        return Ok(None);
+    }
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
         .map_err(|error| format!("resolving live database path: {error}"))?;
     let database_path = PathBuf::from(&resolved.canonical_path);
-    mcp_agent_mail_db::recovery_retention::retention_resident_stats(
+    let stats = mcp_agent_mail_db::recovery_retention::retention_resident_stats(
         &probe_target.storage_root,
         &database_path,
         None,
     )
-    .map_err(|error| format!("inspecting direct backup retention: {error}"))
+    .map_err(|error| format!("inspecting retained recovery evidence: {error}"))?;
+    let staging = mcp_agent_mail_db::recovery_retention::staging::assess_automatic_backup_staging(
+        &database_path,
+        stats.proactive_backup_staging,
+    )
+    .map_err(|error| format!("automatic backup staging assessment unavailable: {error}"))?;
+    Ok(Some(DoctorRetentionHealth { stats, staging }))
+}
+
+fn doctor_backup_retention_health(
+    probe_target: &DoctorLiveProbeTarget,
+) -> Result<(&'static str, String), String> {
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        .map_err(|error| format!("resolving live database path: {error}"))?;
+    let database_path = PathBuf::from(&resolved.canonical_path);
+    let metadata = mcp_agent_mail_db::snapshot::snapshot_metadata_state(&database_path)
+        .map_err(|error| format!("inspecting snapshot metadata: {error}"))?;
+    let footprint = mcp_agent_mail_server::backup_rotation::periodic_backup_footprint(
+        &probe_target.storage_root,
+        &database_path,
+        mcp_agent_mail_server::backup_rotation::resolved_keep_per_kind(),
+    )
+    .map_err(|error| format!("inspecting periodic backups: {error}"))?;
+    Ok(backup_retention_health(
+        &mcp_agent_mail_db::snapshot::snapshot_meta_path(&database_path),
+        &metadata,
+        &footprint,
+        cfg!(unix) && mcp_agent_mail_server::backup_rotation::periodic_reclamation_enabled(),
+    ))
 }
 
 fn format_resident_to_live_database_ratio(
@@ -569,12 +857,14 @@ fn doctor_live_probe_target_from_server_config(
             database_url: server_config.database_url,
             storage_root: server_config.storage_root,
             source: "live_server",
+            integrity_guard_enabled: server_config.integrity_guard_enabled,
         };
     }
     DoctorLiveProbeTarget {
         database_url: config.database_url.clone(),
         storage_root: config.storage_root.clone(),
         source: "local_config_unattested",
+        integrity_guard_enabled: None,
     }
 }
 
@@ -602,8 +892,8 @@ fn doctor_live_probe_target(config: &Config) -> DoctorLiveProbeTarget {
 ///    keeps `am doctor explain <fm-id>` informative regardless of run
 ///    history.
 /// 3. If neither stage matches, exit 64 with a hint pointing operators
-///    at `am doctor fixers` (enumerate registry) and `am doctor --json`
-///    (list current findings).
+///    at `am doctor fixers` (enumerate registry) and
+///    `am doctor fix --list --json` (list current findings).
 pub fn handle_explain(
     target: &std::path::Path,
     finding_id: &str,
@@ -614,6 +904,8 @@ pub fn handle_explain(
     // than aborting — silently better UX for `explain` on a registered
     // FM that simply hasn't fired in any run yet.
     let root = runs::doctor_root(target);
+    let specs = fixers::registry();
+    let spec = specs.iter().find(|s| s.id == finding_id);
     let latest_envelope = latest_doctor_report_path_for_root(&root).and_then(|report_path| {
         let body = std::fs::read_to_string(&report_path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -622,6 +914,13 @@ pub fn handle_explain(
             f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
                 || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
         })?;
+        // A legacy check name matched above is not an FM id; `fix --only`
+        // would refuse it with exit 64, so only an FM gets a fix command.
+        let first_action = if spec.is_some() {
+            fixers::fix_only_command(finding_id)
+        } else {
+            TRIAGE_SCAN_COMMAND.to_string()
+        };
         Some(serde_json::json!({
             "schema_version": "1.0",
             "mode": "latest_run",
@@ -629,7 +928,7 @@ pub fn handle_explain(
             "finding": matched,
             "report_path": report_path.to_string_lossy(),
             "next_actions": [
-                format!("am doctor --fix --only {finding_id} --yes"),
+                first_action,
                 "am doctor capabilities --json".to_string(),
             ],
         }))
@@ -642,8 +941,7 @@ pub fn handle_explain(
 
     // Stage 2: registry fallback. Useful for `explain <fm-id>` when
     // the FM is registered but hasn't fired in any run.
-    let specs = fixers::registry();
-    if let Some(spec) = specs.iter().find(|s| s.id == finding_id) {
+    if let Some(spec) = spec {
         let envelope = serde_json::json!({
             "schema_version": "1.0",
             "mode": "registry",
@@ -652,7 +950,7 @@ pub fn handle_explain(
             "note": "No matching finding in latest run; showing the FM's static contract from the registry.",
             "next_actions": [
                 format!("am doctor fix --only {finding_id} --list --json"),
-                format!("am doctor --fix --only {finding_id} --yes"),
+                fixers::fix_only_command(finding_id),
                 "am doctor fixers --format json".to_string(),
                 "am doctor capabilities --json".to_string(),
             ],
@@ -664,7 +962,7 @@ pub fn handle_explain(
     // Stage 3: not in latest run, not in registry → truly unknown.
     eprintln!("error: finding `{finding_id}` not found in latest run AND not a registered FM.");
     eprintln!(
-        "       Run `am doctor fixers` to enumerate registered FM ids, or `am doctor --json` to list current findings."
+        "       Run `am doctor fixers` to enumerate registered FM ids, or `{TRIAGE_SCAN_COMMAND}` to list current findings."
     );
     Err(CliError::ExitCode(64))
 }
@@ -1620,7 +1918,6 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
     v.extend(
         mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default()
             .into_iter()
-            .filter(|location| location.tool == mcp_agent_mail_core::mcp_config::McpConfigTool::Omp)
             .map(|location| location.config_path),
     );
     let mut seen = std::collections::HashSet::new();
@@ -1636,7 +1933,7 @@ fn canonical_mcp_url_for_config(config: &Config) -> String {
 /// `git` isn't on PATH (the known-bad-git FM is unreachable in that case).
 fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::DetectInputs> {
     use std::process::Command;
-    let which_git = Command::new("sh")
+    let which_git = Command::new("sh") // ubs:ignore — fixed literal command below has no interpolated input; this local doctor resolves the operator's PATH git
         .arg("-c")
         .arg("command -v git")
         .output()
@@ -1649,7 +1946,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
             .trim()
             .to_string(),
     );
-    let out = Command::new(&system_git_path)
+    let out = Command::new(&system_git_path) // ubs:ignore — executable is the operator's PATH git resolved by the fixed command above, not request content
         .arg("--version")
         .output()
         .ok()?;
@@ -1658,10 +1955,10 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let system_git_version = git_version_text_from_stdout(&raw);
-    let am_git_binary_env = std::env::var("AM_GIT_BINARY").ok();
+    let am_git_binary_env = mcp_agent_mail_core::config::infra_env_value("AM_GIT_BINARY");
     let am_git_binary_version = am_git_binary_env
         .as_deref()
-        .and_then(|path| Command::new(path).arg("--version").output().ok())
+        .and_then(|path| Command::new(path).arg("--version").output().ok()) // ubs:ignore — AM_GIT_BINARY is an explicit trusted local executable override being diagnosed
         .filter(|output| output.status.success())
         .map(|output| git_version_text_from_stdout(&String::from_utf8_lossy(&output.stdout)));
     Some(fixers::known_bad_git_no_override::DetectInputs {
@@ -2460,34 +2757,33 @@ fn support_schema_versions(
     database_url: &str,
     redaction: &SupportRedactionContext,
 ) -> serde_json::Value {
-    let conn = match crate::open_db_for_doctor_check(database_url) {
-        Ok(conn) => conn,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "unavailable",
-                "detail": redact_support_text(&err.to_string(), redaction),
+    let sample_from_query =
+        |query_fn: &dyn Fn(&str) -> Option<Vec<mcp_agent_mail_db::sqlmodel_core::Row>>| {
+            let user_version = query_fn("PRAGMA user_version").and_then(|rows| {
+                rows.first()
+                    .and_then(|row| row.get_named::<i64>("user_version").ok())
             });
-        }
-    };
-    let user_version = conn
-        .query_sync("PRAGMA user_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("user_version").ok())
-        });
-    let sqlite_version = conn
-        .query_sync("SELECT sqlite_version() AS sqlite_version", &[])
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<String>("sqlite_version").ok())
-        });
-    serde_json::json!({
-        "status": "captured",
-        "database_user_version": user_version,
-        "sqlite_version": sqlite_version,
-    })
+            let sqlite_version =
+                query_fn("SELECT sqlite_version() AS sqlite_version").and_then(|rows| {
+                    rows.first()
+                        .and_then(|row| row.get_named::<String>("sqlite_version").ok())
+                });
+            serde_json::json!({
+                "status": "captured",
+                "database_user_version": user_version,
+                "sqlite_version": sqlite_version,
+            })
+        };
+    if let Ok(conn) = crate::open_db_sync_read_only_with_database_url(database_url) {
+        return sample_from_query(&|sql| conn.query_sync(sql, &[]).ok());
+    }
+    match crate::open_db_for_doctor_check_read_only_with_context(database_url) {
+        Ok(opened) => sample_from_query(&|sql| opened.conn.query_sync(sql, &[]).ok()),
+        Err(err) => serde_json::json!({
+            "status": "unavailable",
+            "detail": redact_support_text(&err.to_string(), redaction),
+        }),
+    }
 }
 
 fn support_sqlite_sidecar_metadata(database_path: &Path) -> serde_json::Value {
@@ -2910,7 +3206,7 @@ fn print_skipped_doctor_report(skipped: &SkippedDoctorReport) {
 /// per invocation, however many reports were skipped.
 fn print_doctor_history_recovery_hint() {
     ftui_runtime::ftui_println!(
-        "doctor_history: next: am doctor  (writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
+        "doctor_history: next: {TRIAGE_SCAN_COMMAND}  (re-detects from current state; the next fix that changes something writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
     );
 }
 
@@ -3187,10 +3483,21 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         );
     }
     let mut live_mailbox_degraded = false;
-    match crate::doctor_database_fix_strategy_read_only(
+    let fix_strategy = if crate::robot::live_server_proves_mailbox_healthy(
+        &config,
         &probe_target.database_url,
         &probe_target.storage_root,
-    ) {
+    )? {
+        Ok(crate::DoctorDatabaseFixStrategy::None(
+            "Database passed live server health_check probes".to_string(),
+        ))
+    } else {
+        crate::doctor_database_fix_strategy_read_only(
+            &probe_target.database_url,
+            &probe_target.storage_root,
+        )
+    };
+    match fix_strategy {
         Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
         Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
             ftui_runtime::ftui_println!(
@@ -3266,7 +3573,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
     if corruption.corruption_class_total > 0 {
         ftui_runtime::ftui_println!(
-            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor --json",
+            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor check --json",
             corruption.corruption_class_total,
             corruption.detections_total
         );
@@ -3319,15 +3626,57 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         if descriptors.status == "fail" {
             return Err(CliError::ExitCode(1));
         }
+        // br-31eew (GH#337): a proactive backup that silently stopped
+        // refreshing left one mailbox with a 3.5-week-old backup and only a
+        // repeated log warning. With a live owner, say so here.
+        if let Ok(resolved) =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        {
+            let backup = PathBuf::from(format!("{}.bak", resolved.canonical_path));
+            let backup_age_secs = std::fs::symlink_metadata(&backup)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| modified.elapsed().map_or(0, |age| age.as_secs()));
+            let owner_age_secs = owner_pids
+                .iter()
+                .filter_map(|pid| crate::process_age_seconds(*pid))
+                .max();
+            let (status, detail) = proactive_backup_health(
+                probe_target
+                    .integrity_guard_enabled
+                    .unwrap_or(config.integrity_guard_enabled),
+                probe_target.integrity_guard_enabled.is_some(),
+                backup_age_secs,
+                owner_age_secs,
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&backup),
+            );
+            ftui_runtime::ftui_println!("proactive_backup: {status} ({detail})");
+            if status == "fail" {
+                return Err(CliError::ExitCode(1));
+            }
+        }
     }
 
-    match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
-        .and_then(|opened| {
-            check_reservation_parity_with_canonical_conn(&opened.conn, &probe_target.storage_root)
+    let reservation_parity =
+        match crate::open_db_sync_read_only_with_database_url(&probe_target.database_url) {
+            Ok(conn) => check_reservation_parity_with_sync_query(&conn, &probe_target.storage_root)
                 .map_err(|error| {
                     CliError::Other(format!("reservation parity check failed: {error}"))
-                })
-        }) {
+                }),
+            Err(_) => {
+                crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
+                    .and_then(|opened| {
+                        check_reservation_parity_with_canonical_conn(
+                            &opened.conn,
+                            &probe_target.storage_root,
+                        )
+                        .map_err(|error| {
+                            CliError::Other(format!("reservation parity check failed: {error}"))
+                        })
+                    })
+            }
+        };
+    match reservation_parity {
         Ok(report) => {
             ftui_runtime::ftui_println!("{}", report.health_line());
             if !report.ok {
@@ -3338,7 +3687,23 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                         COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
                     );
                 } else {
-                    return Err(CliError::ExitCode(1));
+                    let release_progress =
+                        reservation_reconcile::read_progress(&probe_target.storage_root);
+                    let active_progress =
+                        active_reservations::read_progress(&probe_target.storage_root);
+                    match reservation_parity_reconciling(
+                        &report,
+                        release_progress.as_ref(),
+                        active_progress.as_ref(),
+                        mcp_agent_mail_core::timestamps::now_micros(),
+                    ) {
+                        Ok(note) => ftui_runtime::ftui_println!("{note}"),
+                        Err(Some(stalled)) => {
+                            ftui_runtime::ftui_println!("{stalled}");
+                            return Err(CliError::ExitCode(1));
+                        }
+                        Err(None) => return Err(CliError::ExitCode(1)),
+                    }
                 }
             }
         }
@@ -3392,13 +3757,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
-    // GH#210: make retention debt visible in the cheap health surface. This
-    // is informational rather than a mailbox-integrity failure: forensics are
-    // evidence, and reclaim only moves them into a reversible staging area.
-    // The ratio uses the exact live mailbox target selected above, never the
-    // CLI's potentially unrelated XDG default.
-    match doctor_retention_resident_stats(&probe_target) {
-        Ok(stats) => {
+    // Retention and staging refusal are operational degradation. They must
+    // affect this health result without becoming mailbox-corruption claims.
+    // Use the exact live mailbox target selected above and the producer's
+    // shared count/projected-byte assessment; byte alarms cannot mask refusal.
+    let mut backup_health_unavailable_or_blocked = false;
+    match doctor_retention_health(&probe_target) {
+        Ok(Some(DoctorRetentionHealth { stats, staging })) => {
             let live_database = stats
                 .live_database_bytes
                 .map_or_else(|| "unavailable".to_string(), crate::format_bytes);
@@ -3407,19 +3772,75 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                 stats.live_database_bytes,
             );
             ftui_runtime::ftui_println!(
-                "retention_resident: {} active artifact(s) (recovery_debris={} direct_backups={} reclaimable_staged={}) resident={} live_db={} ratio={}",
-                stats.recovery_debris_artifacts + stats.direct_backup_only_artifacts,
+                "retention_resident: {} active artifact(s) (recovery_debris={} direct_backups={} reclaimable_staged={}) resident={} live_db={} ratio={} staging_artifacts={} resident_attention={}",
+                stats.recovery_debris_artifacts
+                    + stats.direct_backup_only_artifacts
+                    + stats.proactive_backup_staging.artifacts(),
                 stats.recovery_debris_artifacts,
                 stats.direct_backup_only_artifacts,
                 crate::format_bytes(stats.reclaimable_staging_bytes),
                 crate::format_bytes(stats.resident_bytes),
                 live_database,
                 ratio,
+                stats.proactive_backup_staging.artifacts(),
+                stats.resident_attention(config.doctor_retention_alert_bytes),
+            );
+            if stats.resident_attention(config.doctor_retention_alert_bytes) {
+                backup_health_unavailable_or_blocked = true;
+                ftui_runtime::ftui_println!(
+                    "retention_resident: warn retained recovery evidence exceeds the configured absolute and live-database ratio thresholds; inspect the retained evidence and am doctor reclaim --dry-run (lists reclaimable debris only); this is not database corruption"
+                );
+            }
+            match staging.check_budget() {
+                Ok(()) => ftui_runtime::ftui_println!(
+                    "automatic_backup_staging: ok retained_artifacts={}/{} retained_bytes={} projected_bytes={} byte_limit={}",
+                    staging.inventory.artifacts(),
+                    mcp_agent_mail_db::recovery_retention::staging::MAX_RETAINED_STAGES,
+                    staging.inventory.bytes,
+                    staging.projected_bytes,
+                    staging.byte_limit,
+                ),
+                Err(error) => {
+                    backup_health_unavailable_or_blocked = true;
+                    ftui_runtime::ftui_println!(
+                        "automatic_backup_staging: fail (automatic backups refused: {error}); {}",
+                        mcp_agent_mail_db::recovery_retention::staging::STAGING_REMEDIATION,
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            ftui_runtime::ftui_println!(
+                "automatic_backup_staging: not_applicable (in-memory mailbox)"
             );
         }
         Err(error) => {
-            ftui_runtime::ftui_println!("retention_resident: not_run ({error})");
+            backup_health_unavailable_or_blocked = true;
+            ftui_runtime::ftui_println!(
+                "automatic_backup_staging: unavailable ({error}); inspect mailbox paths and permissions; no clean backup staging budget was established"
+            );
         }
+    }
+
+    // GH#355: metadata that verified backups cannot replace, or a periodic
+    // footprint at the producer's limit, silently stopped fresh restore
+    // points while this command still reported a healthy mailbox.
+    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&probe_target.database_url) {
+        match doctor_backup_retention_health(&probe_target) {
+            Ok((status, detail)) => {
+                ftui_runtime::ftui_println!("backup_retention: {status} ({detail})");
+                if status == "fail" {
+                    backup_health_unavailable_or_blocked = true;
+                }
+            }
+            Err(error) => {
+                backup_health_unavailable_or_blocked = true;
+                ftui_runtime::ftui_println!("backup_retention: unavailable ({error})");
+            }
+        }
+    }
+    if backup_health_unavailable_or_blocked {
+        return Err(CliError::ExitCode(1));
     }
 
     let root = runs::doctor_root(target);
@@ -3644,7 +4065,7 @@ pub fn handle_undo(
     Ok(())
 }
 
-/// Compute the canonical write_scopes for `am doctor --fix`.
+/// Compute the canonical write_scopes for `am doctor fix` and `undo`.
 ///
 /// These match `analysis/safety_envelope.md` (Phase 3 synthesis).
 pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
@@ -3653,6 +4074,10 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
         v.push(home.join(".config").join("mcp-agent-mail"));
         v.push(home.join(".codex"));
         v.push(home.join(".claude"));
+        // Claude Code's primary config is a file beside `.claude`, not
+        // inside it. Match the detector's explicit input without granting
+        // write authority over the rest of HOME.
+        v.push(home.join(".claude.json"));
         v.push(home.join(".gemini"));
         v.push(home.join(".cursor"));
         v.push(home.join(".windsurf"));
@@ -3680,7 +4105,68 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
     v.push(PathBuf::from(".doctor"));
     v.push(PathBuf::from(".git/hooks"));
     v.push(PathBuf::from(".gitignore"));
+    if let Ok(project) = std::env::current_dir() {
+        // Per-FM fix already authorizes its project root, but undo uses
+        // these defaults. Admit the same supported project config files
+        // without granting undo authority over arbitrary project contents.
+        v.extend(project_config_write_scopes(
+            &project,
+            default_mcp_config_candidates(),
+        ));
+    }
     v
+}
+
+fn project_config_write_scopes(
+    project: &Path,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let Ok(canonical_project) = project.canonicalize() else {
+        return Vec::new();
+    };
+    candidates
+        .into_iter()
+        .filter(|path| path.starts_with(project))
+        .filter_map(|path| mutate::canonicalize_existing_or_parent(&path).ok())
+        .filter(|path| path.starts_with(&canonical_project))
+        .collect()
+}
+
+#[cfg(test)]
+fn ensure_private_test_git_root(root: &Path) {
+    // RCH places TMPDIR inside its checkout. A fixture must own its nearest
+    // Git authority instead of contending on that enclosing repository's
+    // nonblocking mutation guard. Preserve explicitly prepared repositories.
+    if !root.join(".git").exists() {
+        let initialized = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "-q"])
+            .output()
+            .expect("initialize private doctor fixture repository");
+        assert!(
+            initialized.status.success(),
+            "fixture git init failed: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+    }
+    let discovered = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .expect("discover doctor fixture Git authority");
+    assert!(
+        discovered.status.success(),
+        "fixture Git discovery failed: {}",
+        String::from_utf8_lossy(&discovered.stderr)
+    );
+    let discovered = String::from_utf8(discovered.stdout).expect("fixture Git root is UTF-8");
+    assert_eq!(
+        std::fs::canonicalize(discovered.trim()).unwrap(),
+        std::fs::canonicalize(root).unwrap(),
+        "doctor fixture must not inherit an enclosing Git authority"
+    );
 }
 
 #[cfg(test)]
@@ -3699,6 +4185,247 @@ mod tests {
     const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
     const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
     const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
+    #[test]
+    fn proactive_backup_health_fails_on_a_backup_that_stopped_refreshing() {
+        // br-31eew (GH#337): a 3.5-week-old backup under a long-running
+        // server with blocking companions is a failure, not a quiet warning.
+        let day = 24 * 60 * 60;
+        let (status, detail) =
+            proactive_backup_health(true, true, Some(25 * day), Some(30 * day), false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("600h00m old"), "{detail}");
+        assert!(detail.contains("companion files"), "{detail}");
+        let (status, detail) =
+            proactive_backup_health(true, true, Some(2 * day), Some(3 * day), true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(!detail.contains("companion"), "{detail}");
+        assert_eq!(
+            proactive_backup_health(true, true, None, Some(day), true).0,
+            "warn"
+        );
+        // A server that does not report its guard state: the CLI's own
+        // setting is a guess, so a stale backup is a warning, not a failure.
+        let (status, detail) =
+            proactive_backup_health(true, false, Some(2 * day), Some(3 * day), true);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
+        let (status, detail) = proactive_backup_health(false, false, None, Some(3 * day), true);
+        assert_eq!(status, "ok", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
+        assert!(
+            !proactive_backup_health(false, true, None, Some(3 * day), true)
+                .1
+                .contains("did not report")
+        );
+
+        // Negative controls: a fresh backup, a server that just started
+        // (the guard has not had a cycle yet), an unknown owner age, and a
+        // disabled guard are all ok.
+        for (age, owner, guard) in [
+            (Some(3_600), Some(30 * day), true),
+            (Some(30 * day), Some(600), true),
+            (Some(30 * day), None, true),
+            (None, Some(600), true),
+            (Some(30 * day), Some(30 * day), false),
+        ] {
+            let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
+            assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
+
+    #[test]
+    fn backup_retention_health_fails_when_backups_cannot_refresh() {
+        use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+        use mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint;
+
+        let meta = Path::new("/mail/storage.sqlite3.bak.meta.json");
+        let footprint = |images, retained_bytes| PeriodicBackupFootprint {
+            images,
+            retained_bytes,
+            projected_bytes: 1024,
+            image_limit: 6,
+            byte_limit: 512 * 1024 * 1024,
+        };
+        let healthy = footprint(3, 3 * 1024);
+
+        for state in [
+            SnapshotMetadataState::Absent,
+            SnapshotMetadataState::Current,
+        ] {
+            let (status, detail) = backup_retention_health(meta, &state, &healthy, true);
+            assert_eq!(status, "ok", "{state:?}: {detail}");
+            assert!(detail.contains("backup_images=3/6"), "{detail}");
+        }
+
+        // A legacy record is replaced by the next verified backup.
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &healthy, true);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("snapshot_metadata=legacy"), "{detail}");
+        assert!(detail.contains("v0.3.13-v0.3.30"), "{detail}");
+
+        // Metadata verified backups refuse to replace stops restore points.
+        let unrecognized = SnapshotMetadataState::Unrecognized(
+            "snapshot metadata refuses to replace unrecognized regular file".to_string(),
+        );
+        let (status, detail) = backup_retention_health(meta, &unrecognized, &healthy, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains(meta.to_str().unwrap()), "{detail}");
+        assert!(detail.contains("move that file aside"), "{detail}");
+
+        // GH#355's mailbox: 784 generations, 24.7 GiB, automatic backups paused.
+        // Without current metadata nothing can be deleted until a verified
+        // repair backup lands, so the operator is told what to do otherwise.
+        let backlog = footprint(784, 24_700 * 1024 * 1024);
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("backup_images=784/6"), "{detail}");
+        assert!(detail.contains("automatic backups are paused"), "{detail}");
+        assert!(detail.contains("one verified repair backup"), "{detail}");
+        assert!(
+            detail.contains("remove old timestamped .bak files"),
+            "{detail}"
+        );
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("bounded batch"), "{detail}");
+        assert!(detail.contains("stops falling"), "{detail}");
+        assert!(!detail.contains("one verified repair backup"), "{detail}");
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("removed by hand"), "{detail}");
+
+        // The byte limit alone also pauses the producer.
+        let (status, detail) = backup_retention_health(
+            meta,
+            &SnapshotMetadataState::Current,
+            &footprint(2, 512 * 1024 * 1024),
+            true,
+        );
+        assert_eq!(status, "fail", "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_reports_snapshot_metadata_that_blocks_backups() {
+        // GH#355: a stale sidecar blocked rotation and every verified backup
+        // while `am doctor health` printed "ok: live mailbox healthy".
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        /// (label, sidecar, .bak generations, exits 1, expected output)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            usize,
+            bool,
+            &'static [&'static str],
+        );
+        let cases: [Case; 4] = [
+            (
+                "clean",
+                None,
+                0,
+                false,
+                &["backup_retention: ok", "snapshot_metadata=none"],
+            ),
+            (
+                "legacy record, no backlog",
+                Some("legacy"),
+                2,
+                false,
+                &["backup_retention: warn", "snapshot_metadata=legacy"],
+            ),
+            (
+                "unrecognized record",
+                Some("unrecognized"),
+                2,
+                true,
+                &["backup_retention: fail", "move that file aside"],
+            ),
+            (
+                "legacy record with a stranded backlog",
+                Some("legacy"),
+                40,
+                true,
+                &[
+                    "backup_retention: fail",
+                    "snapshot_metadata=legacy",
+                    "backup_images=40/",
+                    "automatic backups are paused",
+                ],
+            ),
+        ];
+        for (label, metadata, generations, fails, expected) in cases {
+            let target = tempfile::tempdir().unwrap();
+            let storage_root = tempfile::tempdir().unwrap();
+            let db_path = storage_root.path().join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
+            seed_healthy_live_mailbox(&db_path);
+            let meta_path = storage_root.path().join("storage.sqlite3.bak.meta.json");
+            // The v0.3.30 shape from the report: no schema, size or SHA-256.
+            let meta_bytes = metadata.map(|kind| match kind {
+                "legacy" => serde_json::to_vec_pretty(&serde_json::json!({
+                    "created_us": 1_789_546_475_731_049_i64,
+                    "integrity_verified": true,
+                    "integrity_kind": "integrity_check",
+                    "schema_version": 1,
+                    "row_counts": {"agents": 21, "messages": 5257},
+                    "source_path": db_path.to_str().unwrap(),
+                    "snapshot_path": format!("{}.bak", db_path.display()),
+                    "binary_version": "0.3.30"
+                }))
+                .unwrap(),
+                _ => b"operator evidence, not snapshot metadata".to_vec(),
+            });
+            if let Some(bytes) = &meta_bytes {
+                fs::write(&meta_path, bytes).unwrap();
+            }
+            if generations > 0 {
+                fs::copy(&db_path, storage_root.path().join("storage.sqlite3.bak")).unwrap();
+            }
+            for index in 1..generations {
+                fs::copy(
+                    &db_path,
+                    storage_root
+                        .path()
+                        .join(format!("storage.sqlite3.bak.20260921_{index:06}")),
+                )
+                .unwrap();
+            }
+
+            let (result, output) =
+                run_health_capturing(target.path(), &db_url, storage_root.path());
+
+            for needle in expected {
+                assert!(output.contains(needle), "{label}: {needle:?} in:\n{output}");
+            }
+            if fails {
+                assert!(
+                    matches!(result, Err(CliError::ExitCode(1))),
+                    "{label}: {result:?}\n{output}"
+                );
+                assert!(
+                    !output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            } else {
+                assert!(result.is_ok(), "{label}: {result:?}\n{output}");
+                assert!(
+                    output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            }
+            // Health is read-only: the metadata is reported, never replaced.
+            if let Some(bytes) = meta_bytes {
+                assert_eq!(fs::read(&meta_path).unwrap(), bytes, "{label}");
+            }
+        }
+    }
 
     // ---- GH#315: stale unusable doctor reports must not break live health ----
 
@@ -4203,6 +4930,143 @@ mod tests {
     }
 
     #[test]
+    fn default_mcp_config_candidates_include_non_omp_project_paths() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [
+            ".claude/settings.local.json",
+            ".codex/config.toml",
+            "codex.mcp.json",
+            "cursor.mcp.json",
+            "gemini.mcp.json",
+            ".vscode/mcp.json",
+            "windsurf.mcp.json",
+            "cline.mcp.json",
+            "opencode.json",
+            "factory.mcp.json",
+        ] {
+            assert!(
+                candidates.contains(&project.join(relative)),
+                "per-FM fixers must inspect the shared mutable project config {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_exclude_read_only_omp_fallbacks() {
+        let project = std::env::current_dir().expect("current project directory");
+        let candidates = default_mcp_config_candidates();
+        for relative in [".mcp.json", "mcp.json", ".omp/.mcp.json"] {
+            assert!(
+                !candidates.contains(&project.join(relative)),
+                "read-only OMP compatibility source must stay outside mutation authority: {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_home_config_scope_is_file_bounded() {
+        let home = dirs::home_dir().expect("private test home directory");
+        let config = home.join(".claude.json");
+        assert!(default_mcp_config_candidates().contains(&config));
+        let caps = mutate::Capabilities {
+            write_scopes: default_write_scopes(),
+        };
+        assert!(mutate::ensure_in_scope(&caps, &config).is_ok());
+        for outside in [
+            home.clone(),
+            home.join(".claude.json.bak"),
+            home.join("other.json"),
+        ] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &outside),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "adding the supported Claude config must not authorize {}",
+                outside.display()
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_config_candidates_project_scopes_are_file_bounded() {
+        let project = std::env::current_dir().expect("current project directory");
+        let caps = mutate::Capabilities {
+            write_scopes: default_write_scopes(),
+        };
+        for relative in [
+            "cline.mcp.json",
+            "cursor.mcp.json",
+            ".claude/settings.local.json",
+            ".codex/config.toml",
+            ".vscode/mcp.json",
+        ] {
+            assert!(
+                mutate::ensure_in_scope(&caps, &project.join(relative)).is_ok(),
+                "undo must admit the supported project config {relative}"
+            );
+        }
+        for outside in [
+            project.clone(),
+            project.join("operator-note.json"),
+            project.join("cursor.mcp.json.bak"),
+            project.join(".vscode/other.json"),
+            project.join(".mcp.json"),
+            project.join("mcp.json"),
+            project.join(".omp/.mcp.json"),
+            project
+                .parent()
+                .expect("project parent")
+                .join("unrelated-project/cursor.mcp.json"),
+        ] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &outside),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "project config scopes must not authorize {}",
+                outside.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_mcp_config_candidates_project_scopes_reject_parent_symlink_escape() {
+        let root = tempfile::tempdir().expect("private project scope fixture");
+        let project = root.path().join("project");
+        let outside = root.path().join("outside");
+        fs::create_dir(&project).expect("project directory");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("mcp.json"), b"outside bytes").expect("outside config");
+        std::os::unix::fs::symlink(&outside, project.join(".vscode"))
+            .expect("escaped config parent");
+        let supported = project.join("cursor.mcp.json");
+        let caps = mutate::Capabilities {
+            write_scopes: project_config_write_scopes(
+                &project,
+                [supported.clone(), project.join(".vscode/mcp.json")],
+            ),
+        };
+        assert!(mutate::ensure_in_scope(&caps, &supported).is_ok());
+        for path in [outside.join("mcp.json"), project.join(".vscode/mcp.json")] {
+            assert!(
+                matches!(
+                    mutate::ensure_in_scope(&caps, &path),
+                    Err(mutate::MutateError::OutOfScope(_))
+                ),
+                "an escaped config parent must not authorize {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            fs::read(outside.join("mcp.json")).unwrap(),
+            b"outside bytes"
+        );
+    }
+
+    #[test]
     fn fix_only_shared_sqlite_lock_holder_child() {
         let Ok(db_path) = std::env::var(FIX_ONLY_LOCK_DB_ENV) else {
             return;
@@ -4256,7 +5120,7 @@ mod tests {
         let release_path = td.path().join("holder.release");
         let test_exe = std::env::current_exe().expect("resolve doctor test executable");
 
-        let holder = std::process::Command::new(&test_exe)
+        let holder = std::process::Command::new(&test_exe) // ubs:ignore — cfg(test) reexecutes std::env::current_exe for the real cross-process lock witness
             .arg(FIX_ONLY_LOCK_HOLDER_TEST)
             .arg("--exact")
             .arg("--nocapture")
@@ -4286,7 +5150,7 @@ mod tests {
             fixers::reservation_db_archive_parity::FM_ID,
             fixers::reservation_artifact_normalize::FM_ID,
         ] {
-            let output = std::process::Command::new(&test_exe)
+            let output = std::process::Command::new(&test_exe) // ubs:ignore — cfg(test) current_exe reexecutes this integration probe against the owned private mailbox
                 .arg(FIX_ONLY_LOCK_INVOKER_TEST)
                 .arg("--exact")
                 .arg("--nocapture")
@@ -4450,6 +5314,147 @@ mod tests {
         );
     }
 
+    fn capture_retention_health(
+        target: &Path,
+        storage_root: &Path,
+        primary: &Path,
+        alert_bytes: &str,
+    ) -> (CliResult<()>, String) {
+        let db_url = format!("sqlite:///{}", primary.display());
+        let storage_root_s = storage_root.display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                ("HTTP_PORT", "47351"),
+                ("DOCTOR_RETENTION_ALERT_BYTES", alert_bytes),
+            ],
+            || handle_health(target),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        (result, output)
+    }
+
+    #[test]
+    fn memory_mailbox_has_no_filesystem_backup_staging_assessment() {
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: PathBuf::from("/not-inspected-by-retention"),
+            ..Config::default()
+        };
+        let target = doctor_live_probe_target_from_server_config(&config, None);
+        assert!(matches!(doctor_retention_health(&target), Ok(None)));
+    }
+
+    #[test]
+    fn doctor_health_fails_on_retained_stages_with_byte_alerts_disabled() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for legacy in [false, true] {
+            let target = tempfile::tempdir().unwrap().keep();
+            let root = tempfile::tempdir().unwrap().keep();
+            let primary = root.join("storage.sqlite3");
+            seed_healthy_live_mailbox(&primary);
+            let mut evidence = Vec::new();
+            for ordinal in 0..3 {
+                let path = if legacy {
+                    root.join(format!(".snapshot-inspect-{ordinal}.sqlite3"))
+                } else {
+                    let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal}"));
+                    std::fs::create_dir(&stage).unwrap();
+                    stage.join("snapshot.sqlite3")
+                };
+                std::fs::write(&path, b"retained evidence").unwrap();
+                evidence.push(path);
+            }
+            let (result, output) = capture_retention_health(&target, &root, &primary, "0");
+            assert!(
+                matches!(result, Err(CliError::ExitCode(1))),
+                "{result:?}\n{output}"
+            );
+            assert!(output.contains("automatic_backup_staging: fail (automatic backups refused: 3 retained staging artifacts"), "{output}");
+            assert!(output.contains("resident_attention=false"), "{output}");
+            assert!(
+                output.contains("am doctor reclaim does not move these stages"),
+                "{output}"
+            );
+            assert!(!output.contains("ok: live mailbox healthy"), "{output}");
+            for path in evidence {
+                assert_eq!(std::fs::read(path).unwrap(), b"retained evidence");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_health_applies_resident_attention_without_calling_evidence_corrupt() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let target = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
+        let primary = root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&primary);
+        let forensic = root.join("doctor/forensics/storage.sqlite3/retained-incident/sqlite");
+        std::fs::create_dir_all(&forensic).unwrap();
+        let evidence = forensic.join("storage.sqlite3");
+        let bytes = std::fs::metadata(&primary)
+            .unwrap()
+            .len()
+            .checked_mul(21)
+            .unwrap();
+        std::fs::File::create(&evidence)
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        let (result, output) = capture_retention_health(&target, &root, &primary, "1");
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "{result:?}\n{output}"
+        );
+        assert!(output.contains("resident_attention=true"), "{output}");
+        assert!(output.contains("automatic_backup_staging: ok"), "{output}");
+        assert!(
+            output.contains("this is not database corruption"),
+            "{output}"
+        );
+        let (disabled, output) = capture_retention_health(&target, &root, &primary, "0");
+        assert!(disabled.is_ok(), "{disabled:?}\n{output}");
+        assert!(output.contains("resident_attention=false"), "{output}");
+        assert_eq!(std::fs::metadata(evidence).unwrap().len(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_fails_when_staging_inventory_is_unavailable() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let target = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
+        let primary = root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&primary);
+        let outside = root.join("outside-evidence");
+        std::fs::write(&outside, b"preserved").unwrap();
+        let alias = root.join(".snapshot-inspect-aliased.sqlite3");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let (result, output) = capture_retention_health(&target, &root, &primary, "0");
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "{result:?}\n{output}"
+        );
+        assert!(
+            output.contains("automatic_backup_staging: unavailable"),
+            "{output}"
+        );
+        assert!(!output.contains("automatic backups refused"), "{output}");
+        assert!(!output.contains("ok: live mailbox healthy"), "{output}");
+        assert_eq!(std::fs::read_link(alias).unwrap(), outside);
+        assert_eq!(std::fs::read(outside).unwrap(), b"preserved");
+    }
+
     #[test]
     fn resident_to_live_database_ratio_is_null_safe_and_precise() {
         assert_eq!(
@@ -4502,6 +5507,169 @@ mod tests {
         };
 
         assert!(!reservation_parity_is_cosmetic(&report));
+    }
+
+    #[test]
+    fn health_reports_converging_release_drift_but_never_a_stuck_reconciler() {
+        use mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary;
+        let report = |drift: ReservationParityDriftSummary| ReservationParityReport {
+            schema_version:
+                mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            live_generation: None,
+            db_reservations: 32,
+            archive_reservations: 32,
+            drift,
+            examples: Vec::new(),
+        };
+        // The live-host shape: 16 released-in-DB / active-in-archive rows.
+        let pending = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 16,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        let minute = 60 * 1_000_000;
+        let now = 1_000 * minute;
+        let progress =
+            |pass_us, last_repair_us| reservation_reconcile::ReservationReconcileProgress {
+                pid: 7,
+                pass_us,
+                last_repair_us,
+            };
+        let active_progress =
+            |pass_us, last_repair_us| active_reservations::ActiveReservationProgress {
+                pid: 9,
+                pass_us,
+                last_repair_us,
+            };
+
+        let converging = reservation_parity_reconciling(
+            &pending,
+            Some(&progress(now - minute, Some(now - 2 * minute))),
+            None,
+            now,
+        )
+        .expect("a reconciler that just republished a release is converging");
+        assert!(converging.contains("reconciling 16"), "{converging}");
+
+        // No reconciler evidence, a reconciler that stopped running, and one
+        // that runs without repairing anything all keep health failing.
+        for (label, progress) in [
+            ("absent", None),
+            (
+                "stale pass",
+                Some(progress(now - 11 * minute, Some(now - 11 * minute))),
+            ),
+            (
+                "no recent repair",
+                Some(progress(now - minute, Some(now - 30 * minute))),
+            ),
+            ("never repaired", Some(progress(now - minute, None))),
+            // Written before the clock was stepped back: not recent.
+            (
+                "future repair",
+                Some(progress(now - minute, Some(now + 30 * minute))),
+            ),
+            (
+                "future pass",
+                Some(progress(now + 30 * minute, Some(now + 30 * minute))),
+            ),
+        ] {
+            let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), None, now)
+                .expect_err(label)
+                .expect("pending releases get a reason");
+            assert!(
+                stalled.contains("am doctor fix --only"),
+                "{label}: {stalled}"
+            );
+        }
+
+        // Reconcilable missing active artifacts follow the same convergence rule.
+        let pending_active = report(ReservationParityDriftSummary {
+            missing_archive_artifacts: 8,
+            active_pending_rows: 8,
+            ..Default::default()
+        });
+        let converging_active = reservation_parity_reconciling(
+            &pending_active,
+            None,
+            Some(&active_progress(now - minute, Some(now - 2 * minute))),
+            now,
+        )
+        .expect("an active reconciler that just repaired an artifact is converging");
+        assert!(
+            converging_active.contains("reconciling 8 active reservation(s)"),
+            "{converging_active}"
+        );
+        for (label, progress, expected_detail) in [
+            (
+                "absent",
+                None,
+                "active reservation(s) missing archive artifact(s)",
+            ),
+            (
+                "stale pass",
+                Some(active_progress(now - 11 * minute, Some(now - 11 * minute))),
+                "active reservation(s) missing archive artifact(s)",
+            ),
+            (
+                "no recent repair",
+                Some(active_progress(now - minute, Some(now - 30 * minute))),
+                "missing active reservation artifact(s)",
+            ),
+            (
+                "never repaired",
+                Some(active_progress(now - minute, None)),
+                "missing active reservation artifact(s)",
+            ),
+        ] {
+            let stalled =
+                reservation_parity_reconciling(&pending_active, None, progress.as_ref(), now)
+                    .expect_err(label)
+                    .expect("pending active repairs get a reason");
+            assert!(
+                stalled.contains(expected_detail) && stalled.contains("am doctor fix --only"),
+                "{label}: {stalled}"
+            );
+        }
+
+        // Unreconcilable missing active artifacts (e.g. expired or missing holder)
+        // are not owned by the active reconciler and fail without a reconciler note.
+        let unreconcilable_active = report(ReservationParityDriftSummary {
+            missing_archive_artifacts: 8,
+            active_pending_rows: 7,
+            ..Default::default()
+        });
+        assert_eq!(
+            reservation_parity_reconciling(
+                &unreconcilable_active,
+                None,
+                Some(&active_progress(now - minute, Some(now - minute))),
+                now,
+            ),
+            Err(None)
+        );
+
+        // Drift the reconciler does not own fails without a reconciler note,
+        // even while it is visibly repairing other rows.
+        let mixed = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 17,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        assert_eq!(
+            reservation_parity_reconciling(
+                &mixed,
+                Some(&progress(now - minute, Some(now - minute))),
+                None,
+                now
+            ),
+            Err(None)
+        );
     }
 
     #[test]
@@ -4561,10 +5729,12 @@ mod tests {
             Some(crate::robot::LiveServerMailboxConfig {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: PathBuf::from("/srv/agent-mail/archive"),
+                integrity_guard_enabled: Some(false),
             }),
         );
 
         assert_eq!(target.source, "live_server");
+        assert_eq!(target.integrity_guard_enabled, Some(false));
         assert_eq!(
             target.database_url,
             "sqlite:////srv/agent-mail/server.sqlite3"
@@ -4666,13 +5836,61 @@ mod tests {
             .as_str()
             .expect("absent report must carry a human-readable note");
         assert!(
-            note.contains("No doctor report exists yet") && note.contains("am doctor"),
-            "note must say the report is missing and how to produce one: {note}"
+            note.contains("No doctor report exists yet") && note.contains(TRIAGE_SCAN_COMMAND),
+            "note must say the report is missing and what to run instead: {note}"
         );
-        assert_eq!(report["recommended_command"], "am doctor");
+        // Bare `am doctor` is a clap usage error (exit 2); the next step must
+        // be a command that parses and runs read-only.
+        assert_eq!(report["recommended_command"], TRIAGE_SCAN_COMMAND);
+        assert_doctor_command_parses(TRIAGE_SCAN_COMMAND);
         // The live probe is healthy, so no synthetic finding materializes.
         assert_eq!(report["live_health"]["status"], "ok");
         assert_eq!(report["findings"], serde_json::json!([]));
+    }
+
+    fn assert_doctor_command_parses(command: &str) {
+        use clap::Parser as _;
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        if let Err(err) = crate::Cli::try_parse_from(&argv) {
+            panic!("`{command}` does not parse: {err}");
+        }
+    }
+
+    #[test]
+    fn triage_findings_command_targets_a_registered_fm_and_parses() {
+        let p0 = fixers::registry()
+            .into_iter()
+            .find(|spec| spec.severity == "P0")
+            .expect("registry has a P0 FM")
+            .id;
+        let p2 = "fm-db-state-files-legacy-fts-residue";
+        // A P0 anywhere wins and is applied; otherwise the first FM is only
+        // rehearsed.
+        let mixed = serde_json::json!([
+            {"id": p2, "severity": "P2"},
+            {"id": p0, "severity": "P0"},
+        ]);
+        assert_eq!(
+            triage_findings_command(&mixed),
+            fixers::fix_only_command(p0)
+        );
+        let minor = serde_json::json!([{"id": p2, "severity": "P2"}]);
+        assert_eq!(
+            triage_findings_command(&minor),
+            format!("am doctor fix --only {p2} --dry-run")
+        );
+        // Per-FM run envelopes carry counts, not findings: re-detect.
+        assert_eq!(
+            triage_findings_command(&serde_json::json!([])),
+            TRIAGE_SCAN_COMMAND
+        );
+        for command in [
+            triage_findings_command(&mixed),
+            triage_findings_command(&minor),
+            triage_findings_command(&serde_json::Value::Null),
+        ] {
+            assert_doctor_command_parses(&command);
+        }
     }
 
     #[cfg(unix)]

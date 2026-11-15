@@ -221,34 +221,62 @@ fn apply_snapshot_migrations(
             continue;
         }
 
-        let already_satisfied =
-            reconstruct_migration_preflight_already_satisfied(conn, &migration)?;
-        if !already_satisfied {
-            conn.execute_raw(&migration.up).map_err(|e| {
+        // Reconstruction can already own a transaction. A savepoint makes
+        // every multi-step rebuild and its ledger entry atomic in either case.
+        conn.execute_raw("SAVEPOINT reconstruct_migration")
+            .map_err(|error| {
+                DbError::Sqlite(format!("reconstruct: migration savepoint: {error}"))
+            })?;
+        let applied = (|| -> DbResult<()> {
+            let already_satisfied =
+                reconstruct_migration_preflight_already_satisfied(conn, &migration)?;
+            if !already_satisfied {
+                let statements = schema::migration_sql_statements(&migration);
+                if statements.len() > 1 {
+                    let rows = conn
+                        .query_sync(schema::PROJECT_EVENT_SCHEMA_SQL, &[])
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                    schema::validate_multi_statement_migration_schema(&migration, &rows)
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                }
+                for sql in statements {
+                    conn.execute_raw(sql).map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct: apply {phase} migration {} ({}): {e}",
+                            migration.id, migration.description
+                        ))
+                    })?;
+                }
+            }
+
+            conn.execute_sync(
+                &format!(
+                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
+                    schema::MIGRATIONS_TABLE_NAME,
+                ),
+                &[
+                    Value::Text(migration.id.clone()),
+                    Value::Text(migration.description.clone()),
+                    Value::BigInt(crate::now_micros()),
+                ],
+            )
+            .map_err(|e| {
                 DbError::Sqlite(format!(
-                    "reconstruct: apply {phase} migration {} ({}): {e}",
-                    migration.id, migration.description
+                    "reconstruct: record {phase} migration {}: {e}",
+                    migration.id
                 ))
             })?;
+            conn.execute_raw("RELEASE reconstruct_migration")
+                .map_err(|error| {
+                    DbError::Sqlite(format!("reconstruct: commit migration: {error}"))
+                })?;
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            let _ = conn.execute_raw("ROLLBACK TO reconstruct_migration");
+            let _ = conn.execute_raw("RELEASE reconstruct_migration");
+            return Err(error);
         }
-
-        conn.execute_sync(
-            &format!(
-                "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
-                schema::MIGRATIONS_TABLE_NAME,
-            ),
-            &[
-                Value::Text(migration.id.clone()),
-                Value::Text(migration.description.clone()),
-                Value::BigInt(crate::now_micros()),
-            ],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct: record {phase} migration {}: {e}",
-                migration.id
-            ))
-        })?;
         applied_ids.insert(migration.id.clone());
     }
 
@@ -441,6 +469,11 @@ pub struct ReconstructStats {
     pub messages: usize,
     /// Number of message-recipient rows inserted.
     pub recipients: usize,
+    /// Number of project shared-mailbox deliveries restored (GH#282).
+    pub project_mailbox_deliveries: usize,
+    /// Number of shared-mailbox read/ack receipts restored from a salvaged
+    /// database (GH#282).
+    pub salvaged_project_mailbox_receipts: usize,
     /// Number of duplicate canonical archive files skipped because their
     /// positive frontmatter `id` had already been recovered within the same
     /// project.
@@ -721,6 +754,13 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; preserved {} same-project canonical id reuse collision(s) under generated DB ids",
                 self.same_project_canonical_identity_collisions
+            )?;
+        }
+        if self.project_mailbox_deliveries > 0 || self.salvaged_project_mailbox_receipts > 0 {
+            write!(
+                f,
+                "; restored {} project mailbox deliveries ({} salvaged receipts)",
+                self.project_mailbox_deliveries, self.salvaged_project_mailbox_receipts
             )?;
         }
         if self.suppressed_warnings > 0 {
@@ -1480,6 +1520,7 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
+    crate::mail_retention::require_complete(storage_root)?;
     reconstruct_from_archive_impl(db_path, storage_root, false)
 }
 
@@ -1547,6 +1588,7 @@ fn reconstruct_from_archive_impl(
     storage_root: &Path,
     create_empty_target: bool,
 ) -> DbResult<ReconstructStats> {
+    crate::mail_retention::require_complete(storage_root)?;
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
@@ -1834,14 +1876,32 @@ fn reconstruct_from_archive_impl(
     }
     conn.execute_raw("COMMIT;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: commit transaction: {e}")))?;
-    drop(conn);
-    crate::pool::wal_checkpoint_truncate_path(db_path)
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: checkpoint: {e}")))?;
+    if let Some(floor) = crate::mail_retention::require_complete(storage_root)? {
+        crate::id_floor::advance_messages_id_floor(&conn, Some(floor))?;
+    }
+    finalize_reconstruction_candidate(conn, db_path, "reconstruct")?;
 
     stats.finalize_duplicate_warnings();
     stats.finalize_cross_project_canonical_collision_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
+}
+
+/// Compact only the privately owned candidate, after its writes have committed
+/// and before callers can fingerprint it for promotion. Rebuilding the file
+/// reclaims both freelist pages and unreachable pages left by an index rebuild;
+/// a zero freelist alone does not prove that the image is compact (br-talqb).
+/// Any failure here makes the candidate ineligible for promotion.
+fn finalize_reconstruction_candidate(conn: DbConn, db_path: &Path, context: &str) -> DbResult<()> {
+    conn.execute_raw("VACUUM;").map_err(|error| {
+        DbError::Sqlite(format!(
+            "{context}: compact candidate before promotion: {error}"
+        ))
+    })?;
+    drop(conn);
+    crate::pool::wal_checkpoint_truncate_path(db_path)
+        .map_err(|error| DbError::Sqlite(format!("{context}: checkpoint candidate: {error}")))?;
+    Ok(())
 }
 
 struct MaterializedLiveSalvage {
@@ -2099,6 +2159,8 @@ pub fn reconstruct_from_archive_with_live_salvage(
 ///   `integrity_check`, degrades to archive-only (warned, still promotable)
 /// - a merge that fails with a corruption-class error also degrades; the
 ///   merge transaction is rolled back first
+/// - candidate compaction/checkpoint failures always refuse promotion, including
+///   after a successful salvage merge has committed
 ///
 /// Private implementation shared by the explicit public source-kind entry
 /// points and the module's focused salvage tests. Production callers must use
@@ -2135,24 +2197,32 @@ fn reconstruct_from_archive_with_salvage(
              rebuilt archive-only candidate so doctor can promote a heal"
         ));
     }
-    if let Some(salvage_db_path) = salvage_for_merge
-        && let Err(error) = merge_salvaged_database(db_path, salvage_db_path, &mut stats)
-    {
-        let message = error.to_string();
-        if crate::pool::is_corruption_error_message(&message) {
-            // Merge rolled back. Keep the archive-only candidate so
-            // `am doctor reconstruct` can promote a heal instead of
-            // leaving the mailbox wedged on a corrupt-but-openable source.
-            stats.push_warning(format!(
-                "salvage merge from {} failed with corruption ({message}); \
-                 keeping archive-only candidate so doctor can promote a heal",
-                salvage_db_path.display()
-            ));
-        } else {
-            return Err(DbError::Sqlite(format!(
-                "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
-                salvage_db_path.display()
-            )));
+    if let Some(salvage_db_path) = salvage_for_merge {
+        match merge_salvaged_database(db_path, salvage_db_path, &mut stats) {
+            Ok(conn) => {
+                // The merge is committed. A finalization failure must never be
+                // treated as source corruption with a rolled-back transaction:
+                // this candidate already carries DB-only coordination state.
+                finalize_reconstruction_candidate(conn, db_path, "reconstruct salvage")?;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if crate::pool::is_corruption_error_message(&message) {
+                    // Merge rolled back. Keep the archive-only candidate so
+                    // `am doctor reconstruct` can promote a heal instead of
+                    // leaving the mailbox wedged on a corrupt-but-openable source.
+                    stats.push_warning(format!(
+                        "salvage merge from {} failed with corruption ({message}); \
+                         keeping archive-only candidate so doctor can promote a heal",
+                        salvage_db_path.display()
+                    ));
+                } else {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct salvage merge from {} failed; refusing to promote the archive-only candidate because DB-only coordination state could be lost: {error}",
+                        salvage_db_path.display()
+                    )));
+                }
+            }
         }
     }
     Ok(stats)
@@ -2358,7 +2428,13 @@ fn discover_agents(
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
-        let retired_at = parse_ts_from_json(&profile, "retired_at");
+        let retired_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "retired_at",
+            last_active_ts,
+            &profile_source,
+            stats,
+        );
         let display_name = json_str(&profile, "display_name")
             .map(mcp_agent_mail_core::models::normalize_display_name)
             .transpose()
@@ -2380,8 +2456,14 @@ fn discover_agents(
             crate::models::deregistered_task_timestamp_micros(task_description)
                 .unwrap_or(last_active_ts)
         });
-        let deregistered_at =
-            parse_ts_from_json(&profile, "deregistered_at").or(legacy_deregistered_at);
+        let deregistered_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "deregistered_at",
+            legacy_deregistered_at.unwrap_or(last_active_ts),
+            &profile_source,
+            stats,
+        )
+        .or(legacy_deregistered_at);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
@@ -2544,7 +2626,7 @@ fn parse_and_insert_message(
     conn: &DbConn,
     file_path: &Path,
     project_id: i64,
-    _project_slug: &str,
+    project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
     deferred: Option<&mut Vec<DeferredCollisionMessage>>,
@@ -2778,20 +2860,24 @@ fn parse_and_insert_message(
     stats.messages += 1;
 
     // Insert recipients
-    for name in &to_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "to")?;
-        stats.recipients += 1;
-    }
-    for name in &cc_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "cc")?;
-        stats.recipients += 1;
-    }
-    for name in &bcc_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "bcc")?;
-        stats.recipients += 1;
+    for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")] {
+        for name in names {
+            if reconstruct_project_mailbox_recipient(
+                conn,
+                project_id,
+                project_slug,
+                message_id,
+                created_ts,
+                name,
+                kind,
+                stats,
+            )? {
+                continue;
+            }
+            let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
+            insert_recipient(conn, message_id, aid, kind)?;
+            stats.recipients += 1;
+        }
     }
 
     Ok(())
@@ -3025,6 +3111,68 @@ fn ensure_agent_exists(
     Ok(aid)
 }
 
+fn project_slug_by_id(conn: &DbConn, project_id: i64) -> DbResult<Option<String>> {
+    conn.query_sync(
+        "SELECT slug FROM projects WHERE id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| DbError::Sqlite(format!("query slug of project {project_id}: {e}")))
+    .map(|rows| {
+        rows.first()
+            .and_then(|row| row.get_named::<String>("slug").ok())
+    })
+}
+
+/// GH#282: restore a shared-mailbox delivery named in a recovered envelope.
+///
+/// Returns `true` when `name` is a project mailbox address, which is handled
+/// here and must never become a (placeholder) agent. Only the message's own
+/// project can be addressed, and only as to/cc; anything else is reported and
+/// skipped rather than invented.
+fn reconstruct_project_mailbox_recipient(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    message_id: i64,
+    delivered_ts: i64,
+    name: &str,
+    kind: &str,
+    stats: &mut ReconstructStats,
+) -> DbResult<bool> {
+    let Some(ident) = crate::project_mailbox::parse_project_mailbox_address(name) else {
+        return Ok(false);
+    };
+    if ident != project_slug || !matches!(kind, "to" | "cc") {
+        stats.push_warning(format!(
+            "message {message_id} names project mailbox {name:?} as {kind}; only its own \
+             project's mailbox ('project:{project_slug}') as to/cc is restored"
+        ));
+        return Ok(true);
+    }
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO project_mailbox_deliveries \
+         (message_id, project_id, kind, delivered_ts) VALUES (?, ?, ?, ?)",
+        &[
+            Value::BigInt(message_id),
+            Value::BigInt(project_id),
+            Value::Text(kind.to_string()),
+            Value::BigInt(delivered_ts),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(format!("insert project mailbox delivery {message_id}: {e}")))?;
+    conn.execute_sync(
+        crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(message_id),
+            Value::BigInt(delivered_ts),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(format!("insert project mailbox event {message_id}: {e}")))?;
+    stats.project_mailbox_deliveries += 1;
+    Ok(true)
+}
+
 fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -> DbResult<()> {
     conn.execute_sync(
         "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
@@ -3246,6 +3394,36 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
             "cc" => cc_names.push(name),
             "bcc" => bcc_names.push(name),
             _ => to_names.push(name),
+        }
+    }
+
+    // GH#282: the shared-mailbox address has no recipient row; keep it in the
+    // envelope while the project delivery exists.
+    let delivery = match conn.query_sync(
+        "SELECT project_id, kind FROM project_mailbox_deliveries WHERE message_id = ?",
+        &[Value::BigInt(message_id)],
+    ) {
+        Ok(rows) => rows,
+        Err(e)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(&e.to_string()) =>
+        {
+            Vec::new()
+        }
+        Err(e) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage: query project mailbox delivery for message {message_id}: {e}"
+            )));
+        }
+    };
+    if let Some(row) = delivery.first() {
+        let project_id = row.get_named::<i64>("project_id").unwrap_or_default();
+        if let Some(slug) = project_slug_by_id(conn, project_id)? {
+            let address = crate::project_mailbox::project_mailbox_address(&slug);
+            if row.get_named::<String>("kind").ok().as_deref() == Some("cc") {
+                cc_names.push(address);
+            } else {
+                to_names.push(address);
+            }
         }
     }
 
@@ -4287,7 +4465,7 @@ fn merge_salvaged_database(
     target_db_path: &Path,
     salvage_db_path: &Path,
     stats: &mut ReconstructStats,
-) -> DbResult<()> {
+) -> DbResult<DbConn> {
     let target_path = target_db_path.to_str().ok_or_else(|| {
         DbError::Sqlite(format!(
             "reconstruct salvage: target path {} is not valid UTF-8",
@@ -4330,7 +4508,7 @@ fn merge_salvaged_database(
             "Salvage database {} contained none of the expected mail/product tables",
             salvage_db_path.display()
         ));
-        return Ok(());
+        return Ok(target_conn);
     }
 
     target_conn
@@ -5957,9 +6135,36 @@ fn merge_salvaged_database(
                     message_id_map.insert(source_message_id, target_message_id);
                     stats.salvaged_messages += 1;
 
+                    let target_project_slug = if to_names
+                        .iter()
+                        .chain(&cc_names)
+                        .chain(&bcc_names)
+                        .any(|name| {
+                            crate::project_mailbox::parse_project_mailbox_address(name).is_some()
+                        }) {
+                        project_slug_by_id(&target_conn, target_project_id)?
+                    } else {
+                        None
+                    };
                     for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")]
                     {
                         for name in names {
+                            // GH#282: a shared-mailbox address restores the
+                            // project delivery, never a placeholder agent.
+                            if let Some(slug) = target_project_slug.as_deref()
+                                && reconstruct_project_mailbox_recipient(
+                                    &target_conn,
+                                    target_project_id,
+                                    slug,
+                                    target_message_id,
+                                    source_created_ts,
+                                    name,
+                                    kind,
+                                    stats,
+                                )?
+                            {
+                                continue;
+                            }
                             let agent_id = ensure_agent_exists(
                                 &target_conn,
                                 target_project_id,
@@ -6187,6 +6392,120 @@ fn merge_salvaged_database(
             }
         }
 
+        // GH#282: shared-mailbox read/ack receipts are DB-only state, like
+        // recipient read/ack. Carry them over for deliveries the candidate
+        // holds, so a rebuild neither loses reads nor revives acknowledged
+        // project mail as unacknowledged.
+        // Replay order cannot reproduce issued delivery cursors. Restore the
+        // source ledger only after every identity/recipient mapping is settled,
+        // and before shared receipts rely on recovered delivery visibility.
+        for message_id in crate::reconstruct_delivery::preserve_delivery_history(
+            &target_conn,
+            &salvage_conn,
+            &project_id_map,
+            &agent_id_map,
+            &message_id_map,
+        )? {
+            recipient_json_updates.insert(message_id);
+        }
+
+        if table_exists(&salvage_conn, "project_mailbox_receipts")? {
+            let mut receipt_rowid_floor = 0i64;
+            loop {
+                let receipt_rows = salvage_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT rowid AS salvage_rowid, message_id, agent_id, read_ts, ack_ts \
+                             FROM project_mailbox_receipts WHERE rowid > ? \
+                             ORDER BY rowid LIMIT {SALVAGE_RECIPIENT_BATCH_ROWS}"
+                        ),
+                        &[Value::BigInt(receipt_rowid_floor)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query project mailbox receipts: {e}"
+                        ))
+                    })?;
+                if receipt_rows.is_empty() {
+                    break;
+                }
+                for row in &receipt_rows {
+                    receipt_rowid_floor = row.get_named::<i64>("salvage_rowid").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode project mailbox receipt rowid: {e}"
+                        ))
+                    })?;
+                    let source_message_id = row.get_named::<i64>("message_id").unwrap_or(0);
+                    let source_agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+                    let (Some(target_message_id), Some(target_agent_id)) = (
+                        message_id_map.get(&source_message_id).copied(),
+                        agent_id_map.get(&source_agent_id).copied(),
+                    ) else {
+                        stats.push_warning(format!(
+                            "skipped salvaged project mailbox receipt ({source_message_id}, {source_agent_id}): message or agent was not carried into the candidate"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    };
+                    let delivery = target_conn
+                        .query_sync(
+                            "SELECT d.message_id FROM project_mailbox_deliveries d \
+                             JOIN agents a ON a.id = ? AND a.project_id = d.project_id \
+                             WHERE d.message_id = ?",
+                            &[
+                                Value::BigInt(target_agent_id),
+                                Value::BigInt(target_message_id),
+                            ],
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: query project mailbox delivery {target_message_id}: {e}"
+                            ))
+                        })?;
+                    if delivery.is_empty() {
+                        stats.push_warning(format!(
+                            "skipped salvaged project mailbox receipt ({source_message_id}, {source_agent_id}): the candidate holds no matching project delivery"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    }
+                    let read_ts = row.get_named::<i64>("read_ts").ok();
+                    let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                    for (sql, params) in [
+                        (
+                            "INSERT OR IGNORE INTO project_mailbox_receipts \
+                             (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, NULL, NULL)",
+                            vec![
+                                Value::BigInt(target_message_id),
+                                Value::BigInt(target_agent_id),
+                            ],
+                        ),
+                        (
+                            "UPDATE project_mailbox_receipts \
+                             SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
+                             WHERE message_id = ? AND agent_id = ?",
+                            vec![
+                                read_ts.map_or(Value::Null, Value::BigInt),
+                                ack_ts.map_or(Value::Null, Value::BigInt),
+                                Value::BigInt(target_message_id),
+                                Value::BigInt(target_agent_id),
+                            ],
+                        ),
+                    ] {
+                        target_conn.execute_sync(sql, &params).map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: restore project mailbox receipt ({target_message_id}, {target_agent_id}): {e}"
+                            ))
+                        })?;
+                    }
+                    stats.salvaged_project_mailbox_receipts += 1;
+                }
+                if receipt_rows.len() < SALVAGE_RECIPIENT_BATCH_ROWS {
+                    break;
+                }
+            }
+        }
+
         for message_id in recipient_json_updates {
             sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
@@ -6248,6 +6567,9 @@ fn merge_salvaged_database(
                 ))
             })?;
         if !foreign_key_failures.is_empty() {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
             return Err(DbError::Sqlite(format!(
                 "reconstruct salvage: post-merge foreign_key_check reported {} violation(s); refusing promotion",
                 foreign_key_failures.len()
@@ -6272,15 +6594,7 @@ fn merge_salvaged_database(
             "reconstruct salvage: commit transaction: {e}"
         )));
     }
-    drop(target_conn);
-    if let Err(e) = crate::pool::wal_checkpoint_truncate_path(target_db_path) {
-        stats.push_warning(format!(
-            "Salvage merge committed, but WAL checkpoint failed for {}: {e}",
-            target_db_path.display()
-        ));
-    }
-
-    Ok(())
+    Ok(target_conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -6552,6 +6866,31 @@ fn parse_ts_from_json(value: &serde_json::Value, key: &str) -> Option<i64> {
     }
 }
 
+/// An unreadable lifecycle timestamp still records an inactive identity.
+/// Archive-only recovery must preserve that evidence just as live-DB salvage
+/// does: treating a malformed non-null marker as absence would silently
+/// restore permission to send, receive, and acquire new reservations. Keep
+/// valid timestamps unchanged and allow absent/null fields from active or
+/// older profiles; substitute an observed profile timestamp only when the
+/// marker is present but cannot be decoded, and report the uncertainty.
+fn parse_reconstructed_agent_lifecycle_timestamp(
+    profile: &serde_json::Value,
+    field: &str,
+    fallback: i64,
+    source: &str,
+    stats: &mut ReconstructStats,
+) -> Option<i64> {
+    if profile.get(field).is_none_or(serde_json::Value::is_null) {
+        return None;
+    }
+    parse_ts_from_json(profile, field).or_else(|| {
+        stats.push_warning(format!(
+            "{source} has an unparseable {field} value; preserving the inactive state with fallback timestamp {fallback}"
+        ));
+        Some(fallback)
+    })
+}
+
 /// Query the ID of a row by a unique text column, or the last inserted row.
 fn query_last_insert_or_existing_id(
     conn: &DbConn,
@@ -6696,7 +7035,7 @@ pub fn apply_archive_ahead_delta(
     }
     let db_ids = collect_db_message_ids(db_path)
         .map_err(|e| DbError::Sqlite(format!("incremental apply: collect db message ids: {e}")))?;
-    let missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
+    let mut missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
     if missing.len() > max_messages {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
             "{} archive messages are missing from the database, above the incremental bound of {max_messages}",
@@ -6735,7 +7074,67 @@ pub fn apply_archive_ahead_delta(
     conn.execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("incremental apply: begin transaction: {e}")))?;
 
-    let outcome = apply_delta_in_transaction(&conn, &project_dirs, &missing, max_messages);
+    // GH#357: startup reconciliation precedes normal pool migrations. Replay
+    // needs these additive message columns even on an otherwise healthy older
+    // database. Use the canonical migration definitions, inside the
+    // same transaction as the delta, without running unrelated rebuild/drop
+    // migrations against the live primary. A refusal or failure rolls back both.
+    let outcome = (|| {
+        // The guarded inventory can use a different engine/snapshot. Confirm
+        // absence in the canonical write transaction before touching a row:
+        // a committed WAL row is never a missing message to replay or rewrite.
+        let mut present = Vec::new();
+        for id in &missing {
+            if !conn
+                .query_sync(
+                    "SELECT id FROM messages WHERE id = ?",
+                    &[Value::BigInt(*id)],
+                )
+                .map_err(|error| DbError::Sqlite(format!("archive delta recheck: {error}")))?
+                .is_empty()
+            {
+                present.push(*id);
+            }
+        }
+        for id in present {
+            missing.remove(&id);
+        }
+        let mut added_column = false;
+        for migration in schema::schema_migrations() {
+            let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
+                continue;
+            };
+            if table == "messages"
+                && matches!(
+                    column.as_str(),
+                    "recipients_json" | "topic" | "archive_metadata_json"
+                )
+                && !reconstruct_migration_preflight_already_satisfied(&conn, &migration)?
+            {
+                conn.execute_raw(&migration.up).map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "archive delta schema preflight {}: {error}",
+                        migration.id
+                    ))
+                })?;
+                added_column = true;
+            }
+        }
+        if added_column {
+            // v31's canonical record materialization is required before the
+            // runtime engine next decodes legacy short records (br-2hpuk).
+            // This preserves every value, including unknown reply lineage.
+            conn.execute_raw(
+                "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NULL",
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!("archive delta record materialization: {error}"))
+            })?;
+        }
+        // Leave the ledger to normal initialization: it preflights existing
+        // columns, validates checksums, and runs dependent backfills/indexes.
+        apply_delta_in_transaction(&conn, &project_dirs, &missing, max_messages)
+    })();
     match outcome {
         Ok(ArchiveDeltaApplyOutcome::Applied(stats)) => {
             conn.execute_raw("COMMIT;")
@@ -6772,16 +7171,31 @@ fn apply_delta_in_transaction(
         collect_message_files_with_ids(&messages_dir, missing, &mut project_files)?;
         let existing = conn
             .query_sync(
-                "SELECT id FROM projects WHERE slug = ?",
+                "SELECT id, human_key FROM projects WHERE slug = ?",
                 &[Value::Text(slug.clone())],
             )
             .map_err(|e| {
                 DbError::Sqlite(format!("incremental apply: inspect project {slug}: {e}"))
             })?;
-        if project_files.is_empty() && !existing.is_empty() {
-            continue;
-        }
-        if existing.is_empty() {
+        let human_key = read_project_human_key(project_path, slug, &mut stats);
+        if let Some(existing_row) = existing.first() {
+            let existing_human_key =
+                existing_row.get_named::<String>("human_key").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "incremental apply: read project {slug} human_key: {e}"
+                    ))
+                })?;
+            if !is_synthetic_project_placeholder(slug, &human_key)
+                && existing_human_key.trim() != human_key.trim()
+            {
+                return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+                    "archive project {slug} human_key conflicts with existing database project"
+                )));
+            }
+            if project_files.is_empty() {
+                continue;
+            }
+        } else {
             projects_added += 1;
             if projects_added > max_projects {
                 return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
@@ -6791,7 +7205,6 @@ fn apply_delta_in_transaction(
         }
         projects_visited += 1;
         let now = crate::now_micros();
-        let human_key = read_project_human_key(project_path, slug, &mut stats);
         conn.execute_sync(
             "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
             &[
@@ -6813,9 +7226,12 @@ fn apply_delta_in_transaction(
 
     let expected = missing.len();
     if expected == 0 && projects_added == 0 {
-        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
-            "the database already holds every canonical archive message id and project".to_string(),
-        ));
+        return Ok(ArchiveDeltaApplyOutcome::Applied(ArchiveDeltaApplyStats {
+            missing_message_ids: 0,
+            messages_applied: 0,
+            projects_visited,
+            duplicate_files_skipped: 0,
+        }));
     }
     let found: BTreeSet<i64> = candidate_files.iter().map(|(id, ..)| *id).collect();
     if found.len() != expected {
@@ -6942,6 +7358,330 @@ fn collect_message_files_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_compact_reconstruction_candidate(conn: &DbConn) {
+        assert_eq!(
+            conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                .get_named::<i64>("freelist_count")
+                .unwrap(),
+            0,
+            "recovery must not hand unused pages to promotion"
+        );
+        let integrity = conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        assert_eq!(integrity.len(), 1, "{integrity:?}");
+        assert_eq!(
+            integrity[0].get_named::<String>("integrity_check").unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_compacts_candidate_without_freelist_or_never_used_pages() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        // Exercise ordinary free pages and GH#289's more dangerous shape:
+        // pages unreachable from both b-trees and the freelist. Merely checking
+        // freelist_count would accept the latter without reclaiming anything.
+        for orphan_pages in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("candidate.sqlite3");
+            let atc_path = directory.path().join("atc.sqlite3");
+            std::fs::write(&atc_path, b"live telemetry must remain untouched").unwrap();
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL).unwrap();
+            conn.execute_raw(&schema::init_schema_sql_base()).unwrap();
+            conn.execute_raw(&schema::schema_user_version_sql())
+                .unwrap();
+            conn.execute_raw(
+                "PRAGMA application_id = 1296124236;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO projects(id, slug, human_key, created_at)
+                 VALUES(42, 'compaction', '/compaction', 1);
+                 INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES(5, 42, 'Alice', 'test', 'test', 1, 1),
+                       (6, 42, 'Bob', 'test', 'test', 1, 1);
+                 WITH RECURSIVE ids(id) AS (
+                     SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 128
+                 ) INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts,
+                                        thread_id, archive_metadata_json)
+                   SELECT id, 42, 5, 'subject-' || id, hex(zeroblob(8192)), id,
+                          'thread', CASE WHEN id = 2 THEN '{\"reply_to\":1}' ELSE '{}' END
+                   FROM ids;
+                 DELETE FROM messages WHERE id > 2;
+                 INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES(1, 6, 'to', 101, 202), (2, 6, 'to', NULL, NULL);
+                 REINDEX;
+                 COMMIT;",
+            )
+            .unwrap();
+            let free_pages = conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                .get_named::<i64>("freelist_count")
+                .unwrap();
+            let page_count = conn.query_sync("PRAGMA page_count", &[]).unwrap()[0]
+                .get_named::<i64>("page_count")
+                .unwrap();
+            assert!(free_pages > page_count / 2, "fixture must be mostly unused");
+
+            let queries = [
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+                "SELECT * FROM projects ORDER BY id",
+                "SELECT * FROM agents ORDER BY id",
+                "SELECT * FROM messages ORDER BY id",
+                "SELECT * FROM message_recipients ORDER BY message_id, agent_id",
+                "SELECT * FROM sqlite_sequence ORDER BY name",
+                "PRAGMA user_version",
+                "PRAGMA application_id",
+            ];
+            let snapshot = |conn: &DbConn| {
+                queries
+                    .iter()
+                    .map(|sql| {
+                        conn.query_sync(sql, &[])
+                            .unwrap()
+                            .iter()
+                            .map(|row| row.values().cloned().collect::<Vec<_>>())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = snapshot(&conn);
+            drop(conn);
+            let bytes_before = std::fs::metadata(&path).unwrap().len();
+            if orphan_pages {
+                // SQLite's database header stores the freelist head and count
+                // at offsets 32 and 36. Detach only already-free pages in this
+                // private fixture; every schema and application row stays live.
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(32)).unwrap();
+                file.write_all(&[0; 8]).unwrap();
+                file.sync_all().unwrap();
+            }
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            if orphan_pages {
+                assert_eq!(
+                    conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
+                        .get_named::<i64>("freelist_count")
+                        .unwrap(),
+                    0
+                );
+                assert!(
+                    conn.query_sync("PRAGMA integrity_check", &[])
+                        .unwrap()
+                        .iter()
+                        .any(|row| row
+                            .get_named::<String>("integrity_check")
+                            .unwrap()
+                            .contains("never used"))
+                );
+            }
+
+            finalize_reconstruction_candidate(conn, &path, "reconstruct test").unwrap();
+
+            assert!(std::fs::metadata(&path).unwrap().len() < bytes_before / 2);
+            let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+            assert_compact_reconstruction_candidate(&conn);
+            assert_eq!(
+                snapshot(&conn),
+                before,
+                "all logical state must survive VACUUM"
+            );
+            conn.execute_raw(
+                "INSERT INTO messages(project_id, sender_id, subject, body_md, created_ts)
+                 VALUES(42, 5, 'after compaction', 'new body', 129)",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT id FROM messages WHERE subject = 'after compaction'",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_named::<i64>("id")
+                    .unwrap(),
+                129,
+                "deleted message IDs must never be reused after compaction"
+            );
+            assert_eq!(
+                std::fs::read(&atc_path).unwrap(),
+                b"live telemetry must remain untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruct_candidate_compaction_refuses_read_only_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate.sqlite3");
+        let conn = DbConn::open_file(path.to_str().unwrap()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE committed_state(id INTEGER PRIMARY KEY, receipt TEXT);
+             INSERT INTO committed_state VALUES(42, 'durable salvage receipt');",
+        )
+        .unwrap();
+        drop(conn);
+        let before = exact_test_directory_files(directory.path());
+        let conn = open_read_only_salvage_db(&path).unwrap();
+        let error = finalize_reconstruction_candidate(conn, &path, "reconstruct salvage")
+            .expect_err("failed compaction cannot authorize promotion of committed salvage");
+        assert!(
+            error
+                .to_string()
+                .contains("compact candidate before promotion"),
+            "{error}"
+        );
+        assert_eq!(exact_test_directory_files(directory.path()), before);
+    }
+
+    #[test]
+    fn snapshot_project_event_migration_rolls_back_and_can_retry() {
+        let conn = DbConn::open_memory().expect("canonical reconstruction database");
+        let mut legacy = schema::schema_migrations_base();
+        let index = legacy
+            .iter()
+            .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+            .unwrap();
+        let migration = legacy.remove(index);
+        // This fixture predates the v33 event representation. Installing v34
+        // first creates a mixed-epoch schema that the ownership guard refuses
+        // before the intended ledger-write rollback control can be reached.
+        legacy.retain(|migration| !migration.id.starts_with("v34_"));
+        apply_snapshot_migrations(&conn, legacy, "legacy fixture").unwrap();
+        conn.execute_raw(
+            "PRAGMA foreign_keys = OFF; \
+             INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'shared','/shared',1); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1); \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'shared','body',10); \
+             INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,1,'project',10);"
+        ).unwrap();
+        conn.execute_raw(&format!(
+            "CREATE TRIGGER reject_snapshot_migration BEFORE INSERT ON {} \
+             BEGIN SELECT RAISE(ABORT, 'snapshot ledger failure'); END",
+            schema::MIGRATIONS_TABLE_NAME,
+        ))
+        .unwrap();
+        let error = apply_snapshot_migrations(&conn, vec![migration.clone()], "upgrade")
+            .expect_err("snapshot rebuild must roll back if its ledger write fails");
+        assert!(
+            error.to_string().contains("snapshot ledger failure"),
+            "{error}"
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT agent_id FROM inbox_delivery_events WHERE seq = 42",
+                &[],
+            )
+            .unwrap()[0]
+                .get_named::<i64>("agent_id")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'inbox_delivery_events_v33'",
+                &[],
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        conn.execute_raw("DROP TRIGGER reject_snapshot_migration")
+            .unwrap();
+        apply_snapshot_migrations(&conn, vec![migration], "retry").unwrap();
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE agent_id IS NULL",
+                &[],
+            )
+            .unwrap()[0]
+                .get_named::<i64>("seq")
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_project_event_migration_preserves_mixed_epoch_authority_on_refusal() {
+        let conn = DbConn::open_memory().expect("canonical reconstruction database");
+        let mut mixed = schema::schema_migrations_base();
+        let index = mixed
+            .iter()
+            .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+            .unwrap();
+        let migration = mixed.remove(index);
+        // Deliberately install later cursor authority without its historical
+        // predecessor. This is a refusal control, not the pre-v33 retry fixture.
+        apply_snapshot_migrations(&conn, mixed, "mixed-epoch fixture").unwrap();
+        for sql in [
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'shared','/shared',1)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1)",
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'shared','retained body',10)",
+            "INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,1,'project',10)",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        let snapshot = || {
+            [
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name".to_string(),
+                "SELECT * FROM messages ORDER BY id".to_string(),
+                "SELECT * FROM inbox_delivery_events ORDER BY seq".to_string(),
+                "SELECT * FROM inbox_delivery_cursor_state ORDER BY project_id,scope,scope_id"
+                    .to_string(),
+                format!(
+                    "SELECT * FROM {} ORDER BY id",
+                    schema::MIGRATIONS_TABLE_NAME
+                ),
+            ]
+            .map(|sql| {
+                conn.query_sync(&sql, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().cloned().collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let before = snapshot();
+        let error = apply_snapshot_migrations(&conn, vec![migration], "mixed-epoch upgrade")
+            .expect_err("later cursor authority must not be accepted as historical v33 ownership");
+        assert!(
+            error.to_string().contains("refuses unsupported trigger"),
+            "{error}"
+        );
+        assert!(
+            [
+                "trg_inbox_delivery_cursor_insert",
+                "trg_inbox_delivery_cursor_delete",
+                "trg_messages_cascade_inbox_delivery_events",
+            ]
+            .iter()
+            .any(|name| error.to_string().contains(name)),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "mixed schema, ledger and cursor data remain intact"
+        );
+    }
 
     #[test]
     fn recovered_archive_metadata_rejects_unknown_or_invalid_lineage() {
@@ -7086,10 +7826,26 @@ mod tests {
         for (path, bytes) in artifacts {
             assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
         }
-        assert!(matches!(
-            apply_archive_ahead_delta(&db, &storage, 2).expect("repeat bounded delta"),
-            ArchiveDeltaApplyOutcome::NotApplicable(_)
-        ));
+        // GH#357: a delta with nothing missing is an applied no-op, so startup
+        // re-checks drift instead of escalating to reconstruction. The repeat
+        // must not replay rows or re-attest reply metadata.
+        let repeat = apply_archive_ahead_delta(&db, &storage, 2).expect("repeat bounded delta");
+        let ArchiveDeltaApplyOutcome::Applied(stats) = repeat else {
+            panic!("an already-applied delta must be an applied no-op");
+        };
+        assert_eq!(stats.missing_message_ids, 0);
+        assert_eq!(stats.messages_applied, 0);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect repeat");
+        assert_incremental_reply_metadata_rows(&conn);
+        let after = conn
+            .query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM message_recipients ORDER BY message_id",
+                &[],
+            )
+            .expect("read receipts after the repeat");
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].get_as::<i64>(1).unwrap(), 123);
+        assert_eq!(after[0].get_as::<i64>(2).unwrap(), 456);
     }
 
     #[test]
@@ -7391,6 +8147,206 @@ mod tests {
         assert_eq!(rows[0].get_as::<String>(0).unwrap(), "{}");
         assert_eq!(rows[1].get_as::<String>(0).unwrap(), r#"{"reply_to":1}"#);
         assert_eq!(rows[2].get_as::<Option<String>>(0).unwrap(), None);
+    }
+
+    /// GH#282: an archived envelope addressed to the project mailbox restores
+    /// the single project delivery and its cursor event, never a placeholder
+    /// agent named after the address. A foreign project's address or a bcc
+    /// slot is reported and skipped.
+    #[test]
+    fn reconstruct_restores_project_mailbox_deliveries_without_placeholder_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/team");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).expect("message directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"team","human_key":"/team","created_at":1}"#,
+        )
+        .expect("project metadata");
+        for (id, to, bcc) in [
+            (
+                1,
+                serde_json::json!(["project:team"]),
+                serde_json::json!([]),
+            ),
+            (
+                2,
+                serde_json::json!(["Bob", "project:elsewhere"]),
+                serde_json::json!(["project:team"]),
+            ),
+        ] {
+            let message = serde_json::json!({
+                "id": id, "from": "Alice", "to": to, "cc": [], "bcc": bcc,
+                "subject": format!("shared {id}"), "created": "2026-10-01T00:00:00Z",
+                "attachments": [], "importance": "normal", "ack_required": false
+            });
+            std::fs::write(
+                messages.join(format!("2026-10-01T00-00-00Z__shared__{id}.md")),
+                format!("---json\n{message}\n---\n\nbody\n"),
+            )
+            .expect("message artifact");
+        }
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct");
+        assert_eq!(stats.messages, 2);
+        assert_eq!(stats.project_mailbox_deliveries, 1);
+        assert_eq!(
+            stats
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("project mailbox"))
+                .count(),
+            2,
+            "{:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let deliveries = conn
+            .query_sync(
+                "SELECT message_id, kind FROM project_mailbox_deliveries ORDER BY message_id",
+                &[],
+            )
+            .expect("deliveries");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].get_as::<i64>(0).unwrap(), 1);
+        assert_eq!(deliveries[0].get_as::<String>(1).unwrap(), "to");
+        let events = conn
+            .query_sync(
+                "SELECT COUNT(*) FROM inbox_delivery_events WHERE agent_id IS NULL AND message_id = 1",
+                &[],
+            )
+            .expect("cursor event");
+        assert_eq!(events[0].get_as::<i64>(0).unwrap(), 1);
+        let agents = conn
+            .query_sync("SELECT name FROM agents ORDER BY name", &[])
+            .expect("agents");
+        let names: Vec<String> = agents
+            .iter()
+            .map(|row| row.get_as::<String>(0).unwrap())
+            .collect();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn reconstructed_deregistration_excludes_shared_delivery_and_retains_direct_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/lifecycle");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"lifecycle","human_key":"/lifecycle","created_at":1}"#,
+        )
+        .unwrap();
+        for name in ["Sender", "Active", "Ended", "Retired"] {
+            let dir = project.join("agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = serde_json::json!({
+                "name": name, "program": "test", "model": "test",
+                "inception_ts": 1, "last_active_ts": 2, "contact_policy": "auto",
+                "retired_at": (name == "Retired").then_some(100),
+                "deregistered_at": (name == "Ended").then_some(100),
+            });
+            std::fs::write(
+                dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        }
+        for (id, recipient) in [(1, "project:lifecycle"), (2, "Ended")] {
+            let message = serde_json::json!({
+                "id": id, "from": "Sender", "to": [recipient], "cc": [], "bcc": [],
+                "subject": format!("lifecycle {id}"), "created": "2026-10-01T00:00:00Z",
+                "attachments": [], "importance": "high", "ack_required": true,
+            });
+            std::fs::write(
+                messages.join(format!("2026-10-01T00-00-00Z__lifecycle__{id}.md")),
+                format!("---json\n{message}\n---\n\nretained body {id}\n"),
+            )
+            .unwrap();
+        }
+        let db = tmp.path().join("restored.sqlite3");
+        let stats = reconstruct_from_archive(&db, &storage).unwrap();
+        assert_eq!(
+            (
+                stats.agents,
+                stats.messages,
+                stats.recipients,
+                stats.project_mailbox_deliveries
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(stats.parse_errors, 0);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(db.to_str().unwrap()).unwrap(),
+            "reconstructed lifecycle shared mailbox",
+        );
+        conn.execute_raw("PRAGMA query_only=ON").unwrap();
+        let identities = conn
+            .query_sync("SELECT id, project_id, name FROM agents", &[])
+            .unwrap();
+        let ids: HashMap<String, i64> = identities
+            .iter()
+            .map(|row| (row.get_named("name").unwrap(), row.get_named("id").unwrap()))
+            .collect();
+        let project_id = identities[0].get_named::<i64>("project_id").unwrap();
+        let lifecycle = conn
+            .query_sync(
+                "SELECT a.retired_at, a.contact_policy, d.deregistered_at FROM agents a \
+             JOIN agent_deregistrations d ON d.agent_id=a.id WHERE a.name='Ended'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle[0].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<String>("contact_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<i64>("deregistered_at").unwrap(),
+            100
+        );
+        for (name, expected) in [("Active", vec![1]), ("Ended", vec![2]), ("Retired", vec![])] {
+            let inbox = crate::sync::fetch_inbox_rows_from_conn(
+                &*conn, project_id, ids[name], false, false, false, None, 50,
+            )
+            .unwrap();
+            assert_eq!(
+                inbox
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}"
+            );
+            if name == "Ended" {
+                assert_eq!(inbox[0].kind, "to");
+                assert_eq!(inbox[0].message.body_md, "retained body 2\n");
+            }
+        }
+        let delivery = crate::project_mailbox::project_mailbox_delivery_from_conn(&*conn, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivery
+                .agents
+                .iter()
+                .map(|agent| agent.agent_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Active"]
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7936,6 +8892,8 @@ mod tests {
             agents: 5,
             messages: 100,
             recipients: 200,
+            project_mailbox_deliveries: 0,
+            salvaged_project_mailbox_receipts: 0,
             duplicate_canonical_message_files: 0,
             duplicate_canonical_message_ids: 0,
             cross_project_canonical_collisions: 0,
@@ -8190,6 +9148,214 @@ mod tests {
                 .get_named::<i64>("deregistered_at")
                 .expect("deregistered_at"),
             crate::iso_to_micros("2026-02-22T13:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn reconstructed_agent_lifecycle_timestamp_preserves_active_and_valid_states() {
+        let mut stats = ReconstructStats::default();
+        for field in ["retired_at", "deregistered_at"] {
+            for profile in [serde_json::json!({}), serde_json::json!({field: null})] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &profile,
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    None,
+                    "absent and explicit null markers must retain active state"
+                );
+            }
+            for timestamp in [
+                serde_json::json!(2_000_000),
+                serde_json::json!("2000000"),
+                serde_json::json!("1970-01-01T00:00:02Z"),
+            ] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &serde_json::json!({field: timestamp}),
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    Some(2_000_000),
+                    "valid lifecycle evidence must not be replaced by a fallback"
+                );
+            }
+        }
+        assert_eq!(stats.warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_preserves_malformed_agent_lifecycle_markers_and_history() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("lifecycle.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects/demo");
+        let write_profile = |name: &str, lifecycle: serde_json::Value| {
+            let agent_dir = project_dir.join("agents").join(name);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let mut profile = serde_json::json!({
+                "name": name,
+                "program": "claude-code",
+                "model": "opus-4.6",
+                "inception_ts": 1_000_000,
+                "last_active_ts": 4_000_000,
+            });
+            profile
+                .as_object_mut()
+                .unwrap()
+                .extend(lifecycle.as_object().unwrap().clone());
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        };
+        let malformed = [
+            serde_json::json!("private-invalid-timestamp"),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!(u64::MAX),
+            serde_json::json!([]),
+            serde_json::json!({"timestamp": 2_000_000}),
+        ];
+        for (index, marker) in malformed.iter().enumerate() {
+            write_profile(
+                &format!("Retired{index}"),
+                serde_json::json!({"retired_at": marker}),
+            );
+            write_profile(
+                &format!("Deregistered{index}"),
+                serde_json::json!({"deregistered_at": marker}),
+            );
+        }
+        write_profile(
+            "Active",
+            serde_json::json!({"retired_at": null, "deregistered_at": null}),
+        );
+        write_profile("Legacy", serde_json::json!({}));
+        write_profile(
+            "LegacyEnded",
+            serde_json::json!({
+                "task_description": "[DEREGISTERED 1970-01-01T00:00:02Z] completed work",
+                "contact_policy": "block_all",
+                "deregistered_at": "invalid",
+            }),
+        );
+        let messages_dir = project_dir.join("messages/2026/01");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-01-01T00-00-00Z__history__77.md"),
+            "---json\n{\"id\":77,\"from\":\"Retired0\",\"to\":[\"Deregistered0\"],\"subject\":\"Retained history\",\"importance\":\"normal\",\"created_ts\":\"2026-01-01T00:00:00Z\"}\n---\n\nretained transcript\n",
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct archive");
+        assert_eq!(stats.agents, malformed.len() * 2 + 3);
+        assert_eq!(
+            (stats.messages, stats.recipients, stats.parse_errors),
+            (1, 1, 0)
+        );
+        for (field, count) in [
+            ("retired_at", malformed.len()),
+            ("deregistered_at", malformed.len() + 1),
+        ] {
+            assert_eq!(
+                stats
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.contains(&format!("unparseable {field}")))
+                    .count(),
+                count,
+                "every uncertain lifecycle marker must be reported"
+            );
+        }
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("private-invalid-timestamp"))
+        );
+
+        // Reopen the actual reconstructed database: both lifecycle columns
+        // and the deregistration ledger must survive candidate construction.
+        let conn =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen rebuilt DB");
+        for index in 0..malformed.len() {
+            for (prefix, retired_at, deregistered_at) in [
+                ("Retired", Some(4_000_000), None),
+                ("Deregistered", None, Some(4_000_000)),
+            ] {
+                let rows = conn
+                    .query_sync(
+                        "SELECT a.retired_at, d.deregistered_at FROM agents a \
+                     LEFT JOIN agent_deregistrations d ON d.agent_id = a.id WHERE a.name = ?",
+                        &[Value::Text(format!("{prefix}{index}"))],
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("retired_at").unwrap(),
+                    retired_at
+                );
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("deregistered_at").unwrap(),
+                    deregistered_at
+                );
+            }
+        }
+        let legacy = conn
+            .query_sync(
+                "SELECT d.deregistered_at FROM agent_deregistrations d \
+             JOIN agents a ON a.id = d.agent_id WHERE a.name = 'LegacyEnded'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            legacy[0].get_named::<i64>("deregistered_at").unwrap(),
+            2_000_000
+        );
+        let active = conn.query_sync(
+            "SELECT a.name FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.retired_at IS NULL AND d.agent_id IS NULL ORDER BY a.name",
+            &[],
+        ).unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|row| row.get_named::<String>("name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Active", "Legacy"],
+            "malformed inactive markers must not restore eligibility for new work"
+        );
+        let history = conn
+            .query_sync(
+                "SELECT m.body_md, sender.name AS sender, recipient.name AS recipient \
+             FROM messages m JOIN agents sender ON sender.id = m.sender_id \
+             JOIN message_recipients r ON r.message_id = m.id \
+             JOIN agents recipient ON recipient.id = r.agent_id WHERE m.id = 77",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].get_named::<String>("body_md").unwrap(),
+            "retained transcript\n"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("sender").unwrap(),
+            "Retired0"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("recipient").unwrap(),
+            "Deregistered0"
         );
     }
 
@@ -8987,6 +10153,7 @@ body
 
         let target = SqliteDbConn::open_file(target_path.to_str().unwrap())
             .expect("open reconstructed target");
+        assert_compact_reconstruction_candidate(&target);
         let subjects = target
             .query_sync("SELECT subject FROM messages ORDER BY id", &[])
             .expect("query reconstructed messages")
@@ -9545,6 +10712,7 @@ Hello Bob, this is a test message.
 
         // Verify the message was inserted correctly
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        assert_compact_reconstruction_candidate(&conn);
         let rows = conn
             .query_sync(
                 "SELECT subject, body_md, thread_id, topic, recipients_json FROM messages LIMIT 1",

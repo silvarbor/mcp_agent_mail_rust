@@ -85,6 +85,19 @@ pub struct ReservationParityDriftSummary {
     pub exclusive_mismatches: usize,
     pub thread_provenance_mismatches: usize,
     pub parse_errors: usize,
+    /// Rows released in `SQLite` whose live-generation artifact still reads
+    /// active. This is the direction the server's background reconciler
+    /// repairs, by republishing the whole artifact from `SQLite`
+    /// (br-kp1in.19). A sub-count of rows already counted above, not
+    /// additional drift.
+    pub release_pending_rows: usize,
+    /// The share of `total()` those rows account for.
+    pub release_pending_mismatches: usize,
+    /// Active `SQLite` rows counted in `missing_archive_artifacts` that meet
+    /// every source and destination invariant required by
+    /// `active_reservations::reconcile_active_reservations` (br-kp1in.19).
+    /// A sub-count of `missing_archive_artifacts`, not additional drift.
+    pub active_pending_rows: usize,
 }
 
 impl ReservationParityDriftSummary {
@@ -243,8 +256,23 @@ impl ReservationParityReport {
             .collect::<Vec<_>>()
             .join(",");
 
+        let mut pending = String::new();
+        if self.drift.release_pending_rows > 0 {
+            let _ = write!(
+                pending,
+                " release_pending_rows={}",
+                self.drift.release_pending_rows
+            );
+        }
+        if self.drift.active_pending_rows > 0 {
+            let _ = write!(
+                pending,
+                " active_pending_rows={}",
+                self.drift.active_pending_rows
+            );
+        }
         format!(
-            "reservation_parity: drift total={} db={} archive={} fields=[{}] examples=[{}]",
+            "reservation_parity: drift total={} db={} archive={} fields=[{}] examples=[{}]{pending}",
             self.drift.total(),
             self.db_reservations,
             self.archive_reservations,
@@ -257,11 +285,18 @@ impl ReservationParityReport {
 #[derive(Debug, Clone)]
 struct DbReservationState {
     reservation_id: i64,
+    project_id: i64,
+    agent_id: i64,
     project_slug: String,
+    project_human_key: String,
+    resolved_agent_name: Option<String>,
     agent_name: String,
     reason: String,
     path_pattern: String,
+    raw_exclusive: i64,
     exclusive: bool,
+    created_ts: i64,
+    expires_ts: i64,
     reservation_released_ts: Option<i64>,
     ledger_released_ts: Option<i64>,
 }
@@ -353,11 +388,17 @@ where
 {
     let rows = query(
         "SELECT fr.id AS reservation_id,
+                fr.project_id AS project_id,
+                fr.agent_id AS agent_id,
                 p.slug AS project_slug,
+                p.human_key AS project_human_key,
+                a.name AS resolved_agent_name,
                 COALESCE(a.name, '<missing-agent-id:' || fr.agent_id || '>') AS agent_name,
                 COALESCE(fr.reason, '') AS reason,
                 COALESCE(fr.path_pattern, '') AS path_pattern,
                 fr.exclusive AS exclusive,
+                fr.created_ts AS created_ts,
+                fr.expires_ts AS expires_ts,
                 fr.released_ts AS reservation_released_ts,
                 rr.released_ts AS ledger_released_ts
          FROM file_reservations fr
@@ -370,12 +411,27 @@ where
 
     rows.into_iter()
         .map(|row| {
+            let raw_exclusive = row
+                .get_named::<i64>("exclusive")
+                .map_err(|error| error.to_string())?;
             Ok(DbReservationState {
                 reservation_id: row
                     .get_named::<i64>("reservation_id")
                     .map_err(|error| error.to_string())?,
+                project_id: row
+                    .get_named::<i64>("project_id")
+                    .map_err(|error| error.to_string())?,
+                agent_id: row
+                    .get_named::<i64>("agent_id")
+                    .map_err(|error| error.to_string())?,
                 project_slug: row
                     .get_named::<String>("project_slug")
+                    .map_err(|error| error.to_string())?,
+                project_human_key: row
+                    .get_named::<String>("project_human_key")
+                    .map_err(|error| error.to_string())?,
+                resolved_agent_name: row
+                    .get_named::<Option<String>>("resolved_agent_name")
                     .map_err(|error| error.to_string())?,
                 agent_name: row
                     .get_named::<String>("agent_name")
@@ -386,10 +442,14 @@ where
                 path_pattern: row
                     .get_named::<String>("path_pattern")
                     .map_err(|error| error.to_string())?,
-                exclusive: row
-                    .get_named::<i64>("exclusive")
-                    .map_err(|error| error.to_string())?
-                    != 0,
+                raw_exclusive,
+                exclusive: raw_exclusive != 0,
+                created_ts: row
+                    .get_named::<i64>("created_ts")
+                    .map_err(|error| error.to_string())?,
+                expires_ts: row
+                    .get_named::<i64>("expires_ts")
+                    .map_err(|error| error.to_string())?,
                 reservation_released_ts: row
                     .get_named::<Option<i64>>("reservation_released_ts")
                     .map_err(|error| error.to_string())?,
@@ -424,6 +484,16 @@ pub fn check_reservation_parity_with_db_conn(
     conn: &mcp_agent_mail_db::DbConn,
     storage_root: &Path,
 ) -> Result<ReservationParityReport, String> {
+    check_reservation_parity_with_sync_query(conn, storage_root)
+}
+
+pub fn check_reservation_parity_with_sync_query<Q>(
+    conn: &Q,
+    storage_root: &Path,
+) -> Result<ReservationParityReport, String>
+where
+    Q: mcp_agent_mail_db::pool::SyncQuery,
+{
     check_reservation_parity_with_query(
         |sql, params| {
             conn.query_sync(sql, params)
@@ -627,8 +697,32 @@ where
                 } else {
                     // An *active* reservation invisible to the archive is
                     // genuine drift: the durable ledger cannot vouch for a
-                    // live lock. Self-heals via F1 reconcile-on-read.
+                    // live lock. Self-heals via F1 reconcile-on-read and
+                    // background `active_reservations` reconciliation.
                     drift.missing_archive_artifacts += 1;
+                    let candidate = mcp_agent_mail_storage::recovery::active_reservations::ActiveReservationCandidate {
+                        id: db.reservation_id,
+                        project_id: db.project_id,
+                        agent_id: db.agent_id,
+                        slug: &db.project_slug,
+                        human_key: &db.project_human_key,
+                        resolved_agent_name: db.resolved_agent_name.as_deref(),
+                        path_pattern: &db.path_pattern,
+                        reason: &db.reason,
+                        exclusive: db.raw_exclusive,
+                        created_ts: db.created_ts,
+                        expires_ts: db.expires_ts,
+                        hot_release_ts: db.reservation_released_ts,
+                        ledger_release_ts: db.ledger_released_ts,
+                        live_generation: current_generation.as_deref(),
+                    };
+                    if mcp_agent_mail_storage::recovery::active_reservations::is_reconcilable_missing_active_reservation(
+                        &candidate,
+                        storage_root,
+                        mcp_agent_mail_db::now_micros(),
+                    ) {
+                        drift.active_pending_rows += 1;
+                    }
                     examples.push(ReservationParityExample {
                         reservation_id,
                         project_slug,
@@ -708,6 +802,41 @@ where
 }
 
 fn compare_reservation_pair(
+    db: &DbReservationState,
+    archive: &ArchiveReservationState,
+    drift: &mut ReservationParityDriftSummary,
+    examples: &mut Vec<ReservationParityExample>,
+) {
+    let identity = |drift: &ReservationParityDriftSummary| {
+        (
+            drift.agent_id_mismatches,
+            drift.path_pattern_mismatches,
+            drift.exclusive_mismatches,
+            drift.thread_provenance_mismatches,
+        )
+    };
+    let before = drift.total();
+    let identity_before = identity(drift);
+    compare_reservation_fields(db, archive, drift, examples);
+    let row_mismatches = drift.total() - before;
+    // The release reconciler republishes only an artifact whose identity
+    // matches the live row (and that carries the fields it checks); it defers
+    // anything else on every pass, so only release-field drift on such an
+    // artifact is drift it is converging.
+    let republishable = identity(drift) == identity_before
+        && archive.path_pattern.is_some()
+        && archive.exclusive.is_some();
+    if row_mismatches > 0
+        && republishable
+        && db.active_status() == "released"
+        && archive.active_status() == "active"
+    {
+        drift.release_pending_rows += 1;
+        drift.release_pending_mismatches += row_mismatches;
+    }
+}
+
+fn compare_reservation_fields(
     db: &DbReservationState,
     archive: &ArchiveReservationState,
     drift: &mut ReservationParityDriftSummary,
@@ -961,12 +1090,10 @@ impl From<ArchiveReservationState> for ArchiveReservationView {
 /// Read a single project's archive reservation artifact `id-<id>.json`, if it
 /// exists and parses (symlink-safe — a symlinked artifact is never dereferenced).
 ///
-/// This is the F1 reconcile-on-read primitive: the reservation read path looks up
-/// only the *active* reservations' artifacts (bounded by the active set, never the
-/// project's full reservation history), so detecting a missing/stale artifact and
-/// healing it on next access stays cheap even on a long-lived mailbox. A missing
-/// or malformed artifact returns `None` (it must never block a reservation call);
-/// the caller treats `None` as "needs healing".
+/// A missing or malformed artifact returns `None` (it must never block a
+/// reservation call); the caller treats `None` as "needs healing". For a set
+/// of active or released rows, use [`read_project_archive_reservations_for_generation`]
+/// so legacy and missing artifacts share one directory scan.
 ///
 /// Generation-blind: equivalent to
 /// [`read_project_archive_reservation_for_generation`] with an unknown live
@@ -1031,7 +1158,48 @@ pub fn read_project_archive_reservation_for_generation(
             reservation_id,
         )
     })?;
-    if path_is_symlink(&path) {
+    read_resolved_project_archive_reservation(&path, project_slug, reservation_id)
+}
+
+/// Read one reconciliation pass's artifacts with at most one directory scan.
+///
+/// Exact live-generation files use direct lookups. Legacy, absent and
+/// foreign-only IDs share one filename inventory, preserving the scalar
+/// reader's generation choice and foreign fallback. Only selected files are
+/// parsed, and every path's file type is checked again before reading. The
+/// result is local to this pass; later calls observe newly published artifacts.
+#[must_use]
+pub fn read_project_archive_reservations_for_generation(
+    storage_root: &Path,
+    project_slug: &str,
+    reservation_ids: impl IntoIterator<Item = i64>,
+    live_generation: Option<&str>,
+) -> BTreeMap<i64, ArchiveReservationView> {
+    let reservation_dir = storage_root
+        .join("projects")
+        .join(project_slug)
+        .join("file_reservations");
+    mcp_agent_mail_core::reservation_artifact::find_reservation_artifacts_for_generation(
+        &reservation_dir,
+        reservation_ids,
+        live_generation,
+    )
+    .into_iter()
+    .filter_map(|(id, resolved)| {
+        let path = resolved
+            .matching_generation
+            .or(resolved.unattributed_fallback)?;
+        read_resolved_project_archive_reservation(&path, project_slug, id).map(|view| (id, view))
+    })
+    .collect()
+}
+
+fn read_resolved_project_archive_reservation(
+    path: &Path,
+    project_slug: &str,
+    reservation_id: i64,
+) -> Option<ArchiveReservationView> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
         return None;
     }
     // Attribute the generation from the located filename (stamped or legacy).
@@ -1040,7 +1208,7 @@ pub fn read_project_archive_reservation_for_generation(
         .and_then(|name| name.to_str())
         .and_then(mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename)
         .and_then(|parsed| parsed.generation);
-    parse_archive_reservation(&path, project_slug, reservation_id, generation)
+    parse_archive_reservation(path, project_slug, reservation_id, generation)
         .ok()
         .map(ArchiveReservationView::from)
 }
@@ -1130,11 +1298,18 @@ mod tests {
     fn db_state(path: &str, exclusive: bool) -> DbReservationState {
         DbReservationState {
             reservation_id: 1,
+            project_id: 1,
+            agent_id: 1,
             project_slug: "proj".to_string(),
+            project_human_key: "/proj".to_string(),
+            resolved_agent_name: Some("Agent".to_string()),
             agent_name: "Agent".to_string(),
             reason: "r".to_string(),
             path_pattern: path.to_string(),
+            raw_exclusive: i64::from(exclusive),
             exclusive,
+            created_ts: 100,
+            expires_ts: 9_999_999_999_999_999,
             reservation_released_ts: None,
             ledger_released_ts: None,
         }
@@ -1467,10 +1642,46 @@ mod tests {
 
         let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
         assert_eq!(report.drift.missing_archive_artifacts, 1);
+        assert_eq!(report.drift.active_pending_rows, 1);
         assert_eq!(report.drift.reconstructed_prior_generation_rows, 0);
         assert_eq!(report.drift.released_rows_without_artifacts, 0);
         assert_eq!(report.drift.total(), 1);
         assert!(!report.ok);
+        assert!(report.health_line().contains("active_pending_rows=1"));
+    }
+
+    #[test]
+    fn active_pending_rows_excludes_expired_orphan_and_unversioned_missing_artifacts() {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let conn = seed_single_reservation_db("beef2222");
+        conn.execute_raw("PRAGMA foreign_keys = OFF").unwrap();
+        // Row 2: expired (not eligible for active_reservations reconciler).
+        conn.execute_raw(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (2, 1, 1, 'src/expired.rs', 1, 'expired', 100, 200, NULL)",
+        )
+        .unwrap();
+        // Row 3: missing holder agent in `agents`.
+        conn.execute_raw(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (3, 1, 999, 'src/orphan.rs', 1, 'orphan', 100, 9999999999999999, NULL)",
+        )
+        .unwrap();
+
+        let report = check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(report.drift.missing_archive_artifacts, 3);
+        assert_eq!(
+            report.drift.active_pending_rows, 1,
+            "only the live, valid row 1 is reconcilable by active_reservations"
+        );
+
+        // Removing the live generation makes even row 1 unreconcilable by the
+        // generation-stamped active reconciler.
+        conn.execute_raw("DELETE FROM db_identity").unwrap();
+        let unversioned =
+            check_reservation_parity_with_db_conn(&conn, storage.path()).expect("parity");
+        assert_eq!(unversioned.drift.missing_archive_artifacts, 3);
+        assert_eq!(unversioned.drift.active_pending_rows, 0);
     }
 
     #[test]
@@ -1597,6 +1808,47 @@ mod tests {
         let mut examples = Vec::new();
         compare_reservation_pair(db, archive, &mut drift, &mut examples);
         (drift, examples)
+    }
+
+    #[test]
+    fn release_pending_counts_only_released_in_db_active_in_archive_rows() {
+        // The reconciler's direction: released in SQLite, artifact still active.
+        let mut released = db_state("src/a.rs", true);
+        released.reservation_released_ts = Some(1_000);
+        let (drift, _) = run_compare(&released, &archive_state(Some("src/a.rs"), Some(true)));
+        assert_eq!(drift.released_ts_mismatches, 1);
+        assert_eq!(drift.active_status_mismatches, 1);
+        assert_eq!(drift.release_pending_rows, 1);
+        assert_eq!(drift.release_pending_mismatches, drift.total());
+
+        // An identity mismatch (path, agent, exclusive, thread) or a legacy
+        // artifact without the fields the reconciler checks is never
+        // republished, so none of that row's drift is pending.
+        let (drift, _) = run_compare(&released, &archive_state(Some("src/b.rs"), Some(true)));
+        assert_eq!(drift.total(), 3);
+        assert_eq!(drift.release_pending_rows, 0);
+        assert_eq!(drift.release_pending_mismatches, 0);
+        let (drift, _) = run_compare(&released, &archive_state(None, Some(true)));
+        assert_eq!(drift.total(), 2);
+        assert_eq!(drift.release_pending_rows, 0);
+
+        // The opposite direction is not the reconciler's to repair: the
+        // archive says released while SQLite holds a live lease.
+        let mut archived_release = archive_state(Some("src/a.rs"), Some(true));
+        archived_release.released_ts = Some(1_000);
+        let (drift, _) = run_compare(&db_state("src/a.rs", true), &archived_release);
+        assert_eq!(drift.active_status_mismatches, 1);
+        assert_eq!(drift.release_pending_rows, 0);
+        assert_eq!(drift.release_pending_mismatches, 0);
+
+        // A released row whose artifact agrees is not pending at all.
+        let (drift, _) = run_compare(&released, &{
+            let mut agreeing = archive_state(Some("src/a.rs"), Some(true));
+            agreeing.released_ts = Some(1_000);
+            agreeing
+        });
+        assert_eq!(drift.total(), 0);
+        assert_eq!(drift.release_pending_rows, 0);
     }
 
     #[test]
@@ -1751,5 +2003,108 @@ mod tests {
         assert!(
             read_project_archive_reservation_for_generation(root, slug, 404, Some(live)).is_none()
         );
+    }
+
+    #[test]
+    fn batch_reader_matches_scalar_views_and_preserves_malformed_file_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let slug = "batch-lookup";
+        let live = "bbbb2222";
+        let foreign = "aaaa1111";
+        for (id, generation, agent) in [
+            (1, Some(live), "BlueLake"),
+            (1, Some(foreign), "GreenCastle"),
+            (1, None, "RedFox"),
+            (2, None, "BlueLake"),
+            (2, Some(foreign), "GreenCastle"),
+            (3, Some(foreign), "GreenCastle"),
+            (4, Some(live), "BlueLake"),
+            (5, None, "BlueLake"),
+            (6, Some(live), "BlueLake"),
+        ] {
+            write_reservation_artifact(root, slug, id, generation, agent, "src/**", true);
+        }
+        let reservations = root.join("projects").join(slug).join("file_reservations");
+        std::fs::rename(
+            reservations.join("id-4-gbbbb2222.json"),
+            reservations.join("id-0004-gbbbb2222.json"),
+        )
+        .unwrap();
+        // A malformed current-generation file remains a failed read; it must
+        // not silently select valid but stale legacy coverage instead.
+        std::fs::write(reservations.join("id-5-gbbbb2222.json"), b"not JSON").unwrap();
+        std::fs::write(
+            reservations.join("id-6-gbbbb2222.json"),
+            br#"{"id":999,"agent":"BlueLake"}"#,
+        )
+        .unwrap();
+        for generation in [Some(live), Some(foreign), None, Some(""), Some("../bad")] {
+            let expected = [1, 2, 3, 4, 5, 6, 404, 0, -1]
+                .into_iter()
+                .filter_map(|id| {
+                    read_project_archive_reservation_for_generation(root, slug, id, generation)
+                        .map(|view| (id, view))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let actual = read_project_archive_reservations_for_generation(
+                root,
+                slug,
+                [1, 2, 3, 4, 5, 6, 404, 0, -1, 1],
+                generation,
+            );
+            assert_eq!(actual, expected, "generation={generation:?}");
+        }
+        let first = read_project_archive_reservations_for_generation(
+            root,
+            slug,
+            [1, 2, 3, 4, 5, 6],
+            Some(live),
+        );
+        assert_eq!(first.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(first[&1].agent_name, "BlueLake");
+        assert_eq!(first[&2].generation, None);
+        assert_eq!(first[&3].generation.as_deref(), Some(foreign));
+        assert_eq!(first[&4].generation.as_deref(), Some(live));
+
+        write_reservation_artifact(root, slug, 3, Some(live), "BlueLake", "src/**", true);
+        let next = read_project_archive_reservations_for_generation(root, slug, [3], Some(live));
+        assert_eq!(next[&3].generation.as_deref(), Some(live));
+        assert_eq!(next[&3].agent_name, "BlueLake");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_reader_rechecks_selected_artifacts_after_symlink_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let slug = "batch-replacement";
+        write_reservation_artifact(dir.path(), slug, 1, None, "BlueLake", "src/**", true);
+        let reservations = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        let selected =
+            mcp_agent_mail_core::reservation_artifact::find_reservation_artifacts_for_generation(
+                &reservations,
+                [1],
+                Some("aabb"),
+            );
+        let path = selected[&1]
+            .matching_generation
+            .as_ref()
+            .expect("legacy file");
+        std::fs::rename(path, reservations.join("retained-legacy")).unwrap();
+        let target = outside.path().join("outside.json");
+        let bytes = br#"{"id":1,"agent":"GreenCastle","path_pattern":"private/**"}"#;
+        std::fs::write(&target, bytes).unwrap();
+        std::os::unix::fs::symlink(&target, path).unwrap();
+        assert!(read_resolved_project_archive_reservation(path, slug, 1).is_none());
+        assert!(
+            read_project_archive_reservations_for_generation(dir.path(), slug, [1], Some("aabb"))
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
     }
 }

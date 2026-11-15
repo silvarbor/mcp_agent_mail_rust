@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.36"
+version = "0.3.40"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -27,26 +27,27 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.10.0", package = "fastmcp-rust" }
-fastmcp-core = "0.10.0"
-fastmcp-server = "0.10.0"
-fastmcp-transport = "0.10.0"
-fastmcp-protocol = "0.10.0"
+fastmcp = { version = "0.13.0", package = "fastmcp-rust" }
+fastmcp-core = "0.13.0"
+fastmcp-server = "0.13.0"
+fastmcp-transport = "0.13.0"
+fastmcp-protocol = "0.13.0"
 
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
-# The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
-fsqlite = "=0.4.4"
-fsqlite-types = "=0.4.4"
+# GH#372: 0.4.13 fixes descending-key index page amplification in persisted
+# tool metrics. Existing bloated mailboxes need an explicit offline VACUUM.
+fsqlite = "=0.4.13"
+fsqlite-types = "=0.4.13"
 
-sqlmodel = "=0.5.0"
-sqlmodel-core = "=0.5.0"
-sqlmodel-query = "=0.5.0"
-sqlmodel-schema = "=0.5.0"
-sqlmodel-session = "=0.5.0"
-sqlmodel-pool = "=0.5.0"
-sqlmodel-frankensqlite = "=0.5.0"
-sqlmodel-sqlite = "=0.5.0"
+sqlmodel = "=0.5.1"
+sqlmodel-core = "=0.5.1"
+sqlmodel-query = "=0.5.1"
+sqlmodel-schema = "=0.5.1"
+sqlmodel-session = "=0.5.1"
+sqlmodel-pool = "=0.5.1"
+sqlmodel-frankensqlite = "=0.5.1"
+sqlmodel-sqlite = "=0.5.1"
 
 ftui = { version = "0.7.0", default-features = false, features = ["runtime", "extras"] }
 ftui-runtime = { version = "0.7.0" }
@@ -55,7 +56,6 @@ ftui-widgets = { version = "0.7.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.7.0"
 ftui-harness = "0.7.0"
 ftui-render = "0.7.0"
-beads_rust = { version = "=0.6.0", default-features = false }
 toon = { version = "0.2.4", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
@@ -75,7 +75,7 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.2.2"
+franken-agent-detection = "0.3.7"
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 serde = { version = "1", features = ["derive"] }
@@ -87,7 +87,7 @@ json5 = "1.3.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 web-time = "1.1.0"
-comrak = { version = "0.55.0", default-features = false }
+comrak = { version = "0.56.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"
 ammonia = "4.2.0"
@@ -107,8 +107,14 @@ sha2 = "0.11.0"
 hex = "0.4"
 base64 = "0.23"
 ed25519-dalek = "3"
+# Synchronous age-v1 passphrase decryption; no CLI, plugin, or async features.
+age = { version = "=0.11.3", default-features = false, features = ["armor"] }
+# Preserve canonical terminal passphrase bytes (including tabs). 7.5's raw
+# editor silently discards control characters such as a literal tab.
+rpassword = "=7.4.0"
+zeroize = "1.9.0"
 blake2 = "0.11"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
@@ -195,72 +201,29 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Preserve GH321 proposal negotiation and GH332 empty-extension-header admission
-# on FastMCP's Asupersync 0.5 line; registry 0.10.0 predates both fixes.
-# Keep all framework crates together.
-fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-# Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
-# read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox uses the separate 0.4.4 compatibility revision below.
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-# v0.4.4 omitted c76b22's prepared-DML binding and CREATE-prefix repairs.
-# Preserve the reproduced recipient UPDATE fix on the exact release base.
-# Package aliases let Beads retain its independently versioned 0.3 family.
-# Retain NOCASE ordering, INSERT SELECT UPSERT bindings, and bounded Linux descriptors.
-fsqlite-044 = { package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ast-044 = { package = "fsqlite-ast", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-btree-044 = { package = "fsqlite-btree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-core-044 = { package = "fsqlite-core", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-error-044 = { package = "fsqlite-error", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ext-fts5-044 = { package = "fsqlite-ext-fts5", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ext-icu-044 = { package = "fsqlite-ext-icu", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ext-json-044 = { package = "fsqlite-ext-json", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ext-misc-044 = { package = "fsqlite-ext-misc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-ext-rtree-044 = { package = "fsqlite-ext-rtree", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-func-044 = { package = "fsqlite-func", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-mvcc-044 = { package = "fsqlite-mvcc", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-observability-044 = { package = "fsqlite-observability", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-pager-044 = { package = "fsqlite-pager", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-parser-044 = { package = "fsqlite-parser", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-planner-044 = { package = "fsqlite-planner", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-types-044 = { package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-vdbe-044 = { package = "fsqlite-vdbe", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-vfs-044 = { package = "fsqlite-vfs", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-fsqlite-wal-044 = { package = "fsqlite-wal", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "db458bfba780e79d099d9f8986da5a1f7b360901" }
-# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# patched FrankenSQLite 0.4.4 and pinned FastMCP 0.10.0.
+# br-kp1in.87: published 0.5.1 still leaks pending-request accounting when
+# an acquisition future is dropped. Pin upstream's waiter guard and full
+# acquisition deadline fix. Patch core too so the pool's workspace dependency
+# and registry drivers share one Connection trait. Core's only source change
+# from registry 0.5.1 documents interrupted retirement; the API is unchanged.
+sqlmodel-pool = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
+sqlmodel-core = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
+# Beads directory discovery and queries use the installed br CLI. Do not embed
+# a separate storage engine for filesystem discovery: its old Git source
+# carried a submodule that prevented strict clean-source releases (br-kp1in.45).
+# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.1
+# (pool/core pinned above for cancellation cleanup),
+# registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
+# 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
+# Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
+# the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
+# 0.4.10 adds the b-tree insert-in-transaction (bd-obwsy) and retried-fsync
+# (bd-alyrn) integrity fixes and max-rowid parity (br-9pnpe).
+# 0.4.13 adds balanced descending index splits, including promoted dividers
+# and minimum-size cells (FrankenSQLite GH#521; Agent Mail GH#372).
 # No mutable sibling checkout is required.
 #
-# beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it
-# to a mutable sibling: even an unused patch adds that checkout to remote
-# source discovery, and a matching sibling version changes locked resolution.
-# ftui 0.7.0, franken-agent-detection 0.2.2, and tru 0.2.4 resolve from
+# ftui 0.7.0, franken-agent-detection 0.3.7, and tru 0.2.5 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.
 # rich_rust resolves from the registry; no local console patch is required.

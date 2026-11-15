@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod unified;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
@@ -22,6 +24,7 @@ use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_core::models::format_agent_label;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
+use mcp_agent_mail_db::search_planner::TextFieldScope;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_storage::{self as storage, ensure_archive_root};
@@ -839,14 +842,58 @@ first body
             },
         )
         .expect("insert recipe");
+        live_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (77, 'pinned-proj', '/pinned-proj', 0)",
+                &[],
+            )
+            .expect("insert pinned project");
+        let pinned_id = mcp_agent_mail_db::search_recipes::insert_recipe(
+            &live_conn,
+            &mcp_agent_mail_db::search_recipes::SearchRecipe {
+                name: "Pinned project recipe".to_string(),
+                scope_mode: mcp_agent_mail_db::search_recipes::ScopeMode::Project,
+                scope_id: Some(77),
+                ..Default::default()
+            },
+        )
+        .expect("insert pinned recipe");
         drop(live_conn);
 
-        let recipes = with_mail_ui_env(&storage_root, &db_path, load_recipes);
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", None)
+        });
+        let live = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Live saved recipe")
+            .expect("live recipe listed");
         assert!(
-            recipes
-                .iter()
-                .any(|recipe| recipe.name == "Live saved recipe")
+            live.href.starts_with("/mail/ahead-project/search?"),
+            "{}",
+            live.href
         );
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        // A project-scoped saved search opens in its own project.
+        assert!(
+            pinned.href.starts_with("/mail/pinned-proj/search?"),
+            "{}",
+            pinned.href
+        );
+        assert!(pinned.href.ends_with(&format!("recipe={pinned_id}")));
+        assert_eq!(pinned.use_count, 0);
+
+        // Following its link counts a use.
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", Some(pinned_id))
+        });
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        assert_eq!(pinned.use_count, 1);
     }
 
     #[test]
@@ -913,6 +960,127 @@ first body
             .expect("attachments route should return html");
         assert!(html.contains("artifact.txt"), "{html}");
         assert!(html.contains("128"), "{html}");
+    }
+
+    #[test]
+    fn overseer_compose_offers_active_agents_and_not_itself() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("overseer-recipients");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-overseer-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "CopperHawk",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let retired = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "SilverFern",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        outcome_ok(block_on(queries::insert_system_agent(
+            &cx,
+            &pool,
+            pid,
+            OVERSEER_AGENT_NAME,
+            "WebUI",
+            "Human",
+            "operator",
+        )));
+
+        let html = render_overseer_compose(&cx, &pool, &project.slug)
+            .expect("overseer compose should render")
+            .expect("overseer compose returns html");
+        assert!(html.contains("CopperHawk"), "{html}");
+        assert!(
+            !html.contains("SilverFern"),
+            "retired agents are not recipients"
+        );
+        assert!(
+            !html.contains(OVERSEER_AGENT_NAME),
+            "the overseer does not write to itself"
+        );
+    }
+
+    #[test]
+    fn project_page_hides_deregistered_agents_and_sets_retired_ones_apart() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("project-page-roster");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-project-roster-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        let register = |name: &str| {
+            outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, pid, name, "test", "test", None, None, None,
+            )))
+        };
+        register("CopperHawk");
+        let retired = register("SilverFern");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        let gone = register("AmberCove");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            Some(2),
+        )));
+        outcome_ok(block_on(queries::deregister_agent(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            3,
+        )));
+
+        let html = render_project(&cx, &pool, &project.slug, false)
+            .expect("project page should render")
+            .expect("project page returns html");
+        assert!(
+            !html.contains("AmberCove"),
+            "deregistered agents never return, so the page does not list them"
+        );
+        assert!(html.contains("1 active · 1 retired"), "{html}");
+        let retired_section = html
+            .find("data-retired-agents")
+            .expect("retired agents get their own section");
+        let active = html.find("CopperHawk").expect("active agent listed");
+        let retired = html.find("SilverFern").expect("retired agent listed");
+        assert!(active < retired_section, "active agents come first");
+        assert!(
+            retired > retired_section,
+            "retired agents are listed in the retired section"
+        );
     }
 
     #[test]
@@ -1144,7 +1312,7 @@ first body
         );
         assert!(!directory.contains("<script>alert(1)</script>"));
 
-        let detail = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let detail = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("render message")
             .expect("message HTML");
         assert!(detail.contains(
@@ -1158,7 +1326,7 @@ first body
         );
         assert!(!detail.contains("<script>alert(1)</script>"));
 
-        let thread = render_thread(&cx, &pool, &project.slug, "display-thread")
+        let thread = render_thread(&cx, &pool, &project.slug, "display-thread", false)
             .expect("render thread")
             .expect("thread HTML");
         assert!(thread.contains("Réviseur &lt;img src=x onerror=alert(1)&gt;"));
@@ -1281,7 +1449,7 @@ first body
             payload["messages"][0]["sender_label"],
             "Reviewer <RedStone>"
         );
-        let thread = render_thread(&cx, &pool, &local.slug, "foreign-thread")
+        let thread = render_thread(&cx, &pool, &local.slug, "foreign-thread", false)
             .expect("foreign thread")
             .expect("thread HTML");
         assert!(thread.contains("Reviewer &lt;RedStone&gt;"));
@@ -1416,7 +1584,7 @@ first body
             );
             assert_eq!(profiles["agent_profiles"][0]["id"], blue.id.unwrap());
             assert_eq!(profiles["agent_profiles"][0]["label"], expected);
-            let detail = render_message(&cx, &pool, &project.slug, root.id.unwrap())
+            let detail = render_message(&cx, &pool, &project.slug, root.id.unwrap(), false)
                 .expect("message detail")
                 .expect("message HTML");
             assert!(detail.contains("Reviewer &lt;RedStone&gt;"));
@@ -1497,7 +1665,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(html.contains("GreenCastle"));
@@ -1562,7 +1730,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root_id)
+        let html = render_message(&cx, &pool, &project.slug, root_id, false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1697,7 +1865,7 @@ first body
             &[(recipient.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(!html.contains("marked.parse(markdownContent)"), "{html}");
@@ -1759,7 +1927,7 @@ first body
         )
         .expect("delete sender row");
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1846,9 +2014,7 @@ first body
             "{html}"
         );
         assert!(
-            html.contains(
-                "window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
-            ),
+            html.contains("window.agentMailAppendAuth(selectedMessage.thread_url)"),
             "{html}"
         );
         assert!(
@@ -1869,6 +2035,22 @@ first body
             html.contains("window.agentMailNavigate = function"),
             "base.html must DEFINE window.agentMailNavigate, not just reference it: {html}"
         );
+        // "Copy link" buttons call agentMailAbsoluteUrl; it was never defined,
+        // so every click threw before copying.
+        assert!(
+            html.contains("window.agentMailAbsoluteUrl = function"),
+            "base.html must DEFINE window.agentMailAbsoluteUrl: {html}"
+        );
+        // Server-rendered links, GET forms and fetch() calls carry the token
+        // through these hooks; without them every plain href 401s.
+        for hook in [
+            "window.agentMailWithToken = function",
+            "document.addEventListener('click', carryOnLink, true)",
+            "document.addEventListener('submit', function (event)",
+            "window.fetch = function (input, init)",
+        ] {
+            assert!(html.contains(hook), "base.html must install {hook}: {html}");
+        }
     }
 }
 
@@ -1948,8 +2130,6 @@ fn block_on_outcome<T>(
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
                 404
-            } else if e.is_retryable() {
-                503
             } else {
                 500
             };
@@ -1958,7 +2138,6 @@ fn block_on_outcome<T>(
                 status,
                 match status {
                     404 => "Not found".to_string(),
-                    503 => "Database temporarily busy; retry the request".to_string(),
                     _ => "Internal server error".to_string(),
                 },
             ))
@@ -2055,7 +2234,11 @@ fn is_valid_project_identifier(slug: &str) -> bool {
 }
 
 fn is_valid_archive_agent_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric())
+    // Keep historical alphanumeric archive names readable, including system
+    // identities. Punctuated IDs use the common portable-name rules, with
+    // exact spelling so this path boundary rejects whitespace aliases.
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+        || mcp_agent_mail_core::models::normalize_agent_name(name).as_deref() == Some(name)
 }
 
 fn is_valid_time_travel_timestamp(timestamp: &str) -> bool {
@@ -2145,10 +2328,26 @@ fn percent_encode_path_segment(input: &str) -> String {
 }
 
 pub fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
+    // Browsers normalize dot path segments even when their dots are encoded.
+    // Keep those legitimate conversation keys in a query parameter instead.
+    if matches!(thread_id, "." | "..") {
+        return format!(
+            "/mail/{project_slug}/thread?thread_id={}",
+            percent_encode_path_segment(thread_id)
+        );
+    }
     format!(
         "/mail/{project_slug}/thread/{}",
         percent_encode_path_segment(thread_id)
     )
+}
+
+fn mail_thread_href_for_mode(project_slug: &str, thread_id: &str, static_export: bool) -> String {
+    if static_export {
+        crate::static_export::export_thread_route(project_slug, thread_id)
+    } else {
+        mail_thread_href(project_slug, thread_id)
+    }
 }
 
 #[cfg(test)]
@@ -2292,17 +2491,48 @@ mod utility_tests {
     }
 
     #[test]
-    fn apply_mail_search_field_scope_prefixes_query() {
+    fn mail_search_field_is_a_search_parameter_not_a_query_prefix() {
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "subject"),
-            "subject:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("field=subject")),
+            TextFieldScope::Subject
         );
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "body"),
-            "body_md:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=body")),
+            TextFieldScope::Body
         );
-        assert_eq!(apply_mail_search_field_scope("deploy", ""), "deploy");
-        assert_eq!(apply_mail_search_field_scope("", "subject"), "");
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("field=both")),
+            TextFieldScope::SubjectAndBody
+        );
+        // A project/product scope value is not a field scope.
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=project")),
+            TextFieldScope::SubjectAndBody
+        );
+    }
+
+    #[test]
+    fn inbox_pages_reach_past_the_newest_ten_thousand() {
+        assert_eq!(inbox_fetch_window(1, 50), (0, 51));
+        assert_eq!(inbox_fetch_window(2, 50), (50, 101));
+        // The default page size: page 3 must read past row 20,000.
+        assert_eq!(inbox_fetch_window(3, 10_000), (20_000, 30_001));
+        assert_eq!(
+            inbox_fetch_window(0, 0),
+            (0, 2),
+            "page and limit floor at 1"
+        );
+    }
+
+    #[test]
+    fn mail_search_direction_needs_an_agent() {
+        assert_eq!(parse_mail_search_direction("direction=inbox", ""), "");
+        assert_eq!(parse_mail_search_direction("direction=outbox", ""), "");
+        assert_eq!(
+            parse_mail_search_direction("direction=inbox", "BlueLake"),
+            "inbox"
+        );
+        assert_eq!(parse_mail_search_direction("q=x", "BlueLake"), "");
     }
 
     #[test]
@@ -2310,7 +2540,8 @@ mod utility_tests {
         assert_eq!(parse_mail_search_order("order=time"), "time");
         assert_eq!(parse_mail_search_order("sort=relevance"), "relevance");
         assert_eq!(parse_mail_search_order("sort=newest"), "time");
-        assert_eq!(parse_mail_search_order("sort=oldest"), "time");
+        // Saved searches carry sort=oldest; it is its own order, not newest.
+        assert_eq!(parse_mail_search_order("sort=oldest"), "oldest");
     }
 
     #[test]
@@ -2473,13 +2704,25 @@ mod utility_tests {
     }
 
     #[test]
-    fn archive_agent_name_validation_python_parity() {
-        assert!(is_valid_archive_agent_name("Agent123"));
-        assert!(is_valid_archive_agent_name("A"));
+    fn archive_agent_name_validation_accepts_legacy_and_explicit_identities() {
+        for name in [
+            "Agent123",
+            "A",
+            "bluelake",
+            "HumanOverseer",
+            "AirTrafficControl",
+            "agent-name",
+            "Review-API",
+            "db.migrations_2",
+        ] {
+            assert!(is_valid_archive_agent_name(name), "rejected {name:?}");
+        }
         assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("agent-name"));
         assert!(!is_valid_archive_agent_name("agent name"));
         assert!(!is_valid_archive_agent_name("agent!"));
+        let maximum = format!("task-{}", "x".repeat(123));
+        assert!(is_valid_archive_agent_name(&maximum));
+        assert!(!is_valid_archive_agent_name(&format!("{maximum}x")));
     }
 
     #[test]
@@ -2750,13 +2993,38 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_time_travel_rejects_bad_agent_name() {
-        // is_valid_archive_agent_name rejects path-traversal and special chars.
-        assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("../etc"));
-        assert!(!is_valid_archive_agent_name("agent;DROP"));
-        assert!(!is_valid_archive_agent_name("a b c"));
+        // Explicit task IDs must not weaken the archive path boundary or
+        // introduce platform-specific aliases that registration would refuse.
+        for name in [
+            "",
+            "../etc",
+            "agent/other",
+            "agent\\other",
+            "agent;DROP",
+            "a b c",
+            "agent%2Fother",
+            "agent@project",
+            "project:demo#agent",
+            "agent..other",
+            "agent.work.",
+            "NUL.archive",
+            "COM1.archive",
+            "LPT9.archive",
+            "YOUR_AGENT",
+            "review-placeholder",
+            "codex-cli",
+            "claude-sonnet-4.5",
+            "réview-api",
+            " review-api",
+            "review-api ",
+            "\treview-api\n",
+        ] {
+            assert!(!is_valid_archive_agent_name(name), "accepted {name:?}");
+        }
         assert!(is_valid_archive_agent_name("BlueLake"));
         assert!(is_valid_archive_agent_name("Agent42"));
+        assert!(is_valid_archive_agent_name("review-api"));
+        assert!(is_valid_archive_agent_name("Review.API_2"));
     }
 
     #[test]
@@ -3474,6 +3742,7 @@ struct UnifiedMessage {
     created_relative: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     project_slug: String,
     project_name: String,
     sender: String,
@@ -3509,29 +3778,28 @@ struct UnifiedMessageAggregate {
 impl UnifiedMessageAggregate {
     fn from_inbox_row(
         project: &ProjectRow,
-        recipient: &AgentRow,
+        recipient_name: &str,
+        recipient_display_name: Option<&str>,
         row: &queries::InboxRow,
-        root_ids_with_replies: &HashSet<i64>,
     ) -> Self {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
-        recipients.insert(recipient.name.clone());
+        recipients.insert(recipient_name.to_string());
         let recipient_labels = BTreeMap::from([(
-            recipient.name.clone(),
-            format_agent_label(&recipient.name, recipient.display_name.as_deref()),
+            recipient_name.to_string(),
+            format_agent_label(recipient_name, recipient_display_name),
         )]);
         let mut recipient_read = BTreeMap::new();
-        recipient_read.insert(recipient.name.clone(), row.read_ts.is_some());
+        recipient_read.insert(recipient_name.to_string(), row.read_ts.is_some());
         Self {
             id: message.id.unwrap_or(0),
             subject: message.subject.clone(),
             body_md: message.body_md.clone(),
             created_ts: message.created_ts,
             importance: message.importance.clone(),
-            thread_id: display_thread_ref_for_message(
+            thread_id: queries::canonical_thread_id(
                 message.id.unwrap_or(0),
                 message.thread_id.as_deref(),
-                root_ids_with_replies,
             ),
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
@@ -3545,14 +3813,19 @@ impl UnifiedMessageAggregate {
         }
     }
 
-    fn absorb(&mut self, recipient: &AgentRow, row: &queries::InboxRow) {
-        self.recipients.insert(recipient.name.clone());
+    fn absorb(
+        &mut self,
+        recipient_name: &str,
+        recipient_display_name: Option<&str>,
+        row: &queries::InboxRow,
+    ) {
+        self.recipients.insert(recipient_name.to_string());
         self.recipient_labels.insert(
-            recipient.name.clone(),
-            format_agent_label(&recipient.name, recipient.display_name.as_deref()),
+            recipient_name.to_string(),
+            format_agent_label(recipient_name, recipient_display_name),
         );
         self.recipient_read
-            .insert(recipient.name.clone(), row.read_ts.is_some());
+            .insert(recipient_name.to_string(), row.read_ts.is_some());
         self.all_read &= row.read_ts.is_some();
     }
 
@@ -3577,6 +3850,7 @@ impl UnifiedMessageAggregate {
             created_relative: ts_display_relative(self.created_ts),
             created,
             importance: self.importance,
+            thread_url: mail_thread_href(&self.project_slug, &self.thread_id),
             thread_id: self.thread_id,
             project_slug: self.project_slug,
             project_name: self.project_name,
@@ -3592,41 +3866,6 @@ impl UnifiedMessageAggregate {
     }
 }
 
-fn explicit_thread_ref(thread_id: Option<&str>) -> Option<String> {
-    thread_id
-        .map(str::trim)
-        .filter(|thread_id| !thread_id.is_empty())
-        .map(str::to_string)
-}
-
-fn root_ids_with_replies(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    root_message_ids: &[i64],
-) -> Result<HashSet<i64>, (u16, String)> {
-    Ok(block_on_outcome(
-        cx,
-        queries::list_numeric_thread_roots_with_replies(cx, pool, project_id, root_message_ids),
-    )?
-    .into_iter()
-    .collect())
-}
-
-fn display_thread_ref_for_message(
-    message_id: i64,
-    thread_id: Option<&str>,
-    root_ids_with_replies: &HashSet<i64>,
-) -> String {
-    if let Some(thread_ref) = explicit_thread_ref(thread_id) {
-        return thread_ref;
-    }
-    if message_id > 0 && root_ids_with_replies.contains(&message_id) {
-        return message_id.to_string();
-    }
-    String::new()
-}
-
 fn collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -3634,152 +3873,84 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    const MIN_CANDIDATE_WINDOW: usize = 64;
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let projects = projects_rows
-        .iter()
-        .filter_map(|project| project.id.map(|id| (id, project)))
-        .collect::<BTreeMap<_, _>>();
-    let profiles = block_on_outcome(cx, queries::list_mail_ui_agent_profiles(cx, pool))?;
-    // Preserve list_agents' case-insensitive recipient selection while keeping
-    // every historical sender available by its exact ID.
-    let mut names = HashSet::new();
-    let recipient_ids = profiles
-        .iter()
-        .filter(|agent| names.insert((agent.project_id, agent.name.to_ascii_lowercase())))
-        .filter_map(|agent| agent.id)
-        .collect::<HashSet<_>>();
-    let agents = profiles
-        .iter()
-        .filter_map(|agent| agent.id.map(|id| (id, agent)))
-        .collect::<BTreeMap<_, _>>();
-    let mut out = Vec::new();
-    let mut before = None;
-    while out.len() < limit {
-        let candidates = block_on_outcome(
-            cx,
-            queries::list_mail_ui_message_window(
-                cx,
-                pool,
-                before,
-                filter_importance,
-                limit.max(MIN_CANDIDATE_WINDOW),
-            ),
-        )?;
-        if candidates.is_empty() {
-            break;
-        }
-        before = candidates
-            .last()
-            .and_then(|message| message.id.map(|id| (message.created_ts, id)));
-        let ids = candidates
-            .iter()
-            .filter_map(|message| message.id)
-            .collect::<Vec<_>>();
-        let receipts = block_on_outcome(cx, queries::list_mail_ui_receipts(cx, pool, &ids))?;
-        let mut deliveries = BTreeMap::<i64, Vec<queries::MailUiReceiptRow>>::new();
-        for receipt in receipts {
-            if recipient_ids.contains(&receipt.agent_id) {
-                deliveries
-                    .entry(receipt.message_id)
-                    .or_default()
-                    .push(receipt);
-            }
-        }
-        for message in candidates {
-            if !matches_importance_filter(&message.importance, filter_importance) {
-                continue;
-            }
-            let Some(project) = projects.get(&message.project_id) else {
-                continue;
-            };
-            let Some(receipts) = message.id.and_then(|id| deliveries.remove(&id)) else {
-                continue;
-            };
-            if let Some(aggregate) =
-                aggregate_unified_deliveries(project, message, receipts, &agents)
-            {
-                out.push(aggregate);
-                if out.len() == limit {
-                    break;
-                }
-            }
+    let mut messages = unified::collect(cx, pool, projects_rows, limit, filter_importance)?;
+    let labels = load_agent_labels(cx, pool, messages.iter().map(|message| message.sender_id))?;
+    for message in &mut messages {
+        if let Some(label) = labels.get(&message.sender_id) {
+            message.sender_label.clone_from(label);
         }
     }
-    resolve_unified_root_refs(cx, pool, &projects, &mut out)?;
-    Ok(out)
+    Ok(messages)
 }
 
-fn aggregate_unified_deliveries(
-    project: &ProjectRow,
-    message: mcp_agent_mail_db::models::MessageRow,
-    receipts: Vec<queries::MailUiReceiptRow>,
-    agents: &BTreeMap<i64, &AgentRow>,
-) -> Option<UnifiedMessageAggregate> {
-    let sender = agents.get(&message.sender_id);
-    let mut row = queries::InboxRow {
-        sender_name: sender.map_or_else(
-            || queries::UNKNOWN_SENDER_DISPLAY.to_string(),
-            |agent| agent.name.clone(),
-        ),
-        message,
-        kind: String::new(),
-        read_ts: None,
-        ack_ts: None,
-    };
-    let mut aggregate: Option<UnifiedMessageAggregate> = None;
-    for receipt in receipts {
-        let Some(agent) = agents
-            .get(&receipt.agent_id)
-            .filter(|agent| agent.project_id == row.message.project_id)
-        else {
-            continue;
-        };
-        row.read_ts = receipt.read_ts;
-        row.ack_ts = receipt.ack_ts;
-        if let Some(aggregate) = &mut aggregate {
-            aggregate.absorb(agent, &row);
-        } else {
-            aggregate = Some(UnifiedMessageAggregate::from_inbox_row(
-                project,
-                agent,
-                &row,
-                &HashSet::new(),
-            ));
-        }
-    }
-    if let (Some(aggregate), Some(sender)) = (&mut aggregate, sender) {
-        aggregate.sender_label = format_agent_label(&sender.name, sender.display_name.as_deref());
-    }
-    aggregate
-}
-
-/// Probe numeric thread roots only after selecting the bounded message view.
-fn resolve_unified_root_refs(
+#[cfg(test)]
+fn reference_collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
-    projects: &BTreeMap<i64, &ProjectRow>,
-    messages: &mut [UnifiedMessageAggregate],
-) -> Result<(), (u16, String)> {
-    for (&project_id, project) in projects {
-        let root_ids = messages
-            .iter()
-            .filter(|message| message.project_slug == project.slug && message.thread_id.is_empty())
-            .map(|message| message.id)
-            .collect::<Vec<_>>();
-        if root_ids.is_empty() {
-            continue;
-        }
-        let roots = root_ids_with_replies(cx, pool, project_id, &root_ids)?;
-        for message in messages.iter_mut() {
-            if message.project_slug == project.slug && roots.contains(&message.id) {
-                message.thread_id = message.id.to_string();
+    projects_rows: &[ProjectRow],
+    limit: usize,
+    filter_importance: Option<&str>,
+) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
+    // Applying the importance filter after a tight per-agent inbox window can
+    // hide matching messages behind newer non-matching rows. Over-fetch when a
+    // server-side importance filter is active so the filtered unified view stays
+    // complete and then truncate after aggregation.
+    let per_agent_limit = if filter_importance.is_some() {
+        limit.max(10_000)
+    } else {
+        limit.max(1)
+    };
+    let mut messages: BTreeMap<i64, UnifiedMessageAggregate> = BTreeMap::new();
+
+    for project in projects_rows {
+        let pid = project.id.unwrap_or(0);
+        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+        let mut project_inbox_rows = Vec::new();
+        for agent in &agents_rows {
+            let aid = agent.id.unwrap_or(0);
+            let inbox = block_on_outcome(
+                cx,
+                queries::fetch_inbox(cx, pool, pid, aid, false, None, per_agent_limit),
+            )?;
+            for row in inbox {
+                let message = &row.message;
+                if !matches_importance_filter(&message.importance, filter_importance) {
+                    continue;
+                }
+                project_inbox_rows.push((agent, row));
             }
         }
+
+        for (agent, row) in project_inbox_rows {
+            let message = &row.message;
+            let Some(message_id) = message.id else {
+                continue;
+            };
+            if let Some(entry) = messages.get_mut(&message_id) {
+                entry.absorb(&agent.name, agent.display_name.as_deref(), &row);
+                continue;
+            }
+
+            let aggregate = UnifiedMessageAggregate::from_inbox_row(
+                project,
+                &agent.name,
+                agent.display_name.as_deref(),
+                &row,
+            );
+            messages.insert(message_id, aggregate);
+        }
     }
-    Ok(())
+
+    let mut out: Vec<UnifiedMessageAggregate> = messages.into_values().collect();
+    out.sort_by(|a, b| b.created_ts.cmp(&a.created_ts).then(b.id.cmp(&a.id)));
+    out.truncate(limit);
+    let sender_labels = load_agent_labels(cx, pool, out.iter().map(|message| message.sender_id))?;
+    for message in &mut out {
+        if let Some(label) = sender_labels.get(&message.sender_id) {
+            message.sender_label.clone_from(label);
+        }
+    }
+    Ok(out)
 }
 
 /// Resolve labels by stable agent ID, including senders from another project.
@@ -3859,6 +4030,11 @@ fn render_unified_inbox(
     )?
     .into_iter()
     .map(UnifiedMessageAggregate::into_view)
+    .map(|mut message| {
+        message.thread_url =
+            mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
+        message
+    })
     .collect::<Vec<_>>();
 
     let total_messages = messages.len();
@@ -3894,6 +4070,7 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "created_relative": message.created_relative,
         "importance": message.importance,
         "thread_id": message.thread_id,
+        "thread_url": message.thread_url,
         "sender": message.sender,
         "sender_label": message.sender_label,
         "recipients": message.recipients,
@@ -3914,8 +4091,42 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
 #[derive(Serialize)]
 struct ProjectCtx {
     project: ProjectView,
+    /// Agents that are not retired, most recently active first.
     agents: Vec<AgentView>,
+    /// Retired agents, listed apart from the active ones. Deregistered agents
+    /// appear in neither list (GH#358).
+    retired_agents: Vec<AgentView>,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    has_more_threads: bool,
     static_export: bool,
+}
+
+const RECENT_CONVERSATIONS: usize = 6;
+const DEFAULT_CONVERSATIONS_PAGE_SIZE: usize = 50;
+const MAX_CONVERSATIONS_PAGE_SIZE: usize = 200;
+
+#[derive(Serialize)]
+struct ConversationView {
+    thread_id: String,
+    subject: String,
+    message_count: i64,
+    first_activity: String,
+    last_activity: String,
+    last_activity_relative: String,
+    thread_url: String,
+}
+
+fn conversation_view(project_slug: &str, row: queries::ProjectThreadSummary) -> ConversationView {
+    ConversationView {
+        thread_url: mail_thread_href(project_slug, &row.thread_id),
+        thread_id: row.thread_id,
+        subject: row.subject,
+        message_count: row.message_count,
+        first_activity: ts_display(row.first_created_ts),
+        last_activity: ts_display(row.last_created_ts),
+        last_activity_relative: ts_display_relative(row.last_created_ts),
+    }
 }
 
 #[derive(Serialize)]
@@ -3935,6 +4146,8 @@ struct AgentView {
     model: String,
     task_description: String,
     last_active: String,
+    /// Display timestamp of retirement; empty for an active agent.
+    retired_at: String,
 }
 
 fn project_view(p: &ProjectRow) -> ProjectView {
@@ -3979,6 +4192,7 @@ fn agent_view(a: &AgentRow) -> AgentView {
         model: a.model.clone(),
         task_description: a.task_description.clone(),
         last_active: ts_display(a.last_active_ts),
+        retired_at: ts_display_opt(a.retired_at),
     }
 }
 
@@ -3989,15 +4203,400 @@ fn render_project(
     static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
+    // The roster keeps retired agents but drops permanent deregistrations,
+    // which can never return (GH#358). It is ordered most recently active
+    // first, and the partition below keeps that order within each list.
+    let roster = block_on_outcome(cx, queries::list_agent_roster(cx, pool, p.id.unwrap_or(0)))?;
+    let (retired, active): (Vec<_>, Vec<_>) =
+        roster.iter().partition(|agent| agent.retired_at.is_some());
+    // Static snapshots do not export the dynamic conversation browser.
+    let (threads, has_more_threads) = if static_export {
+        (Vec::new(), false)
+    } else {
+        let page = block_on_outcome(
+            cx,
+            queries::list_project_threads(cx, pool, p.id.unwrap_or(0), RECENT_CONVERSATIONS, None),
+        )?;
+        let has_more = page.next_cursor.is_some();
+        (
+            page.threads
+                .into_iter()
+                .map(|row| conversation_view(&p.slug, row))
+                .collect(),
+            has_more,
+        )
+    };
     render(
         "mail_project.html",
         ProjectCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: active.into_iter().map(agent_view).collect(),
+            retired_agents: retired.into_iter().map(agent_view).collect(),
+            threads,
+            threads_url: format!("/mail/{}/threads", p.slug),
+            has_more_threads,
             static_export,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /mail/{project}/threads — canonical project conversations
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ThreadsCtx {
+    project: ProjectView,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    next_page_url: String,
+    previous_page_url: String,
+    page_size: usize,
+    static_export: bool,
+}
+
+/// Bind navigation state to its project and page size. The snapshot watermark
+/// keeps newly arriving messages from moving conversations between pages.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationCursor {
+    version: u8,
+    project_id: i64,
+    page_size: usize,
+    position: queries::ProjectThreadCursor,
+}
+
+fn conversations_page_size(query: &str) -> Result<usize, (u16, String)> {
+    let Some(raw) = extract_query_str(query, "limit") else {
+        return Ok(DEFAULT_CONVERSATIONS_PAGE_SIZE);
+    };
+    let size = raw
+        .parse::<usize>()
+        .map_err(|_| (400, "Invalid conversation page size".to_string()))?;
+    Ok(size.clamp(1, MAX_CONVERSATIONS_PAGE_SIZE))
+}
+
+fn decode_conversation_cursor(
+    raw: &str,
+    project_id: i64,
+    page_size: usize,
+) -> Result<queries::ProjectThreadCursor, (u16, String)> {
+    use base64::Engine as _;
+
+    let invalid = || (400, "Invalid conversation cursor".to_string());
+    if raw.len() > 1024 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| invalid())?;
+    let cursor: ConversationCursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if cursor.version != 1
+        || cursor.project_id != project_id
+        || cursor.page_size != page_size
+        || cursor.position.anchor_message_id <= 0
+        || cursor.position.snapshot_id < cursor.position.anchor_message_id
+    {
+        return Err(invalid());
+    }
+    Ok(cursor.position)
+}
+
+fn conversation_page_url(
+    project: &ProjectRow,
+    page_size: usize,
+    position: Option<queries::ProjectThreadCursor>,
+    static_export: bool,
+) -> Result<String, (u16, String)> {
+    use base64::Engine as _;
+
+    let Some(position) = position else {
+        return Ok(String::new());
+    };
+    let bytes = serde_json::to_vec(&ConversationCursor {
+        version: 1,
+        project_id: project.id.unwrap_or(0),
+        page_size,
+        position,
+    })
+    .map_err(|err| (500, format!("Could not encode conversation cursor: {err}")))?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let suffix = if static_export {
+        "&__static_export=1"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "/mail/{}/threads?limit={page_size}&cursor={encoded}{suffix}",
+        project.slug
+    ))
+}
+
+fn render_project_threads(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    query: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let page_size = conversations_page_size(query)?;
+    let project = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let project_id = project.id.unwrap_or(0);
+    let cursor = extract_query_str(query, "cursor")
+        .map(|raw| decode_conversation_cursor(&raw, project_id, page_size))
+        .transpose()?;
+    let page = block_on_outcome(
+        cx,
+        queries::list_project_threads(cx, pool, project_id, page_size, cursor.as_ref()),
+    )?;
+    let static_export = is_static_export_request(query);
+    render(
+        "mail_threads.html",
+        ThreadsCtx {
+            project: project_view(&project),
+            threads: page
+                .threads
+                .into_iter()
+                .map(|row| conversation_view(&project.slug, row))
+                .collect(),
+            threads_url: format!("/mail/{}/threads", project.slug),
+            next_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.next_cursor,
+                static_export,
+            )?,
+            previous_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.previous_cursor,
+                static_export,
+            )?,
+            page_size,
+            static_export,
+        },
+    )
+}
+
+#[cfg(test)]
+mod conversation_ui_tests {
+    use super::*;
+
+    fn page_link(html: &str, relation: &str) -> Option<String> {
+        let relation_start = html.find(&format!("rel=\"{relation}\""))?;
+        let tag_start = html[..relation_start].rfind("<a ")?;
+        let tag = &html[tag_start..relation_start];
+        let href_start = tag.find("href=\"")? + "href=\"".len();
+        let href = tag[href_start..].split('"').next()?;
+        Some(href.replace("&#x2f;", "/").replace("&amp;", "&"))
+    }
+
+    fn follow_link(cx: &Cx, pool: &DbPool, link: &str) -> String {
+        let (path, query) = link.split_once('?').unwrap_or((link, ""));
+        dispatch_project_route(
+            path.strip_prefix("/mail").expect("mail URL"),
+            "GET",
+            "",
+            cx,
+            pool,
+            pool,
+            query,
+        )
+        .expect("conversation link succeeds")
+        .expect("conversation HTML")
+    }
+
+    #[test]
+    fn project_conversations_follow_stable_rendered_pagination_links() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-ui");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-ui"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let send = |thread: &str, subject: &str| {
+            block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Private body must not be in conversation summaries",
+                    Some(thread),
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message")
+        };
+        for index in 0..9 {
+            send(&format!("topic-{index}"), &format!("Conversation {index}"));
+        }
+
+        let preview = render_project(&cx, &pool, &project.slug, false)
+            .unwrap()
+            .unwrap();
+        assert!(preview.contains("Active Conversations"));
+        for index in 3..9 {
+            assert!(preview.contains(&format!("Conversation {index}")));
+            assert!(html_contains_url(
+                &preview,
+                &mail_thread_href(&project.slug, &format!("topic-{index}")),
+            ));
+        }
+        assert!(!preview.contains("Conversation 2"));
+        assert!(!preview.contains("Private body"));
+
+        let first_url = format!("/mail/{}/threads?limit=3", project.slug);
+        let first = follow_link(&cx, &pool, &first_url);
+        assert!(first.contains("Conversation 8"));
+        assert!(first.contains("Conversation 6"));
+        assert!(!first.contains("Conversation 5"));
+        assert!(page_link(&first, "prev").is_none());
+        let older = page_link(&first, "next").expect("older page link");
+
+        // Both a new conversation and a reply to an unseen conversation arrive
+        // after page one. Following its links must retain the original window.
+        send("new-topic", "Arrived after browsing began");
+        send("topic-0", "New activity on the oldest conversation");
+        let second = follow_link(&cx, &pool, &older);
+        for index in 3..6 {
+            assert!(second.contains(&format!("Conversation {index}")));
+        }
+        assert!(!second.contains("Conversation 6"));
+        assert!(!second.contains("Arrived after browsing began"));
+        assert!(!second.contains("New activity on the oldest conversation"));
+        let newer = page_link(&second, "prev").expect("newer page link");
+        let back = follow_link(&cx, &pool, &newer);
+        assert!(back.contains("Conversation 8"));
+        assert!(back.contains("Conversation 6"));
+        assert!(!back.contains("Conversation 5"));
+        assert!(page_link(&back, "prev").is_none());
+        let last = follow_link(
+            &cx,
+            &pool,
+            &page_link(&second, "next").expect("last page link"),
+        );
+        for index in 0..3 {
+            assert!(last.contains(&format!("Conversation {index}")));
+        }
+        assert!(page_link(&last, "next").is_none());
+        assert!(!last.contains("New activity on the oldest conversation"));
+
+        let fresh = follow_link(&cx, &pool, &first_url);
+        assert!(fresh.contains("Arrived after browsing began"));
+        assert!(fresh.contains("New activity on the oldest conversation"));
+    }
+
+    #[test]
+    fn project_conversations_validate_bounded_project_specific_cursors() {
+        let project = ProjectRow {
+            id: Some(7),
+            slug: "demo".to_string(),
+            human_key: "/demo".to_string(),
+            created_at: 0,
+        };
+        let cursor = queries::ProjectThreadCursor {
+            snapshot_id: 30,
+            anchor_created_ts: 50,
+            anchor_message_id: 15,
+            newer: false,
+        };
+        let url = conversation_page_url(&project, 10, Some(cursor), false).unwrap();
+        let query = url.split_once('?').unwrap().1;
+        let encoded = extract_query_str(query, "cursor").unwrap();
+        assert!(decode_conversation_cursor(&encoded, 7, 10).is_ok());
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 8, 10).unwrap_err().0,
+            400
+        );
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 7, 20).unwrap_err().0,
+            400
+        );
+        for bad in ["not_base64!", "e30", &"A".repeat(1025)] {
+            assert_eq!(decode_conversation_cursor(bad, 7, 10).unwrap_err().0, 400);
+        }
+        assert_eq!(conversations_page_size("").unwrap(), 50);
+        assert_eq!(conversations_page_size("limit=0").unwrap(), 1);
+        assert_eq!(conversations_page_size("limit=9999").unwrap(), 200);
+        for query in ["limit=-1", "limit=wrong", "limit=999999999999999999999999"] {
+            assert_eq!(conversations_page_size(query).unwrap_err().0, 400);
+        }
+    }
+
+    #[test]
+    fn project_conversations_search_links_open_canonical_roots_and_exact_keys() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-search");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-search"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let mut expected = Vec::new();
+        for (thread, subject) in [
+            (None, "Standalone search result"),
+            (Some(" padded/key+%2F "), "Exact key search result"),
+            (Some(".."), "Dot key search result"),
+        ] {
+            let message = block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Search conversation body",
+                    thread,
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message");
+            let key = thread.map_or_else(|| message.id.unwrap().to_string(), str::to_string);
+            expected.push((key, subject));
+        }
+
+        // Facet-only search exercises the real DB result projection, including
+        // a null thread_id. Saved recipes are unrelated to this isolated pool.
+        let html = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "unsupported://conversation-ui-search")],
+            || render_search(&cx, &pool, &project.slug, "imp=normal"),
+        )
+        .expect("project search")
+        .expect("search HTML");
+        for (key, subject) in expected {
+            let link = mail_thread_href(&project.slug, &key);
+            assert!(html.contains(subject), "search includes {subject}");
+            assert!(html_contains_url(&html, &link), "search links to {key}");
+            let conversation = follow_link(&cx, &pool, &link);
+            assert!(conversation.contains(subject));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4034,6 +4633,16 @@ struct InboxMessage {
     read: bool,
 }
 
+/// `(offset, rows to fetch)` for inbox page `page` (1-based) of `limit` rows:
+/// offset-based like Python, fetching through the page plus one row so "Older
+/// Messages" shows exactly when there is more. Python fetched a fixed 10,000
+/// rows and paged inside them, so nothing older than those was reachable.
+fn inbox_fetch_window(page: usize, limit: usize) -> (usize, usize) {
+    let limit = limit.max(1);
+    let offset = page.max(1).saturating_sub(1).saturating_mul(limit);
+    (offset, offset.saturating_add(limit).saturating_add(1))
+}
+
 fn render_inbox(
     cx: &Cx,
     pool: &DbPool,
@@ -4048,32 +4657,16 @@ fn render_inbox(
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
 
-    // Fetch a generous amount, then paginate client-side (Python parity).
-    let fetch_limit = 10_000;
+    let page = page.max(1);
+    let (offset, fetch_limit) = inbox_fetch_window(page, limit);
     let inbox = block_on_outcome(
         cx,
         queries::fetch_inbox(cx, pool, pid, aid, false, None, fetch_limit),
     )?;
     let total = inbox.len();
-    let candidate_root_ids: Vec<i64> = inbox
+    let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
+    let sender_ids: Vec<i64> = page_rows
         .iter()
-        .filter_map(|row| {
-            if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
-                row.message.id.filter(|message_id| *message_id > 0)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
-
-    // Offset-based pagination (Python: offset = (page - 1) * limit).
-    let page = page.max(1);
-    let offset = (page - 1).saturating_mul(limit.max(1));
-    let sender_ids: Vec<i64> = inbox
-        .iter()
-        .skip(offset)
-        .take(limit)
         .map(|row| row.message.sender_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -4091,13 +4684,9 @@ fn render_inbox(
             })
             .collect();
     let mut items = Vec::new();
-    for row in inbox.iter().skip(offset).take(limit) {
+    for row in page_rows {
         let m = &row.message;
-        let thread_id = display_thread_ref_for_message(
-            m.id.unwrap_or(0),
-            m.thread_id.as_deref(),
-            &reply_root_ids,
-        );
+        let thread_id = queries::canonical_thread_id(m.id.unwrap_or(0), m.thread_id.as_deref());
         items.push(InboxMessage {
             id: m.id.unwrap_or(0),
             subject: m.subject.clone(),
@@ -4109,11 +4698,7 @@ fn render_inbox(
                 .unwrap_or_else(|| row.sender_name.clone()),
             importance: m.importance.clone(),
             thread_id: thread_id.clone(),
-            thread_url: if thread_id.is_empty() {
-                String::new()
-            } else {
-                mail_thread_href(&p.slug, &thread_id)
-            },
+            thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
             created: ts_display(m.created_ts),
             ack_required: m.ack_required_bool(),
             acked: row.ack_ts.is_some(),
@@ -4158,6 +4743,7 @@ struct MessageCtx {
     other_thread_items: Vec<MessageThreadPreview>,
     extra_thread_count: usize,
     commit_sha: Option<String>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -4195,6 +4781,7 @@ fn render_message(
     pool: &DbPool,
     project_slug: &str,
     message_id: i64,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
@@ -4222,43 +4809,30 @@ fn render_message(
         pool,
         recipients.iter().map(|recipient| recipient.agent_id),
     )?;
-    let stored_thread_ref = explicit_thread_ref(m.thread_id.as_deref());
-    let candidate_thread_ref = stored_thread_ref
-        .clone()
-        .or_else(|| (current_message_id > 0).then(|| current_message_id.to_string()));
-    let thread_items = if let Some(thread_id) = candidate_thread_ref.as_deref() {
-        let items = block_on_outcome(
-            cx,
-            queries::list_thread_messages(cx, pool, pid, thread_id, None),
-        )?;
-        let labels = load_agent_labels(cx, pool, items.iter().map(|item| item.sender_id))?;
-        items
-            .into_iter()
-            .map(|item| MessageThreadPreview {
-                id: item.id,
-                from_label: labels
-                    .get(&item.sender_id)
-                    .cloned()
-                    .unwrap_or_else(|| item.from.clone()),
-                from: item.from,
-                subject: item.subject,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let thread_ref = queries::canonical_thread_id(current_message_id, m.thread_id.as_deref());
+    let items = block_on_outcome(
+        cx,
+        queries::list_canonical_thread_messages(cx, pool, pid, &thread_ref, None),
+    )?;
+    let labels = load_agent_labels(cx, pool, items.iter().map(|item| item.sender_id))?;
+    let thread_items = items
+        .into_iter()
+        .map(|item| MessageThreadPreview {
+            id: item.id,
+            from_label: labels
+                .get(&item.sender_id)
+                .cloned()
+                .unwrap_or_else(|| item.from.clone()),
+            from: item.from,
+            subject: item.subject,
+        })
+        .collect::<Vec<_>>();
     let other_thread_items = thread_items
         .iter()
         .filter(|item| item.id != current_message_id)
         .cloned()
         .collect::<Vec<_>>();
     let extra_thread_count = other_thread_items.len().saturating_sub(5);
-    let thread_ref = if stored_thread_ref.is_some() || thread_items.len() > 1 {
-        candidate_thread_ref.unwrap_or_default()
-    } else {
-        String::new()
-    };
-
     render(
         "mail_message.html",
         MessageCtx {
@@ -4269,7 +4843,7 @@ fn render_message(
                 body_md: m.body_md.clone(),
                 body_html: markdown::render_markdown_to_safe_html(&m.body_md),
                 importance: m.importance.clone(),
-                thread_url: mail_thread_href(&p.slug, &thread_ref),
+                thread_url: mail_thread_href_for_mode(&p.slug, &thread_ref, static_export),
                 thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
@@ -4291,6 +4865,7 @@ fn render_message(
             other_thread_items,
             extra_thread_count,
             commit_sha: None,
+            static_export,
         },
     )
 }
@@ -4392,6 +4967,7 @@ struct ThreadCtx {
     thread_subject: String,
     message_count: usize,
     messages: Vec<ThreadMessage>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -4411,13 +4987,17 @@ fn render_thread(
     pool: &DbPool,
     project_slug: &str,
     thread_id: &str,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
     let thread_msgs = block_on_outcome(
         cx,
-        queries::list_thread_messages(cx, pool, pid, thread_id, None),
+        queries::list_canonical_thread_messages(cx, pool, pid, thread_id, None),
     )?;
+    if thread_msgs.is_empty() {
+        return Err((404, "Thread not found".to_string()));
+    }
     let sender_labels = load_agent_labels(
         cx,
         pool,
@@ -4454,6 +5034,7 @@ fn render_thread(
             thread_subject,
             message_count,
             messages,
+            static_export,
         },
     )
 }
@@ -4515,7 +5096,10 @@ struct RecipeView {
     id: i64,
     name: String,
     description: String,
-    route: String,
+    /// Where the saved search opens: its pinned project's search page for a
+    /// Project/Product scope, else this project's, tagged with the recipe id
+    /// so opening it counts a use.
+    href: String,
     pinned: bool,
     use_count: i64,
 }
@@ -4554,23 +5138,31 @@ fn parse_mail_search_field_scope(query: &str) -> String {
     String::new()
 }
 
-fn apply_mail_search_field_scope(query: &str, field_scope: &str) -> String {
-    if query.is_empty() {
-        return String::new();
-    }
+/// The search service's field scope for a normalized `field` parameter.
+fn mail_search_text_fields(field_scope: &str) -> TextFieldScope {
     match field_scope {
-        "subject" => format!("subject:{query}"),
-        "body" => format!("body_md:{query}"),
-        _ => query.to_string(),
+        "subject" => TextFieldScope::Subject,
+        "body" => TextFieldScope::Body,
+        _ => TextFieldScope::SubjectAndBody,
     }
 }
 
 fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "relevance" => Some("relevance"),
-        "time" | "newest" | "oldest" => Some("time"),
+        "time" | "newest" => Some("time"),
+        "oldest" => Some("oldest"),
         _ => None,
     }
+}
+
+/// Inbox/Outbox are relative to an agent. With "All agents" no search path
+/// applies them, so they are not kept as a filter: the form then shows
+/// "Any", which is what the results are.
+fn parse_mail_search_direction(query: &str, agent_filter: &str) -> String {
+    extract_query_str(query, "direction")
+        .filter(|_| !agent_filter.is_empty())
+        .unwrap_or_default()
 }
 
 fn parse_mail_search_order(query: &str) -> String {
@@ -4783,7 +5375,7 @@ fn render_search(
     let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
     let thread_filter = extract_query_str(query_str, "thread").unwrap_or_default();
     let ack_filter = extract_query_str(query_str, "ack").unwrap_or_else(|| "any".to_string());
-    let direction_filter = extract_query_str(query_str, "direction").unwrap_or_default();
+    let direction_filter = parse_mail_search_direction(query_str, &agent_filter);
     let from_date = extract_query_str(query_str, "from_date").unwrap_or_default();
     let to_date = extract_query_str(query_str, "to_date").unwrap_or_default();
 
@@ -4803,10 +5395,10 @@ fn render_search(
             max_ts: parse_date_to_micros_end(&to_date),
         };
 
-        let ranking = if order == "time" {
-            RankingMode::Recency
-        } else {
-            RankingMode::Relevance
+        let ranking = match order.as_str() {
+            "time" => RankingMode::Recency,
+            "oldest" => RankingMode::Oldest,
+            _ => RankingMode::Relevance,
         };
 
         let direction = match direction_filter.as_str() {
@@ -4816,10 +5408,10 @@ fn render_search(
         };
 
         let ack_required = parse_ack_filter_param(&ack_filter);
-        let scoped_query = apply_mail_search_field_scope(&q, &field_scope);
 
         let search_query = SearchQuery {
-            text: scoped_query,
+            text: q.clone(),
+            text_fields: mail_search_text_fields(&field_scope),
             doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
             project_id: Some(pid),
             product_id: None,
@@ -4856,23 +5448,21 @@ fn render_search(
         let web_results: Vec<WebSearchResult> = resp
             .results
             .iter()
-            .map(|r| WebSearchResult {
-                id: r.id,
-                subject: r.title.clone(),
-                snippet: highlight_snippet(&r.body, &q, 250),
-                from_name: r.from_agent.clone().unwrap_or_default(),
-                created: r.created_ts.map_or_else(String::new, ts_display),
-                created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
-                importance: r.importance.clone().unwrap_or_default(),
-                thread_url: r
-                    .thread_id
-                    .as_deref()
-                    .map_or_else(String::new, |thread_id| {
-                        mail_thread_href(project_slug, thread_id)
-                    }),
-                thread_id: r.thread_id.clone().unwrap_or_default(),
-                ack_required: r.ack_required.unwrap_or(false),
-                score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+            .map(|r| {
+                let thread_id = queries::canonical_thread_id(r.id, r.thread_id.as_deref());
+                WebSearchResult {
+                    id: r.id,
+                    subject: r.title.clone(),
+                    snippet: highlight_snippet(&r.body, &q, 250),
+                    from_name: r.from_agent.clone().unwrap_or_default(),
+                    created: r.created_ts.map_or_else(String::new, ts_display),
+                    created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
+                    importance: r.importance.clone().unwrap_or_default(),
+                    thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
+                    thread_id,
+                    ack_required: r.ack_required.unwrap_or(false),
+                    score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+                }
             })
             .collect();
 
@@ -4887,7 +5477,8 @@ fn render_search(
     let agents: Vec<AgentView> = agents_rows.iter().map(agent_view).collect();
 
     // ── Load saved recipes ──────────────────────────────────────────
-    let recipes = load_recipes();
+    let opened_recipe = extract_query_str(query_str, "recipe").and_then(|id| id.parse().ok());
+    let recipes = load_recipes(&p.slug, opened_recipe);
 
     let result_count = results.len();
     let deep_link = build_search_deep_link(project_slug, query_str);
@@ -4928,7 +5519,9 @@ fn render_search(
 /// Recipes are operator-local metadata, not archive-backed state, so they must
 /// come from the configured live sqlite file even when the rest of the page is
 /// rendered from an archive-backed observability snapshot.
-fn load_recipes() -> Vec<RecipeView> {
+/// Saved searches for the sidebar of `project_slug`'s search page. `opened`
+/// is the recipe whose link was just followed; its use count goes up first.
+fn load_recipes(project_slug: &str, opened: Option<i64>) -> Vec<RecipeView> {
     let config = Config::from_env();
     // `list_recipes` self-heals its schema with idempotent DDL, so this
     // apparently read-only route must hold the promotion lease from before the
@@ -4939,16 +5532,39 @@ fn load_recipes() -> Vec<RecipeView> {
     };
     // Wrap in DbConnGuard so the live metadata connection closes at scope exit.
     let conn = mcp_agent_mail_db::guard_db_conn(conn, "mail_ui::load_recipes");
+    if let Some(recipe_id) = opened {
+        let _ = mcp_agent_mail_db::search_recipes::touch_recipe(&conn, recipe_id);
+    }
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
+    let pinned_project_slug = |project_id: i64| {
+        conn.query_sync(
+            "SELECT slug FROM projects WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id)],
+        )
+        .ok()?
+        .first()?
+        .get_named::<String>("slug")
+        .ok()
+    };
     recipes
         .iter()
-        .map(|r| RecipeView {
-            id: r.id.unwrap_or(0),
-            name: r.name.clone(),
-            description: r.description.clone(),
-            route: r.route_string(),
-            pinned: r.pinned,
-            use_count: r.use_count,
+        .map(|r| {
+            let id = r.id.unwrap_or(0);
+            let slug = r
+                .scope_id
+                .filter(|_| r.scope_mode != mcp_agent_mail_db::search_recipes::ScopeMode::Global)
+                .and_then(pinned_project_slug)
+                .unwrap_or_else(|| project_slug.to_string());
+            let route = r.route_string();
+            let separator = if route.contains('?') { '&' } else { '?' };
+            RecipeView {
+                id,
+                name: r.name.clone(),
+                description: r.description.clone(),
+                href: format!("/mail/{slug}{route}{separator}recipe={id}"),
+                pinned: r.pinned,
+                use_count: r.use_count,
+            }
         })
         .collect()
 }
@@ -5264,12 +5880,21 @@ fn render_overseer_compose(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+    // Recipients are the agents still working here: not retired ones, and
+    // not HumanOverseer, which the first overseer send registers.
+    let agents = block_on_outcome(
+        cx,
+        queries::list_active_agents_bounded(cx, pool, pid, None, None),
+    )?;
     render(
         "overseer_compose.html",
         OverseerComposeCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: agents
+                .iter()
+                .filter(|agent| agent.name != OVERSEER_AGENT_NAME)
+                .map(agent_view)
+                .collect(),
         },
     )
 }
@@ -5302,6 +5927,19 @@ fn dispatch_project_route(
 
     match rest {
         "" => render_project(cx, read_pool, project_slug, is_static_export_request(query)),
+        "threads" if method == "GET" => render_project_threads(cx, read_pool, project_slug, query),
+        "thread" if method == "GET" => {
+            let thread_id = extract_query_str(query, "thread_id")
+                .ok_or_else(|| (400, "Missing thread ID".to_string()))?;
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
+        }
+        "threads" | "thread" => Err((405, "Method Not Allowed".to_string())),
         "search" => render_search(cx, read_pool, project_slug, query),
         "file_reservations" => render_file_reservations(cx, read_pool, project_slug),
         "attachments" => render_attachments(cx, read_pool, project_slug),
@@ -5351,15 +5989,30 @@ fn dispatch_project_route(
             let mid: i64 = mid_str
                 .parse()
                 .map_err(|_| (400, format!("Invalid message ID: {mid_str}")))?;
-            render_message(cx, read_pool, project_slug, mid)
+            render_message(
+                cx,
+                read_pool,
+                project_slug,
+                mid,
+                is_static_export_request(query),
+            )
         }
         _ if rest.starts_with("thread/") => {
+            if method != "GET" {
+                return Err((405, "Method Not Allowed".to_string()));
+            }
             let encoded_thread_id = rest.strip_prefix("thread/").unwrap_or("");
             let thread_id = percent_decode_path_segment(encoded_thread_id);
             if thread_id.is_empty() {
                 return Err((400, "Missing thread ID".to_string()));
             }
-            render_thread(cx, read_pool, project_slug, &thread_id)
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
         }
         _ => Ok(None),
     }
@@ -6127,6 +6780,7 @@ const OVERSEER_PREAMBLE: &str = "---\n\n\
     ---\n\n";
 
 const OVERSEER_SEND_INTENT: &str = "human_overseer_send";
+const OVERSEER_AGENT_NAME: &str = "HumanOverseer";
 const OVERSEER_REASON_MAX_CHARS: usize = 500;
 const OVERSEER_MAX_RECIPIENTS: usize = 100;
 
@@ -6226,19 +6880,20 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     if subject.is_empty() {
         return Err(err("Subject is required"));
     }
-    if subject.len() > 200 {
+    // Limits count characters, as the form's counters do, not UTF-8 bytes.
+    if subject.chars().count() > 200 {
         return Err(err("Subject too long (maximum 200 characters)"));
     }
     if body_md.is_empty() {
         return Err(err("Message body is required"));
     }
-    if body_md.len() > 50_000 {
+    if body_md.chars().count() > 50_000 {
         return Err(err("Message body too long (maximum 50,000 characters)"));
     }
     if reason.is_empty() {
         return Err(err("Intervention reason is required"));
     }
-    if reason.len() > OVERSEER_REASON_MAX_CHARS {
+    if reason.chars().count() > OVERSEER_REASON_MAX_CHARS {
         return Err(err("Intervention reason too long (maximum 500 characters)"));
     }
 
@@ -6279,7 +6934,7 @@ fn handle_overseer_send(
             cx,
             pool,
             pid,
-            "HumanOverseer",
+            OVERSEER_AGENT_NAME,
             "WebUI",
             "Human",
             "Human operator providing guidance and oversight to agents",
@@ -6353,7 +7008,7 @@ fn handle_overseer_send(
         "recipient_count": valid_names.len(),
         "thread_id": thread_id,
         "audit": {
-            "actor": "HumanOverseer",
+            "actor": OVERSEER_AGENT_NAME,
             "human_overseer": true,
             "contact_policy_bypass": true,
             "reason": parsed.reason,
@@ -6502,224 +7157,6 @@ mod fresh_eyes_regression_tests {
             .expect("project creation should seed the canonical sibling suggestion");
         assert_eq!(row.status, queries::ProjectSiblingStatus::Suggested);
         assert!(row.score >= queries::PROJECT_SIBLING_MIN_SUGGESTION_SCORE);
-    }
-
-    #[test]
-    fn unified_inbox_query_count_does_not_grow_with_agent_population() {
-        let runtime = message_fixture_runtime();
-        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(120));
-        let pool = make_test_pool("unified-query-bound");
-        let project = outcome_ok(block_on(queries::ensure_project(
-            &cx,
-            &pool,
-            "/tmp/unified-query-bound",
-        )));
-        let sender = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project.id.unwrap(),
-            "RedFox",
-            "test",
-            "test",
-            None,
-            None,
-            None,
-        )));
-        let recipient = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project.id.unwrap(),
-            "BlueLake",
-            "test",
-            "test",
-            None,
-            None,
-            None,
-        )));
-        let message = outcome_ok(block_on(queries::create_message_with_recipients(
-            &cx,
-            &pool,
-            project.id.unwrap(),
-            sender.id.unwrap(),
-            "Bounded queries",
-            "Retained body",
-            Some("bounded-thread"),
-            "normal",
-            false,
-            "[]",
-            &[(recipient.id.unwrap(), "to")],
-        )));
-        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let tracker = std::sync::Arc::new(mcp_agent_mail_db::tracking::QueryTracker::new());
-        tracker.enable(None);
-        let _tracking = mcp_agent_mail_db::tracking::set_active_tracker(tracker.clone());
-        let first = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
-            .expect("initial inbox");
-        let first_count = tracker.snapshot().total;
-        for name in mcp_agent_mail_core::models::VALID_ADJECTIVES
-            .iter()
-            .flat_map(|adjective| {
-                mcp_agent_mail_core::models::VALID_NOUNS
-                    .iter()
-                    .map(move |noun| format!("{adjective}{noun}"))
-            })
-            .filter(|name| name != "RedFox" && name != "BlueLake")
-            .take(155)
-        {
-            outcome_ok(block_on(queries::register_agent(
-                &cx,
-                &pool,
-                project.id.unwrap(),
-                &name,
-                "test",
-                "test",
-                None,
-                None,
-                None,
-            )));
-        }
-        tracker.reset();
-        let second = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
-            .expect("large directory inbox");
-        assert!(first_count > 0, "actual SQL tracking must be active");
-        assert_eq!(
-            tracker.snapshot().total,
-            first_count,
-            "155 additional agents must not add inbox queries"
-        );
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_eq!(first[0].id, message.id.unwrap());
-        assert_eq!(second[0].id, message.id.unwrap());
-        assert_eq!(second[0].body_md, "Retained body");
-    }
-
-    #[test]
-    fn unified_inbox_sparse_windows_preserve_order_filter_and_global_cap() {
-        let runtime = message_fixture_runtime();
-        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(120));
-        let pool = make_test_pool("unified-sparse-windows");
-        let project = outcome_ok(block_on(queries::ensure_project(
-            &cx,
-            &pool,
-            "/tmp/unified-sparse-windows",
-        )));
-        let sender = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project.id.unwrap(),
-            "RedFox",
-            "test",
-            "test",
-            None,
-            None,
-            None,
-        )));
-        let recipient = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            project.id.unwrap(),
-            "BlueLake",
-            "test",
-            "test",
-            None,
-            None,
-            None,
-        )));
-        let foreign_project = outcome_ok(block_on(queries::ensure_project(
-            &cx,
-            &pool,
-            "/tmp/unified-sparse-foreign",
-        )));
-        let foreign_recipient = outcome_ok(block_on(queries::register_agent(
-            &cx,
-            &pool,
-            foreign_project.id.unwrap(),
-            "BlueLake",
-            "test",
-            "test",
-            None,
-            None,
-            None,
-        )));
-        let conn = match block_on(pool.acquire(&cx)) {
-            asupersync::Outcome::Ok(conn) => conn,
-            asupersync::Outcome::Err(error) => panic!("acquire fixture connection: {error}"),
-            asupersync::Outcome::Cancelled(reason) => {
-                panic!("fixture connection cancelled: {reason}")
-            }
-            asupersync::Outcome::Panicked(payload) => {
-                panic!("fixture connection panicked: {}", payload.message())
-            }
-        };
-        conn.execute_sync("BEGIN IMMEDIATE", &[])
-            .expect("start fixture transaction");
-        for id in 1..=1100 {
-            conn.execute_sync("INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (?, ?, ?, 'Bounded mail', 'Preserved body', ?, 0, 100, '[]', '[]')", &[
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project.id.unwrap()),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(sender.id.unwrap()),
-                mcp_agent_mail_db::sqlmodel_core::Value::Text(if id == 1 { "high" } else { "normal" }.to_string()),
-            ]).expect("insert real message fixture");
-            if id <= 1001 {
-                conn.execute_sync("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')", &[
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(recipient.id.unwrap()),
-                ]).expect("insert real delivery fixture");
-            }
-            if id == 1100 {
-                conn.execute_sync("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, 'to')", &[
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
-                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(foreign_recipient.id.unwrap()),
-                ]).expect("insert foreign-project delivery fixture");
-            }
-        }
-        conn.execute_sync("COMMIT", &[]).expect("commit fixtures");
-        drop(conn);
-        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let first = collect_unified_message_aggregates(&cx, &pool, &projects, 1, None)
-            .expect("skip undelivered candidate pages");
-        assert_eq!(first.len(), 1);
-        assert_eq!(
-            first[0].id, 1001,
-            "newer undelivered messages must not consume result slots"
-        );
-        let filtered = collect_unified_message_aggregates(&cx, &pool, &projects, 1, Some("HIGH"))
-            .expect("filter before limiting");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(
-            filtered[0].id, 1,
-            "filter must reach the older high-priority message"
-        );
-        let capped = collect_unified_message_aggregates(&cx, &pool, &projects, 1000, None)
-            .expect("global result cap");
-        assert_eq!(capped.len(), 1000);
-        assert_eq!(capped.first().unwrap().id, 1001);
-        assert_eq!(capped.last().unwrap().id, 2);
-        assert!(
-            capped.windows(2).all(|pair| pair[0].id > pair[1].id),
-            "equal timestamps must order by descending stable ID"
-        );
-        assert!(
-            capped
-                .iter()
-                .all(|message| message.recipients.contains("BlueLake")
-                    && !message.all_read
-                    && message.body_md == "Preserved body")
-        );
-    }
-
-    #[test]
-    fn unified_inbox_busy_error_is_retryable_http_503() {
-        let cx = Cx::for_testing();
-        let error = block_on_outcome::<()>(&cx, async {
-            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(
-                "database is busy".to_string(),
-            ))
-        })
-        .expect_err("busy read must remain retryable");
-        assert_eq!(error.0, 503);
-        assert_eq!(error.1, "Database temporarily busy; retry the request");
     }
 
     #[test]
@@ -7176,6 +7613,108 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
+    fn handle_mark_all_read_clears_shared_and_mixed_inboxes_for_only_the_viewer() {
+        for mixed in [false, true] {
+            let runtime = message_fixture_runtime();
+            let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+            let label = if mixed {
+                "mail-ui-all-read-mixed"
+            } else {
+                "mail-ui-all-read-shared"
+            };
+            let pool = make_test_pool(label);
+            let project = outcome_ok(block_on(queries::ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/{label}"),
+            )));
+            let project_id = project.id.expect("project id");
+            let sender = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None, None,
+            )));
+            let viewer = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )));
+            let peer = outcome_ok(block_on(queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )));
+            let viewer_id = viewer.id.expect("viewer id");
+            let peer_id = peer.id.expect("peer id");
+            let mut deliveries = vec![
+                ("first shared", false, true),
+                ("second shared", false, true),
+            ];
+            if mixed {
+                deliveries.extend([("direct", true, false), ("direct and shared", true, true)]);
+            }
+            let expected_marked = deliveries.len();
+            for (subject, direct, shared) in deliveries {
+                let recipients = if direct {
+                    vec![(viewer_id, "to")]
+                } else {
+                    Vec::new()
+                };
+                outcome_ok(block_on(queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    subject,
+                    "Body",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &recipients,
+                    shared.then_some("to"),
+                )));
+            }
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("all-read route succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["success"], true);
+            assert_eq!(response["marked_count"], expected_marked);
+            assert!(
+                outcome_ok(block_on(queries::fetch_inbox_unread(
+                    &cx, &pool, project_id, viewer_id, false, None, 100,
+                )))
+                .is_empty()
+            );
+            let peer_unread = outcome_ok(block_on(queries::fetch_inbox_unread(
+                &cx, &pool, project_id, peer_id, false, None, 100,
+            )));
+            assert_eq!(peer_unread.len(), if mixed { 3 } else { 2 });
+            let unacked = outcome_ok(block_on(queries::fetch_unacked_for_agent(
+                &cx, &pool, project_id, viewer_id, 100,
+            )));
+            assert_eq!(
+                unacked.len(),
+                expected_marked,
+                "reading never acknowledges mail"
+            );
+            assert!(unacked.iter().all(|row| row.read_ts.is_some()));
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("repeated all-read succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["marked_count"], 0);
+        }
+    }
+
+    #[test]
     fn sibling_update_route_persists_and_index_renders_both_orientations() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-sibling");
@@ -7517,6 +8056,19 @@ mod overseer_form_validation_tests {
         body["subject"] = json!("x".repeat(201));
         let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject too long (maximum 200 characters)");
+    }
+
+    #[test]
+    fn parse_overseer_body_limits_count_characters_not_bytes() {
+        // 200 two-byte characters fit the 200-character subject the form allows.
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["subject"] = json!("é".repeat(200));
+        body["reason"] = json!("ü".repeat(500));
+        assert!(parse_overseer_body(&body.to_string()).is_ok());
+        body["subject"] = json!("é".repeat(201));
+        let (status, msg) = parse_err_message(&body.to_string());
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject too long (maximum 200 characters)");
     }

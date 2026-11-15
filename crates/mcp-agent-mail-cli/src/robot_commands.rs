@@ -289,6 +289,18 @@ struct ParsedAttachment {
     size_text: String,
     size_bytes: usize,
     mime_type: String,
+    storage: String,
+}
+
+/// How an attachment record is stored: its `type` when that says `file` or
+/// `inline`, else inferred from a `data_uri` (inline) or `path` (file).
+fn parse_attachment_storage(value: &serde_json::Value) -> String {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some(kind @ ("file" | "inline")) => kind.to_string(),
+        _ if value.get("data_uri").is_some_and(|v| !v.is_null()) => "inline".to_string(),
+        _ if value.get("path").is_some_and(|v| !v.is_null()) => "file".to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
@@ -379,6 +391,7 @@ fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
                 size_text,
                 size_bytes,
                 mime_type: parse_attachment_mime_type(value),
+                storage: parse_attachment_storage(value),
             }
         })
         .collect()
@@ -1324,6 +1337,8 @@ pub struct InboxEntry {
     pub id: i64,
     pub priority: String,
     pub from: String,
+    pub sender_display_name: Option<String>,
+    pub to_display_names: BTreeMap<String, Option<String>>,
     pub subject: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
@@ -1331,6 +1346,10 @@ pub struct InboxEntry {
     pub age: String,
     pub ack_status: String,
     pub importance: String,
+    /// `"project"` for mail delivered through the project's shared mailbox
+    /// (GH#282), as `fetch_inbox` reports it; absent for direct deliveries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
 }
@@ -2237,6 +2256,11 @@ pub struct ProjectRow {
 /// robot attachments — attachment entry.
 #[derive(Debug, Serialize)]
 pub struct AttachmentRow {
+    /// File name (from `name`, else the last segment of `path`).
+    pub name: String,
+    /// `file` (stored in the archive), `inline` (embedded in the message), or
+    /// `unknown` when the record says neither.
+    pub storage: String,
     pub r#type: String,
     pub size: usize,
     pub sender: String,
@@ -2931,7 +2955,8 @@ fn classify_handoff(input: &HandoffClassificationInput) -> HandoffClassification
 /// Shared arguments for all `am robot` subcommands.
 #[derive(Debug, Args)]
 pub struct RobotArgs {
-    /// Output format: toon (default at TTY), json (default when piped), md (for thread/message).
+    /// Output format: toon (default at TTY), json (default when piped), md (thread and
+    /// message only, where it is the default whether or not stdout is a TTY).
     #[arg(long, global = true, value_parser = parse_output_format)]
     pub format: Option<OutputFormat>,
 
@@ -2973,18 +2998,18 @@ pub enum RobotSubcommand {
 
     /// Actionable inbox with priority ordering, urgency/ack synthesis.
     ///
-    /// Defaults to UNREAD messages only (as if --unread were passed) unless
-    /// --urgent, --ack-overdue, or --all is given. Listing never marks
-    /// messages read: read state changes only via explicit `am mail read`
-    /// or acknowledgement (GH#229).
+    /// Defaults to unread messages plus any whose acknowledgement is overdue
+    /// (as if --unread were passed) unless --urgent, --ack-overdue, or --all
+    /// is given. Listing never marks messages read: read state changes only
+    /// via explicit `am mail read` or acknowledgement (GH#229).
     Inbox {
-        /// Show only urgent messages.
+        /// Show only unread high/urgent messages.
         #[arg(long)]
         urgent: bool,
-        /// Show only ack-overdue messages.
+        /// Show only ack-required messages unacknowledged for over 30 minutes.
         #[arg(long)]
         ack_overdue: bool,
-        /// Show only unread messages.
+        /// Show unread messages plus overdue acknowledgements (the default).
         #[arg(long)]
         unread: bool,
         /// Show all messages (no filtering).
@@ -3006,7 +3031,8 @@ pub enum RobotSubcommand {
         /// Filter by event kind (message, reservation, agent).
         #[arg(long)]
         kind: Option<String>,
-        /// Filter by event source.
+        /// Filter by event source (an agent name, case-insensitive). The timeline
+        /// covers the whole project; `--agent` does not narrow it.
         #[arg(long)]
         source: Option<String>,
     },
@@ -3031,6 +3057,9 @@ pub enum RobotSubcommand {
         /// Show messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
+        /// Require the configured MCP server, even when its mailbox differs from local configuration.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Full-text search with facets and relevance scores.
@@ -3046,18 +3075,30 @@ pub enum RobotSubcommand {
         /// Limit results to messages after this timestamp.
         #[arg(long)]
         since: Option<String>,
+        /// Maximum matches to return, from 1 through 1000.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Continue from next_cursor using the same query and filters.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 
     /// Single message with thread position, adjacent messages, sender info.
     Message {
         /// Message ID.
         id: i64,
+        /// Require the configured MCP server, even when its mailbox differs from local configuration.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Resolve any resource:// URI and return in robot format.
     Navigate {
         /// Resource URI (e.g. resource://inbox/AgentName).
         uri: String,
+        /// Read a reservation resource from the configured MCP server, without local DB access.
+        #[arg(long)]
+        server: bool,
     },
 
     // ── Track 4: Monitoring & Analytics ─────────────────────────────────
@@ -3069,12 +3110,16 @@ pub enum RobotSubcommand {
         /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
-        /// Show only conflicting reservations.
+        /// Add the overlapping subset (`conflicting_active`) to the view;
+        /// `all_active`, conflicts and expiring reservations stay listed.
         #[arg(long)]
         conflicts: bool,
         /// Warn about reservations expiring within N minutes.
         #[arg(long)]
         expiring: Option<u32>,
+        /// Read the configured MCP server without opening the local database.
+        #[arg(long)]
+        server: bool,
     },
 
     /// Tool performance summary (calls, errors, error%, latency percentiles).
@@ -3116,7 +3161,8 @@ pub enum RobotSubcommand {
     /// Project summary with per-project agent/message/reservation counts.
     Projects,
 
-    /// Attachment inventory with type, size, provenance, storage mode.
+    /// Attachment inventory: name, storage mode, type, size and provenance
+    /// (sender, message), from the newest 100 messages that carry attachments.
     Attachments,
 
     // ── Track 5: Air Traffic Controller ─────────────────────────────────
@@ -3125,10 +3171,11 @@ pub enum RobotSubcommand {
         /// Show only decisions/executions at or after this ISO-8601 timestamp.
         #[arg(long)]
         since: Option<String>,
-        /// Filter open-stratum counters to a matching canonical stratum key.
+        /// Filter open-stratum counters to stratum keys containing this text
+        /// (case-insensitive), e.g. `liveness` or a full key like `liveness:probe:0`.
         #[arg(long)]
         stratum: Option<String>,
-        /// Only render the summary block.
+        /// Only render the summary block (and the latest canary verdict).
         #[arg(long)]
         summary_only: bool,
         /// Maximum items to show.
@@ -3345,8 +3392,7 @@ fn resolved_project_flag_or_env(flag: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| {
-            std::env::var("AGENT_MAIL_PROJECT")
-                .ok()
+            mcp_agent_mail_core::config::process_env_value("AGENT_MAIL_PROJECT")
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
@@ -5267,6 +5313,9 @@ fn build_status_with_phase(
 
     // 1. Inbox counts (agent-specific, if resolved)
     let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
+        // Direct and shared obligations must describe the same observation.
+        // A plain status read creates neither receipts nor agent activity.
+        let snapshot = RobotInboxReadSnapshot::begin(conn)?;
         let inbox_sql = "
             SELECT
                 SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread,
@@ -5289,7 +5338,7 @@ fn build_status_with_phase(
                 ],
             )
             .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
-        if let Some(row) = rows.first() {
+        let direct = if let Some(row) = rows.first() {
             (
                 row.get_named::<i64>("unread").unwrap_or(0) as usize,
                 row.get_named::<i64>("urgent").unwrap_or(0) as usize,
@@ -5298,7 +5347,23 @@ fn build_status_with_phase(
             )
         } else {
             (0, 0, 0, 0)
-        }
+        };
+        let shared = mcp_agent_mail_db::project_mailbox::project_mailbox_inbox_counts_from_conn(
+            conn, project_id, *agent_id, threshold,
+        )
+        .map_err(|error| CliError::Other(format!("project inbox counts failed: {error}")))?;
+        snapshot.finish()?;
+        let add = |direct: usize, shared: usize| {
+            direct
+                .checked_add(shared)
+                .ok_or_else(|| CliError::Other("inbox count overflow".to_string()))
+        };
+        (
+            add(direct.0, shared.unread)?,
+            add(direct.1, shared.urgent)?,
+            add(direct.2, shared.ack_required)?,
+            add(direct.3, shared.ack_overdue)?,
+        )
     } else {
         (0, 0, 0, 0)
     };
@@ -5629,8 +5694,35 @@ fn build_status_with_snapshot_cache(
     project_id: i64,
     project_slug: &str,
     agent: Option<(i64, String)>,
+    phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<(StatusData, Vec<String>), CliError> {
+    let snapshot = RobotInboxReadSnapshot::begin(conn)?;
+    let result =
+        build_status_with_snapshot_cache_in_snapshot(conn, project_id, project_slug, agent, phase)?;
+    snapshot.finish()?;
+    Ok(result)
+}
+
+fn build_status_with_snapshot_cache_in_snapshot(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
     mut phase: Option<&mut TailLatencyPhaseRecorder>,
 ) -> Result<(StatusData, Vec<String>), CliError> {
+    // Shared visibility and receipts can change without touching the legacy
+    // generation's direct-recipient or last-active timestamps. As for the
+    // inbox cache, only a proven direct-only project may use that generation.
+    // Failed schema observations go through the live reader, which reports
+    // the error instead of returning stale or apparently empty mail.
+    if agent.is_some()
+        && !mcp_agent_mail_db::project_mailbox::has_project_mailbox_deliveries(conn, project_id)
+            .is_ok_and(|present| !present)
+    {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_shared_state");
+        return build_status_with_phase(conn, project_id, project_slug, agent, phase);
+    }
+
     let db_identity = robot_db_identity(conn);
     let generation = match robot_status_snapshot_generation(conn, project_id) {
         Ok(generation) => {
@@ -5916,7 +6008,214 @@ struct RobotInboxServerRequest {
 struct ServerInboxEntry {
     entry: InboxEntry,
     bucket: i64,
+    ack_overdue: bool,
     created_ts: i64,
+}
+
+struct RobotInboxReadSnapshot<'a> {
+    conn: &'a DbConn,
+    active: bool,
+}
+
+impl<'a> RobotInboxReadSnapshot<'a> {
+    fn begin(conn: &'a DbConn) -> Result<Self, CliError> {
+        conn.execute_raw("SAVEPOINT am_robot_inbox")
+            .map_err(|error| CliError::Other(format!("inbox snapshot failed: {error}")))?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn finish(mut self) -> Result<(), CliError> {
+        self.conn
+            .execute_raw("RELEASE SAVEPOINT am_robot_inbox")
+            .map_err(|error| CliError::Other(format!("inbox snapshot release failed: {error}")))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RobotInboxReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_raw("RELEASE SAVEPOINT am_robot_inbox");
+        }
+    }
+}
+
+struct InboxPriority {
+    bucket: i64,
+    label: &'static str,
+    ack_status: &'static str,
+    ack_overdue: bool,
+}
+
+fn inbox_priority(
+    importance: &str,
+    ack_required: bool,
+    read_ts: Option<i64>,
+    ack_ts: Option<i64>,
+    created_ts: i64,
+    ack_threshold: i64,
+) -> InboxPriority {
+    let ack_overdue = ack_required && ack_ts.is_none() && created_ts < ack_threshold;
+    let (bucket, label) = if matches!(importance, "urgent" | "high") && read_ts.is_none() {
+        (1, "urgent")
+    } else if ack_overdue {
+        (2, "ack-overdue")
+    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
+        (3, "ack-required")
+    } else if read_ts.is_none() {
+        (4, "unread")
+    } else if ack_required && ack_ts.is_none() {
+        (5, "read-unacked")
+    } else {
+        (6, "read")
+    };
+    let ack_status = if !ack_required {
+        "none"
+    } else if ack_ts.is_some() {
+        "acked"
+    } else if ack_overdue {
+        "overdue"
+    } else if read_ts.is_some() {
+        "pending"
+    } else {
+        "required"
+    };
+    InboxPriority {
+        bucket,
+        label,
+        ack_status,
+        ack_overdue,
+    }
+}
+
+fn project_inbox_candidates(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    request: &RobotInboxServerRequest,
+    now_us: i64,
+    ack_threshold: i64,
+) -> Result<Vec<ServerInboxEntry>, CliError> {
+    use mcp_agent_mail_db::sync::{InboxBodyPolicy, InboxFetchOptions};
+
+    let base = InboxFetchOptions {
+        urgent_only: false,
+        unread_only: false,
+        ack_required_only: false,
+        ack_overdue_before: None,
+        topic: None,
+        body_policy: if request.include_bodies {
+            InboxBodyPolicy::Full
+        } else {
+            InboxBodyPolicy::MetadataOnly
+        },
+    };
+    let urgent = InboxFetchOptions {
+        urgent_only: true,
+        unread_only: true,
+        ..base
+    };
+    let overdue = InboxFetchOptions {
+        ack_overdue_before: Some(ack_threshold),
+        ..base
+    };
+
+    // A newest-only window can hide old urgent mail. Each window contains
+    // one priority bucket and possibly higher buckets, so their bounded union
+    // contains every row the final priority-ordered limit can select.
+    let windows = if request.urgent {
+        vec![urgent]
+    } else if request.ack_overdue {
+        vec![
+            InboxFetchOptions {
+                ack_overdue_before: Some(ack_threshold),
+                ..urgent
+            },
+            overdue,
+        ]
+    } else {
+        let mut windows = vec![
+            urgent,
+            overdue,
+            InboxFetchOptions {
+                ack_required_only: true,
+                unread_only: true,
+                ..base
+            },
+            InboxFetchOptions {
+                unread_only: true,
+                ..base
+            },
+        ];
+        if request.all || !request.unread {
+            windows.push(InboxFetchOptions {
+                ack_required_only: true,
+                ..base
+            });
+        }
+        if request.all {
+            windows.push(base);
+        }
+        windows
+    };
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let display_names = mcp_agent_mail_db::sync::agent_display_names_from_conn(conn, project_id)
+        .map_err(|error| CliError::Other(format!("project inbox labels failed: {error}")))?;
+    for options in windows {
+        let rows = mcp_agent_mail_db::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            conn,
+            project_id,
+            agent_id,
+            None,
+            request.limit,
+            options,
+        )
+        .map_err(|error| CliError::Other(format!("project inbox query failed: {error}")))?;
+        for row in rows {
+            let message = row.message;
+            let id = message.id.ok_or_else(|| {
+                CliError::Other("project inbox message has no persisted id".to_string())
+            })?;
+            if !seen.insert(id) {
+                continue;
+            }
+            let priority = inbox_priority(
+                &message.importance,
+                message.ack_required != 0,
+                row.read_ts,
+                row.ack_ts,
+                message.created_ts,
+                ack_threshold,
+            );
+            candidates.push(ServerInboxEntry {
+                entry: InboxEntry {
+                    id,
+                    priority: priority.label.to_string(),
+                    from: row.sender_name,
+                    sender_display_name: row.sender_display_name,
+                    to_display_names: crate::inbox_visible_to_display_names(
+                        &message.recipients_json,
+                        &display_names,
+                    ),
+                    subject: message.subject,
+                    topic: message.topic,
+                    thread: canonical_thread_ref(id, message.thread_id.as_deref().unwrap_or("")),
+                    age: format_age(age_seconds_from_micros(now_us, message.created_ts)),
+                    ack_status: priority.ack_status.to_string(),
+                    importance: message.importance,
+                    via: Some("project".to_string()),
+                    body_md: request.include_bodies.then_some(message.body_md),
+                },
+                bucket: priority.bucket,
+                ack_overdue: priority.ack_overdue,
+                created_ts: message.created_ts,
+            });
+        }
+    }
+    Ok(candidates)
 }
 
 fn render_inbox_result(
@@ -5961,6 +6260,19 @@ fn robot_server_project_key(project_flag: Option<&str>) -> Result<String, CliErr
     Ok(cwd.to_string_lossy().into_owned())
 }
 
+fn automatic_robot_project_selection(
+    project_flag: Option<&str>,
+) -> Result<crate::message_read::ProjectSelection, CliError> {
+    if let Some(key) = resolved_project_flag_or_env(project_flag) {
+        return Ok(crate::message_read::ProjectSelection::Exact(key));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("cannot get CWD: {error}")))?;
+    Ok(crate::message_read::ProjectSelection::Ancestors(
+        cwd.to_string_lossy().into_owned(),
+    ))
+}
+
 fn build_robot_inbox_server_request(
     project_flag: Option<&str>,
     agent_flag: Option<&str>,
@@ -5986,193 +6298,308 @@ fn build_robot_inbox_server_request(
     }))
 }
 
+/// No candidates when this mailbox's server cannot be confirmed: the caller
+/// labels its local fallback rather than guessing an endpoint.
 fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
-    crate::check_inbox_server_urls_for_agent_mail_url(
-        &crate::local_server_url(config),
-        &config.http_path,
+    crate::local_server_url(config).map_or_else(
+        |_| Vec::new(),
+        |url| crate::check_inbox_server_urls_for_agent_mail_url(&url, &config.http_path),
     )
 }
 
-fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json::Value {
-    let ack_overdue_only = !request.urgent && request.ack_overdue;
-    let unread_only = if request.urgent {
-        true
-    } else if ack_overdue_only || request.all {
-        false
-    } else {
-        request.unread
-    };
-    serde_json::json!({
-        "project_key": request.project_key,
-        "agent_name": request.agent_name,
-        "urgent_only": request.urgent,
-        "limit": i32::try_from(request.limit).unwrap_or(i32::MAX),
-        "include_bodies": request.include_bodies,
-        "unread_only": unread_only,
-        "ack_overdue_only": ack_overdue_only,
-        // `am inbox` is a listing, not a consumption: without this the
-        // fetch_inbox tool auto-marks every returned row read, and the
-        // client-side bucket filter then hides those same rows from the very
-        // response that consumed them — messages nobody ever saw become
-        // permanently invisible to the default unread-only view (GH#229).
-        // Read-state changes are left to explicit `am mail read` / ack, the
-        // same non-consuming-peek contract check-inbox adopted in GH#207.
-        "mark_read": false,
+const ROBOT_INBOX_SNAPSHOT_LIMIT_MAX: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboxSnapshotAgent {
+    id: i64,
+    project_id: i64,
+    name: String,
+    inception_ts: i64,
+}
+
+fn invalid_inbox_snapshot(detail: &str) -> CliError {
+    CliError::Other(format!(
+        "invalid server inbox snapshot: {detail}; refusing unverified inbox data"
+    ))
+}
+
+fn inbox_snapshot_text<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, CliError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("missing or invalid {key}")))
+}
+
+fn inbox_snapshot_optional_text<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, CliError> {
+    match value.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(invalid_inbox_snapshot(&format!("invalid {key}"))),
+    }
+}
+
+fn inbox_snapshot_timestamp(value: &serde_json::Value, key: &str) -> Result<i64, CliError> {
+    mcp_agent_mail_db::iso_to_micros(inbox_snapshot_text(value, key)?)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("invalid {key} timestamp")))
+}
+
+fn inbox_snapshot_optional_timestamp(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<Option<i64>, CliError> {
+    // Missing receipts cannot be treated as unread/unacknowledged.
+    if value.get(key) == Some(&serde_json::Value::Null) {
+        return Ok(None);
+    }
+    inbox_snapshot_timestamp(value, key).map(Some)
+}
+
+fn inbox_snapshot_positive_id(value: &serde_json::Value, key: &str) -> Result<i64, CliError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| invalid_inbox_snapshot(&format!("missing or invalid {key}")))
+}
+
+fn inbox_snapshot_agent(
+    value: &serde_json::Value,
+    project_id: i64,
+) -> Result<InboxSnapshotAgent, CliError> {
+    let name = inbox_snapshot_text(value, "name")?;
+    if name.trim().is_empty()
+        || value.get("project_id").and_then(serde_json::Value::as_i64) != Some(project_id)
+    {
+        return Err(invalid_inbox_snapshot("invalid agent name or project"));
+    }
+    Ok(InboxSnapshotAgent {
+        id: inbox_snapshot_positive_id(value, "id")?,
+        project_id,
+        name: name.to_string(),
+        inception_ts: inbox_snapshot_timestamp(value, "inception_ts")?,
     })
 }
 
-fn server_inbox_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
-    if let Some(rows) = payload.as_array() {
-        return Some(rows);
-    }
-    if let Some(rows) = payload
-        .get("messages")
+fn resolve_server_inbox_agent(
+    descriptor: &serde_json::Value,
+    project_id: i64,
+    requested_name: &str,
+) -> Result<InboxSnapshotAgent, CliError> {
+    let agents = descriptor
+        .get("agents")
         .and_then(serde_json::Value::as_array)
-    {
-        return Some(rows);
+        .ok_or_else(|| invalid_inbox_snapshot("missing project agent roster"))?;
+    let mut selected = None;
+    for value in agents {
+        let agent = inbox_snapshot_agent(value, project_id)?;
+        if agent.name.eq_ignore_ascii_case(requested_name.trim()) {
+            if selected.is_some() {
+                return Err(invalid_inbox_snapshot("ambiguous requested agent"));
+            }
+            selected = Some(agent);
+        }
     }
-    payload.get("result").and_then(serde_json::Value::as_array)
-}
-
-fn server_inbox_iso_micros(row: &serde_json::Value, key: &str) -> Option<i64> {
-    row.get(key)
-        .and_then(serde_json::Value::as_str)
-        .and_then(mcp_agent_mail_db::iso_to_micros)
+    selected
+        .ok_or_else(|| invalid_inbox_snapshot("requested agent is absent from the project roster"))
 }
 
 fn server_inbox_row_to_entry(
     row: &serde_json::Value,
+    project_id: i64,
     now_us: i64,
     ack_threshold: i64,
     include_bodies: bool,
-) -> ServerInboxEntry {
-    let id = row
-        .get("id")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let importance = row
-        .get("importance")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("normal")
-        .to_string();
-    let read_ts = server_inbox_iso_micros(row, "read_ts");
-    let ack_ts = server_inbox_iso_micros(row, "ack_ts");
-    let created_ts = server_inbox_iso_micros(row, "created_ts").unwrap_or(0);
+) -> Result<ServerInboxEntry, CliError> {
+    let id = inbox_snapshot_positive_id(row, "id")?;
+    inbox_snapshot_positive_id(row, "sender_id")?;
+    let from = inbox_snapshot_text(row, "from")?;
+    if from.trim().is_empty()
+        || row.get("project_id").and_then(serde_json::Value::as_i64) != Some(project_id)
+    {
+        return Err(invalid_inbox_snapshot("invalid sender or message project"));
+    }
+    let importance = inbox_snapshot_text(row, "importance")?;
+    if !matches!(importance, "low" | "normal" | "high" | "urgent") {
+        return Err(invalid_inbox_snapshot("invalid importance"));
+    }
+    let read_ts = inbox_snapshot_optional_timestamp(row, "read_ts")?;
+    let ack_ts = inbox_snapshot_optional_timestamp(row, "ack_ts")?;
+    let created_ts = inbox_snapshot_timestamp(row, "created_ts")?;
     let ack_required = row
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let bucket = if matches!(importance.as_str(), "urgent" | "high") && read_ts.is_none() {
-        1
-    } else if ack_required && ack_ts.is_none() && created_ts < ack_threshold {
-        2
-    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
-        3
-    } else if read_ts.is_none() {
-        4
-    } else if ack_required && ack_ts.is_none() {
-        5
-    } else {
-        6
-    };
-    let priority = match bucket {
-        1 => "urgent",
-        2 => "ack-overdue",
-        3 => "ack-required",
-        4 => "unread",
-        5 => "read-unacked",
-        _ => "read",
+        .ok_or_else(|| invalid_inbox_snapshot("invalid acknowledgement requirement"))?;
+    let kind = inbox_snapshot_text(row, "kind")?;
+    let via = inbox_snapshot_optional_text(row, "via")?;
+    if !matches!(kind, "to" | "cc" | "bcc" | "project")
+        || (kind == "project" && via != Some("project"))
+        || (kind != "project" && via.is_some())
+    {
+        return Err(invalid_inbox_snapshot(
+            "invalid delivery kind or project mailbox marker",
+        ));
     }
-    .to_string();
-    let ack_status = if !ack_required {
-        "none".to_string()
-    } else if ack_ts.is_some() {
-        "acked".to_string()
-    } else if bucket == 2 {
-        "overdue".to_string()
-    } else if read_ts.is_some() {
-        "pending".to_string()
+    let body_md = if include_bodies {
+        Some(inbox_snapshot_text(row, "body_md")?.to_string())
     } else {
-        "required".to_string()
+        if row.get("body_md").is_some() {
+            return Err(invalid_inbox_snapshot(
+                "body returned for a metadata-only inbox",
+            ));
+        }
+        None
     };
-    let thread_id = row
-        .get("thread_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let priority = inbox_priority(
+        importance,
+        ack_required,
+        read_ts,
+        ack_ts,
+        created_ts,
+        ack_threshold,
+    );
+    let thread_id = inbox_snapshot_optional_text(row, "thread_id")?.unwrap_or_default();
     let age_seconds = age_seconds_from_micros(now_us, created_ts);
-    ServerInboxEntry {
+    Ok(ServerInboxEntry {
         entry: InboxEntry {
             id,
-            priority,
-            from: row
-                .get("from")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            subject: row
-                .get("subject")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            topic: row
-                .get("topic")
+            priority: priority.label.to_string(),
+            from: from.to_string(),
+            subject: inbox_snapshot_text(row, "subject")?.to_string(),
+            topic: inbox_snapshot_optional_text(row, "topic")?.map(str::to_string),
+            sender_display_name: row
+                .get("sender_display_name")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            to_display_names: row
+                .get("to_display_names")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             thread: canonical_thread_ref(id, thread_id),
             age: format_age(age_seconds),
-            ack_status,
-            importance,
-            body_md: if include_bodies {
-                row.get("body_md")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            },
+            ack_status: priority.ack_status.to_string(),
+            importance: importance.to_string(),
+            via: via.map(str::to_string),
+            body_md,
         },
-        bucket,
+        bucket: priority.bucket,
+        ack_overdue: priority.ack_overdue,
         created_ts,
-    }
+    })
 }
 
-fn build_inbox_from_server_payload(
+fn validate_inbox_priority_snapshot(
     payload: &serde_json::Value,
     request: &RobotInboxServerRequest,
+    project: &crate::context::ResolvedProject,
+    agent: &InboxSnapshotAgent,
 ) -> Result<InboxResult, CliError> {
-    let rows = server_inbox_rows(payload)
-        .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
-    let now_us = mcp_agent_mail_db::now_micros();
-    let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
-    let mut projected = rows
-        .iter()
-        .map(|row| server_inbox_row_to_entry(row, now_us, ack_threshold, request.include_bodies))
-        .filter(|row| {
-            if request.urgent {
-                row.bucket == 1
-            } else if request.ack_overdue {
-                row.bucket == 2
-            } else if request.all {
-                true
-            } else if request.unread {
-                row.bucket <= 4
-            } else {
-                row.bucket <= 5
-            }
-        })
-        .collect::<Vec<_>>();
-    projected.sort_by(|left, right| {
-        left.bucket
-            .cmp(&right.bucket)
-            .then_with(|| right.created_ts.cmp(&left.created_ts))
-            .then_with(|| right.entry.id.cmp(&left.entry.id))
-    });
-    projected.truncate(request.limit);
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || payload.get("complete").and_then(serde_json::Value::as_bool) != Some(true)
+        || payload.get("limit").and_then(serde_json::Value::as_u64)
+            != u64::try_from(request.limit).ok()
+    {
+        return Err(invalid_inbox_snapshot(
+            "unsupported, incomplete or differently bounded snapshot",
+        ));
+    }
+    for (key, expected) in [
+        ("urgent", request.urgent),
+        ("ack_overdue", request.ack_overdue),
+        ("unread", request.unread),
+        ("all", request.all),
+        ("include_bodies", request.include_bodies),
+    ] {
+        if payload.get(key).and_then(serde_json::Value::as_bool) != Some(expected) {
+            return Err(invalid_inbox_snapshot(
+                "snapshot filters do not match the request",
+            ));
+        }
+    }
+    let snapshot_project = crate::reservation_read::validate_project(
+        payload
+            .get("project")
+            .ok_or_else(|| invalid_inbox_snapshot("missing project identity"))?,
+        &project.slug,
+    )?;
+    let snapshot_agent = inbox_snapshot_agent(
+        payload
+            .get("agent")
+            .ok_or_else(|| invalid_inbox_snapshot("missing agent identity"))?,
+        project.id,
+    )?;
+    if !crate::reservation_read::same_project(project, &snapshot_project)
+        || &snapshot_agent != agent
+    {
+        return Err(invalid_inbox_snapshot(
+            "snapshot project or agent identity mismatch",
+        ));
+    }
+    let now_us = inbox_snapshot_timestamp(payload, "captured_ts")?;
+    let ack_threshold = inbox_snapshot_timestamp(payload, "ack_overdue_before")?;
+    if ack_threshold != micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US) {
+        return Err(invalid_inbox_snapshot("inconsistent acknowledgement clock"));
+    }
+    let rows = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_inbox_snapshot("missing message rows"))?;
+    if rows.len() > request.limit
+        || rows.len() > ROBOT_INBOX_SNAPSHOT_LIMIT_MAX
+        || payload.get("count").and_then(serde_json::Value::as_u64)
+            != u64::try_from(rows.len()).ok()
+    {
+        return Err(invalid_inbox_snapshot(
+            "snapshot count or row bound mismatch",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(rows.len());
+    let mut previous = None;
+    let mut projected = Vec::with_capacity(rows.len());
+    for value in rows {
+        let row = server_inbox_row_to_entry(
+            value,
+            project.id,
+            now_us,
+            ack_threshold,
+            request.include_bodies,
+        )?;
+        let matches = if request.urgent {
+            row.bucket == 1
+        } else if request.ack_overdue {
+            row.ack_overdue
+        } else if request.all {
+            true
+        } else if request.unread {
+            row.bucket <= 4
+        } else {
+            row.bucket <= 5
+        };
+        let key = (
+            row.bucket,
+            std::cmp::Reverse(row.created_ts),
+            std::cmp::Reverse(row.entry.id),
+        );
+        if !matches || !seen.insert(row.entry.id) || previous.is_some_and(|prior| prior > key) {
+            return Err(invalid_inbox_snapshot(
+                "duplicate, out-of-order or out-of-scope message",
+            ));
+        }
+        previous = Some(key);
+        projected.push(row);
+    }
 
     let mut overdue_ids = Vec::new();
     let entries = projected
         .into_iter()
         .map(|row| {
-            if row.bucket == 2 {
+            if row.ack_overdue {
                 overdue_ids.push(row.entry.id);
             }
             row.entry
@@ -6225,58 +6652,69 @@ fn build_inbox_from_server_payload(
 fn try_build_inbox_via_server(
     request: &RobotInboxServerRequest,
     config: &mcp_agent_mail_core::Config,
-) -> Result<Option<InboxResult>, CliError> {
-    let urls = robot_inbox_server_urls(config);
-    if urls.is_empty() {
+    selection: &crate::message_read::ProjectSelection,
+) -> Result<Option<(InboxResult, String, String)>, CliError> {
+    // Preserve the existing zero/unbounded local requests and special Git
+    // project identities before accepting any daemon as the read authority.
+    if request.limit == 0
+        || request.limit > ROBOT_INBOX_SNAPSHOT_LIMIT_MAX
+        || !selection.permits_automatic_read(config)
+    {
         return Ok(None);
     }
-    let bearer = crate::local_server_bearer_token(config);
-    let mut last_unavailable: Option<(String, String)> = None;
-
-    for server_url in urls {
-        let arguments = robot_inbox_server_arguments(request);
-        let call = crate::context::run_async(async {
-            Ok(crate::try_call_server_tool(
-                &server_url,
-                bearer.as_deref(),
-                "fetch_inbox",
-                arguments,
-            )
-            .await)
-        })?;
-        match call {
-            crate::ServerToolCall::Success(result) => {
-                let payload = crate::coerce_tool_result_json_or_error("fetch_inbox", result)?;
-                return build_inbox_from_server_payload(&payload, request).map(Some);
-            }
-            crate::ServerToolCall::Unavailable(message) => {
-                last_unavailable = Some((server_url, message));
-            }
-            crate::ServerToolCall::Rejected(message) => {
-                if crate::mail_server_rejection_allows_local_fallback(&message) {
-                    tracing::debug!(
-                        message = %message,
-                        "robot inbox fell back to local scope after server scope mismatch"
-                    );
-                    return Ok(None);
-                }
-                return Err(CliError::Other(format!(
-                    "fetch_inbox via server failed: {message}"
-                )));
-            }
+    crate::context::run_async(async {
+        let Some(session) =
+            crate::reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        if !selection.supported_by(&session) || !session.supports_inbox_priority_snapshot() {
+            return Ok(None);
         }
-    }
-
-    if let Some((server_url, message)) = last_unavailable {
-        crate::reject_local_fallback_if_mailbox_owned(
-            "robot inbox",
-            &server_url,
-            &message,
-            &config.database_url,
-            config.storage_root.as_path(),
+        // Retired agents retain direct-mail history. The ordinary directory
+        // lists available recipients, so explicitly include historical
+        // identities in both witnesses after negotiating this capability.
+        let project_uri = format!(
+            "{}&include_retired=true",
+            crate::message_read::project_resource_uri(selection)?
+        );
+        let (project, descriptor) =
+            crate::message_read::read_project_descriptor(&session, &project_uri, selection).await?;
+        let agent = resolve_server_inbox_agent(&descriptor, project.id, &request.agent_name)?;
+        let uri = format!(
+            "resource://inbox/{}?project={}&context=true&urgent={}&ack_overdue={}&unread={}&all={}&limit={}&include_bodies={}&format=json",
+            crate::reservation_read::encode_resource_component(&agent.name),
+            crate::reservation_read::encode_resource_component(&project.slug),
+            request.urgent,
+            request.ack_overdue,
+            request.unread,
+            request.all,
+            request.limit,
+            request.include_bodies,
+        );
+        let canonical_request = RobotInboxServerRequest {
+            project_key: project.slug.clone(),
+            agent_name: agent.name.clone(),
+            ..request.clone()
+        };
+        let result = validate_inbox_priority_snapshot(
+            &session.read(&uri).await?,
+            &canonical_request,
+            &project,
+            &agent,
         )?;
-    }
-    Ok(None)
+        let (after_project, after) =
+            crate::message_read::read_project_descriptor(&session, &project_uri, selection).await?;
+        if !crate::reservation_read::same_project(&project, &after_project)
+            || resolve_server_inbox_agent(&after, after_project.id, &request.agent_name)? != agent
+        {
+            return Err(invalid_inbox_snapshot(
+                "project or agent identity changed during inbox read",
+            ));
+        }
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((result, project.slug, agent.name)))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6374,16 +6812,30 @@ fn build_inbox_with_phase(
     let now_us = mcp_agent_mail_db::now_micros();
     // ack_overdue threshold: 30 minutes
     let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
+    let snapshot = RobotInboxReadSnapshot::begin(conn)?;
+    let request = RobotInboxServerRequest {
+        project_key: project_slug.to_string(),
+        agent_name: agent_name.to_string(),
+        urgent: urgent_only,
+        ack_overdue: ack_overdue_only,
+        unread: unread_only,
+        all: show_all,
+        limit,
+        include_bodies,
+    };
 
     // Build WHERE filter based on flags
     let bucket_filter = if urgent_only {
         "AND priority_bucket = 1"
     } else if ack_overdue_only {
-        "AND priority_bucket = 2"
+        // Urgent unread mail ranks in bucket 1 even once its ack is overdue;
+        // `robot status` counts it as overdue and points here, so match on
+        // the overdue condition rather than the bucket.
+        "AND sub.ack_overdue = 1"
     } else if show_all {
         "" // no filter
     } else if unread_only {
-        "AND priority_bucket <= 4" // unread only (read_ts IS NULL)
+        "AND priority_bucket <= 4" // unread, plus read mail whose ack is overdue
     } else {
         "AND priority_bucket <= 5" // include read but un-acked messages
     };
@@ -6396,11 +6848,12 @@ fn build_inbox_with_phase(
     let sql = format!(
         "SELECT sub.id, sub.subject, sub.topic, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
-                sub.priority_bucket,
-                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
+                sub.priority_bucket, sub.ack_overdue, sub.recipients_json,
+                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
+                a_sender.display_name AS sender_display_name
          FROM (
              SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required,
-                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select},
+                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select}, m.recipients_json,
                     CASE
                         WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 2
@@ -6408,14 +6861,18 @@ fn build_inbox_with_phase(
                         WHEN mr.read_ts IS NULL THEN 4
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 5
                         ELSE 6
-                    END AS priority_bucket
+                    END AS priority_bucket,
+                    CASE
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 1
+                        ELSE 0
+                    END AS ack_overdue
              FROM message_recipients mr
              JOIN messages m ON m.id = mr.message_id
              WHERE mr.agent_id = ? AND m.project_id = ?
          ) sub
          LEFT JOIN agents a_sender ON a_sender.id = sub.sender_id
          WHERE 1=1 {bucket_filter}
-         ORDER BY sub.priority_bucket ASC, sub.created_ts DESC
+         ORDER BY sub.priority_bucket ASC, sub.created_ts DESC, sub.id DESC
          LIMIT ?"
     );
 
@@ -6423,6 +6880,7 @@ fn build_inbox_with_phase(
         .query_sync(
             &sql,
             &[
+                Value::BigInt(ack_threshold),
                 Value::BigInt(ack_threshold),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
@@ -6432,12 +6890,15 @@ fn build_inbox_with_phase(
         .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
     mark_tail_latency_phase(&mut phase, "sqlite_query");
 
-    let mut entries = Vec::new();
-    let mut overdue_ids = Vec::new();
+    let mut projected = Vec::new();
+
+    let display_names = mcp_agent_mail_db::sync::agent_display_names_from_conn(conn, project_id)
+        .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
 
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
         let bucket: i64 = row.get_named("priority_bucket").unwrap_or(7);
+        let ack_overdue = row.get_named::<i64>("ack_overdue").unwrap_or(0) == 1;
         let sender: String = row.get_named("sender_name").unwrap_or_default();
         let subject: String = row.get_named("subject").unwrap_or_default();
         let topic: Option<String> = row.get_named("topic").ok();
@@ -6462,7 +6923,7 @@ fn build_inbox_with_phase(
             "none".to_string()
         } else if ack_ts.is_some() {
             "acked".to_string()
-        } else if bucket == 2 {
+        } else if ack_overdue {
             "overdue".to_string()
         } else if read_ts.is_some() {
             "pending".to_string()
@@ -6472,29 +6933,63 @@ fn build_inbox_with_phase(
 
         let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
-        if bucket == 2 {
-            overdue_ids.push(id);
-        }
-
         let body_md = if include_bodies {
             row.get_named::<String>("body_md").ok()
         } else {
             None
         };
 
-        entries.push(InboxEntry {
-            id,
-            priority: priority_label.to_string(),
-            from: sender,
-            subject,
-            topic,
-            thread: thread_ref,
-            age: format_age(age_seconds),
-            ack_status,
-            importance,
-            body_md,
+        projected.push(ServerInboxEntry {
+            entry: InboxEntry {
+                id,
+                priority: priority_label.to_string(),
+                from: sender,
+                sender_display_name: row.get_named("sender_display_name").ok(),
+                to_display_names: crate::inbox_visible_to_display_names(
+                    &row.get_named::<String>("recipients_json")
+                        .unwrap_or_default(),
+                    &display_names,
+                ),
+                subject,
+                topic,
+                thread: thread_ref,
+                age: format_age(age_seconds),
+                ack_status,
+                importance,
+                via: None,
+                body_md,
+            },
+            bucket,
+            ack_overdue,
+            created_ts,
         });
     }
+    projected.extend(project_inbox_candidates(
+        conn,
+        project_id,
+        agent_id,
+        &request,
+        now_us,
+        ack_threshold,
+    )?);
+    snapshot.finish()?;
+    projected.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| right.created_ts.cmp(&left.created_ts))
+            .then_with(|| right.entry.id.cmp(&left.entry.id))
+    });
+    projected.truncate(limit);
+    let mut overdue_ids = Vec::new();
+    let entries = projected
+        .into_iter()
+        .map(|row| {
+            if row.ack_overdue {
+                overdue_ids.push(row.entry.id);
+            }
+            row.entry
+        })
+        .collect::<Vec<_>>();
     mark_tail_latency_phase(
         &mut phase,
         if include_bodies {
@@ -6579,6 +7074,41 @@ fn build_inbox_with_snapshot_cache(
         );
     }
 
+    // The legacy generation stamp follows direct-recipient touches only.
+    // Shared visibility also depends on lazy receipts and viewer retirement/
+    // contact policy. Probe deliveries without visibility so a retired viewer
+    // cannot receive cached formerly-visible mail. A failed schema probe also
+    // bypasses the cache and lets the authoritative live reader report it.
+    let direct_only = conn
+        .query_sync(
+            "SELECT message_id FROM project_mailbox_deliveries WHERE project_id = ? LIMIT 1",
+            &[Value::BigInt(project_id)],
+        )
+        .is_ok_and(|rows| rows.is_empty())
+        && conn
+            .query_sync(
+                "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+                &[],
+            )
+            .is_ok();
+    if !direct_only {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_shared_state");
+        return build_inbox_with_phase(
+            conn,
+            project_id,
+            project_slug,
+            agent_id,
+            agent_name,
+            urgent_only,
+            ack_overdue_only,
+            unread_only,
+            show_all,
+            limit,
+            include_bodies,
+            phase,
+        );
+    }
+
     let db_identity = robot_db_identity(conn);
     let generation = match robot_status_snapshot_generation(conn, project_id) {
         Ok(generation) => {
@@ -6625,10 +7155,30 @@ fn build_inbox_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
+        && entry
+            .result
+            .entries
+            .iter()
+            .all(|message| message.via.is_none())
         && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
-        return Ok(entry.result.clone());
+        let mut result = entry.result.clone();
+        let display_names =
+            mcp_agent_mail_db::sync::agent_display_names_from_conn(conn, project_id)
+                .map_err(|e| CliError::Other(format!("inbox display names query failed: {e}")))?;
+        let sender_display_names =
+            inbox_sender_display_names_by_message(conn, project_id, &result.entries)?;
+        for row in &mut result.entries {
+            row.sender_display_name = sender_display_names.get(&row.id).cloned().flatten();
+            for (name, label) in &mut row.to_display_names {
+                *label = display_names
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .flatten();
+            }
+        }
+        return Ok(result);
     }
 
     mark_tail_latency_phase(&mut phase, "snapshot_cache_miss");
@@ -6646,6 +7196,11 @@ fn build_inbox_with_snapshot_cache(
         include_bodies,
         phase,
     )?;
+    // A shared delivery can arrive after the direct-only eligibility probe.
+    // Never store its live result under a generation that cannot track it.
+    if result.entries.iter().any(|message| message.via.is_some()) {
+        return Ok(result);
+    }
     if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
         cache.clear();
     }
@@ -6658,6 +7213,44 @@ fn build_inbox_with_snapshot_cache(
         },
     );
     Ok(result)
+}
+
+fn inbox_sender_display_names_by_message(
+    conn: &DbConn,
+    project_id: i64,
+    entries: &[InboxEntry],
+) -> Result<BTreeMap<i64, Option<String>>, CliError> {
+    if entries.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = entries.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut params = Vec::with_capacity(entries.len() + 1);
+    params.push(Value::BigInt(project_id));
+    params.extend(entries.iter().map(|entry| Value::BigInt(entry.id)));
+    // Cross-project deliveries keep the source agent's global sender_id.
+    // Resolve the current label through that identity even when a recipient
+    // project has an agent with the same routing name.
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT m.id, a.display_name AS sender_display_name
+             FROM messages m LEFT JOIN agents a ON a.id = m.sender_id
+             WHERE m.project_id = ? AND m.id IN ({placeholders})"
+            ),
+            &params,
+        )
+        .map_err(|e| CliError::Other(format!("inbox sender display names query failed: {e}")))?;
+    rows.iter()
+        .map(|row| {
+            let id = row.get_named("id").map_err(|e| {
+                CliError::Other(format!("inbox sender message ID decode failed: {e}"))
+            })?;
+            let label = row.get_named("sender_display_name").map_err(|e| {
+                CliError::Other(format!("inbox sender display name decode failed: {e}"))
+            })?;
+            Ok((id, label))
+        })
+        .collect()
 }
 
 fn load_recipient_display_names(
@@ -6917,12 +7510,15 @@ fn build_outbox_entries(
             id,
             priority: "sent".to_string(),
             from: recipient_names,
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             subject,
             topic,
             thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
             importance,
+            via: None,
             body_md,
         });
     }
@@ -6937,7 +7533,11 @@ fn build_outbox_entries(
 struct ThreadData {
     thread_id: String,
     subject: String,
+    /// Every message in the thread (after `--since`), shown or not.
     message_count: usize,
+    /// Older messages left out by `--limit`; absent when none were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_older: Option<usize>,
     participants: Vec<String>,
     last_activity: String,
     messages: Vec<ThreadMessage>,
@@ -6958,6 +7558,11 @@ impl MarkdownRenderable for ThreadData {
             self.participants.join(", "),
             self.last_activity,
         );
+        if let Some(omitted) = self.omitted_older {
+            md.push_str(&format!(
+                "*{omitted} older message(s) not shown; raise --limit to include them.*\n\n---\n\n"
+            ));
+        }
         for msg in &self.messages {
             let topic_line = msg
                 .topic
@@ -7004,6 +7609,18 @@ fn build_thread(
     }
 
     let where_clause = conditions.join(" AND ");
+    // The newest `--limit` messages are shown; count the rest so a long
+    // thread is not mistaken for a complete one.
+    let total: usize = conn
+        .query_sync(
+            &format!("SELECT COUNT(*) AS n FROM messages m WHERE {where_clause}"),
+            &params,
+        )
+        .map_err(|e| CliError::Other(format!("thread count query failed: {e}")))?
+        .first()
+        .and_then(|row| row.get_named::<i64>("n").ok())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
     let effective_limit = limit.unwrap_or(200);
     params.push(Value::BigInt(
         effective_limit.try_into().unwrap_or(i64::MAX),
@@ -7032,6 +7649,7 @@ fn build_thread(
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("thread query failed: {e}")))?;
     rows.reverse();
+    let omitted = total.saturating_sub(rows.len());
 
     let mut messages = Vec::new();
     let mut last_ts: i64 = 0;
@@ -7071,7 +7689,8 @@ fn build_thread(
         let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
         messages.push(ThreadMessage {
-            position: idx + 1,
+            // Position in the whole thread, not in the shown window.
+            position: omitted + idx + 1,
             from: sender,
             to: to_names.join(", "),
             age: format_age(age_seconds),
@@ -7092,7 +7711,8 @@ fn build_thread(
     Ok(ThreadData {
         thread_id: thread_id.to_string(),
         subject: thread_subject,
-        message_count: messages.len(),
+        message_count: total.max(messages.len()),
+        omitted_older: (omitted > 0).then_some(omitted),
         participants,
         last_activity,
         messages,
@@ -7100,6 +7720,117 @@ fn build_thread(
 }
 
 // ── Message command implementation ──────────────────────────────────────────
+
+fn server_context_ack(
+    message: &mcp_agent_mail_db::message_context::ContextMessage,
+    pending: &str,
+) -> String {
+    if !message.ack_required {
+        "none".into()
+    } else if message.recipient_count > 0 && message.acked_count == message.recipient_count {
+        "done".into()
+    } else if message.acked_count > 0 {
+        format!(
+            "partial ({}/{})",
+            message.acked_count, message.recipient_count
+        )
+    } else {
+        pending.into()
+    }
+}
+
+fn build_thread_from_server(
+    snapshot: mcp_agent_mail_db::message_context::ThreadContextSnapshot,
+) -> ThreadData {
+    let last_ts = snapshot
+        .messages
+        .iter()
+        .map(|message| message.created_ts)
+        .max()
+        .unwrap_or(0);
+    let messages = snapshot
+        .messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let ack = server_context_ack(&message, "required");
+            ThreadMessage {
+                position: snapshot.omitted_older + index + 1,
+                from: message.from,
+                to: message.to.join(", "),
+                age: format_age(age_seconds_from_micros(
+                    snapshot.captured_ts,
+                    message.created_ts,
+                )),
+                importance: message.importance,
+                ack,
+                subject: message.subject,
+                topic: message.topic,
+                body: message.body_md,
+            }
+        })
+        .collect();
+    ThreadData {
+        thread_id: snapshot.thread_id,
+        subject: snapshot.subject,
+        message_count: snapshot.message_count,
+        omitted_older: (snapshot.omitted_older > 0).then_some(snapshot.omitted_older),
+        participants: snapshot.participants,
+        last_activity: if last_ts > 0 {
+            format_age(age_seconds_from_micros(snapshot.captured_ts, last_ts))
+        } else {
+            "unknown".into()
+        },
+        messages,
+    }
+}
+
+fn build_message_from_server(
+    snapshot: mcp_agent_mail_db::message_context::MessageContextSnapshot,
+) -> MessageContext {
+    let message = snapshot.message;
+    let ack_status = server_context_ack(&message, "pending");
+    let adjacent = |value: mcp_agent_mail_db::message_context::AdjacentMessage| {
+        format!(
+            "#{} {}: {}",
+            value.id,
+            value.from,
+            truncate_str(&value.subject, 60)
+        )
+    };
+    let attachments = parse_attachments_json(&message.attachments_json)
+        .into_iter()
+        .map(|attachment| AttachmentInfo {
+            name: attachment.name,
+            size: attachment.size_text,
+            mime_type: attachment.mime_type,
+        })
+        .collect();
+    MessageContext {
+        id: message.id,
+        from: message.from,
+        from_program: message.from_program.filter(|value| !value.is_empty()),
+        from_model: message.from_model.filter(|value| !value.is_empty()),
+        to: message.to,
+        subject: message.subject,
+        topic: message.topic,
+        // The resource validator requires a body before rendering is possible.
+        body: message.body_md.unwrap_or_default(),
+        thread: snapshot.thread_id,
+        position: snapshot.position,
+        total_in_thread: snapshot.total_in_thread,
+        importance: message.importance,
+        ack_status,
+        created: mcp_agent_mail_db::micros_to_iso(message.created_ts),
+        age: format_age(age_seconds_from_micros(
+            snapshot.captured_ts,
+            message.created_ts,
+        )),
+        previous: snapshot.previous.map(adjacent),
+        next: snapshot.next.map(adjacent),
+        attachments,
+    }
+}
 
 fn append_thread_membership_condition(
     alias: &str,
@@ -7403,6 +8134,8 @@ pub struct SearchData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<mcp_agent_mail_tools::search::SearchDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<LexicalBackfillHealth>,
@@ -7500,22 +8233,53 @@ fn search_hit_age(now_us: i64, created_ts: i64) -> String {
     })
 }
 
+fn validate_robot_search_window(limit: usize, cursor: Option<&str>) -> Result<(), CliError> {
+    if !(1..=1000).contains(&limit) {
+        return Err(CliError::InvalidArgument(
+            "search --limit must be between 1 and 1000".to_string(),
+        ));
+    }
+    if let Some(cursor) = cursor
+        && (cursor.len() > 128
+            || mcp_agent_mail_db::search_planner::SearchCursor::decode(cursor).is_none())
+    {
+        return Err(CliError::InvalidArgument(
+            "invalid search cursor; use next_cursor from the same query and filters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Robot search through the running server (br-kp1in.18); `Ok(None)` sends
 /// the caller to the private-snapshot path.
 fn search_via_server(
     config: &mcp_agent_mail_core::Config,
-    project_key: &str,
+    selection: &crate::message_read::ProjectSelection,
     query: &str,
+    recipient_kind: Option<&str>,
     importance: Option<&str>,
     since: Option<&str>,
-) -> Result<Option<SearchData>, CliError> {
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
+    validate_robot_search_window(limit, cursor)?;
+    let recipient_kind = parse_search_recipient_kind(recipient_kind)?;
+    if !selection.permits_automatic_read(config) {
+        return Ok(None);
+    }
     let mut arguments = serde_json::json!({
-        "project_key": project_key,
+        "project_key": selection.key(),
         "query": query,
-        "limit": 20,
+        "limit": limit,
         "explain": true,
         "include_body_md": true,
     });
+    if let Some(kind) = &recipient_kind {
+        arguments["recipient_kind"] = kind.as_str().into();
+    }
+    if let Some(cursor) = cursor {
+        arguments["cursor"] = cursor.into();
+    }
     if let Some(importance) = importance.map(str::trim).filter(|value| !value.is_empty()) {
         arguments["importance"] = importance.into();
     }
@@ -7524,47 +8288,44 @@ fn search_via_server(
         arguments["since"] =
             mcp_agent_mail_core::timestamps::micros_to_iso(parse_since_micros(since)?).into();
     }
-    // Same endpoints and credentials as robot inbox's server route.
-    let bearer = crate::local_server_bearer_token(config);
-    for server_url in robot_inbox_server_urls(config) {
-        let call = crate::context::run_async(async {
-            Ok(crate::try_call_server_tool(
-                &server_url,
-                bearer.as_deref(),
-                "search_messages",
-                arguments.clone(),
-            )
-            .await)
-        })?;
-        match call {
-            crate::ServerToolCall::Success(result) => {
-                let Ok(payload) =
-                    crate::coerce_tool_result_json_or_error("search_messages", result)
-                else {
-                    return Ok(None);
-                };
-                let Ok(response) = serde_json::from_value(payload) else {
-                    return Ok(None);
-                };
-                return Ok(search_data_from_server_response(
-                    query,
-                    response,
-                    mcp_agent_mail_db::now_micros(),
-                ));
-            }
-            crate::ServerToolCall::Unavailable(_) => {}
-            // An unknown project or a bad filter: the direct path reports it.
-            crate::ServerToolCall::Rejected(_) => return Ok(None),
+    crate::context::run_async(async {
+        let Some(session) =
+            crate::reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        if !selection.supported_by(&session)
+            || (recipient_kind.is_some() && !session.supports_search_recipient_kind())
+        {
+            return Ok(None);
         }
-    }
-    Ok(None)
+        let (project_uri, project) =
+            crate::message_read::project_before(&session, selection).await?;
+        // Resolve a path/slug once, then bind the tool call to the verified
+        // stored project. No worktree identity discovery or local DB admission.
+        arguments["project_key"] = project.human_key.clone().into();
+        let payload = session.call_tool("search_messages", arguments).await?;
+        let response = serde_json::from_value(payload).map_err(|_| {
+            CliError::Other("invalid server search response; refusing unverified results".into())
+        })?;
+        let data =
+            search_data_from_server_response(query, response, mcp_agent_mail_db::now_micros())
+                .ok_or_else(|| {
+                    CliError::Other(
+                "server search response omitted relevance scores; refusing incomplete results"
+                    .into(),
+            )
+                })?;
+        crate::message_read::project_after(&session, &project_uri, selection, &project).await?;
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((project, data)))
+    })
 }
 
 /// Robot search data from the running server's `search_messages` response,
 /// requested with `explain` and bodies (br-kp1in.18). `None` when a hit
-/// carries no relevance score (a server that predates explain scores): the
-/// caller then takes the private-snapshot path rather than report invented
-/// relevance.
+/// carries no relevance score: callers must refuse incomplete results instead
+/// of reporting invented relevance.
 fn search_data_from_server_response(
     query: &str,
     response: mcp_agent_mail_tools::search::SearchResponse,
@@ -7609,6 +8370,7 @@ fn search_data_from_server_response(
         assistance: response.assistance,
         guidance: response.guidance,
         next_cursor: response.next_cursor,
+        diagnostics: response.diagnostics,
         plan_diagnostic: None,
         search_index: None,
         by_thread,
@@ -7627,7 +8389,9 @@ fn build_search(
     importance_filter: Option<&str>,
     since: Option<&str>,
     limit: usize,
+    cursor: Option<&str>,
 ) -> Result<SearchData, CliError> {
+    validate_robot_search_window(limit, cursor)?;
     let raw_query = query.trim();
     if raw_query.is_empty() {
         return Ok(SearchData {
@@ -7644,6 +8408,7 @@ fn build_search(
             assistance: None,
             guidance: Some(empty_search_guidance()),
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
                 pool,
@@ -7659,15 +8424,18 @@ fn build_search(
     let mut search_query =
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
     search_query.explain = true;
+    search_query.cursor = cursor.map(str::to_string);
 
-    if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
-        let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
-        let Some(parsed) = parsed else {
-            return Err(CliError::InvalidArgument(format!(
-                "invalid importance filter: {imp}"
-            )));
-        };
-        search_query.importance = vec![parsed];
+    // A comma-separated list, as the server-routed search accepts.
+    if let Some(list) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        for imp in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(parsed) = mcp_agent_mail_db::search_planner::Importance::parse(imp) else {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid importance filter: {imp}"
+                )));
+            };
+            search_query.importance.push(parsed);
+        }
     }
 
     if let Some(since_str) = since.map(str::trim).filter(|s| !s.is_empty()) {
@@ -7729,6 +8497,7 @@ fn build_search(
         assistance: collected.assistance,
         guidance,
         next_cursor,
+        diagnostics: None,
         plan_diagnostic,
         search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
             pool,
@@ -7782,6 +8551,7 @@ where
     let mut explain = None;
     let mut assistance = None;
     let mut guidance = None;
+    let mut checked_kind_presence = false;
 
     loop {
         let response = run_query(&paged_query)?;
@@ -7804,6 +8574,25 @@ where
             None => None,
         };
 
+        // Validate and execute the query once before this shortcut, preserving
+        // backend errors and diagnostics. If no recipient of this kind exists
+        // anywhere in this snapshot, later search pages cannot contribute a
+        // match. Do not walk the whole mailbox to prove that negative result.
+        if !checked_kind_presence && let Some(kind) = recipient_kind {
+            checked_kind_presence = true;
+            if kind_id_filter.as_ref().is_some_and(HashSet::is_empty)
+                && !has_message_recipients_of_kind(conn, kind)?
+            {
+                return Ok(CollectedSearchRows {
+                    rows: out,
+                    explain,
+                    assistance,
+                    guidance,
+                    next_cursor: None,
+                });
+            }
+        }
+
         let mut omitted_matching_row_in_page = false;
         for row in response.results {
             if let Some(filter_ids) = &kind_id_filter
@@ -7822,13 +8611,31 @@ where
         }
 
         if out.len() >= requested_limit {
+            // A recipient filter can fill the visible page before the backend
+            // page ends. Its backend cursor would skip matching rows we have
+            // not returned. Resume at the last visible match instead.
+            let visible_cursor = omitted_matching_row_in_page
+                .then(|| out.last())
+                .flatten()
+                .and_then(|row| {
+                    // Query hints can rewrite relevance to recency. Use the
+                    // executed ranking so a timestamp cursor never becomes
+                    // an all-zero relevance boundary and loses later hits.
+                    let score = row.score.unwrap_or(0.0);
+                    score.is_finite().then(|| {
+                        mcp_agent_mail_db::search_service::search_result_cursor(
+                            row,
+                            response.ranking,
+                        )
+                    })
+                });
             return Ok(CollectedSearchRows {
                 rows: out,
                 explain,
                 assistance,
                 guidance,
                 next_cursor: if omitted_matching_row_in_page {
-                    None
+                    visible_cursor
                 } else {
                     next_cursor
                 },
@@ -7880,6 +8687,15 @@ fn execute_robot_search_query(
         Outcome::Cancelled(_) => Err(CliError::Other("search request cancelled".to_string())),
         Outcome::Panicked(p) => Err(CliError::Other(format!("search request panicked: {p}"))),
     }
+}
+
+fn has_message_recipients_of_kind(conn: &DbConn, kind: &str) -> Result<bool, CliError> {
+    conn.query_sync(
+        "SELECT 1 FROM message_recipients WHERE kind = ? LIMIT 1",
+        &[Value::Text(kind.to_string())],
+    )
+    .map(|rows| !rows.is_empty())
+    .map_err(|error| CliError::Other(format!("kind presence query failed: {error}")))
 }
 
 fn search_message_ids_by_recipient_kind(
@@ -7954,6 +8770,19 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
             "last check passed (0 failures since last ok); {} historical failures across {} checks (lifetime tally, not current state)",
             metrics.failures_total, metrics.checks_total
         )
+    };
+
+    // GH#291: an accepted full check can still carry proven never-written
+    // orphan pages. Say so; it is leaked space, not a failed probe.
+    let detail = if metrics.never_written_orphan_pages > 0
+        && !(full_check_failed || last_check_failed || runtime_failures_without_checks)
+    {
+        format!(
+            "{detail}; {} never-written orphan page(s) (leaked space, not data damage)",
+            metrics.never_written_orphan_pages
+        )
+    } else {
+        detail
     };
 
     (
@@ -8309,6 +9138,463 @@ fn summarize_archive_db_parity_probe(
     }
 }
 
+#[derive(Debug)]
+struct LiveServerRobotHealthProbes {
+    db_file: String,
+    db_connectivity: HealthProbe,
+    db_file_sanity: HealthProbeAssessment,
+    db_schema: HealthProbeAssessment,
+    archive_db_parity: HealthProbeAssessment,
+    search_index_snapshot: LexicalBackfillHealth,
+    search_index_probe: HealthProbe,
+    search_index_unhealthy: bool,
+    search_index_degraded: bool,
+    integrity_metrics: Option<mcp_agent_mail_db::IntegrityMetrics>,
+}
+
+fn live_server_archive_parity_probe_from_health(
+    storage_root: &Path,
+    typed: &mcp_agent_mail_tools::identity::HealthCheckResponse,
+) -> HealthProbeAssessment {
+    let projects_root = storage_root.join("projects");
+    if !storage_root.exists() {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: storage root missing at {}",
+                    storage_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+    if !crate::path_is_real_directory(&projects_root) {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "Skipped: no canonical archive projects directory found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+    if typed
+        .semantic_readiness
+        .detail
+        .contains("archive projects=0, agents=0, messages=0")
+    {
+        return HealthProbeAssessment {
+            probe: HealthProbe {
+                name: "archive_db_parity".into(),
+                status: "warn".into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "No canonical archive content found under {}",
+                    projects_root.display()
+                ),
+            },
+            unhealthy: false,
+            degraded: true,
+        };
+    }
+
+    let parity_degraded = typed.verdicts.archive_db_parity.status != "green"
+        || typed.semantic_readiness.status != "ok";
+    HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "archive_db_parity".into(),
+            status: if parity_degraded { "warn" } else { "ok" }.into(),
+            latency_ms: 0.0,
+            detail: typed.verdicts.archive_db_parity.detail.clone(),
+        },
+        unhealthy: false,
+        degraded: parity_degraded,
+    }
+}
+
+fn parse_health_check_response(
+    server_health: &serde_json::Value,
+) -> Option<mcp_agent_mail_tools::identity::HealthCheckResponse> {
+    let mut normalized = server_health.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.entry("failing_verdicts")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(disk) = obj
+            .get_mut("disk")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            disk.entry("errors")
+                .or_insert_with(|| serde_json::json!([]));
+        }
+    }
+    serde_json::from_value(normalized).ok()
+}
+
+#[derive(Debug)]
+struct LiveServerHealthAssessment {
+    probe: HealthProbe,
+    level: mcp_agent_mail_core::HealthLevel,
+    pressure: Option<(mcp_agent_mail_core::HealthLevel, String)>,
+    circuits: Option<mcp_agent_mail_db::DbHealthStatus>,
+}
+
+/// Preserve the serving process's verdict even when a local read succeeds.
+/// A fresh CLI's empty counters cannot disprove daemon memory pressure, a
+/// stalled archive drain, or an open write circuit.
+fn assess_live_server_health(
+    config: &mcp_agent_mail_core::Config,
+    payload: &serde_json::Value,
+    latency_ms: f64,
+) -> Result<Option<LiveServerHealthAssessment>, CliError> {
+    use mcp_agent_mail_core::HealthLevel;
+
+    if !crate::reservation_read::mailbox_config_matches(payload, config)? {
+        return Ok(None);
+    }
+    let typed = parse_health_check_response(payload).ok_or_else(|| {
+        CliError::Other(
+            "invalid server health response; refusing incomplete health evidence".into(),
+        )
+    })?;
+    let parse_level = |value: &str| match value {
+        "green" => Ok(HealthLevel::Green),
+        "yellow" => Ok(HealthLevel::Yellow),
+        "red" => Ok(HealthLevel::Red),
+        _ => Err(CliError::Other(
+            "invalid server health level; refusing unverified health evidence".into(),
+        )),
+    };
+    let mut level = parse_level(&typed.health_level)?;
+    let mut details = Vec::new();
+    match typed.status.as_str() {
+        "ok" => {}
+        "error" => {
+            level = HealthLevel::Red;
+            details.push("server reports an error".to_string());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server health status; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    for (name, verdict) in [
+        ("transport_health", &typed.verdicts.transport_health),
+        ("db_health", &typed.verdicts.db_health),
+        ("write_health", &typed.verdicts.write_health),
+        ("semantic_readiness", &typed.verdicts.semantic_readiness),
+        ("archive_db_parity", &typed.verdicts.archive_db_parity),
+        ("doctor_readiness", &typed.verdicts.doctor_readiness),
+        ("integrity_check", &typed.verdicts.integrity_check),
+    ] {
+        let verdict_level = parse_level(&verdict.status)?;
+        if verdict_level != HealthLevel::Green {
+            level = level.max(if verdict.critical {
+                verdict_level
+            } else {
+                HealthLevel::Yellow
+            });
+            details.push(format!("{name}={}: {}", verdict.status, verdict.detail));
+        }
+    }
+    match typed.semantic_readiness.status.as_str() {
+        "ok" => {}
+        "warn" => {
+            level = level.max(HealthLevel::Yellow);
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        "fail" => {
+            level = HealthLevel::Red;
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server semantic readiness; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    let mut pressure: Option<(HealthLevel, String)> = None;
+    for contributor in &typed.health_level_contributors {
+        let contributor_level = parse_level(&contributor.level)?;
+        level = level.max(contributor_level);
+        if contributor.name == "pressure"
+            && pressure
+                .as_ref()
+                .is_none_or(|(current, _)| contributor_level >= *current)
+        {
+            pressure = Some((contributor_level, contributor.detail.clone()));
+        }
+        if contributor_level != HealthLevel::Green {
+            details.push(format!(
+                "{}={}: {}",
+                contributor.name, contributor.level, contributor.detail
+            ));
+        }
+    }
+    if let Some(recovery) = &typed.recovery
+        && recovery.mode != "healthy"
+    {
+        level = level.max(HealthLevel::Yellow);
+        details.push(format!("mailbox recovery mode: {}", recovery.mode));
+    }
+    if let Some(circuits) = &typed.circuit_breakers {
+        let valid_state = |state: &str| matches!(state, "closed" | "open" | "half_open");
+        if !valid_state(&circuits.circuit_state)
+            || circuits
+                .circuits
+                .iter()
+                .any(|circuit| circuit.subsystem.trim().is_empty() || !valid_state(&circuit.state))
+        {
+            return Err(CliError::Other(
+                "invalid server circuit state; refusing unverified health evidence".into(),
+            ));
+        }
+        if circuits.circuit_state != "closed" {
+            level = level.max(HealthLevel::Yellow);
+            details.push(format!("db circuit={}", circuits.circuit_state));
+        }
+        for circuit in &circuits.circuits {
+            if circuit.state != "closed" {
+                level = level.max(HealthLevel::Yellow);
+                details.push(format!(
+                    "{} circuit={} ({} failures)",
+                    circuit.subsystem, circuit.state, circuit.failures
+                ));
+            }
+        }
+    }
+    let detail = if details.is_empty() {
+        format!("live server health_level={level}")
+    } else {
+        format!("live server health_level={level}; {}", details.join("; "))
+    };
+    Ok(Some(LiveServerHealthAssessment {
+        probe: HealthProbe {
+            name: "server_health".into(),
+            status: match level {
+                HealthLevel::Green => "ok",
+                HealthLevel::Yellow => "degraded",
+                HealthLevel::Red => "fail",
+            }
+            .into(),
+            latency_ms: (latency_ms * 100.0).round() / 100.0,
+            detail,
+        },
+        level,
+        pressure,
+        circuits: typed.circuit_breakers,
+    }))
+}
+
+fn synthesize_robot_health_probes_from_server(
+    config: &mcp_agent_mail_core::Config,
+    server_health: &serde_json::Value,
+    rpc_latency_ms: f64,
+) -> Option<LiveServerRobotHealthProbes> {
+    let typed = parse_health_check_response(server_health)?;
+    if mailbox_database_identity(&config.database_url)
+        != mailbox_database_identity(&typed.database_url)
+        || mailbox_storage_identity(&config.storage_root)
+            != mailbox_storage_identity(Path::new(&typed.storage_root))
+    {
+        return None;
+    }
+
+    if typed.verdicts.db_health.status != "green"
+        || typed.verdicts.write_health.status != "green"
+        || typed.verdicts.integrity_check.status == "red"
+        || typed.verdicts.archive_db_parity.status == "red"
+        || typed.semantic_readiness.status == "fail"
+    {
+        return None;
+    }
+    if typed
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.mode != "healthy")
+    {
+        return None;
+    }
+
+    let resolved =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    if resolved.canonical_path == ":memory:" {
+        return None;
+    }
+    let db_path = Path::new(&resolved.canonical_path);
+    let file_size = db_path.metadata().ok().filter(|m| m.is_file())?.len();
+    if file_size == 0 || crate::doctor_truncated_wal_sidecar_detail(db_path).is_some() {
+        return None;
+    }
+
+    let archive_db_parity =
+        live_server_archive_parity_probe_from_health(&config.storage_root, &typed);
+    let search_index_snapshot = typed
+        .lexical_backfill
+        .clone()
+        .or_else(|| robot_search_index_health_from_config(config).ok())?;
+    let search_status = search_index_probe_status(&search_index_snapshot);
+    let search_index_probe = HealthProbe {
+        name: "search_index".into(),
+        status: search_status.into(),
+        latency_ms: 0.0,
+        detail: search_index_probe_detail(&search_index_snapshot),
+    };
+
+    let db_connectivity = HealthProbe {
+        name: "db_connectivity".into(),
+        status: "ok".into(),
+        latency_ms: (rpc_latency_ms * 100.0).round() / 100.0,
+        detail: format!(
+            "SQLite read-only connection healthy at {} (attested by live server: {})",
+            resolved.canonical_path, typed.verdicts.db_health.detail
+        ),
+    };
+
+    let db_file_sanity = HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "db_file_sanity".into(),
+            status: "ok".into(),
+            latency_ms: 0.0,
+            detail: format!("quick_check OK ({file_size} bytes; attested by live server)"),
+        },
+        unhealthy: false,
+        degraded: false,
+    };
+
+    let db_schema = HealthProbeAssessment {
+        probe: HealthProbe {
+            name: "db_schema".into(),
+            status: "ok".into(),
+            latency_ms: 0.0,
+            detail: "Core SQLite schema tables are present".into(),
+        },
+        unhealthy: false,
+        degraded: false,
+    };
+
+    let integrity_metrics =
+        typed
+            .integrity
+            .map(|server_integrity| mcp_agent_mail_db::IntegrityMetrics {
+                last_ok_ts: server_integrity.last_ok_ts,
+                last_check_ts: server_integrity.last_check_ts,
+                last_full_check_ts: server_integrity.last_full_check_ts,
+                last_check_kind: server_integrity.last_check_kind,
+                last_check_outcome: server_integrity.last_check_outcome,
+                last_full_check_outcome: server_integrity.last_full_check_outcome,
+                checks_total: server_integrity.checks_total,
+                failures_total: server_integrity.failures_total,
+                failures_since_last_ok: 0,
+                never_written_orphan_pages: 0,
+            });
+
+    Some(LiveServerRobotHealthProbes {
+        db_file: resolved.canonical_path,
+        db_connectivity,
+        db_file_sanity,
+        db_schema,
+        archive_db_parity,
+        search_index_snapshot,
+        search_index_probe,
+        search_index_unhealthy: search_status == "fail",
+        search_index_degraded: search_status != "ok",
+        integrity_metrics,
+    })
+}
+
+fn live_server_health_payload_proves_mailbox_healthy(
+    target_database_url: &str,
+    target_storage_root: &Path,
+    server_health: &serde_json::Value,
+) -> bool {
+    let Some(typed) = parse_health_check_response(server_health) else {
+        return false;
+    };
+    if mailbox_database_identity(target_database_url)
+        != mailbox_database_identity(&typed.database_url)
+        || mailbox_storage_identity(target_storage_root)
+            != mailbox_storage_identity(Path::new(&typed.storage_root))
+    {
+        return false;
+    }
+    if typed.verdicts.db_health.status != "green"
+        || typed.verdicts.write_health.status != "green"
+        || typed.verdicts.archive_db_parity.status == "red"
+        || typed.semantic_readiness.status != "ok"
+        || typed.verdicts.integrity_check.status == "red"
+        || typed
+            .verdicts
+            .integrity_check
+            .detail
+            .contains("orphan page")
+    {
+        return false;
+    }
+    if typed
+        .integrity
+        .as_ref()
+        .is_some_and(|integrity| integrity.failures_total > 0)
+    {
+        return false;
+    }
+    if typed
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.mode != "healthy")
+    {
+        return false;
+    }
+    let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(target_database_url)
+    else {
+        return false;
+    };
+    if resolved.canonical_path == ":memory:" {
+        return false;
+    }
+    let db_path = Path::new(&resolved.canonical_path);
+    let Ok(meta) = db_path.metadata() else {
+        return false;
+    };
+    meta.is_file()
+        && meta.len() > 0
+        && crate::doctor_truncated_wal_sidecar_detail(db_path).is_none()
+}
+
+pub(crate) fn live_server_proves_mailbox_healthy(
+    config: &mcp_agent_mail_core::Config,
+    target_database_url: &str,
+    target_storage_root: &Path,
+) -> Result<bool, CliError> {
+    // Doctor may already have selected the daemon's advertised mailbox instead
+    // of the CLI's XDG default. Pin the health read to that selected pair while
+    // retaining the configured endpoint and credential.
+    let mut target_config = config.clone();
+    target_config.database_url = target_database_url.to_string();
+    target_config.storage_root = target_storage_root.to_path_buf();
+    let Some((server_health, latency_ms)) =
+        crate::probe_local_jsonrpc_health_with_latency(&target_config)?
+    else {
+        return Ok(false);
+    };
+    assess_live_server_health(&target_config, &server_health, latency_ms)?
+        .ok_or_else(|| CliError::Other("server health mailbox identity changed".into()))?;
+    Ok(live_server_health_payload_proves_mailbox_healthy(
+        target_database_url,
+        target_storage_root,
+        &server_health,
+    ))
+}
+
 // ── Reservations command implementation ─────────────────────────────────────
 
 /// Conflict between two reservations.
@@ -8605,11 +9891,6 @@ fn build_reservations_at(
     conflicts_only: bool,
     expiring_minutes: Option<u32>,
 ) -> Result<(ReservationsData, Vec<String>), CliError> {
-    let expiring_threshold = now_us.saturating_add(
-        i64::from(expiring_minutes.unwrap_or(10))
-            .saturating_mul(60)
-            .saturating_mul(1_000_000),
-    );
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let release_ledger = release_ledger_index(conn, has_release_ledger)?;
@@ -8633,23 +9914,82 @@ fn build_reservations_at(
         )
         .map_err(|e| CliError::Other(format!("reservations query failed: {e}")))?;
 
+    let records = all_rows
+        .iter()
+        .filter(|row| {
+            !row.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
+        .map(|row| crate::reservation_read::ServerReservation {
+            id: row.get_named("id").unwrap_or(0),
+            agent: row.get_named("agent_name").unwrap_or_default(),
+            path_pattern: row.get_named("path_pattern").unwrap_or_default(),
+            exclusive: row.get_named::<i64>("exclusive").unwrap_or(1) != 0,
+            reason: String::new(),
+            created_ts: row.get_named("created_ts").unwrap_or(0),
+            expires_ts: row.get_named("expires_ts").unwrap_or(0),
+            released_ts: None,
+        })
+        // Keep direct-read expiry checks at the database authority, including
+        // the existing fallback for an invalid stored expiry value.
+        .filter(|row| row.expires_ts > now_us)
+        .collect::<Vec<_>>();
+    // Preserve holder-ID scoping on direct reads, including a malformed
+    // cross-project holder reference with the same display name.
+    let my_reservation_ids: HashSet<i64> = all_rows
+        .iter()
+        .filter_map(|row| {
+            let (agent_id, _) = agent.as_ref()?;
+            (row.get_named::<i64>("agent_id").ok() == Some(*agent_id))
+                .then(|| row.get_named::<i64>("id").ok())
+                .flatten()
+        })
+        .collect();
+    build_reservations_from_records(
+        &records,
+        now_us,
+        project_slug,
+        agent.map(|(_, name)| name),
+        &my_reservation_ids,
+        show_all,
+        conflicts_only,
+        expiring_minutes,
+    )
+}
+
+/// Both read authorities use the same projection, conflict analysis and output
+/// contract. Server rows never pass through a temporary or competing database.
+fn build_reservations_from_records(
+    records: &[crate::reservation_read::ServerReservation],
+    now_us: i64,
+    project_slug: &str,
+    agent: Option<String>,
+    my_reservation_ids: &HashSet<i64>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+) -> Result<(ReservationsData, Vec<String>), CliError> {
+    let expiring_threshold = now_us.saturating_add(
+        i64::from(expiring_minutes.unwrap_or(10))
+            .saturating_mul(60)
+            .saturating_mul(1_000_000),
+    );
     let mut all_active = Vec::new();
     let mut my_reservations = Vec::new();
     let mut expiring_soon = Vec::new();
 
-    for row in &all_rows {
-        if row
-            .get_named::<i64>("id")
-            .is_ok_and(|id| release_ledger.contains(id))
-        {
+    for row in records {
+        // Each authority has already selected its active leases. A client
+        // clock ahead of the server must not turn that snapshot into an empty
+        // success; use the local clock only for relative display values.
+        if reservation_is_released(row.released_ts) {
             continue;
         }
-        let path: String = row.get_named("path_pattern").unwrap_or_default();
-        let exclusive: bool = row.get_named::<i64>("exclusive").unwrap_or(1) != 0;
-        let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-        let expires_ts: i64 = row.get_named("expires_ts").unwrap_or(0);
-        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
-        let agent_id_row: i64 = row.get_named("agent_id").unwrap_or(0);
+        let path = row.path_pattern.clone();
+        let exclusive = row.exclusive;
+        let created_ts = row.created_ts;
+        let expires_ts = row.expires_ts;
+        let agent_name = row.agent.clone();
 
         let remaining_seconds = remaining_seconds_from_micros(now_us, expires_ts);
         let created_age = age_seconds_from_micros(now_us, created_ts);
@@ -8668,9 +10008,7 @@ fn build_reservations_at(
 
         all_active.push(entry.clone());
 
-        if let Some((my_id, _)) = &agent
-            && agent_id_row == *my_id
-        {
+        if my_reservation_ids.contains(&row.id) {
             my_reservations.push(entry.clone());
         }
 
@@ -8731,11 +10069,7 @@ fn build_reservations_at(
             && left.path_b == right.path_b
     });
 
-    let scoped_agent_name = if !show_all {
-        agent.as_ref().map(|(_, name)| name.as_str())
-    } else {
-        None
-    };
+    let scoped_agent_name = if !show_all { agent.as_deref() } else { None };
     let scoped_conflicts: Vec<_> = if let Some(agent_name) = scoped_agent_name {
         conflicts
             .iter()
@@ -8765,7 +10099,7 @@ fn build_reservations_at(
 
     // Build actions
     let mut actions = Vec::new();
-    if let Some((_, ref agent_name)) = agent {
+    if let Some(ref agent_name) = agent {
         let project_arg = robot_shell_arg(project_slug);
         let agent_arg = robot_shell_arg(agent_name);
         for entry in &scoped_expiring_soon {
@@ -8796,19 +10130,18 @@ fn build_reservations_at(
             .filter(|e| conflict_paths.contains(&e.path))
             .cloned()
             .collect();
+        // The expiring set stays too: the documented pre-edit safety check is
+        // `--conflicts --expiring N`, and the renew actions above are built
+        // from it, so dropping it here left actions with nothing behind them.
         return Ok((
             ReservationsData {
                 my_reservations: vec![],
                 all_active: scoped_all_active,
                 conflicting_active,
                 conflicts: scoped_conflicts,
-                expiring_soon: vec![],
+                expiring_soon: scoped_expiring_soon,
                 playbooks: scoped_playbooks,
-                forecast: ReservationForecast {
-                    expiry_herds: vec![],
-                    conflict_hotspots: scoped_forecast.conflict_hotspots,
-                }
-                .into_option(),
+                forecast: scoped_forecast.into_option(),
             },
             actions,
         ));
@@ -8917,6 +10250,32 @@ fn build_reservations_with_snapshot_cache(
         },
     );
     Ok((data, actions))
+}
+
+fn resolve_server_reservation_agent(
+    read: &crate::reservation_read::ServerReservationRead,
+    explicit_flag: Option<&str>,
+) -> Result<Option<String>, CliError> {
+    let Some(name) = resolved_agent_flag_or_env(explicit_flag) else {
+        return Ok(None);
+    };
+    let mut matching = read
+        .agent_names
+        .iter()
+        .filter(|candidate| candidate.eq_ignore_ascii_case(&name));
+    let first = matching.next();
+    if matching.next().is_some() {
+        return Err(CliError::InvalidArgument(format!(
+            "ambiguous agent name: {name}"
+        )));
+    }
+    match first {
+        Some(canonical) => Ok(Some(canonical.clone())),
+        None if explicit_flag.is_none() => Ok(None),
+        None => Err(CliError::InvalidArgument(format!(
+            "agent not found in server project roster: {name}"
+        ))),
+    }
 }
 
 /// Check whether two reservation path patterns can overlap.
@@ -9670,10 +11029,11 @@ fn build_handoff(
             })
             .then_with(|| left.id.cmp(&right.id))
     });
-    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
-
-    let summary =
+    // Count every classified bead; `--limit` only trims the listed records.
+    let mut summary =
         summarize_handoff_records(total_in_progress, scanned, truncated_by_budget, &records);
+    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
+    summary.shown = records.len();
     let mut actions: Vec<String> = records
         .iter()
         .filter(|record| record.action != "keep")
@@ -9707,6 +11067,11 @@ fn build_handoff(
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
+
+/// Agent names are case-insensitive everywhere else, so the source filter is too.
+fn timeline_source_matches(filter: Option<&str>, source: &str) -> bool {
+    filter.is_none_or(|filter| filter.eq_ignore_ascii_case(source))
+}
 
 fn build_timeline(
     conn: &DbConn,
@@ -9756,7 +11121,7 @@ fn build_timeline(
             let importance: String = row.get_named("importance").unwrap_or_default();
             let sender: String = row.get_named("sender").unwrap_or_default();
 
-            if source_filter.is_some() && source_filter != Some(sender.as_str()) {
+            if !timeline_source_matches(source_filter, &sender) {
                 continue;
             }
 
@@ -9809,7 +11174,7 @@ fn build_timeline(
                 continue;
             }
 
-            if source_filter.is_some() && source_filter != Some(agent.as_str()) {
+            if !timeline_source_matches(source_filter, &agent) {
                 continue;
             }
 
@@ -9853,7 +11218,7 @@ fn build_timeline(
             let inception_ts: i64 = row.get_named("inception_ts").unwrap_or(0);
             let program: String = row.get_named("program").unwrap_or_default();
 
-            if source_filter.is_some() && source_filter != Some(name.as_str()) {
+            if !timeline_source_matches(source_filter, &name) {
                 continue;
             }
 
@@ -11211,7 +12576,7 @@ fn append_malformed_db_agent_diagnostics(
                 reason_code: "malformed_agent_name".to_string(),
                 severity: "warn".to_string(),
                 agent: agent.name.clone(),
-                summary: "Agent name does not match adjective+noun rules".to_string(),
+                summary: "Agent name is not a valid vocabulary name or explicit task ID".to_string(),
                 detail: "The DB row is readable, but the name cannot be normalized by the current agent-name validator.".to_string(),
                 evidence: format!("agent_id={}", agent.id),
                 safe_command: format!(
@@ -11487,7 +12852,7 @@ struct RobotAgentReservationStats {
     active_count: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RobotAgentContactStats {
     respected_count: u64,
     violation_count: u64,
@@ -11708,6 +13073,12 @@ fn fetch_robot_agent_reservation_stats(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROBOT_CONTACT_STATS_AFTER_LINKS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn fetch_robot_agent_contact_stats(
     conn: &DbConn,
     project_id: i64,
@@ -11718,82 +13089,102 @@ fn fetch_robot_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let approved_link_exists_sql = "\
-        SELECT 1 FROM agent_links link \
-        WHERE link.status = 'approved' \
-          AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
-          AND ( \
-            (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
-            OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
-          )";
+    // Reuse the nested read guard so links, policy and deliveries describe one
+    // observation even on the direct live-DB path. Releasing the savepoint
+    // never commits or rolls back a transaction owned by the caller.
+    let Ok(snapshot) = RobotInboxReadSnapshot::begin(conn) else {
+        return HashMap::new();
+    };
+    // The health view can cover a month of mail. Correlated EXISTS probes in
+    // each recipient's CASE expressions repeated the link scan for every
+    // delivery (the CLI counterpart of br-bdo5g). Read the relevant approved
+    // links once, then classify grouped deliveries in Rust. Unlike the TUI's
+    // legacy importer view, this surface intentionally accepts only approved
+    // links, not the obsolete accepted status.
+    let links_sql = format!(
+        "SELECT a_agent_id, b_agent_id FROM agent_links \
+         WHERE status = 'approved' \
+           AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
+           AND (a_agent_id IN ({agent_ids_sql}) OR b_agent_id IN ({agent_ids_sql}))"
+    );
+    let Ok(links) = conn.query_sync(&links_sql, &[Value::BigInt(now)]) else {
+        return HashMap::new();
+    };
+    // A contact link allows both directions; normalize the pair rather than
+    // retaining a second entry for its reverse direction.
+    let Some(approved_links): Option<HashSet<(i64, i64)>> = links
+        .into_iter()
+        .map(|row| {
+            let a = row.get_named::<i64>("a_agent_id").ok()?;
+            let b = row.get_named::<i64>("b_agent_id").ok()?;
+            Some((a.min(b), a.max(b)))
+        })
+        .collect()
+    else {
+        // An undecodable authority row is unavailable evidence, not proof
+        // that a recipient's contact policy was violated.
+        return HashMap::new();
+    };
+    #[cfg(test)]
+    if let Some(after_links) = ROBOT_CONTACT_STATS_AFTER_LINKS.with(|hook| hook.borrow_mut().take())
+    {
+        after_links();
+    }
     let sql = format!(
         "SELECT \
             mr.agent_id AS agent_id, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
-                    WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND EXISTS ({approved_link_exists_sql}) \
-                    THEN 1 \
-                    ELSE 0 END) AS respected_count, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ({approved_link_exists_sql}) \
-                    THEN 1 \
-                    WHEN recipient.contact_policy = 'block_all' \
-                     AND m.sender_id != mr.agent_id \
-                    THEN 1 \
-                    ELSE 0 END) AS violation_count \
+            m.sender_id AS sender_id, \
+            recipient.contact_policy AS contact_policy, \
+            COUNT(*) AS row_count \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          JOIN agents recipient ON recipient.id = mr.agent_id \
          WHERE recipient.project_id = ? \
            AND mr.agent_id IN ({agent_ids_sql}) \
            AND m.created_ts >= ? \
-         GROUP BY mr.agent_id"
+         GROUP BY mr.agent_id, m.sender_id, recipient.contact_policy"
     );
-    conn.query_sync(
-        &sql,
-        &[
-            Value::BigInt(now),
-            Value::BigInt(now),
-            Value::BigInt(project_id),
-            Value::BigInt(window_start),
-        ],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| {
-                let agent_id = row
-                    .get_named::<i64>("agent_id")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(0).ok())
-                    .unwrap_or(0);
-                let respected_count = row
-                    .get_named::<i64>("respected_count")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(1).ok())
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                let violation_count = row
-                    .get_named::<i64>("violation_count")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(2).ok())
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                (
-                    agent_id,
-                    RobotAgentContactStats {
-                        respected_count,
-                        violation_count,
-                    },
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    let stats = conn
+        .query_sync(
+            &sql,
+            &[Value::BigInt(project_id), Value::BigInt(window_start)],
+        )
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, RobotAgentContactStats> = HashMap::new();
+            for row in rows {
+                let Ok(agent_id) = row.get_named::<i64>("agent_id") else {
+                    continue;
+                };
+                let sender_id = row.get_named::<i64>("sender_id").ok();
+                let policy = row.get_named::<String>("contact_policy").ok();
+                let row_count = row.get_named::<i64>("row_count").unwrap_or(0).max(0) as u64;
+                let self_send = sender_id == Some(agent_id);
+                let foreign_sender = sender_id.is_some_and(|sender| sender != agent_id);
+                let linked = sender_id.is_some_and(|sender| {
+                    approved_links.contains(&(sender.min(agent_id), sender.max(agent_id)))
+                });
+                let entry = stats.entry(agent_id).or_default();
+                if matches!(policy.as_deref(), Some("open" | "auto"))
+                    || self_send
+                    || (policy.as_deref() == Some("contacts_only") && linked)
+                {
+                    entry.respected_count = entry.respected_count.saturating_add(row_count);
+                }
+                if foreign_sender
+                    && (policy.as_deref() == Some("block_all")
+                        || (policy.as_deref() == Some("contacts_only") && !linked))
+                {
+                    entry.violation_count = entry.violation_count.saturating_add(row_count);
+                }
+            }
+            stats
+        })
+        .unwrap_or_default();
+    if snapshot.finish().is_err() {
+        return HashMap::new();
+    }
+    stats
 }
 
 fn fetch_robot_agent_decision_counts(
@@ -11872,7 +13263,14 @@ fn median_micros(values: &mut [u64]) -> u64 {
 
 // ── Contacts command implementation ─────────────────────────────────────────
 
-fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, CliError> {
+/// Contact links touching the project: requests its agents made and requests
+/// made to them from other projects (stored under the requester's project).
+/// `agent` narrows to links where that agent is either side.
+fn build_contacts(
+    conn: &DbConn,
+    project_id: i64,
+    agent: Option<&str>,
+) -> Result<Vec<ContactRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -11884,9 +13282,9 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
              FROM agent_links al
              LEFT JOIN agents a1 ON a1.id = al.a_agent_id
              LEFT JOIN agents a2 ON a2.id = al.b_agent_id
-             WHERE al.a_project_id = ?
+             WHERE al.a_project_id = ? OR al.b_project_id = ?
              ORDER BY al.updated_ts DESC",
-            &[Value::BigInt(project_id)],
+            &[Value::BigInt(project_id), Value::BigInt(project_id)],
         )
         .map_err(|e| CliError::Other(format!("contacts query: {e}")))?;
 
@@ -11894,6 +13292,11 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
     for row in &rows {
         let from: String = row.get_named("from_agent").unwrap_or_default();
         let to: String = row.get_named("to_agent").unwrap_or_default();
+        if agent.is_some_and(|agent| {
+            !agent.eq_ignore_ascii_case(&from) && !agent.eq_ignore_ascii_case(&to)
+        }) {
+            continue;
+        }
         let status: String = row.get_named("status").unwrap_or_default();
         let from_policy: String = row.get_named("from_policy").unwrap_or_default();
         let reason: String = row.get_named("reason").unwrap_or_default();
@@ -12413,7 +13816,7 @@ fn build_navigate_from_canonical_resource(
             })
         }
         ["file_reservations", project_key] | ["reservations", project_key] => {
-            let conn = crate::open_db_sync_robot()?;
+            let conn = crate::open_db_sync_robot().map_err(crate::reservation_server_read_error)?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, project_key)?;
             build_navigate_file_reservations(
@@ -12434,7 +13837,7 @@ fn build_navigate_from_canonical_resource(
                     "project query parameter is required".to_string(),
                 ));
             };
-            let conn = crate::open_db_sync_robot()?;
+            let conn = crate::open_db_sync_robot().map_err(crate::reservation_server_read_error)?;
             let (resolved_project_id, resolved_project_slug) =
                 resolve_project_sync(&conn, &project_key)?;
             build_navigate_file_reservations(
@@ -12459,6 +13862,12 @@ fn build_navigate_file_reservations(
     let active_only = query
         .get("active_only")
         .is_none_or(|value| parse_resource_bool(Some(value)));
+    let limit = parse_resource_limit(query.get("limit"), 50);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let now = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let release_ledger = release_ledger_index(conn, has_release_ledger)?;
@@ -12491,23 +13900,37 @@ fn build_navigate_file_reservations(
                  FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ?
-                 ORDER BY fr.created_ts DESC LIMIT 50"
+                 ORDER BY fr.created_ts DESC LIMIT ? OFFSET ?"
             ),
-            vec![Value::BigInt(project_id)],
+            vec![
+                Value::BigInt(project_id),
+                Value::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)),
+                Value::BigInt(i64::try_from(offset).unwrap_or(i64::MAX)),
+            ],
         )
     };
     let rows = conn
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("navigate reservations query failed: {e}")))?;
 
+    // An active page excludes ledger-released and expired leases, as the
+    // resource does, and is paged after that filter.
+    let (skip, take) = if active_only {
+        (offset, limit)
+    } else {
+        (0, usize::MAX)
+    };
     let reservations: Vec<serde_json::Value> = rows
         .iter()
         .filter(|r| {
             !(active_only
-                && r.get_as::<i64>(6)
-                    .is_ok_and(|id| release_ledger.contains(id)))
+                && (r
+                    .get_as::<i64>(6)
+                    .is_ok_and(|id| release_ledger.contains(id))
+                    || r.get_as::<i64>(3).is_ok_and(|expires_ts| expires_ts <= now)))
         })
-        .take(50)
+        .skip(skip)
+        .take(take)
         .map(|r| {
             let legacy_released_ts = r
                 .get_as::<sqlmodel_core::Value>(4)
@@ -12532,6 +13955,80 @@ fn build_navigate_file_reservations(
             data: serde_json::json!({ "reservations": reservations }),
         },
         Some(project_slug.to_string()),
+    ))
+}
+
+fn build_navigate_server_reservations(
+    uri: &str,
+    project_flag: Option<&str>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let (path, query) = split_resource_path_and_query(uri)?;
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_path_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let project_key = match parts_ref.as_slice() {
+        ["file_reservations", key] | ["reservations", key] if !key.trim().is_empty() => key.to_string(),
+        ["file_reservations"] | ["reservations"] => {
+            match query.get("project").filter(|value| !value.trim().is_empty()) {
+                Some(key) => key.clone(),
+                None => robot_server_project_key(project_flag)?,
+            }
+        }
+        _ => return Err(CliError::InvalidArgument(
+            "--server navigation supports only resource://file_reservations/<project> (or resource://reservations/<project>)"
+                .to_string(),
+        )),
+    };
+    let active_only = query
+        .get("active_only")
+        .is_none_or(|value| parse_resource_bool(Some(value)));
+    let limit = parse_resource_limit(query.get("limit"), 50);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let read = crate::reservation_read::read_server(
+        &mcp_agent_mail_core::Config::from_env(),
+        &project_key,
+        active_only,
+    )?;
+    // A URI must not silently override a conflicting explicit/environment
+    // project selector. Both slug and canonical human key can name the same
+    // verified project, so compare identities rather than literal selectors.
+    if let Some(expected) = resolved_project_flag_or_env(project_flag) {
+        crate::reservation_read::verify_project_selector(&read.project, &expected)?;
+    }
+    if let Some(expected) = query.get("project") {
+        crate::reservation_read::verify_project_selector(&read.project, expected)?;
+    }
+    // Native navigation pages newest-first, whereas the MCP resource pages
+    // oldest-first. Require one complete read, then sort and slice locally;
+    // forwarding OFFSET would silently return a different set of leases.
+    // Active membership comes from the server, never from the client clock.
+    let mut records = read.reservations;
+    records.sort_by_key(|row| (std::cmp::Reverse(row.created_ts), row.id));
+    let reservations: Vec<_> = records
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| {
+            serde_json::json!({
+                "path": row.path_pattern,
+                "agent": row.agent,
+                "exclusive": row.exclusive,
+                "expires_ts": row.expires_ts,
+                "released": reservation_is_released(row.released_ts),
+            })
+        })
+        .collect();
+    Ok((
+        NavigateResult::Generic {
+            resource_type: "file_reservations".to_string(),
+            data: serde_json::json!({ "reservations": reservations }),
+        },
+        Some(read.project.slug),
     ))
 }
 
@@ -12729,6 +14226,9 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
 pub(crate) struct LiveServerMailboxConfig {
     pub database_url: String,
     pub storage_root: std::path::PathBuf,
+    /// Whether the server's integrity guard runs (and so refreshes the
+    /// proactive backup); `None` when an older server does not say.
+    pub integrity_guard_enabled: Option<bool>,
 }
 
 fn live_server_mailbox_config_from_ws_state(
@@ -12756,6 +14256,9 @@ fn live_server_mailbox_config_from_ws_state(
     Ok(LiveServerMailboxConfig {
         database_url,
         storage_root,
+        integrity_guard_enabled: config
+            .get("integrity_guard_enabled")
+            .and_then(serde_json::Value::as_bool),
     })
 }
 
@@ -12860,6 +14363,32 @@ pub(crate) fn reservation_read_attestation(
                 "live server mailbox configuration unavailable: {error}; local reservation read cannot attest freshness"
             )),
         ),
+    }
+}
+
+/// Only constructed after a successful, identity-checked MCP resource read.
+/// The user explicitly chose this server as the authority; no comparison with
+/// a local database or archive was needed or performed.
+pub(crate) fn server_reservation_read_attestation() -> ReservationReadAttestation {
+    ReservationReadAttestation {
+        state: "current",
+        source: "mcp_server",
+        database_matches_server: None,
+        storage_root_matches_server: None,
+        detail: "Reservations read through the explicitly selected MCP server; stored project identity verified before and after the read"
+            .to_string(),
+        action: None,
+    }
+}
+
+/// Automatic reads also verify that the daemon owns this CLI's mailbox pair.
+pub(crate) fn local_server_reservation_read_attestation() -> ReservationReadAttestation {
+    ReservationReadAttestation {
+        database_matches_server: Some(true),
+        storage_root_matches_server: Some(true),
+        detail: "Reservations read through the matching local MCP server; database, archive and stored project identity verified before and after the read"
+            .to_string(),
+        ..server_reservation_read_attestation()
     }
 }
 
@@ -13868,9 +15397,10 @@ fn atc_timestamp_matches_since(timestamp_micros: i64, since_micros: Option<i64>)
 }
 
 fn atc_stratum_matches(candidate: &str, filter: Option<&str>) -> bool {
+    // A blank `--stratum ""` filters nothing out rather than everything.
     filter.is_none_or(|needle| {
         let needle = needle.trim().to_ascii_lowercase();
-        !needle.is_empty() && candidate.to_ascii_lowercase().contains(&needle)
+        needle.is_empty() || candidate.to_ascii_lowercase().contains(&needle)
     })
 }
 
@@ -14124,7 +15654,9 @@ fn build_atc_data(
                 limit,
             )
         }),
-        privacy,
+        // The privacy report is an audit, not part of the compact view; the
+        // one-line canary verdict stays because it is a health signal.
+        privacy: privacy.filter(|_| !summary_only),
     }
 }
 
@@ -15229,15 +16761,19 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 limit,
                 include_bodies,
             )? {
-                match try_build_inbox_via_server(&request, &config)? {
-                    Some(result) => {
+                match try_build_inbox_via_server(
+                    &request,
+                    &config,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
+                )? {
+                    Some((result, project_slug, agent_name)) => {
                         phase.mark("server_fetch");
                         render_inbox_result(
                             cmd_name,
                             format,
                             result,
-                            request.project_key,
-                            request.agent_name,
+                            project_slug,
+                            agent_name,
                             phase,
                         )?
                     }
@@ -15274,28 +16810,77 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 )?
             }
         }
-        RobotSubcommand::Thread { id, limit, since } => {
-            let scope = resolve_robot_project_scope(args.project.as_deref())?;
-
+        RobotSubcommand::Thread {
+            id,
+            limit,
+            since,
+            server,
+        } => {
             // For thread command, bodies included in md/json, excluded in toon
             let include_bodies = format != OutputFormat::Toon;
-            let data = build_thread(
-                scope.conn(),
-                scope.project_id,
-                &id,
-                limit,
-                since.as_deref(),
-                include_bodies,
-            )?;
+            let config = mcp_agent_mail_core::Config::from_env();
+            let project_key = robot_server_project_key(args.project.as_deref())?;
+            let cutoff = since.as_deref().map(parse_since_micros).transpose()?;
+            let server_read = if server {
+                Some(crate::message_read::read_thread(
+                    &config,
+                    &project_key,
+                    &id,
+                    limit.unwrap_or(200),
+                    cutoff,
+                    include_bodies,
+                )?)
+            } else {
+                let selection = automatic_robot_project_selection(args.project.as_deref())?;
+                crate::message_read::try_read_thread(
+                    &config,
+                    &selection,
+                    &id,
+                    limit.unwrap_or(200),
+                    cutoff,
+                    include_bodies,
+                )?
+            };
+            let (project_slug, data) = if let Some((project, snapshot)) = server_read {
+                (project.slug, build_thread_from_server(snapshot))
+            } else {
+                let scope = resolve_robot_project_scope(args.project.as_deref())?;
+                let data = build_thread(
+                    scope.conn(),
+                    scope.project_id,
+                    &id,
+                    limit,
+                    since.as_deref(),
+                    include_bodies,
+                )?;
+                (scope.project_slug, data)
+            };
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             format_output_md(&env, format)?
         }
-        RobotSubcommand::Message { id } => {
-            let scope = resolve_robot_project_scope(args.project.as_deref())?;
-            let data = build_message(scope.conn(), scope.project_id, id)?;
+        RobotSubcommand::Message { id, server } => {
+            let config = mcp_agent_mail_core::Config::from_env();
+            let project_key = robot_server_project_key(args.project.as_deref())?;
+            let server_read = if server {
+                Some(crate::message_read::read_message(
+                    &config,
+                    &project_key,
+                    id,
+                )?)
+            } else {
+                let selection = automatic_robot_project_selection(args.project.as_deref())?;
+                crate::message_read::try_read_message(&config, &selection, id)?
+            };
+            let (project_slug, data) = if let Some((project, snapshot)) = server_read {
+                (project.slug, build_message_from_server(snapshot))
+            } else {
+                let scope = resolve_robot_project_scope(args.project.as_deref())?;
+                let data = build_message(scope.conn(), scope.project_id, id)?;
+                (scope.project_slug, data)
+            };
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             format_output_md(&env, format)?
         }
         RobotSubcommand::Search {
@@ -15303,26 +16888,30 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             kind,
             importance,
             since,
+            limit,
+            cursor,
         } => 'search: {
+            validate_robot_search_window(limit, cursor.as_deref())?;
             let config = mcp_agent_mail_core::Config::from_env();
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
-            // per call on a large mailbox. The server's search has no
-            // recipient-kind filter, and only an explicit project is routed.
-            if kind.is_none()
-                && !query.trim().is_empty()
-                && let Some(project_key) = resolved_project_flag_or_env(args.project.as_deref())
-                && let Some(data) = search_via_server(
+            // per call on a large mailbox. Recipient-kind filtering is
+            // negotiated before dispatch so older daemons cannot silently
+            // ignore it. Implicit CWD keeps nearest-ancestor project selection.
+            if !query.trim().is_empty()
+                && let Some((project, data)) = search_via_server(
                     &config,
-                    &project_key,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
                     &query,
+                    kind.as_deref(),
                     importance.as_deref(),
                     since.as_deref(),
+                    limit,
+                    cursor.as_deref(),
                 )?
             {
                 let mut env = RobotEnvelope::new(cmd_name, format, data);
-                env._meta.project =
-                    Some(mcp_agent_mail_core::resolve_project_identity(&project_key).slug);
+                env._meta.project = Some(project.slug);
                 break 'search format_output(&env, format)?;
             }
             let read_db = crate::open_db_sync_async_canonical_read_best_effort_with_database_url(
@@ -15376,7 +16965,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 kind.as_deref(),
                 importance.as_deref(),
                 since.as_deref(),
-                20,
+                limit,
+                cursor.as_deref(),
             )?;
             let search_index = data.search_index.clone();
             let mut env = RobotEnvelope::new(cmd_name, format, data);
@@ -15412,21 +17002,70 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             all,
             conflicts,
             expiring,
+            server,
         } => {
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let config = mcp_agent_mail_core::Config::from_env();
-            let read_attestation = reservation_read_attestation(&config);
-            let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)?;
-            let agent = scope.agent.clone();
-            let (data, actions) = build_reservations_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent,
-                all,
-                conflicts,
-                expiring,
-            )?;
+            let server_read = if server {
+                let project_key = robot_server_project_key(args.project.as_deref())?;
+                Some(crate::reservation_read::read_server(
+                    &config,
+                    &project_key,
+                    true,
+                )?)
+            } else {
+                crate::reservation_read::try_read_local_mailbox(
+                    &config,
+                    &automatic_robot_project_selection(args.project.as_deref())?,
+                    true,
+                )?
+            };
+            let (data, actions, project_slug, read_attestation) =
+                if let Some(mut read) = server_read {
+                    let agent = resolve_server_reservation_agent(&read, agent_flag)?;
+                    let my_reservation_ids: HashSet<i64> = read
+                        .reservations
+                        .iter()
+                        .filter(|row| agent.as_deref() == Some(row.agent.as_str()))
+                        .map(|row| row.id)
+                        .collect();
+                    read.reservations
+                        .sort_by_key(|row| (row.expires_ts, row.id));
+                    let (data, actions) = build_reservations_from_records(
+                        &read.reservations,
+                        mcp_agent_mail_db::now_micros(),
+                        &read.project.slug,
+                        agent,
+                        &my_reservation_ids,
+                        all,
+                        conflicts,
+                        expiring,
+                    )?;
+                    (
+                        data,
+                        actions,
+                        read.project.slug,
+                        if server {
+                            server_reservation_read_attestation()
+                        } else {
+                            local_server_reservation_read_attestation()
+                        },
+                    )
+                } else {
+                    let read_attestation = reservation_read_attestation(&config);
+                    let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)
+                        .map_err(crate::reservation_server_read_error)?;
+                    let (data, actions) = build_reservations_with_snapshot_cache(
+                        scope.conn(),
+                        scope.project_id,
+                        &scope.project_slug,
+                        scope.agent.clone(),
+                        all,
+                        conflicts,
+                        expiring,
+                    )?;
+                    (data, actions, scope.project_slug, read_attestation)
+                };
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -15435,7 +17074,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     reservation_read_attestation: read_attestation.clone(),
                 },
             );
-            env._meta.project = Some(scope.project_slug);
+            env._meta.project = Some(project_slug);
             if read_attestation.state != "current" {
                 env = env.with_alert("warn", read_attestation.detail, read_attestation.action);
             }
@@ -15531,10 +17170,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_alert(
                     "error",
                     format!(
-                        "{} corruption-class error(s) classified since start; run `am doctor --json`",
+                        "{} corruption-class error(s) classified since start; run `am doctor check --json`",
                         corruption.corruption_class_total
                     ),
-                    Some("am doctor --json".to_string()),
+                    Some("am doctor check --json".to_string()),
                 );
             } else if corruption.detections_total > 0 {
                 env = env.with_alert(
@@ -15565,106 +17204,190 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
+            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config)?;
+            let server_assessment = live_server_health
+                .as_ref()
+                .map(|(payload, latency)| assess_live_server_health(&config, payload, *latency))
+                .transpose()?
+                .flatten();
+            let (server_unhealthy, server_degraded, server_pressure, server_circuits, server_alert) =
+                if let Some(assessment) = server_assessment {
+                    let unhealthy = assessment.level == mcp_agent_mail_core::HealthLevel::Red;
+                    let degraded = assessment.level != mcp_agent_mail_core::HealthLevel::Green;
+                    let alert = degraded.then(|| assessment.probe.detail.clone());
+                    probes.push(assessment.probe);
+                    (
+                        unhealthy,
+                        degraded,
+                        assessment.pressure,
+                        assessment.circuits,
+                        alert,
+                    )
+                } else {
+                    (false, false, None, None, None)
+                };
+            let mut integrity_override: Option<mcp_agent_mail_db::IntegrityMetrics> = None;
 
-            // 1. DB connectivity probe
-            let db_start = std::time::Instant::now();
-            let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
-                &config.database_url,
-            ) {
-                Ok((conn, opened_path)) => {
-                    // Verify canonical DB reachability with a lightweight query.
-                    let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
-                    db_file = Some(opened_path.clone());
-                    if query_ok {
-                        db_conn = Some(conn);
-                    }
-                    let detail = if query_ok {
-                        format!("SQLite read-only connection healthy at {opened_path}")
-                    } else {
-                        db_error_message =
-                            Some(format!("SQLite read-only query failed at {opened_path}"));
-                        format!("SQLite read-only query failed at {opened_path}")
-                    };
-                    probes.push(HealthProbe {
-                        name: "db_connectivity".into(),
-                        status: if query_ok { "ok" } else { "fail" }.into(),
-                        latency_ms: 0.0,
-                        detail,
-                    });
-                    query_ok
-                }
-                Err(error) => {
-                    db_error_message = Some(error.to_string());
-                    probes.push(HealthProbe {
-                        name: "db_connectivity".into(),
-                        status: "fail".into(),
-                        latency_ms: 0.0,
-                        detail: format!("Cannot open database read-only: {error}"),
-                    });
-                    false
-                }
-            };
-            let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
-            if let Some(probe) = probes.last_mut()
-                && probe.name == "db_connectivity"
-            {
-                probe.latency_ms = (db_ms * 100.0).round() / 100.0;
-            }
-
-            // 1b. Live sqlite file sanity probe (non-mutating).
-            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
-            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
-            let db_file_sanity_degraded = db_file_sanity.degraded;
-            probes.push(db_file_sanity.probe);
-
-            // 1c. Core schema presence probe.
-            let db_schema = summarize_db_schema_probe(db_conn.as_ref());
-            let db_schema_unhealthy = db_schema.unhealthy;
-            probes.push(db_schema.probe);
-
-            // 1d. Canonical archive inventory vs SQLite inventory.
-            let archive_db_parity =
-                summarize_archive_db_parity_probe(db_conn.as_ref(), &config.storage_root);
-            let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
-            let archive_db_parity_degraded = archive_db_parity.degraded;
-            probes.push(archive_db_parity.probe);
-
-            // 1e. Search V3 lexical index/backfill state (read-only).
-            let search_index = robot_search_index_health_from_config(&config);
-            let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
-                match search_index {
-                    Ok(snapshot) => {
-                        let status = search_index_probe_status(&snapshot);
+            let (
+                db_ok,
+                db_file_sanity_unhealthy,
+                db_file_sanity_degraded,
+                db_schema_unhealthy,
+                archive_db_parity_unhealthy,
+                archive_db_parity_degraded,
+                search_index_snapshot,
+                search_index_unhealthy,
+                search_index_degraded,
+            ) = if let Some(live) = live_server_health
+                .as_ref()
+                .and_then(|(payload, latency_ms)| {
+                    synthesize_robot_health_probes_from_server(&config, payload, *latency_ms)
+                }) {
+                db_file = Some(live.db_file);
+                probes.push(live.db_connectivity);
+                let db_file_sanity_unhealthy = live.db_file_sanity.unhealthy;
+                let db_file_sanity_degraded = live.db_file_sanity.degraded;
+                probes.push(live.db_file_sanity.probe);
+                let db_schema_unhealthy = live.db_schema.unhealthy;
+                probes.push(live.db_schema.probe);
+                let archive_db_parity_unhealthy = live.archive_db_parity.unhealthy;
+                let archive_db_parity_degraded = live.archive_db_parity.degraded;
+                probes.push(live.archive_db_parity.probe);
+                probes.push(live.search_index_probe);
+                integrity_override = live.integrity_metrics;
+                (
+                    true,
+                    db_file_sanity_unhealthy,
+                    db_file_sanity_degraded,
+                    db_schema_unhealthy,
+                    archive_db_parity_unhealthy,
+                    archive_db_parity_degraded,
+                    Some(live.search_index_snapshot),
+                    live.search_index_unhealthy,
+                    live.search_index_degraded,
+                )
+            } else {
+                // 1. DB connectivity probe
+                let db_start = std::time::Instant::now();
+                let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
+                    &config.database_url,
+                ) {
+                    Ok((conn, opened_path)) => {
+                        // Verify canonical DB reachability with a lightweight query.
+                        let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
+                        db_file = Some(opened_path.clone());
+                        if query_ok {
+                            db_conn = Some(conn);
+                        }
+                        let detail = if query_ok {
+                            format!("SQLite read-only connection healthy at {opened_path}")
+                        } else {
+                            db_error_message =
+                                Some(format!("SQLite read-only query failed at {opened_path}"));
+                            format!("SQLite read-only query failed at {opened_path}")
+                        };
                         probes.push(HealthProbe {
-                            name: "search_index".into(),
-                            status: status.into(),
+                            name: "db_connectivity".into(),
+                            status: if query_ok { "ok" } else { "fail" }.into(),
                             latency_ms: 0.0,
-                            detail: search_index_probe_detail(&snapshot),
+                            detail,
                         });
-                        (Some(snapshot), status == "fail", status != "ok")
+                        query_ok
                     }
                     Err(error) => {
+                        db_error_message = Some(error.to_string());
                         probes.push(HealthProbe {
-                            name: "search_index".into(),
+                            name: "db_connectivity".into(),
                             status: "fail".into(),
                             latency_ms: 0.0,
-                            detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                            detail: format!("Cannot open database read-only: {error}"),
                         });
-                        (None, true, true)
+                        false
                     }
                 };
+                let db_ms = db_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(probe) = probes.last_mut()
+                    && probe.name == "db_connectivity"
+                {
+                    probe.latency_ms = (db_ms * 100.0).round() / 100.0;
+                }
+
+                // 1b. Live sqlite file sanity probe (non-mutating).
+                let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+                let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+                let db_file_sanity_degraded = db_file_sanity.degraded;
+                probes.push(db_file_sanity.probe);
+
+                // 1c. Core schema presence probe.
+                let db_schema = summarize_db_schema_probe(db_conn.as_ref());
+                let db_schema_unhealthy = db_schema.unhealthy;
+                probes.push(db_schema.probe);
+
+                // 1d. Canonical archive inventory vs SQLite inventory.
+                let archive_db_parity =
+                    summarize_archive_db_parity_probe(db_conn.as_ref(), &config.storage_root);
+                let archive_db_parity_unhealthy = archive_db_parity.unhealthy;
+                let archive_db_parity_degraded = archive_db_parity.degraded;
+                probes.push(archive_db_parity.probe);
+
+                // 1e. Search V3 lexical index/backfill state (read-only).
+                let search_index = robot_search_index_health_from_config(&config);
+                let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
+                    match search_index {
+                        Ok(snapshot) => {
+                            let status = search_index_probe_status(&snapshot);
+                            probes.push(HealthProbe {
+                                name: "search_index".into(),
+                                status: status.into(),
+                                latency_ms: 0.0,
+                                detail: search_index_probe_detail(&snapshot),
+                            });
+                            (Some(snapshot), status == "fail", status != "ok")
+                        }
+                        Err(error) => {
+                            probes.push(HealthProbe {
+                                name: "search_index".into(),
+                                status: "fail".into(),
+                                latency_ms: 0.0,
+                                detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                            });
+                            (None, true, true)
+                        }
+                    };
+                (
+                    db_ok,
+                    db_file_sanity_unhealthy,
+                    db_file_sanity_degraded,
+                    db_schema_unhealthy,
+                    archive_db_parity_unhealthy,
+                    archive_db_parity_degraded,
+                    search_index_snapshot,
+                    search_index_unhealthy,
+                    search_index_degraded,
+                )
+            };
 
             // 2. Circuit breaker status
-            let db_health = mcp_agent_mail_db::db_health_status();
+            let circuit_source = if server_circuits.is_some() {
+                "live server"
+            } else {
+                "local process (daemon circuit state unavailable)"
+            };
+            let db_health = server_circuits.unwrap_or_else(mcp_agent_mail_db::db_health_status);
             let open_circuits: Vec<String> = db_health
                 .circuits
                 .iter()
                 .filter(|c| c.state != "closed")
                 .map(|c| format!("{}={} ({} failures)", c.subsystem, c.state, c.failures))
                 .collect();
-            let circuits_ok = open_circuits.is_empty();
+            let circuits_ok = open_circuits.is_empty() && db_health.circuit_state == "closed";
             let circuit_detail = if circuits_ok {
                 "All circuits closed".to_string()
+            } else if open_circuits.is_empty() {
+                format!(
+                    "Active circuit faults: db={} ({} failures)",
+                    db_health.circuit_state, db_health.circuit_failures
+                )
             } else {
                 format!("Active circuit faults: {}", open_circuits.join(", "))
             };
@@ -15672,7 +17395,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "circuit_breakers".into(),
                 status: if circuits_ok { "ok" } else { "degraded" }.into(),
                 latency_ms: 0.0,
-                detail: circuit_detail,
+                detail: format!("{circuit_source}: {circuit_detail}"),
             });
 
             // Per-subsystem circuit details
@@ -15691,7 +17414,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 mcp_agent_mail_core::backpressure::compute_capacity_governor_decision(
                     "search_messages",
                 );
-            let health_str = capacity_decision.health_level.to_string();
+            let health_str = server_pressure
+                .as_ref()
+                .map_or(capacity_decision.health_level, |(level, _)| *level)
+                .to_string();
             let signals = &capacity_decision.signals;
             let backpressure_degraded = health_str != "green";
             let backpressure_unhealthy = health_str == "red";
@@ -15709,26 +17435,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "backpressure".into(),
                 status: health_str.clone(),
                 latency_ms: 0.0,
-                detail: format!(
-                    "decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
-                     wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
-                    capacity_decision.action,
-                    capacity_decision.enforced,
-                    capacity_decision.tool_is_shedable,
-                    signals.pool_utilization_pct,
-                    signals.wbq_depth_pct,
-                    signals.commit_depth_pct,
-                    signals.wbq_queue_p95_us,
-                    signals.commit_queue_p95_us,
-                    signals.disk_pressure_level,
-                    disk_stale,
-                    signals.memory_pressure_level,
-                    memory_stale,
+                detail: server_pressure.map_or_else(
+                    || {
+                        format!(
+                            "local process: decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
+                             wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
+                            capacity_decision.action,
+                            capacity_decision.enforced,
+                            capacity_decision.tool_is_shedable,
+                            signals.pool_utilization_pct,
+                            signals.wbq_depth_pct,
+                            signals.commit_depth_pct,
+                            signals.wbq_queue_p95_us,
+                            signals.commit_queue_p95_us,
+                            signals.disk_pressure_level,
+                            disk_stale,
+                            signals.memory_pressure_level,
+                            memory_stale,
+                        )
+                    },
+                    |(_, detail)| format!("live server: {detail}"),
                 ),
             });
 
             // 4. Integrity metrics
-            let integrity = mcp_agent_mail_db::integrity_metrics();
+            let integrity = integrity_override.unwrap_or_else(mcp_agent_mail_db::integrity_metrics);
             let (integrity_probe, integrity_ok) = summarize_integrity_probe(&integrity);
             probes.push(integrity_probe);
 
@@ -15867,11 +17598,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let descriptors = (!owner_pids.is_empty())
                 .then(|| crate::doctor_server_descriptor_check(&owner_pids));
             let server_health = descriptors.as_ref().and_then(|_| {
-                let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
-                    &config.http_host,
-                    config.http_port,
-                );
-                crate::probe_local_jsonrpc_health(&config, &port_status).payload
+                live_server_health.map(|(payload, _)| payload).or_else(|| {
+                    let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
+                        &config.http_host,
+                        config.http_port,
+                    );
+                    crate::probe_local_jsonrpc_health(&config, &port_status).payload
+                })
             });
             // The server's own leak detector sees growth over time, which a
             // point-in-time /proc sample cannot: relay its verdict too.
@@ -15923,6 +17656,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || search_index_unhealthy
                 || backpressure_unhealthy
                 || descriptors_unhealthy
+                || server_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
@@ -15937,6 +17671,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || process_owner_degraded
                 || descriptors_degraded
                 || write_mode_degraded
+                || server_degraded
             {
                 "degraded"
             } else {
@@ -16081,6 +17816,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             // Alerts
+            if let Some(detail) = server_alert {
+                env = env.with_alert(
+                    if server_unhealthy { "error" } else { "warn" },
+                    detail,
+                    Some("am doctor check --json".to_string()),
+                );
+            }
             if !db_ok {
                 // E4 (br-bvq1x.5.4): attach the safe-remediation contract derived
                 // from the classified DB failure (A2) and point the alert action at
@@ -16405,7 +18147,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Contacts => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
-            let contacts = build_contacts(scope.conn(), scope.project_id)?;
+            // Only an explicit --agent narrows the graph; an AGENT_NAME in the
+            // environment does not hide the rest of the project's links.
+            let agent = args
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            let contacts = build_contacts(scope.conn(), scope.project_id, agent)?;
 
             #[derive(Serialize)]
             struct ContactsData {
@@ -16416,6 +18165,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let count = contacts.len();
             let mut env = RobotEnvelope::new(cmd_name, format, ContactsData { count, contacts });
             env._meta.project = Some(scope.project_slug);
+            env._meta.agent = agent.map(str::to_string);
             format_output(&env, format)?
         }
         RobotSubcommand::Projects => {
@@ -16461,6 +18211,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
                 for attachment in parse_attachments_json(&att_json) {
                     attachments.push(AttachmentRow {
+                        name: attachment.name,
+                        storage: attachment.storage,
                         r#type: attachment.mime_type,
                         size: attachment.size_bytes,
                         sender: sender.clone(),
@@ -16483,9 +18235,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
-        RobotSubcommand::Navigate { uri } => {
-            let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
-                build_navigate_from_canonical_resource(&uri, args.project.as_deref())?
+        RobotSubcommand::Navigate { uri, server } => {
+            let (result, resolved_project) = if server {
+                build_navigate_server_reservations(&uri, args.project.as_deref())?
+            } else if navigate_should_use_canonical_resource(&uri) {
+                // Same fallback as every other robot verb: --project, then
+                // AGENT_MAIL_PROJECT, then the working directory.
+                let default_project = robot_server_project_key(args.project.as_deref()).ok();
+                build_navigate_from_canonical_resource(&uri, default_project.as_deref())?
             } else if let Some(result) = build_navigate_without_db(&uri)? {
                 result
             } else {
@@ -16546,7 +18303,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     format!(
                         "Handoff stopped at the {max_seconds}s wall-clock budget after {scanned} of {total} in-progress beads; results are partial"
                     ),
-                    Some("Rerun with --max-seconds <n> (or --limit <n>) to cover the rest".to_string()),
+                    Some("Rerun with a larger --max-seconds <n> to cover the rest".to_string()),
                 );
             }
             for action in actions {
@@ -16583,8 +18340,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
             // ATC experiences live in the sidecar (br-bvq1x.11.7); the privacy
-            // report reads them from there. No sidecar => no report.
-            let privacy_report = maybe_scope.as_ref().and_then(|_scope| {
+            // report reads them from there. No sidecar => no report, and the
+            // summary-only view never shows it.
+            let privacy_scope = maybe_scope.as_ref().filter(|_| !summary_only);
+            let privacy_report = privacy_scope.and_then(|_scope| {
                 let atc_conn = open_local_atc_sidecar_conn()?;
                 match atc_privacy_report_from_conn(&atc_conn) {
                     Ok(report) => Some(report),
@@ -17144,6 +18903,303 @@ mod tests {
         assert_eq!(approved.violation_count, 0);
     }
 
+    /// Preserve the previous single-statement query as an independent oracle
+    /// for the grouped implementation, including its three-valued comparisons.
+    fn legacy_robot_contact_stats(
+        conn: &DbConn,
+        project_id: i64,
+        agent_ids_sql: &str,
+        window_start: i64,
+        now: i64,
+    ) -> HashMap<i64, RobotAgentContactStats> {
+        use sqlmodel_core::Value as DbValue;
+
+        let approved_link_exists_sql = "\
+            SELECT 1 FROM agent_links link \
+            WHERE link.status = 'approved' \
+              AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
+              AND ( \
+                (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
+                OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
+              )";
+        let sql = format!(
+            "SELECT \
+                mr.agent_id AS agent_id, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                        WHEN m.sender_id = mr.agent_id THEN 1 \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND EXISTS ({approved_link_exists_sql}) \
+                        THEN 1 \
+                        ELSE 0 END) AS respected_count, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND m.sender_id != mr.agent_id \
+                         AND NOT EXISTS ({approved_link_exists_sql}) \
+                        THEN 1 \
+                        WHEN recipient.contact_policy = 'block_all' \
+                         AND m.sender_id != mr.agent_id \
+                        THEN 1 \
+                        ELSE 0 END) AS violation_count \
+             FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             JOIN agents recipient ON recipient.id = mr.agent_id \
+             WHERE recipient.project_id = ? \
+               AND mr.agent_id IN ({agent_ids_sql}) \
+               AND m.created_ts >= ? \
+             GROUP BY mr.agent_id"
+        );
+        conn.query_sync(
+            &sql,
+            &[
+                DbValue::BigInt(now),
+                DbValue::BigInt(now),
+                DbValue::BigInt(project_id),
+                DbValue::BigInt(window_start),
+            ],
+        )
+        .expect("legacy correlated contact query")
+        .into_iter()
+        .map(|row| {
+            (
+                row.get_named::<i64>("agent_id").expect("recipient id"),
+                RobotAgentContactStats {
+                    respected_count: row
+                        .get_named::<i64>("respected_count")
+                        .expect("respected count")
+                        .max(0) as u64,
+                    violation_count: row
+                        .get_named::<i64>("violation_count")
+                        .expect("violation count")
+                        .max(0) as u64,
+                },
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn robot_contact_stats_grouped_matches_legacy_across_policies_and_projects() {
+        use sqlmodel_core::Value as DbValue;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_robot_test_db_with_real_schema(&dir.path().join("contact-health.sqlite3"));
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                (1, 'selected', '/selected', 0), (2, 'other', '/other', 0); \
+             INSERT INTO agents \
+                (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy) \
+             VALUES \
+                (1, 1, 'Auto', '', '', 0, 0, 'auto'), \
+                (2, 1, 'Open', '', '', 0, 0, 'open'), \
+                (3, 1, 'Guarded', '', '', 0, 0, 'contacts_only'), \
+                (4, 1, 'Blocked', '', '', 0, 0, 'block_all'), \
+                (5, 1, 'Expiring', '', '', 0, 0, 'contacts_only'), \
+                (6, 1, 'Approved', '', '', 0, 0, 'contacts_only'), \
+                (7, 1, 'UnknownPolicy', '', '', 0, 0, 'future-policy'), \
+                (8, 1, 'NoMessages', '', '', 0, 0, 'contacts_only'), \
+                (10, 2, 'CrossSender', '', '', 0, 0, 'auto'), \
+                (11, 2, 'ReverseSender', '', '', 0, 0, 'auto'), \
+                (12, 2, 'LegacySender', '', '', 0, 0, 'auto'), \
+                (13, 1, 'PendingSender', '', '', 0, 0, 'auto'), \
+                (20, 2, 'ForeignRecipient', '', '', 0, 0, 'contacts_only'); \
+             INSERT INTO agent_links \
+                (a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts, expires_ts) \
+             VALUES \
+                (2, 10, 1, 3, 'approved', 0, 0, NULL), \
+                (1, 3, 2, 11, 'approved', 0, 0, 2000), \
+                (2, 12, 1, 3, 'accepted', 0, 0, NULL), \
+                (2, 10, 1, 5, 'approved', 0, 0, 999), \
+                (1, 5, 2, 11, 'approved', 0, 0, 1000), \
+                (2, 12, 1, 5, 'approved', 0, 0, -1), \
+                (1, 13, 1, 5, 'pending', 0, 0, NULL), \
+                (2, 10, 1, 6, 'rejected', 0, 0, NULL), \
+                (2, 11, 1, 6, 'approved', 0, 0, 0), \
+                (2, 12, 1, 6, 'approved', 0, 0, 1001), \
+                (2, 10, 2, 20, 'approved', 0, 0, 0); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+                (1, 2, 10, '', '', 500), (2, 2, 11, '', '', 500), \
+                (3, 2, 12, '', '', 500), (4, 1, 13, '', '', 500), \
+                (5, 1, 3, '', '', 500), (6, 1, 4, '', '', 500), \
+                (7, 1, 7, '', '', 500), (8, 2, 10, '', '', 99), \
+                (9, 1, 13, '', '', 100); \
+             INSERT INTO message_recipients (message_id, agent_id) VALUES \
+                (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 20), \
+                (2, 3), (2, 5), (2, 6), (3, 3), (3, 5), (3, 6), \
+                (4, 3), (4, 5), (5, 3), (6, 4), (7, 7), (8, 3), (9, 3);",
+        )
+        .expect("seed policies, link boundaries, and cross-project mail");
+
+        // Multiple deliveries in the same group must keep their full weight.
+        // BCC and CC are deliveries too, as in the original query.
+        conn.execute_raw("BEGIN").expect("begin bulk fixture");
+        for id in 100..228 {
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                 VALUES (?, 2, 10, '', '', 500)",
+                &[DbValue::BigInt(id)],
+            )
+            .expect("insert repeated delivery");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, 3, ?)",
+                &[
+                    DbValue::BigInt(id),
+                    DbValue::Text(if id % 2 == 0 { "cc" } else { "bcc" }.to_string()),
+                ],
+            )
+            .expect("insert repeated recipient");
+        }
+        conn.execute_raw("COMMIT").expect("commit bulk fixture");
+
+        let ids = "1,2,3,4,5,6,7,8,20";
+        let actual = fetch_robot_agent_contact_stats(&conn, 1, ids, 100, 1_000);
+        let legacy = legacy_robot_contact_stats(&conn, 1, ids, 100, 1_000);
+        let expected: HashMap<_, _> = [
+            (1, 1, 0),   // auto
+            (2, 1, 0),   // open
+            (3, 131, 3), // approved in both directions, self-send, grouped CC/BCC
+            (4, 1, 1),   // block_all still permits self-send
+            (5, 1, 3),   // negative expiry permits; past/exact expiry and pending refuse
+            (6, 2, 1),   // zero/future expiry permits; rejected refuses
+            (7, 1, 0),   // unknown policy keeps self-send without inventing violations
+        ]
+        .into_iter()
+        .map(|(id, respected_count, violation_count)| {
+            (
+                id,
+                RobotAgentContactStats {
+                    respected_count,
+                    violation_count,
+                },
+            )
+        })
+        .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, legacy);
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, "", 100, 1_000).is_empty());
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, ids, 501, 1_000).is_empty());
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 2, ids, 100, 1_000),
+            HashMap::from([(
+                20,
+                RobotAgentContactStats {
+                    respected_count: 1,
+                    violation_count: 0,
+                },
+            )]),
+            "the selected project filters recipients, not cross-project senders"
+        );
+    }
+
+    #[test]
+    fn robot_contact_stats_grouped_keeps_a_consistent_snapshot_and_caller_transaction() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("contact-snapshot.sqlite3");
+        let conn = open_robot_test_db_with_real_schema(&db_path);
+        conn.execute_raw(
+            "PRAGMA journal_mode = WAL; \
+             INSERT INTO agents \
+                (id, project_id, name, program, model, inception_ts, last_active_ts, contact_policy) \
+             VALUES (1, 1, 'Sender', '', '', 0, 0, 'open'), \
+                    (2, 1, 'Recipient', '', '', 0, 0, 'block_all'); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, '', '', 100); \
+             INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 2); \
+             INSERT INTO agent_links \
+                (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts) \
+             VALUES (1, 1, 1, 1, 2, 'approved', 0, 0); \
+             PRAGMA query_only = ON;",
+        )
+        .expect("seed direct WAL reader");
+        let writer = std::rc::Rc::new(
+            DbConn::open_file(db_path.to_str().expect("db path")).expect("peer writer"),
+        );
+        let peer = std::rc::Rc::clone(&writer);
+        let wrote = std::rc::Rc::new(std::cell::Cell::new(false));
+        let wrote_in_hook = std::rc::Rc::clone(&wrote);
+        ROBOT_CONTACT_STATS_AFTER_LINKS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Both coherent states classify the delivery as a violation.
+                // Old links plus the NEW contacts_only policy would invent a
+                // respected delivery that never existed in any committed state.
+                peer.execute_raw(
+                    "BEGIN IMMEDIATE; \
+                         UPDATE agent_links SET status = 'rejected' WHERE id = 1; \
+                         UPDATE agents SET contact_policy = 'contacts_only' WHERE id = 2; \
+                         COMMIT;",
+                )
+                .expect("peer changes link and policy between the two reads");
+                wrote_in_hook.set(true);
+            }));
+        });
+        let violation = HashMap::from([(
+            2,
+            RobotAgentContactStats {
+                respected_count: 0,
+                violation_count: 1,
+            },
+        )]);
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation,
+            "links and recipient policy must share the held read snapshot"
+        );
+        assert!(wrote.get(), "peer commit must actually execute");
+        assert_eq!(
+            conn.query_sync("SELECT contact_policy FROM agents WHERE id = 2", &[])
+                .unwrap()[0]
+                .get_named::<String>("contact_policy")
+                .unwrap(),
+            "contacts_only",
+            "the reader must release its snapshot after returning"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
+
+        conn.execute_raw(
+            "PRAGMA query_only = OFF; BEGIN; \
+             UPDATE agents SET contact_policy = 'open' WHERE id = 2;",
+        )
+        .expect("caller-owned transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            HashMap::from([(
+                2,
+                RobotAgentContactStats {
+                    respected_count: 1,
+                    violation_count: 0,
+                },
+            )])
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("successful health read must not commit its caller's transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
+
+        conn.execute_raw(
+            "BEGIN; UPDATE agent_links \
+             SET a_agent_id = 'malformed-id', status = 'approved' WHERE id = 1;",
+        )
+        .expect("plant undecodable link authority in caller transaction");
+        assert!(fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000).is_empty());
+        conn.execute_raw("ROLLBACK")
+            .expect("failed health read must not end its caller's transaction");
+        assert_eq!(
+            fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000),
+            violation
+        );
+    }
+
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
     where
         F: FnOnce() -> T,
@@ -17622,6 +19678,69 @@ mod tests {
         assert_eq!(data.summary.blocked_by_reservation, 1);
     }
 
+    #[test]
+    fn build_handoff_summary_counts_beads_the_limit_leaves_out() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let beads_dir = project_dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let now_us = mcp_agent_mail_db::now_micros();
+        let stale_updated_at = mcp_agent_mail_db::micros_to_iso(now_us - 2 * MICROS_PER_HOUR);
+        let issues = ["br-one", "br-two", "br-three"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "title": "Stale",
+                    "status": "in_progress",
+                    "updated_at": stale_updated_at,
+                    "comments": []
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(beads_dir.join("issues.jsonl"), format!("{issues}\n"))
+            .expect("write issues jsonl");
+
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let conn = open_robot_test_db_with_real_schema(&db_dir.path().join("handoff.sqlite3"));
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'demo', ?, 0)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                project_dir.path().display().to_string(),
+            )],
+        )
+        .expect("insert project");
+        let scope = ResolvedRobotProjectScope {
+            db: RobotDbHandle::from_conn(conn),
+            project_id: 1,
+            project_slug: "demo".to_string(),
+        };
+
+        let (data, _actions) = build_handoff(
+            &scope,
+            30,
+            30,
+            30,
+            false,
+            Some(1),
+            ROBOT_HANDOFF_DEFAULT_MAX_SECONDS,
+            false,
+        )
+        .expect("build handoff");
+
+        assert_eq!(data.records.len(), 1);
+        assert_eq!(data.summary.shown, 1);
+        let s = &data.summary;
+        let classified = s.keep
+            + s.ask_owner
+            + s.takeover_candidates
+            + s.reopen_candidates
+            + s.blocked_by_reservation
+            + s.needs_human_review;
+        assert_eq!(classified, 3, "every stale bead is counted: {s:?}");
+    }
+
     fn sample_atc_snapshot() -> AtcRobotSnapshot {
         AtcRobotSnapshot {
             enabled: true,
@@ -17871,6 +19990,19 @@ mod tests {
             parsed.storage_root,
             std::path::PathBuf::from("/srv/agent-mail/archive")
         );
+        // A server that predates the field does not say whether its
+        // integrity guard runs.
+        assert_eq!(parsed.integrity_guard_enabled, None);
+
+        let parsed = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "config": {
+                "database_url": "sqlite:////srv/agent-mail/server.sqlite3",
+                "storage_root": "/srv/agent-mail/archive",
+                "integrity_guard_enabled": false
+            }
+        }))
+        .expect("parse server mailbox config");
+        assert_eq!(parsed.integrity_guard_enabled, Some(false));
     }
 
     #[test]
@@ -17895,6 +20027,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: std::path::PathBuf::from("/srv/agent-mail/archive"),
+                integrity_guard_enabled: None,
             }),
             None,
         );
@@ -17919,6 +20052,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: config.database_url.clone(),
                 storage_root: config.storage_root.clone(),
+                integrity_guard_enabled: None,
             }),
             None,
         );
@@ -18245,6 +20379,15 @@ mod tests {
     }
 
     #[test]
+    fn atc_stratum_filter_is_a_case_insensitive_substring() {
+        assert!(atc_stratum_matches("liveness:probe:0", Some("LIVENESS")));
+        assert!(atc_stratum_matches("liveness:probe:0", Some("probe:0")));
+        assert!(!atc_stratum_matches("liveness:probe:0", Some("conflict")));
+        assert!(atc_stratum_matches("liveness:probe:0", None));
+        assert!(atc_stratum_matches("liveness:probe:0", Some("  ")));
+    }
+
+    #[test]
     fn build_atc_data_summary_only_filters_since_and_stratum() {
         let data = build_atc_data(
             sample_atc_snapshot(),
@@ -18253,12 +20396,31 @@ mod tests {
             Some("1970-01-01T00:00:02Z"),
             Some("liveness:probe:0"),
             None,
-            None,
+            Some(atc_privacy_report_unavailable()),
             true,
             5,
         );
 
         assert!(data.summary.is_some(), "summary-only should keep summary");
+        assert!(
+            data.privacy.is_none(),
+            "summary-only should drop the privacy report"
+        );
+        let full = build_atc_data(
+            sample_atc_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(atc_privacy_report_unavailable()),
+            false,
+            5,
+        );
+        assert!(
+            full.privacy.is_some(),
+            "the full view keeps the privacy report"
+        );
         assert!(
             data.decisions.is_none(),
             "summary-only should suppress decisions"
@@ -18626,11 +20788,14 @@ mod tests {
             priority: "high".into(),
             from: "RedHarbor".into(),
             subject: "Test".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "br-123".into(),
             age: "5m".into(),
             ack_status: "pending".into(),
             importance: "urgent".into(),
+            via: None,
             body_md: None,
         }];
         let json = serde_json::to_string(&inbox).unwrap();
@@ -18769,17 +20934,51 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "RedFox".into(),
             subject: "Urgent review needed".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "AUTH-001".into(),
             age: "35m ago".into(),
             ack_status: "overdue".into(),
             importance: "high".into(),
+            via: Some("project".into()),
             body_md: Some("Please review the auth changes".into()),
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], 100);
         assert_eq!(json["priority"], "ack-overdue");
+        assert_eq!(json["via"], "project");
         assert_eq!(json["body_md"], "Please review the auth changes");
+    }
+
+    #[test]
+    fn server_inbox_rows_keep_the_project_mailbox_marker() {
+        // GH#282: fetch_inbox flags shared-mailbox mail with via="project";
+        // the robot inbox must not drop it on the way to its own entries.
+        let project_row = serde_json::json!({
+            "id": 7, "project_id":1, "sender_id":2, "importance": "normal", "ack_required": false,
+            "from": "GreenCastle", "subject": "Schema freeze", "thread_id": null,
+            "read_ts":null, "ack_ts":null,
+            "created_ts": "2026-10-08T12:00:00Z", "kind": "project", "via": "project"
+        });
+        let direct_row = serde_json::json!({
+            "id": 8, "project_id":1, "sender_id":2, "importance": "normal", "ack_required": false,
+            "from": "GreenCastle", "subject": "Direct", "thread_id": null,
+            "read_ts":null, "ack_ts":null,
+            "created_ts": "2026-10-08T12:00:00Z", "kind": "to"
+        });
+        let now_us = 1_791_500_000_000_000;
+        let shared = server_inbox_row_to_entry(&project_row, 1, now_us, 0, false)
+            .unwrap()
+            .entry;
+        let direct = server_inbox_row_to_entry(&direct_row, 1, now_us, 0, false)
+            .unwrap()
+            .entry;
+        assert_eq!(shared.via.as_deref(), Some("project"));
+        assert_eq!(direct.via, None);
+        let json = serde_json::to_value(&shared).unwrap();
+        assert_eq!(json["via"], "project");
+        assert!(serde_json::to_value(&direct).unwrap().get("via").is_none());
     }
 
     #[test]
@@ -18789,11 +20988,14 @@ mod tests {
             priority: "unread".into(),
             from: "BlueLake".into(),
             subject: "FYI".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: None,
             thread: "".into(),
             age: "1h ago".into(),
             ack_status: "none".into(),
             importance: "normal".into(),
+            via: None,
             body_md: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
@@ -18801,6 +21003,10 @@ mod tests {
         assert!(
             json.get("body_md").is_none(),
             "body_md should be omitted when None"
+        );
+        assert!(
+            json.get("via").is_none(),
+            "a direct delivery carries no via marker"
         );
     }
 
@@ -18819,11 +21025,14 @@ mod tests {
                     priority: "ack-overdue".into(),
                     from: "RedFox".into(),
                     subject: "Review auth".into(),
+                    sender_display_name: None,
+                    to_display_names: BTreeMap::new(),
                     topic: None,
                     thread: "AUTH-1".into(),
                     age: "35m ago".into(),
                     ack_status: "overdue".into(),
                     importance: "high".into(),
+                    via: None,
                     body_md: None,
                 },
                 InboxEntry {
@@ -18831,11 +21040,14 @@ mod tests {
                     priority: "urgent".into(),
                     from: "BlueLake".into(),
                     subject: "Blocking issue".into(),
+                    sender_display_name: None,
+                    to_display_names: BTreeMap::new(),
                     topic: None,
                     thread: "FEAT-1".into(),
                     age: "10m ago".into(),
                     ack_status: "required".into(),
                     importance: "urgent".into(),
+                    via: None,
                     body_md: None,
                 },
             ],
@@ -18864,10 +21076,16 @@ mod tests {
         assert_eq!(v["_actions"][0], "am mail ack 1");
     }
 
-    #[test]
-    fn robot_inbox_server_arguments_preserve_robot_filter_precedence() {
-        let default_request = RobotInboxServerRequest {
-            project_key: "/tmp/demo".into(),
+    fn inbox_snapshot_test_project() -> Value {
+        serde_json::json!({"id":7,"slug":"demo","human_key":"/work/demo",
+        "created_at":"2026-01-01T00:00:00Z", "agents":[{
+            "id":12,"project_id":7,"name":"BlueLake","inception_ts":"2026-01-01T00:00:00Z"
+        }]})
+    }
+
+    fn inbox_snapshot_test_request() -> RobotInboxServerRequest {
+        RobotInboxServerRequest {
+            project_key: "demo".into(),
             agent_name: "BlueLake".into(),
             urgent: false,
             ack_overdue: false,
@@ -18875,128 +21093,515 @@ mod tests {
             all: false,
             limit: 20,
             include_bodies: false,
-        };
-        let default_args = robot_inbox_server_arguments(&default_request);
-        assert_eq!(default_args["unread_only"], true);
-        assert_eq!(default_args["ack_overdue_only"], false);
-        // Listing must never consume unread state (GH#229).
-        assert_eq!(default_args["mark_read"], false);
+        }
+    }
 
-        let urgent_request = RobotInboxServerRequest {
-            urgent: true,
-            ack_overdue: true,
-            unread: false,
-            ..default_request.clone()
-        };
-        let urgent_args = robot_inbox_server_arguments(&urgent_request);
-        assert_eq!(urgent_args["urgent_only"], true);
-        assert_eq!(urgent_args["unread_only"], true);
-        assert_eq!(urgent_args["ack_overdue_only"], false);
+    fn inbox_snapshot_test_clock() -> i64 {
+        mcp_agent_mail_db::iso_to_micros("2026-01-02T12:00:00Z").unwrap()
+    }
 
-        let overdue_request = RobotInboxServerRequest {
-            urgent: false,
-            ack_overdue: true,
-            unread: false,
-            ..default_request.clone()
-        };
-        let overdue_args = robot_inbox_server_arguments(&overdue_request);
-        assert_eq!(overdue_args["unread_only"], false);
-        assert_eq!(overdue_args["ack_overdue_only"], true);
+    fn inbox_snapshot_test_row(
+        id: i64,
+        importance: &str,
+        age_minutes: i64,
+        ack_required: bool,
+        read: bool,
+    ) -> Value {
+        let now = inbox_snapshot_test_clock();
+        serde_json::json!({"id":id,"project_id":7,"sender_id":13,"from":"GreenCastle",
+            "subject":format!("message {id}"),"thread_id":"coordination","topic":null,
+            "importance":importance,"ack_required":ack_required,
+            "created_ts":mcp_agent_mail_db::micros_to_iso(now - age_minutes * 60_000_000),
+            "read_ts":read.then(|| mcp_agent_mail_db::micros_to_iso(now - 30_000_000)),
+            "ack_ts":null,"kind":"to","via":null})
+    }
 
-        let all_request = RobotInboxServerRequest {
-            unread: false,
-            all: true,
-            ..default_request
-        };
-        let all_args = robot_inbox_server_arguments(&all_request);
-        assert_eq!(all_args["unread_only"], false);
-        assert_eq!(all_args["ack_overdue_only"], false);
-        assert_eq!(all_args["mark_read"], false);
+    fn inbox_snapshot_test_payload(request: &RobotInboxServerRequest, rows: Vec<Value>) -> Value {
+        let project = inbox_snapshot_test_project();
+        let now = inbox_snapshot_test_clock();
+        serde_json::json!({"schema_version":1,"complete":true,"project":project,
+            "agent":project["agents"][0], "captured_ts":mcp_agent_mail_db::micros_to_iso(now),
+            "ack_overdue_before":mcp_agent_mail_db::micros_to_iso(micros_ago(now, ACK_OVERDUE_THRESHOLD_US)),
+            "urgent":request.urgent,"ack_overdue":request.ack_overdue,"unread":request.unread,
+            "all":request.all,"limit":request.limit,"include_bodies":request.include_bodies,
+            "count":rows.len(),"messages":rows})
+    }
+
+    fn validate_inbox_test_snapshot(
+        payload: &Value,
+        request: &RobotInboxServerRequest,
+    ) -> Result<InboxResult, CliError> {
+        let descriptor = inbox_snapshot_test_project();
+        let project = crate::reservation_read::validate_project(&descriptor, "demo").unwrap();
+        let agent = resolve_server_inbox_agent(&descriptor, project.id, "BlueLake").unwrap();
+        validate_inbox_priority_snapshot(payload, request, &project, &agent)
+    }
+
+    fn inbox_snapshot_test_mailbox(config: &mcp_agent_mail_core::Config) -> Value {
+        let mut payload = crate::reservation_read::tests::ancestor_mailbox_payload(config);
+        payload["inbox_priority_snapshot"] = "priority_v1".into();
+        payload
     }
 
     #[test]
-    fn robot_inbox_server_payload_uses_read_and_ack_timestamps_for_priority() {
-        let now = mcp_agent_mail_db::now_micros();
-        let old = mcp_agent_mail_db::micros_to_iso(now - ACK_OVERDUE_THRESHOLD_US - 60_000_000);
-        let recent = mcp_agent_mail_db::micros_to_iso(now - 60_000_000);
-        let read = mcp_agent_mail_db::micros_to_iso(now - 30_000_000);
-        let payload = serde_json::json!([
-            {
-                "id": 2,
-                "subject": "Normal unread",
-                "from": "GreenCastle",
-                "importance": "normal",
-                "ack_required": false,
-                "created_ts": recent.clone(),
-                "thread_id": "normal-thread",
-                "kind": "to"
+    fn robot_inbox_snapshot_preserves_filter_precedence() {
+        let rows = [
+            inbox_snapshot_test_row(1, "urgent", 120, true, false),
+            inbox_snapshot_test_row(2, "normal", 60, true, true),
+            inbox_snapshot_test_row(3, "normal", 5, true, false),
+            inbox_snapshot_test_row(4, "normal", 1, false, false),
+            inbox_snapshot_test_row(5, "normal", 5, true, true),
+            inbox_snapshot_test_row(6, "normal", 1, false, true),
+        ];
+        for (urgent, overdue, unread, all, expected) in [
+            (false, false, true, false, vec![1, 2, 3, 4]),
+            (true, true, false, true, vec![1]),
+            (false, true, true, true, vec![1, 2]),
+            (false, false, false, false, vec![1, 2, 3, 4, 5]),
+            (false, false, true, true, vec![1, 2, 3, 4, 5, 6]),
+        ] {
+            let request = RobotInboxServerRequest {
+                urgent,
+                ack_overdue: overdue,
+                unread,
+                all,
+                ..inbox_snapshot_test_request()
+            };
+            let selected = rows
+                .iter()
+                .filter(|row| expected.contains(&row["id"].as_i64().unwrap()))
+                .cloned()
+                .collect();
+            let payload = inbox_snapshot_test_payload(&request, selected);
+            let result = validate_inbox_test_snapshot(&payload, &request).unwrap();
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(result.entries[0].priority, "urgent");
+            assert_eq!(result.entries[0].ack_status, "overdue");
+        }
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_uses_pinned_authority_and_captured_clock_from_nested_scope() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let requested = mcp_agent_mail_core::resolve_project_path(&nested.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let selection = crate::message_read::ProjectSelection::Ancestors(requested.clone());
+        let mut request = inbox_snapshot_test_request();
+        request.agent_name = "bluelake".into();
+        let mut project = inbox_snapshot_test_project();
+        project["human_key"] =
+            mcp_agent_mail_core::resolve_project_path(&directory.path().to_string_lossy())
+                .to_string_lossy()
+                .into_owned()
+                .into();
+        let mut urgent = inbox_snapshot_test_row(1, "urgent", 120, true, false);
+        urgent["kind"] = "project".into();
+        urgent["via"] = "project".into();
+        urgent["sender_display_name"] = "SPX Maintainer".into();
+        urgent["to_display_names"] = serde_json::json!({"BlueLake": null});
+        let mut payload = inbox_snapshot_test_payload(
+            &request,
+            vec![
+                urgent,
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+                inbox_snapshot_test_row(3, "normal", 1, false, false),
+            ],
+        );
+        payload["project"] = project.clone();
+        project["resolution"] =
+            serde_json::json!({"kind":"nearest_ancestor","requested_path":requested});
+        let (result, calls) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(payload),
+                    TestReply::Resource(project),
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                ]
             },
-            {
-                "id": 3,
-                "subject": "Ack overdue",
-                "from": "RedStone",
-                "importance": "normal",
-                "ack_required": true,
-                "created_ts": old.clone(),
-                "read_ts": read.clone(),
-                "thread_id": "ack-thread",
-                "kind": "to"
+            |config| try_build_inbox_via_server(&request, config, &selection),
+        );
+        let (result, slug, agent) = result.unwrap().unwrap();
+        assert_eq!((slug.as_str(), agent.as_str()), ("demo", "BlueLake"));
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(result.entries[0].via.as_deref(), Some("project"));
+        assert_eq!(
+            result.entries[0].sender_display_name.as_deref(),
+            Some("SPX Maintainer")
+        );
+        assert_eq!(
+            result.entries[0].to_display_names.get("BlueLake"),
+            Some(&None)
+        );
+        assert_eq!(
+            result.entries[1].ack_status, "required",
+            "use captured clock, not CLI wall clock"
+        );
+        assert_eq!(result.entries[1].age, "5m ago");
+        assert!(result.actions[0].contains("--project demo --agent BlueLake"));
+        assert_eq!(calls.len(), 5);
+        assert!(calls.iter().all(|call| call["method"] == "resources/read"));
+        assert_eq!(
+            calls[1]["params"]["uri"],
+            format!(
+                "{}&include_retired=true",
+                crate::message_read::project_resource_uri(&selection).unwrap()
+            )
+        );
+        assert_eq!(
+            calls[2]["params"]["uri"],
+            "resource://inbox/BlueLake?project=demo&context=true&urgent=false&ack_overdue=false&unread=true&all=false&limit=20&include_bodies=false&format=json"
+        );
+    }
+
+    #[test]
+    fn robot_inbox_command_reads_the_priority_snapshot_without_opening_a_local_mailbox() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = inbox_snapshot_test_request();
+        let project = inbox_snapshot_test_project();
+        let snapshot = inbox_snapshot_test_payload(
+            &request,
+            vec![
+                inbox_snapshot_test_row(1, "urgent", 120, true, false),
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+            ],
+        );
+        let ((result, output), calls) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(snapshot),
+                    TestReply::Resource(project),
+                    TestReply::Resource(inbox_snapshot_test_mailbox(config)),
+                ]
             },
-            {
-                "id": 1,
-                "subject": "Urgent unread",
-                "from": "BlueLake",
-                "importance": "urgent",
-                "ack_required": true,
-                "created_ts": old.clone(),
-                "thread_id": "urgent-thread",
-                "kind": "to"
+            |_| {
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                let result = handle_robot(RobotArgs {
+                    format: Some(OutputFormat::Json),
+                    json: true,
+                    project: Some("demo".into()),
+                    agent: Some("bluelake".into()),
+                    command: RobotSubcommand::Inbox {
+                        urgent: false,
+                        ack_overdue: false,
+                        unread: false,
+                        all: false,
+                        limit: None,
+                        include_bodies: false,
+                    },
+                });
+                (result, capture.drain_to_string())
             },
-            {
-                "id": 4,
-                "subject": "Read and acked",
-                "from": "SilverPeak",
-                "importance": "normal",
-                "ack_required": true,
-                "created_ts": old,
-                "read_ts": read.clone(),
-                "ack_ts": read,
-                "thread_id": "done-thread",
-                "kind": "to"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let value: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(value["_meta"]["project"], "demo");
+        assert_eq!(value["_meta"]["agent"], "BlueLake");
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["inbox"][0]["id"], 1);
+        assert_eq!(value["inbox"][0]["ack_status"], "overdue");
+        assert_eq!(value["inbox"][1]["age"], "5m ago");
+        assert!(value["inbox"][0].get("body_md").is_none());
+        assert_eq!(calls.len(), 5);
+        assert!(calls.iter().all(|call| call["method"] == "resources/read"));
+        assert_eq!(
+            calls[1]["params"]["uri"],
+            "resource://project/demo?format=json&include_retired=true"
+        );
+        assert_eq!(calls[1]["params"]["uri"], calls[3]["params"]["uri"]);
+        assert!(
+            calls[2]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("unread=true")
+        );
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_refuses_incomplete_or_unverifiable_rows() {
+        let request = inbox_snapshot_test_request();
+        let valid = inbox_snapshot_test_payload(
+            &request,
+            vec![
+                inbox_snapshot_test_row(1, "urgent", 120, true, false),
+                inbox_snapshot_test_row(2, "normal", 5, true, false),
+                inbox_snapshot_test_row(3, "normal", 1, false, false),
+            ],
+        );
+        assert!(validate_inbox_test_snapshot(&valid, &request).is_ok());
+        for fault in [
+            "schema",
+            "incomplete",
+            "count",
+            "limit",
+            "filter",
+            "clock",
+            "project",
+            "agent",
+            "agent_epoch",
+            "id",
+            "sender",
+            "row_project",
+            "created",
+            "missing_read",
+            "ack",
+            "body",
+            "importance",
+            "kind",
+            "via",
+            "order",
+            "duplicate",
+            "out_of_scope",
+        ] {
+            let mut payload = valid.clone();
+            match fault {
+                "schema" => payload["schema_version"] = 2.into(),
+                "incomplete" => payload["complete"] = false.into(),
+                "count" => payload["count"] = 4.into(),
+                "limit" => payload["limit"] = 19.into(),
+                "filter" => payload["unread"] = false.into(),
+                "clock" => payload["ack_overdue_before"] = payload["captured_ts"].clone(),
+                "project" => payload["project"]["created_at"] = "2026-01-01T01:00:00Z".into(),
+                "agent" => payload["agent"]["id"] = 99.into(),
+                "agent_epoch" => payload["agent"]["inception_ts"] = "2026-01-01T01:00:00Z".into(),
+                "id" => payload["messages"][0]["id"] = 0.into(),
+                "sender" => payload["messages"][0]["sender_id"] = 0.into(),
+                "row_project" => payload["messages"][0]["project_id"] = 99.into(),
+                "created" => payload["messages"][0]["created_ts"] = Value::Null,
+                "missing_read" => {
+                    payload["messages"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("read_ts");
+                }
+                "ack" => payload["messages"][0]["ack_ts"] = "not-a-timestamp".into(),
+                "body" => payload["messages"][0]["body_md"] = Value::Null,
+                "importance" => payload["messages"][0]["importance"] = "unknown".into(),
+                "kind" => payload["messages"][0]["kind"] = "outbox".into(),
+                "via" => payload["messages"][0]["via"] = "project".into(),
+                "order" => payload["messages"].as_array_mut().unwrap().swap(0, 2),
+                "duplicate" => payload["messages"][1] = payload["messages"][0].clone(),
+                "out_of_scope" => {
+                    payload["messages"][2]["read_ts"] = payload["captured_ts"].clone()
+                }
+                _ => unreachable!(),
             }
-        ]);
-        let request = RobotInboxServerRequest {
-            project_key: "/tmp/demo".into(),
-            agent_name: "BlueLake".into(),
-            urgent: false,
-            ack_overdue: false,
-            unread: true,
-            all: false,
-            limit: 10,
-            include_bodies: false,
-        };
-
-        let result = build_inbox_from_server_payload(&payload, &request).expect("server inbox");
-        let ids = result
-            .entries
-            .iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1, 3, 2]);
-        assert_eq!(result.entries[0].priority, "urgent");
-        assert_eq!(result.entries[1].priority, "ack-overdue");
-        assert_eq!(result.entries[1].ack_status, "overdue");
-        assert_eq!(result.alerts.len(), 1);
-
-        let overdue_request = RobotInboxServerRequest {
-            ack_overdue: true,
-            unread: false,
+            assert!(
+                validate_inbox_test_snapshot(&payload, &request).is_err(),
+                "accepted {fault}"
+            );
+        }
+        let with_bodies = RobotInboxServerRequest {
+            include_bodies: true,
             ..request
         };
-        let overdue =
-            build_inbox_from_server_payload(&payload, &overdue_request).expect("overdue inbox");
-        assert_eq!(overdue.entries.len(), 1);
-        assert_eq!(overdue.entries[0].id, 3);
+        let mut payload = valid;
+        payload["include_bodies"] = true.into();
+        assert!(validate_inbox_test_snapshot(&payload, &with_bodies).is_err());
+        for row in payload["messages"].as_array_mut().unwrap() {
+            row["body_md"] = "retained body".into();
+        }
+        assert_eq!(
+            validate_inbox_test_snapshot(&payload, &with_bodies)
+                .unwrap()
+                .entries[0]
+                .body_md
+                .as_deref(),
+            Some("retained body")
+        );
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_negotiates_before_data_and_refuses_changed_authority() {
+        use crate::reservation_read::tests::{TestReply, with_test_server};
+        let request = inbox_snapshot_test_request();
+        let selection = crate::message_read::ProjectSelection::Exact("demo".into());
+        for fault in [
+            "legacy",
+            "future",
+            "unavailable",
+            "auth",
+            "capability_type",
+            "ambiguous_agent",
+            "rpc",
+            "incomplete",
+            "agent_changed",
+            "project_changed",
+            "capability_changed",
+            "mailbox_changed",
+        ] {
+            let (result, calls) = with_test_server(
+                |config| {
+                    if fault == "auth" || fault == "unavailable" {
+                        return vec![TestReply::Raw(
+                            if fault == "auth" { 401 } else { 503 },
+                            serde_json::json!({"jsonrpc":"2.0","error":{"code":-32001,"message":"private-token"}}),
+                        )];
+                    }
+                    let mut capability = inbox_snapshot_test_mailbox(config);
+                    match fault {
+                        "legacy" => {
+                            capability
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("inbox_priority_snapshot");
+                        }
+                        "future" => capability["inbox_priority_snapshot"] = "priority_v2".into(),
+                        "capability_type" => capability["inbox_priority_snapshot"] = true.into(),
+                        _ => (),
+                    }
+                    let mut replies = vec![TestReply::Resource(capability)];
+                    if matches!(fault, "legacy" | "future" | "capability_type") {
+                        return replies;
+                    }
+                    let mut project = inbox_snapshot_test_project();
+                    if fault == "ambiguous_agent" {
+                        let mut duplicate = project["agents"][0].clone();
+                        duplicate["id"] = 13.into();
+                        duplicate["name"] = "bluelake".into();
+                        project["agents"].as_array_mut().unwrap().push(duplicate);
+                    }
+                    replies.push(TestReply::Resource(project.clone()));
+                    if fault == "ambiguous_agent" {
+                        return replies;
+                    }
+                    if fault == "rpc" {
+                        replies.push(TestReply::Raw(200, serde_json::json!({"jsonrpc":"2.0","error":{"code":-32002,"message":"scope mismatch"}})));
+                        return replies;
+                    }
+                    let mut payload = inbox_snapshot_test_payload(
+                        &request,
+                        vec![inbox_snapshot_test_row(1, "urgent", 120, true, false)],
+                    );
+                    if fault == "incomplete" {
+                        payload["complete"] = false.into();
+                    }
+                    replies.push(TestReply::Resource(payload));
+                    if fault == "incomplete" {
+                        return replies;
+                    }
+                    match fault {
+                        "agent_changed" => {
+                            project["agents"][0]["inception_ts"] = "2026-01-01T01:00:00Z".into()
+                        }
+                        "project_changed" => project["created_at"] = "2026-01-01T01:00:00Z".into(),
+                        _ => (),
+                    }
+                    replies.push(TestReply::Resource(project));
+                    if matches!(fault, "agent_changed" | "project_changed") {
+                        return replies;
+                    }
+                    let mut after = inbox_snapshot_test_mailbox(config);
+                    if fault == "capability_changed" {
+                        after
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("inbox_priority_snapshot");
+                    }
+                    if fault == "mailbox_changed" {
+                        after["storage_root"] = "/another/archive".into();
+                    }
+                    replies.push(TestReply::Resource(after));
+                    replies
+                },
+                |config| try_build_inbox_via_server(&request, config, &selection),
+            );
+            if matches!(fault, "legacy" | "future" | "unavailable") {
+                assert!(result.unwrap().is_none(), "{fault}");
+                assert_eq!(calls.len(), 1);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(!error.contains("private-token"), "{fault}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn robot_inbox_snapshot_keeps_unsupported_limits_and_git_paths_local() {
+        use crate::message_read::ProjectSelection;
+        use mcp_agent_mail_core::{Config, ProjectIdentityMode};
+        let path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_TOKEN", "invalid bearer token")],
+            || {
+                for limit in [0, ROBOT_INBOX_SNAPSHOT_LIMIT_MAX + 1] {
+                    let request = RobotInboxServerRequest {
+                        limit,
+                        ..inbox_snapshot_test_request()
+                    };
+                    assert!(
+                        try_build_inbox_via_server(
+                            &request,
+                            &Config::default(),
+                            &ProjectSelection::Exact("demo".into())
+                        )
+                        .unwrap()
+                        .is_none()
+                    );
+                }
+                for mode in [
+                    ProjectIdentityMode::GitRemote,
+                    ProjectIdentityMode::GitCommonDir,
+                    ProjectIdentityMode::GitToplevel,
+                ] {
+                    let config = Config {
+                        worktrees_enabled: true,
+                        project_identity_mode: mode,
+                        ..Config::default()
+                    };
+                    for selection in [
+                        ProjectSelection::Ancestors(path.clone()),
+                        ProjectSelection::Exact(path.clone()),
+                    ] {
+                        assert!(
+                            try_build_inbox_via_server(
+                                &inbox_snapshot_test_request(),
+                                &config,
+                                &selection
+                            )
+                            .unwrap()
+                            .is_none()
+                        );
+                    }
+                    assert!(
+                        try_build_inbox_via_server(
+                            &inbox_snapshot_test_request(),
+                            &config,
+                            &ProjectSelection::Exact("demo".into())
+                        )
+                        .is_err(),
+                        "stored slug remains eligible and attempts its authenticated session"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
@@ -19106,6 +21711,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -19172,6 +21778,122 @@ mod tests {
     }
 
     #[test]
+    fn collect_search_rows_stops_after_one_page_when_recipient_kind_is_absent() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'cc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "an absent kind must not scan the next page");
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        10, "first", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    ranking: Default::default(),
+                    next_cursor: Some("more-search-results".into()),
+                    explain: None,
+                    assistance: None,
+                    guidance: Some(empty_search_guidance()),
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("absent recipient kind");
+        assert_eq!(calls, 1, "execute the backend once to preserve validation");
+        assert!(rows.rows.is_empty());
+        assert!(rows.next_cursor.is_none());
+        assert_eq!(
+            serde_json::to_value(rows.guidance).unwrap(),
+            serde_json::to_value(Some(empty_search_guidance())).unwrap(),
+            "keep the backend's diagnostics"
+        );
+    }
+
+    #[test]
+    fn collect_search_rows_keeps_paging_when_kind_exists_beyond_the_first_page() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'bcc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |query| {
+                calls += 1;
+                let (id, next_cursor) = if query.cursor.is_none() {
+                    (10, Some("second-page".into()))
+                } else {
+                    assert_eq!(query.cursor.as_deref(), Some("second-page"));
+                    (20, None)
+                };
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        id, "match", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    ranking: Default::default(),
+                    next_cursor,
+                    explain: None,
+                    assistance: None,
+                    guidance: None,
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("recipient kind on a later page");
+        assert_eq!(calls, 2);
+        assert_eq!(rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(), [20]);
+        assert!(rows.next_cursor.is_none());
+    }
+
+    #[test]
+    fn collect_search_rows_preserves_backend_errors_before_kind_presence_probe() {
+        use mcp_agent_mail_db::search_planner::SearchQuery;
+
+        // No recipient table: probing it before the backend would hide the
+        // actual query/cursor error behind an unrelated database error.
+        let conn = DbConn::open_memory().expect("real empty database");
+        let result = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| Err(CliError::Other("invalid search cursor control".into())),
+        );
+        match result {
+            Err(CliError::Other(message)) => assert_eq!(message, "invalid search cursor control"),
+            _ => panic!("the original backend error must survive"),
+        }
+    }
+
+    #[test]
     fn collect_search_rows_with_runner_pages_until_kind_matches_fill_limit() {
         use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
@@ -19211,6 +21933,7 @@ mod tests {
                         planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
                         planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
                     ],
+                    ranking: Default::default(),
                     next_cursor: Some("cursor-2".into()),
                     explain: None,
                     assistance: None,
@@ -19221,6 +21944,7 @@ mod tests {
                     results: vec![planner_search_result_row(
                         30, "third", 0.7, 300, "th-3", "Gamma",
                     )],
+                    ranking: Default::default(),
                     next_cursor: None,
                     explain: None,
                     assistance: None,
@@ -19247,7 +21971,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_search_rows_with_runner_suppresses_cursor_when_filter_overflows_page() {
+    fn collect_search_rows_with_runner_resumes_at_last_visible_filtered_match() {
         use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -19277,40 +22001,88 @@ mod tests {
         )
         .expect("insert recipients");
 
-        let mut query = SearchQuery::messages("needle", 1);
-        query.limit = Some(search_page_limit(2, Some("to")));
+        for scored in [true, false] {
+            for more_backend_pages in [true, false] {
+                let mut query = SearchQuery::messages("needle", 1);
+                query.limit = Some(search_page_limit(2, Some("to")));
+                let mut call_count = 0usize;
+                let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
+                    call_count += 1;
+                    assert!(
+                        query.cursor.is_none(),
+                        "collector should not fetch past the page that already filled the visible limit"
+                    );
+                    let mut results = vec![
+                        planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                        planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
+                        planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
+                        planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
+                    ];
+                    if !scored {
+                        for row in &mut results {
+                            row.score = None;
+                        }
+                    }
+                    Ok(SearchResponse {
+                        results,
+                        ranking: Default::default(),
+                        next_cursor: more_backend_pages.then(|| "cursor-after-page".into()),
+                        explain: None,
+                        assistance: None,
+                        guidance: None,
+                        audit: vec![],
+                    })
+                })
+                .expect("collect kind-filtered rows");
 
-        let mut call_count = 0usize;
-        let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
-            call_count += 1;
-            assert!(
-                query.cursor.is_none(),
-                "collector should not fetch past the page that already filled the visible limit"
-            );
-            Ok(SearchResponse {
-                results: vec![
-                    planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
-                    planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
-                    planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
-                    planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
-                ],
-                next_cursor: Some("cursor-after-page".into()),
-                explain: None,
-                assistance: None,
-                guidance: None,
-                audit: vec![],
-            })
-        })
-        .expect("collect kind-filtered rows");
+                assert_eq!(call_count, 1);
+                assert_eq!(
+                    rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![20, 30]
+                );
+                let cursor = mcp_agent_mail_db::search_planner::SearchCursor::decode(
+                    rows.next_cursor
+                        .as_deref()
+                        .expect("unreturned matching row has a continuation"),
+                )
+                .expect("native search cursor");
+                assert_eq!(
+                    cursor.id, 30,
+                    "the backend page boundary would skip message 40"
+                );
+                assert_eq!(
+                    cursor.score.to_bits(),
+                    if scored { 0.7_f64 } else { 0.0_f64 }.to_bits()
+                );
+            }
+        }
+    }
 
-        assert_eq!(call_count, 1);
-        assert_eq!(
-            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            vec![20, 30]
-        );
+    /// GH#291: proven never-written orphan pages are named on a passing
+    /// probe and do not turn it into a warning.
+    #[test]
+    fn summarize_integrity_probe_names_never_written_orphan_pages() {
+        let metrics = mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 2_000,
+            last_check_ts: 2_000,
+            last_full_check_ts: 2_000,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Full),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            checks_total: 5,
+            failures_total: 5,
+            failures_since_last_ok: 0,
+            never_written_orphan_pages: 425,
+        };
+        let (probe, ok) = summarize_integrity_probe(&metrics);
+        assert!(ok);
+        assert_eq!(probe.status, "ok");
         assert!(
-            rows.next_cursor.is_none(),
-            "cursor would skip the unreturned matching row from the current fetched page"
+            probe
+                .detail
+                .contains("425 never-written orphan page(s) (leaked space, not data damage)"),
+            "{}",
+            probe.detail
         );
     }
 
@@ -19326,6 +22098,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 1,
+            never_written_orphan_pages: 0,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -19341,6 +22114,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         });
         assert!(ok);
         assert_eq!(probe.status, "ok");
@@ -19359,6 +22133,7 @@ mod tests {
             checks_total: 0,
             failures_total: 1,
             failures_since_last_ok: 1,
+            never_written_orphan_pages: 0,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -19374,6 +22149,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         });
         assert!(
             !ok,
@@ -19864,12 +22640,65 @@ mod tests {
         conn.query_sync("DELETE FROM agents WHERE id = 2", &[])
             .expect("delete counterparty agent row");
 
-        let contacts = build_contacts(&conn, 1).expect("build contacts");
+        let contacts = build_contacts(&conn, 1, None).expect("build contacts");
 
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].from, "Alice");
         assert_eq!(contacts[0].to, "[unknown-agent-2]");
         assert_eq!(contacts[0].policy, "unknown");
+    }
+
+    #[test]
+    fn build_contacts_lists_incoming_cross_project_requests_and_narrows_by_agent() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let ts = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us);
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0)",
+            &[],
+        )
+        .expect("insert other project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (9, 2, 'Zed', 'codex-cli', 'gpt-5', 0, 0)",
+            &[],
+        )
+        .expect("insert other-project agent");
+        // Zed (project 2) asked Bob (project 1); the link lives under project 2.
+        // Alice asked Carol inside project 1.
+        conn.query_sync(
+            "INSERT INTO agent_links
+             (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
+             VALUES (1, 2, 9, 1, 2, 'pending', 'cross', ?1, ?1, ?1),
+                    (2, 1, 1, 1, 3, 'approved', 'local', ?1, ?1, ?1)",
+            &[ts],
+        )
+        .expect("insert links");
+
+        let pairs = |agent: Option<&str>| {
+            build_contacts(&conn, 1, agent)
+                .expect("build contacts")
+                .into_iter()
+                .map(|row| format!("{}->{}", row.from, row.to))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            pairs(None),
+            ["Alice->Carol", "Zed->Bob"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            pairs(Some("bob")),
+            std::iter::once("Zed->Bob".to_string()).collect()
+        );
+        // Project 2's own view still sees the request it made.
+        assert_eq!(
+            build_contacts(&conn, 2, None).expect("other project").len(),
+            1
+        );
     }
 
     #[test]
@@ -20029,6 +22858,8 @@ mod tests {
     #[test]
     fn test_attachment_row_serialization() {
         let att = AttachmentRow {
+            name: "shot.webp".into(),
+            storage: "file".into(),
             r#type: "image/webp".into(),
             size: 1024,
             sender: "RedFox".into(),
@@ -20037,10 +22868,35 @@ mod tests {
             project: "my-project".into(),
         };
         let v: Value = serde_json::to_value(&att).unwrap();
+        assert_eq!(v["name"], "shot.webp");
+        assert_eq!(v["storage"], "file");
         assert_eq!(v["type"], "image/webp");
         assert_eq!(v["size"], 1024);
         assert_eq!(v["sender"], "RedFox");
         assert_eq!(v["message_id"], 77);
+    }
+
+    #[test]
+    fn attachment_records_report_name_and_storage_mode() {
+        let parsed = parse_attachments_json(
+            r#"[{"type":"file","path":"attachments/ab/shot.webp","media_type":"image/webp","bytes":10},
+                {"type":"inline","data_uri":"data:image/png;base64,AA","name":"tiny.png"},
+                {"path":"attachments/cd/log.txt"},
+                {"media_type":"text/plain"}]"#,
+        );
+        let summary = parsed
+            .iter()
+            .map(|a| (a.name.as_str(), a.storage.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                ("shot.webp", "file"),
+                ("tiny.png", "inline"),
+                ("log.txt", "file"),
+                ("attachment", "unknown"),
+            ]
+        );
     }
 
     #[test]
@@ -21043,11 +23899,14 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "BlueLake".into(),
             subject: "[FEAT-1] Test".into(),
+            sender_display_name: None,
+            to_display_names: BTreeMap::new(),
             topic: Some("feat.1".into()),
             thread: "FEAT-1".into(),
             age: "5m".into(),
             ack_status: "overdue".into(),
             importance: "high".into(),
+            via: None,
             body_md: Some("Message body".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -21069,11 +23928,14 @@ mod tests {
                 priority: "ack-overdue".into(),
                 from: "Agent1".into(),
                 subject: "Urgent".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 topic: None,
                 thread: "".into(),
                 age: "45m".into(),
                 ack_status: "overdue".into(),
                 importance: "urgent".into(),
+                via: None,
                 body_md: None,
             },
             InboxEntry {
@@ -21081,11 +23943,14 @@ mod tests {
                 priority: "urgent".into(),
                 from: "Agent2".into(),
                 subject: "High".into(),
+                sender_display_name: None,
+                to_display_names: BTreeMap::new(),
                 topic: None,
                 thread: "".into(),
                 age: "10m".into(),
                 ack_status: "none".into(),
                 importance: "urgent".into(),
+                via: None,
                 body_md: None,
             },
         ];
@@ -21312,6 +24177,7 @@ mod tests {
             thread_id: "FEAT-123".into(),
             subject: "Add authentication".into(),
             message_count: 5,
+            omitted_older: None,
             participants: vec!["BlueLake".into(), "RedFox".into()],
             last_activity: "10m".into(),
             messages: vec![],
@@ -21327,6 +24193,7 @@ mod tests {
             thread_id: "BUG-42".into(),
             subject: "Fix login issue".into(),
             message_count: 2,
+            omitted_older: None,
             participants: vec!["Alice".into(), "Bob".into()],
             last_activity: "5m".into(),
             messages: vec![ThreadMessage {
@@ -21375,6 +24242,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -21407,6 +24275,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -21419,6 +24288,275 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_results"], 0);
         assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn robot_search_git_identity_paths_keep_the_local_resolver() {
+        use crate::message_read::ProjectSelection;
+        use mcp_agent_mail_core::ProjectIdentityMode;
+
+        let path = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_TOKEN", "invalid bearer token")],
+            || {
+                for mode in [
+                    ProjectIdentityMode::GitRemote,
+                    ProjectIdentityMode::GitCommonDir,
+                    ProjectIdentityMode::GitToplevel,
+                ] {
+                    let config = mcp_agent_mail_core::Config {
+                        worktrees_enabled: true,
+                        project_identity_mode: mode,
+                        ..mcp_agent_mail_core::Config::default()
+                    };
+                    for selection in [
+                        ProjectSelection::Ancestors(path.clone()),
+                        ProjectSelection::Exact(path.clone()),
+                    ] {
+                        assert!(
+                            search_via_server(
+                                &config, &selection, "deploy", None, None, None, 20, None,
+                            )
+                            .unwrap()
+                            .is_none()
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn robot_search_uses_verified_server_project_and_never_opens_local_files() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[{
+                        "id":7,"subject":"Deploy","importance":"high","ack_required":0,
+                        "created_ts":"2026-10-28T00:00:00Z","thread_id":"release","from":"BlueLake",
+                        "to":[],"cc":[],"body_md":"Ready to deploy","score":1.5
+                    }]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| {
+                search_via_server(
+                    config,
+                    &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                    "deploy",
+                    None,
+                    Some("high"),
+                    None,
+                    20,
+                    None,
+                )
+            },
+        );
+        let (project, data) = result.unwrap().expect("selected matching daemon");
+        assert_eq!(project.slug, "registered-project");
+        assert_eq!(data.served_by, Some("server"));
+        assert_eq!(data.results[0].id, 7);
+        assert_eq!(requests[2]["params"]["name"], "search_messages");
+        assert_eq!(
+            requests[2]["params"]["arguments"]["project_key"],
+            "/work/demo"
+        );
+        assert_eq!(requests[2]["params"]["arguments"]["importance"], "high");
+        assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn robot_search_kind_command_uses_negotiated_server_without_local_mailbox() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let ((result, output), requests) = with_test_server(
+            |config| {
+                let mut capability = mailbox_payload(config);
+                capability["search_recipient_kind"] = "delivery_v1".into();
+                vec![
+                    TestReply::Resource(capability.clone()),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[{
+                        "id":7,"subject":"Deploy","importance":"high","ack_required":0,
+                        "created_ts":"2026-10-28T00:00:00Z","thread_id":"release","from":"BlueLake",
+                        "to":["RedFox"],"cc":["GreenHill"],"body_md":"Ready to deploy","score":1.5
+                    }]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(capability),
+                ]
+            },
+            |_| {
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                let result = handle_robot(RobotArgs {
+                    format: Some(OutputFormat::Json),
+                    json: true,
+                    project: Some("registered-project".into()),
+                    agent: None,
+                    command: RobotSubcommand::Search {
+                        query: "deploy".into(),
+                        kind: Some(" CC ".into()),
+                        importance: None,
+                        since: None,
+                        limit: 2,
+                        cursor: None,
+                    },
+                });
+                (result, capture.drain_to_string())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let payload: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(payload["served_by"], "server");
+        assert_eq!(payload["results"][0]["id"], 7);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[2]["method"], "tools/call");
+        assert_eq!(requests[2]["params"]["arguments"]["recipient_kind"], "cc");
+        assert_eq!(
+            requests[2]["params"]["arguments"]["project_key"],
+            "/work/demo"
+        );
+    }
+
+    #[test]
+    fn robot_search_kind_negotiates_before_dispatch_and_rechecks_capability() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        for fault in ["missing", "future", "malformed", "changed"] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut capability = mailbox_payload(config);
+                    match fault {
+                        "future" => capability["search_recipient_kind"] = "delivery_v2".into(),
+                        "malformed" => capability["search_recipient_kind"] = true.into(),
+                        "changed" => capability["search_recipient_kind"] = "delivery_v1".into(),
+                        _ => (),
+                    }
+                    let mut replies = vec![TestReply::Resource(capability)];
+                    if fault == "changed" {
+                        replies.extend([
+                            TestReply::Resource(project.clone()),
+                            TestReply::Tool(serde_json::json!({"result":[]})),
+                            TestReply::Resource(project.clone()),
+                            TestReply::Resource(mailbox_payload(config)),
+                        ]);
+                    }
+                    replies
+                },
+                |config| {
+                    search_via_server(
+                        config,
+                        &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                        "needle",
+                        Some("bcc"),
+                        None,
+                        None,
+                        2,
+                        None,
+                    )
+                },
+            );
+            if matches!(fault, "missing" | "future") {
+                assert!(
+                    result.unwrap().is_none(),
+                    "unsupported daemon must use explicit fallback"
+                );
+            } else {
+                assert!(result.is_err(), "{fault} authority must fail closed");
+            }
+            assert_eq!(requests.len(), if fault == "changed" { 5 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn robot_search_from_nested_directory_uses_negotiated_ancestor_scope() {
+        use crate::reservation_read::tests::{
+            TestReply, ancestor_mailbox_payload, with_test_server,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let human_key =
+            mcp_agent_mail_core::resolve_project_path(&directory.path().to_string_lossy())
+                .to_string_lossy()
+                .into_owned();
+        let requested = mcp_agent_mail_core::resolve_project_path(&nested.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":human_key,"created_at":"2026-10-28T00:00:00Z","agents":[],
+            "resolution":{"kind":"nearest_ancestor","requested_path":requested}});
+        let selection = crate::message_read::ProjectSelection::Ancestors(requested.clone());
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(ancestor_mailbox_payload(config)),
+                ]
+            },
+            |config| search_via_server(config, &selection, "deploy", None, None, None, 20, None),
+        );
+        let (project, data) = result.unwrap().expect("ancestor search used the daemon");
+        assert_eq!(project.human_key, human_key);
+        assert_eq!(data.served_by, Some("server"));
+        assert_eq!(requests[2]["params"]["arguments"]["project_key"], human_key);
+        assert_eq!(
+            requests[1]["params"]["uri"],
+            format!(
+                "resource://project/{}?resolve=ancestors&format=json",
+                crate::reservation_read::encode_resource_component(&requested)
+            )
+        );
+    }
+
+    #[test]
+    fn implicit_conversation_scope_keeps_registered_ancestor_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let conn = mcp_agent_mail_db::DbConn::open_memory().unwrap();
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)").unwrap();
+        conn.query_sync(
+            "INSERT INTO projects (id,slug,human_key,created_at) VALUES (7,'ancestor',?,100)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                root.to_string_lossy().into_owned(),
+            )],
+        )
+        .unwrap();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AGENT_MAIL_PROJECT", "")],
+            || {
+                assert!(matches!(
+                    automatic_robot_project_selection(None).unwrap(),
+                    crate::message_read::ProjectSelection::Ancestors(_)
+                ));
+                assert_eq!(
+                    find_project_for_path_or_ancestors(&conn, &nested).unwrap(),
+                    (7, "ancestor".into())
+                );
+                assert!(
+                    matches!(automatic_robot_project_selection(Some("ancestor")).unwrap(),
+                    crate::message_read::ProjectSelection::Exact(key) if key == "ancestor")
+                );
+            },
+        );
     }
 
     #[test]
@@ -21439,6 +24577,12 @@ mod tests {
                          "from": "BlueLake", "to": [], "cc": [], "score": second_score},
                     ],
                     "next_cursor": "c2",
+                    "diagnostics": {
+                        "degraded": true,
+                        "fallback_mode": "recipient_kind_page_budget",
+                        "budget_exhausted": true,
+                        "remediation_hints": ["Continue with next_cursor"],
+                    },
                 }),
             )
             .expect("server response")
@@ -21449,6 +24593,20 @@ mod tests {
         assert_eq!(data.served_by, Some("server"));
         assert_eq!(data.total_results, 2);
         assert_eq!(data.next_cursor.as_deref(), Some("c2"));
+        let diagnostics = data
+            .diagnostics
+            .as_ref()
+            .expect("server diagnostics survive CLI mapping");
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.budget_exhausted, Some(true));
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("recipient_kind_page_budget")
+        );
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["diagnostics"]["budget_exhausted"],
+            true
+        );
         let (first, second) = (&data.results[0], &data.results[1]);
         assert_eq!((first.id, first.relevance), (7, 1.5));
         assert_eq!(first.snippet, "Roll out the new plan");
@@ -21466,8 +24624,7 @@ mod tests {
             .collect();
         assert!(importance.contains(&("high", 1)) && importance.contains(&("normal", 1)));
 
-        // A server that predates explain scores: take the snapshot path
-        // rather than report relevance nobody computed.
+        // An unscored response cannot report relevance nobody computed.
         assert!(
             search_data_from_server_response("deploy", response(serde_json::Value::Null), now_us)
                 .is_none()
@@ -21499,6 +24656,7 @@ mod tests {
             next_cursor: None,
             plan_diagnostic: None,
             search_index: Some(health.clone()),
+            diagnostics: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -21553,7 +24711,7 @@ mod tests {
                 query_text: "form:BlueLake rollback".into(),
                 applied_filter_hints: Vec::new(),
                 did_you_mean: vec![mcp_agent_mail_db::query_assistance::DidYouMeanHint {
-                    token: "form:BlueLake".into(),
+                    token: "form:BlueLake".into(), // ubs:ignore -- search-typo token in a test; no credential material.
                     suggested_field: "from".into(),
                     value: "BlueLake".into(),
                 }],
@@ -21569,6 +24727,7 @@ mod tests {
                 }],
             }),
             next_cursor: Some("s3feccccccccccccd:i42".into()),
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -22020,12 +25179,13 @@ mod tests {
             &empty,
         )
         .expect("insert agent");
+        // A live lease (expires in 2100): navigate lists only unexpired ones.
         conn.query_sync(
             "INSERT INTO file_reservations (
                 id, project_id, agent_id, path_pattern, \"exclusive\",
                 reason, created_ts, expires_ts, released_ts
              ) VALUES (
-                1, 1, 1, 'src/**', 1, 'test', 1000, 2000, NULL
+                1, 1, 1, 'src/**', 1, 'test', 1000, 4102444800000000, NULL
              )",
             &empty,
         )
@@ -22496,6 +25656,52 @@ mod tests {
             other => panic!("unexpected active-only reservations result: {other:?}"),
         }
         assert_eq!(active_scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn test_build_navigate_active_reservations_skip_expired_leases_and_page() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now = mcp_agent_mail_db::now_micros();
+        let live = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now + 3_600_000_000);
+        let lapsed = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now - 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'lapsed/**', 1, 'a', 10, ?, NULL),
+                (2, 1, 1, 'one/**', 1, 'b', 20, ?, NULL),
+                (3, 1, 2, 'two/**', 1, 'c', 30, ?, NULL),
+                (4, 1, 3, 'three/**', 1, 'd', 40, ?, NULL)",
+            &[lapsed, live.clone(), live.clone(), live],
+        )
+        .expect("insert reservations");
+        let paths = |uri: &str| {
+            let (result, _) =
+                build_navigate(&conn, uri, 1, "proj", None).expect("navigate reservations");
+            let NavigateResult::Generic { data, .. } = result else {
+                panic!("unexpected reservations result: {result:?}");
+            };
+            data["reservations"]
+                .as_array()
+                .expect("reservations array")
+                .iter()
+                .map(|row| row["path"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Newest first; the lease that expired an hour ago is not active.
+        assert_eq!(
+            paths("resource://file_reservations/proj"),
+            vec!["three/**", "two/**", "one/**"]
+        );
+        assert_eq!(
+            paths("resource://file_reservations/proj?limit=1&offset=1"),
+            vec!["two/**"]
+        );
+        assert_eq!(
+            paths("resource://file_reservations/proj?active_only=false&limit=2&offset=2"),
+            vec!["one/**", "lapsed/**"]
+        );
     }
 
     #[test]
@@ -24020,6 +27226,45 @@ mod tests {
     }
 
     #[test]
+    fn test_build_thread_reports_messages_left_out_by_the_limit() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (150, 1, 1, 'one', 'LONG', 'normal', 0, 10, 'b', '[]'),
+                    (151, 1, 1, 'two', 'LONG', 'normal', 0, 20, 'b', '[]'),
+                    (152, 1, 1, 'three', 'LONG', 'normal', 0, 30, 'b', '[]')",
+            &[],
+        )
+        .expect("insert messages");
+
+        let window = build_thread(&conn, 1, "LONG", Some(2), None, false).expect("thread");
+        assert_eq!(window.message_count, 3, "the whole thread is counted");
+        assert_eq!(window.omitted_older, Some(1));
+        assert_eq!(
+            window
+                .messages
+                .iter()
+                .map(|msg| (msg.position, msg.subject.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "two"), (3, "three")],
+            "the newest messages keep their place in the thread"
+        );
+        let json = serde_json::to_value(&window).expect("serialize thread");
+        assert_eq!(json["omitted_older"], 1);
+
+        let whole = build_thread(&conn, 1, "LONG", Some(10), None, false).expect("thread");
+        assert_eq!(whole.message_count, 3);
+        assert_eq!(whole.omitted_older, None);
+        assert!(
+            serde_json::to_value(&whole)
+                .expect("serialize thread")
+                .get("omitted_older")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_build_thread_collects_sender_and_recipient_participants() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let created_ts = mcp_agent_mail_db::now_micros();
@@ -24186,6 +27431,10 @@ mod tests {
 
     #[test]
     fn test_build_inbox_respects_include_bodies_flag() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         conn.query_sync(
             "INSERT INTO messages
@@ -24200,18 +27449,858 @@ mod tests {
             &[],
         )
         .expect("insert inbox recipient");
+        conn.query_sync(
+            "UPDATE agents SET display_name = 'Reviewer Ω' WHERE id IN (1, 2)",
+            &[],
+        )
+        .expect("assign duplicate labels");
+        conn.query_sync(
+            "UPDATE messages SET recipients_json = '{\"to\":[\"Bob\"],\"cc\":[\"Alice\"],\"bcc\":[\"Carol\"]}' WHERE id = 123",
+            &[],
+        )
+        .expect("set recipient metadata");
 
-        let metadata = build_inbox(
-            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        let metadata = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
         )
         .expect("build metadata inbox");
         assert_eq!(metadata.entries[0].body_md, None);
+        assert_eq!(metadata.entries[0].from, "Alice");
+        assert_eq!(
+            metadata.entries[0].sender_display_name.as_deref(),
+            Some("Reviewer Ω")
+        );
+        assert_eq!(
+            serde_json::to_value(&metadata.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": "Reviewer Ω"})
+        );
 
         let full = build_inbox(
             &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, true,
         )
         .expect("build full inbox");
         assert_eq!(full.entries[0].body_md.as_deref(), Some("inbox body"));
+        assert_eq!(
+            full.entries[0].sender_display_name.as_deref(),
+            Some("Reviewer Ω")
+        );
+        let generation = robot_status_snapshot_generation(&conn, 1).expect("snapshot generation");
+        conn.query_sync(
+            "UPDATE agents SET display_name = 'Officer Alpha' WHERE id = 1",
+            &[],
+        )
+        .expect("rename sender label without activity change");
+        conn.query_sync("UPDATE agents SET display_name = NULL WHERE id = 2", &[])
+            .expect("clear recipient label without activity change");
+        assert_eq!(
+            robot_status_snapshot_generation(&conn, 1).expect("unchanged snapshot generation"),
+            generation
+        );
+        let renamed = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("read current labels through cached inbox");
+        assert_eq!(renamed.entries[0].id, 123);
+        assert_eq!(renamed.entries[0].from, "Alice");
+        assert_eq!(
+            renamed.entries[0].sender_display_name.as_deref(),
+            Some("Officer Alpha")
+        );
+        assert_eq!(
+            serde_json::to_value(&renamed.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": null})
+        );
+    }
+
+    #[test]
+    fn robot_inbox_cross_project_sender_labels_follow_global_identity() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'source', '/tmp/source', 0)",
+        )
+        .expect("insert source project");
+        conn.execute_raw(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, display_name)
+             VALUES (4, 2, 'Alice', 'test', 'test', 0, 0, 'Methodology Director')",
+        )
+        .expect("insert source identity with colliding local name");
+        conn.execute_raw("UPDATE agents SET display_name = 'Local namesake' WHERE id = 1")
+            .expect("label local namesake");
+        conn.execute_raw("UPDATE agents SET display_name = 'Reviewer' WHERE id = 2")
+            .expect("label primary recipient");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md, attachments, recipients_json)
+             VALUES (124, 1, 4, 'Cross-project label', 'normal', 0, 10, 'body', '[]',
+                     '{\"to\":[\"Bob\"],\"cc\":[\"Alice\"],\"bcc\":[\"Carol\"]}')",
+        )
+        .expect("insert qualified cross-project delivery");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (124, 2, 'to'), (124, 1, 'cc'), (124, 3, 'bcc')",
+        )
+        .expect("insert recipients");
+        let fresh = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("fresh cross-project robot inbox");
+        assert_eq!(fresh.entries[0].id, 124);
+        assert_eq!(fresh.entries[0].from, "Alice");
+        assert_eq!(
+            fresh.entries[0].sender_display_name.as_deref(),
+            Some("Methodology Director")
+        );
+        assert_eq!(
+            serde_json::to_value(&fresh.entries[0].to_display_names).unwrap(),
+            serde_json::json!({"Bob": "Reviewer"})
+        );
+        let generation = robot_status_snapshot_generation(&conn, 1).expect("recipient generation");
+        for label in [Some("Officer Alpha"), None] {
+            conn.query_sync(
+                "UPDATE agents SET display_name = ? WHERE id = 4",
+                &[label.map_or(sqlmodel_core::Value::Null, |label| {
+                    sqlmodel_core::Value::Text(label.to_string())
+                })],
+            )
+            .expect("rename or clear source identity label");
+            assert_eq!(
+                robot_status_snapshot_generation(&conn, 1).expect("unchanged recipient generation"),
+                generation
+            );
+            let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+            let cached = build_inbox_with_snapshot_cache(
+                &conn,
+                1,
+                "proj",
+                2,
+                "Bob",
+                false,
+                false,
+                true,
+                false,
+                20,
+                false,
+                Some(&mut phase),
+            )
+            .expect("current source label in cached cross-project inbox");
+            assert!(
+                phase
+                    .finish("ok")
+                    .phases
+                    .iter()
+                    .any(|phase| phase.name == "snapshot_cache_hit")
+            );
+            assert_eq!(cached.entries[0].id, 124);
+            assert_eq!(cached.entries[0].from, "Alice");
+            assert_eq!(cached.entries[0].sender_display_name.as_deref(), label);
+            assert_eq!(
+                serde_json::to_value(&cached.entries[0].to_display_names).unwrap(),
+                serde_json::json!({"Bob": "Reviewer"})
+            );
+            let full = build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, true,
+            )
+            .expect("current source label in full cross-project inbox");
+            assert_eq!(full.entries[0].sender_display_name.as_deref(), label);
+            assert_eq!(full.entries[0].body_md.as_deref(), Some("body"));
+        }
+    }
+
+    #[test]
+    fn test_build_timeline_source_filter_ignores_case() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let recent = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+            mcp_agent_mail_db::now_micros() - 60_000_000,
+        );
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (140, 1, 1, 'From Alice', 'T', 'normal', 0, ?, 'b', '[]'),
+                    (141, 1, 2, 'From Bob', 'T', 'normal', 0, ?, 'b', '[]')",
+            &[recent.clone(), recent],
+        )
+        .expect("insert timeline messages");
+
+        let bob =
+            build_timeline(&conn, 1, None, Some("message"), Some("bob")).expect("bob timeline");
+        assert_eq!(
+            bob.iter()
+                .map(|event| event.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bob"]
+        );
+        let everyone =
+            build_timeline(&conn, 1, None, Some("message"), None).expect("project timeline");
+        assert_eq!(everyone.len(), 2);
+        assert!(
+            build_timeline(&conn, 1, None, Some("message"), Some("Dave"))
+                .expect("unknown source")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_build_inbox_ack_overdue_includes_urgent_unread_mail() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        // All three are hours old. 130: urgent, unread, ack overdue.
+        // 131: read, ack overdue. 132: read and acknowledged.
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (130, 1, 1, 'Urgent overdue', 'OVERDUE', 'urgent', 1, 10, 'b', '[]'),
+                    (131, 1, 1, 'Read overdue', 'OVERDUE', 'normal', 1, 20, 'b', '[]'),
+                    (132, 1, 1, 'Acked', 'OVERDUE', 'normal', 1, 30, 'b', '[]')",
+            &[],
+        )
+        .expect("insert inbox messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (130, 2, 'to', NULL, NULL),
+                    (131, 2, 'to', 40, NULL),
+                    (132, 2, 'to', 40, 50)",
+            &[],
+        )
+        .expect("insert inbox recipients");
+
+        let overdue = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, true, false, false, 20, false,
+        )
+        .expect("build overdue inbox");
+        let ids = overdue
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![130, 131]);
+        assert_eq!(overdue.entries[0].priority, "urgent");
+        assert_eq!(overdue.entries[0].ack_status, "overdue");
+        assert_eq!(overdue.entries[1].ack_status, "overdue");
+        assert_eq!(overdue.alerts.len(), 1);
+        assert!(overdue.alerts[0].1.contains("#130, #131"));
+
+        // `--urgent` still lists only the unread urgent message, and the
+        // default view keeps the read-but-overdue message.
+        let default_view = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build default inbox");
+        assert_eq!(
+            default_view
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![130, 131]
+        );
+        let urgent = build_inbox(
+            &conn, 1, "proj", 2, "Bob", true, false, false, false, 20, false,
+        )
+        .expect("build urgent inbox");
+        assert_eq!(
+            urgent
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![130]
+        );
+    }
+
+    #[test]
+    fn robot_inbox_shared_visibility_preserves_direct_delivery_and_read_only_state() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO agents
+                (id, project_id, name, program, model, inception_ts, last_active_ts,
+                 retired_at, contact_policy)
+             VALUES (4, 2, 'OtherSender', '', '', 0, 0, NULL, 'auto'),
+                    (5, 2, 'OtherReader', '', '', 0, 0, NULL, 'auto'),
+                    (6, 1, 'LateReader', '', '', 300, 0, NULL, 'auto'),
+                    (7, 1, 'RetiredReader', '', '', 0, 0, 42, 'auto'),
+                    (8, 1, 'BlockedReader', '', '', 0, 0, NULL, 'BLOCK_ALL');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, thread_id, topic, importance,
+                 ack_required, created_ts, body_md)
+             VALUES (100, 1, 1, 'Shared handoff', 'HANDOFF', 'release', 'normal', 1, 100, 'shared body'),
+                    (101, 1, 1, 'Direct and shared', NULL, NULL, 'normal', 0, 110, 'direct body'),
+                    (102, 1, 2, 'Sent by viewer', NULL, NULL, 'normal', 0, 120, 'own body'),
+                    (200, 2, 4, 'Other project', NULL, NULL, 'normal', 0, 130, 'private body');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             SELECT id, project_id, 'to', created_ts FROM messages;
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (101, 2, 'to');
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (100, 3, 150, 160);
+             PRAGMA query_only = ON;",
+        )
+        .expect("seed real shared mailbox schema");
+
+        let inbox = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, false, true, 20, true,
+        )
+        .expect("read shared inbox with query_only enabled");
+        assert_eq!(
+            inbox
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![100, 101],
+            "the viewer sees one shared handoff and one direct delivery"
+        );
+        let handoff = &inbox.entries[0];
+        assert_eq!(handoff.via.as_deref(), Some("project"));
+        assert_eq!(handoff.topic.as_deref(), Some("release"));
+        assert_eq!(handoff.body_md.as_deref(), Some("shared body"));
+        assert_eq!(handoff.ack_status, "overdue");
+        assert_eq!(inbox.entries[1].via, None, "a direct delivery wins");
+
+        let carol = build_inbox(
+            &conn, 1, "proj", 3, "Carol", false, false, false, true, 20, false,
+        )
+        .expect("read another viewer's receipts");
+        let carol_handoff = carol.entries.iter().find(|entry| entry.id == 100).unwrap();
+        assert_eq!(carol_handoff.ack_status, "acked");
+        assert_eq!(carol_handoff.priority, "read");
+        assert!(carol.entries.iter().all(|entry| entry.body_md.is_none()));
+
+        for (agent_id, agent_name) in [
+            (5, "OtherReader"),
+            (6, "LateReader"),
+            (7, "RetiredReader"),
+            (8, "BlockedReader"),
+        ] {
+            assert!(
+                build_inbox(
+                    &conn, 1, "proj", agent_id, agent_name, false, false, false, true, 20, false,
+                )
+                .expect("visibility refusal remains a successful empty read")
+                .entries
+                .is_empty(),
+                "{agent_name} must not receive shared mail"
+            );
+        }
+
+        let state = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM message_recipients) AS direct_count,
+                        (SELECT COUNT(*) FROM project_mailbox_receipts) AS receipt_count,
+                        (SELECT SUM(last_active_ts) FROM agents) AS activity",
+                &[],
+            )
+            .expect("observe state after read-only inboxes");
+        assert_eq!(state[0].get_named::<i64>("direct_count").unwrap(), 1);
+        assert_eq!(state[0].get_named::<i64>("receipt_count").unwrap(), 1);
+        assert_eq!(state[0].get_named::<i64>("activity").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_named::<i64>("query_only")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn robot_inbox_shared_priority_windows_keep_old_actionable_mail_before_limit() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let recent = mcp_agent_mail_db::now_micros() - MICROS_PER_MINUTE;
+        let old = recent - 2 * MICROS_PER_HOUR;
+        conn.execute_raw(&format!(
+            "INSERT INTO messages
+                (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md)
+             VALUES (300, 1, 1, 'Shared urgent', 'urgent', 1, {old}, 'b'),
+                    (301, 1, 1, 'Direct urgent', 'urgent', 1, {}, 'b'),
+                    (302, 1, 1, 'Shared read overdue', 'normal', 1, {}, 'b'),
+                    (303, 1, 1, 'Shared needs ack', 'normal', 1, {recent}, 'b'),
+                    (304, 1, 1, 'Direct unread', 'normal', 0, {}, 'b'),
+                    (305, 1, 1, 'Shared unread', 'normal', 0, {}, 'b'),
+                    (306, 1, 1, 'Shared read unacked', 'normal', 1, {}, 'b'),
+                    (307, 1, 1, 'Shared settled', 'normal', 0, {}, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             SELECT id, project_id, 'to', created_ts FROM messages WHERE id NOT IN (301, 304);
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (301, 2, 'to'), (304, 2, 'to');
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts)
+             VALUES (302, 2, {recent}), (306, 2, {recent}), (307, 2, {recent});",
+            old + 1,
+            old + 2,
+            recent + 1,
+            recent + 1,
+            recent + 2,
+            recent + 3,
+        ))
+        .expect("seed all six priority classes");
+        for id in 400..410_i64 {
+            conn.query_sync(
+                "INSERT INTO messages
+                    (id, project_id, sender_id, subject, created_ts, body_md)
+                 VALUES (?, 1, 1, 'New ordinary mail', ?, 'b')",
+                &[
+                    sqlmodel_core::Value::BigInt(id),
+                    sqlmodel_core::Value::BigInt(recent + id),
+                ],
+            )
+            .expect("seed newer ordinary mail");
+            conn.query_sync(
+                "INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (?, 1, 'to', ?)",
+                &[
+                    sqlmodel_core::Value::BigInt(id),
+                    sqlmodel_core::Value::BigInt(recent + id),
+                ],
+            )
+            .expect("seed newer shared delivery");
+        }
+        conn.execute_raw("PRAGMA query_only = ON")
+            .expect("make the production inbox read-only");
+
+        for (limit, expected) in [
+            (0, vec![]),
+            (2, vec![301, 300]),
+            (3, vec![301, 300, 302]),
+            (4, vec![301, 300, 302, 303]),
+            (6, vec![301, 300, 302, 303, 409, 408]),
+        ] {
+            let result = build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, limit, false,
+            )
+            .expect("merge priority windows before applying limit");
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "limit {limit} must not hide old urgent mail behind new ordinary deliveries"
+            );
+        }
+        let urgent = build_inbox(
+            &conn, 1, "proj", 2, "Bob", true, false, false, false, 20, false,
+        )
+        .expect("urgent shared inbox");
+        assert_eq!(
+            urgent
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![301, 300]
+        );
+        let overdue = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, true, false, false, 20, false,
+        )
+        .expect("overdue shared inbox");
+        assert_eq!(
+            overdue
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![301, 300, 302]
+        );
+        assert!(overdue.alerts[0].1.contains("#301, #300, #302"));
+
+        let all = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, false, true, 30, false,
+        )
+        .expect("all shared priority classes");
+        let expected = [301, 300, 302, 303]
+            .into_iter()
+            .chain((400..410).rev())
+            .chain([305, 304, 306, 307])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            expected,
+            "equal timestamps use message id as the deterministic tie-break"
+        );
+        assert_eq!(all.entries[16].priority, "read-unacked");
+        assert_eq!(all.entries[17].priority, "read");
+    }
+
+    #[test]
+    fn robot_inbox_shared_receipts_and_policy_bypass_direct_snapshot_cache() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now = mcp_agent_mail_db::now_micros();
+        conn.execute_raw(&format!(
+            "INSERT INTO messages
+                (id, project_id, sender_id, subject, ack_required, created_ts, body_md)
+             VALUES (500, 1, 1, 'Shared cache state', 1, {now}, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (500, 1, 'to', {now});"
+        ))
+        .expect("seed shared cache fixture");
+        let fetch = |all: bool| {
+            build_inbox_with_snapshot_cache(
+                &conn, 1, "proj", 2, "Bob", false, false, !all, all, 20, false, None,
+            )
+            .expect("read the current shared state")
+        };
+        assert_eq!(fetch(false).entries[0].id, 500);
+        conn.execute_raw(&format!(
+            "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts)
+             VALUES (500, 2, {now})"
+        ))
+        .expect("record only Bob's read receipt");
+        assert!(fetch(false).entries.is_empty());
+        assert_eq!(fetch(true).entries[0].ack_status, "pending");
+        conn.execute_raw(&format!(
+            "UPDATE project_mailbox_receipts SET ack_ts = {now} WHERE message_id = 500 AND agent_id = 2"
+        ))
+        .expect("acknowledge shared message");
+        assert_eq!(fetch(true).entries[0].ack_status, "acked");
+        conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 2")
+            .expect("retire viewer without touching last_active_ts");
+        assert!(fetch(true).entries.is_empty());
+        conn.execute_raw(
+            "UPDATE agents SET retired_at = NULL, contact_policy = 'block_all' WHERE id = 2",
+        )
+        .expect("unretire with shared delivery blocked");
+        assert!(fetch(true).entries.is_empty());
+        conn.execute_raw("UPDATE agents SET contact_policy = 'open' WHERE id = 2")
+            .expect("accept shared mail again");
+        assert_eq!(fetch(true).entries[0].id, 500);
+    }
+
+    #[test]
+    fn robot_status_counts_shared_mail_with_direct_precedence_and_independent_receipts() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_temp, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "UPDATE agents SET inception_ts = 100 WHERE id = 2;
+             INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (4, 2, 'OtherSender', 'test', 'test', 0, 0),
+                    (5, 2, 'OtherReader', 'test', 'test', 0, 0),
+                    (6, 1, 'LateReader', 'test', 'test', 300, 0),
+                    (7, 1, 'RetiredReader', 'test', 'test', 0, 0),
+                    (8, 1, 'BlockedReader', 'test', 'test', 0, 0);
+             UPDATE agents SET retired_at = 42 WHERE id = 7;
+             UPDATE agents SET contact_policy = 'block_all' WHERE id = 8;
+             INSERT INTO messages
+             (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+             VALUES (100, 1, 1, 'shared urgent', '', 100, 'urgent', 1),
+                    (101, 1, 1, 'direct wins', '', 110, 'normal', 1),
+                    (102, 1, 1, 'read pending ack', '', 120, 'normal', 1),
+                    (103, 1, 1, 'acked unread', '', 130, 'normal', 1),
+                    (104, 1, 2, 'self authored', '', 140, 'normal', 0),
+                    (105, 1, 1, 'before registration', '', 99, 'normal', 0),
+                    (106, 1, 1, 'direct unread', '', 140, 'normal', 1),
+                    (200, 2, 4, 'other project', '', 130, 'urgent', 1);
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (100, 1, 'to', 100), (101, 1, 'to', 110),
+                    (102, 1, 'to', 120), (103, 1, 'to', 130),
+                    (104, 1, 'to', 140), (105, 1, 'to', 99), (200, 2, 'to', 130);
+             INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (101, 2, 'to', 150, 160), (106, 2, 'to', NULL, NULL);
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (102, 2, 150, NULL), (103, 2, NULL, 160), (100, 3, 150, 160);
+             PRAGMA query_only = ON;",
+        )
+        .unwrap();
+        let (status, actions) = build_status(&conn, 1, "proj", Some((2, "Bob".to_string())))
+            .expect("status reads direct and shared obligations");
+        assert_eq!(
+            (
+                status.unread,
+                status.urgent,
+                status.ack_required,
+                status.ack_overdue,
+            ),
+            (3, 1, 3, 3)
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "am robot inbox --urgent")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "am robot inbox --project proj --agent Bob --ack-overdue")
+        );
+        assert!(
+            status
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.category == "ack_sla")
+        );
+        for viewer_id in [5, 6, 7, 8] {
+            let counts =
+                mcp_agent_mail_db::project_mailbox::project_mailbox_inbox_counts_from_conn(
+                    &conn, 1, viewer_id, 1_000,
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                mcp_agent_mail_db::project_mailbox::ProjectMailboxInboxCounts::default(),
+                "hidden shared mail for {viewer_id}"
+            );
+        }
+        let receipt_rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+            .unwrap();
+        assert_eq!(receipt_rows[0].get_named::<i64>("n").unwrap(), 3);
+        let activity_rows = conn
+            .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(activity_rows[0].get_named::<i64>("n").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_named::<i64>("query_only")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn robot_status_cache_observes_shared_receipts_and_viewer_visibility() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+             VALUES (500, 1, 1, 'urgent shared', '', 100, 'urgent', 1);",
+        )
+        .unwrap();
+        let read_counts = || {
+            let (status, _) = build_status_with_snapshot_cache(
+                &conn,
+                1,
+                "proj",
+                Some((2, "Bob".to_string())),
+                None,
+            )
+            .unwrap();
+            (
+                status.unread,
+                status.urgent,
+                status.ack_required,
+                status.ack_overdue,
+            )
+        };
+        assert_eq!(read_counts(), (0, 0, 0, 0));
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (500, 1, 'to', 100);",
+        )
+        .unwrap();
+        assert_eq!(read_counts(), (1, 1, 1, 1));
+        for (sql, expected) in [
+            (
+                "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (500, 2, 200, NULL)",
+                (0, 0, 1, 1),
+            ),
+            (
+                "UPDATE project_mailbox_receipts SET ack_ts = 300 WHERE agent_id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE project_mailbox_receipts SET read_ts = NULL, ack_ts = NULL WHERE agent_id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET contact_policy = 'block_all' WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET contact_policy = 'auto' WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET retired_at = 42 WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET retired_at = NULL WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET inception_ts = 101 WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET inception_ts = 100 WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+        ] {
+            conn.execute_raw(sql).unwrap();
+            assert_eq!(read_counts(), expected, "mutation: {sql}");
+        }
+    }
+
+    #[test]
+    fn robot_inbox_shared_schema_failures_release_only_their_read_snapshot() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, created_ts, body_md)
+             VALUES (600, 1, 1, 'Retained delivery', 100, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (600, 1, 'to', 100);
+             BEGIN IMMEDIATE;
+             ALTER TABLE project_mailbox_receipts RENAME TO retained_project_mailbox_receipts;
+             COMMIT;",
+        )
+        .expect("retain receipts while simulating an incomplete shared schema");
+        let error = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect_err("missing receipt authority must not become an empty inbox");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete project mailbox schema")
+        );
+
+        conn.execute_raw(
+            "BEGIN;
+             UPDATE messages SET subject = 'Caller change before status error' WHERE id = 600;",
+        )
+        .unwrap();
+        let error =
+            build_status_with_snapshot_cache(&conn, 1, "proj", Some((2, "Bob".to_string())), None)
+                .expect_err("status must report missing shared receipt authority");
+        assert!(error.to_string().contains("project inbox counts failed"));
+        assert_eq!(
+            conn.query_sync("SELECT subject FROM messages WHERE id = 600", &[])
+                .unwrap()[0]
+                .get_named::<String>("subject")
+                .unwrap(),
+            "Caller change before status error"
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("failed status read preserved the caller's transaction");
+
+        conn.execute_raw(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE retained_project_mailbox_receipts RENAME TO project_mailbox_receipts;
+             COMMIT;
+             BEGIN;
+             UPDATE messages SET subject = 'Uncommitted caller change' WHERE id = 600;",
+        )
+        .expect("reader released its failed savepoint, allowing a new transaction");
+        let result = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("read inside the caller's transaction");
+        assert_eq!(result.entries[0].subject, "Uncommitted caller change");
+        conn.execute_raw("ROLLBACK")
+            .expect("inbox read did not commit the caller's transaction");
+        assert_eq!(
+            build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+            )
+            .unwrap()
+            .entries[0]
+                .subject,
+            "Retained delivery"
+        );
+    }
+
+    #[test]
+    fn robot_inbox_direct_cache_rejects_shared_rows_after_delivery_authority_changes() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md)
+             VALUES (650, 1, 1, 'Retained shared authority', 'urgent', 1, 100, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (650, 1, 'to', 100);",
+        )
+        .expect("seed shared mail under the real schema");
+        let shared = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build the result that can arrive after the cache eligibility probe");
+        assert_eq!(shared.entries.len(), 1);
+        assert_eq!(shared.entries[0].via.as_deref(), Some("project"));
+        assert!(!shared.alerts.is_empty());
+        let generation = robot_status_snapshot_generation(&conn, 1).unwrap();
+        let key = RobotInboxSnapshotKey {
+            db_identity: robot_db_identity(&conn),
+            project_id: 1,
+            project_slug: "proj".to_string(),
+            agent_id: 2,
+            agent_name: "Bob".to_string(),
+            urgent_only: false,
+            ack_overdue_only: false,
+            unread_only: true,
+            show_all: false,
+            limit: 20,
+        };
+
+        conn.execute_raw(
+            "UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 650;
+             UPDATE agents SET retired_at = 42 WHERE id = 2;",
+        )
+        .expect("change delivery authority without deleting the retained message");
+        assert_eq!(
+            robot_status_snapshot_generation(&conn, 1).unwrap(),
+            generation,
+            "the legacy stamp does not track shared delivery or retirement changes"
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT message_id FROM project_mailbox_deliveries WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // Model the reachable post-race cache state without timing hooks:
+        // the eligibility probe saw direct-only state, then a live read saw
+        // shared mail and was stored under the same legacy generation.
+        robot_inbox_snapshot_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                RobotInboxSnapshotEntry {
+                    generation,
+                    cached_at: Instant::now(),
+                    result: shared,
+                },
+            );
+
+        let inbox = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("reject shared cache authority and rebuild the live inbox");
+        assert!(inbox.entries.is_empty());
+        assert!(inbox.alerts.is_empty());
+        assert!(inbox.actions.is_empty());
+        assert_eq!(
+            conn.query_sync("SELECT id FROM messages WHERE id = 650", &[])
+                .unwrap()
+                .len(),
+            1,
+            "retaining the message must not preserve obsolete delivery visibility"
+        );
     }
 
     #[test]
@@ -24672,12 +28761,12 @@ mod tests {
             "am doctor health",
             "am doctor check --json",
             "am doctor locks",
-            "am doctor --json",
+            "am doctor triage --quick",
             "am robot status",
-            "am doctor fix --only fm-db-state-files-world-readable-storage-db",
+            "am doctor fix --only fm-db-state-files-world-readable-storage-db --yes",
             "am doctor fix --list --json",
-            "am doctor --dry-run --fix",
-            "am doctor migrate --check",
+            "am doctor fix --dry-run",
+            "am migrate --check",
             "route the write through the running Agent Mail server",
         ] {
             assert!(
@@ -25675,6 +29764,284 @@ mod tests {
     }
 
     #[test]
+    fn robot_and_doctor_health_use_live_server_payload_and_fall_back_on_mismatch_or_fault() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("live_server_health.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo-project"))
+            .expect("create project dir");
+
+        let config = mcp_agent_mail_core::Config {
+            database_url: db_url.clone(),
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+
+        let sample_server_health = |db_url: &str,
+                                    storage_root: &Path,
+                                    db_status: &str,
+                                    write_status: &str,
+                                    parity_status: &str,
+                                    integrity_status: &str,
+                                    integrity_detail: &str| {
+            serde_json::json!({
+                "status": "ok",
+                "health_level": "green",
+                "environment": "test",
+                "http_host": "127.0.0.1",
+                "http_port": 8765,
+                "database_url": db_url,
+                "storage_root": storage_root.display().to_string(),
+                "sqlite_autocommit_write_mode": "mvcc_concurrent",
+                "semantic_readiness": {
+                    "status": if parity_status == "red" { "fail" } else { "ok" },
+                    "detail": "Archive and sqlite inventory are aligned: archive projects=1, agents=1, messages=10, db projects=1, agents=1, messages=10"
+                },
+                "timeout_diagnostics": {
+                    "client_deadline_ms": 30000,
+                    "coalescer_degraded_p99_bound_ms": 15000,
+                    "contended_path": "none",
+                    "stage_exceeded_client_deadline": false,
+                    "p99_window_secs": 300,
+                    "pool_acquire_p99_ms": 0,
+                    "database_write_p99_ms": 0,
+                    "archive_wbq_p99_ms": 0,
+                    "archive_commit_queue_p99_ms": 0,
+                    "git_commit_p99_ms": 0,
+                    "blocking_dispatch_inflight": 0,
+                    "blocking_dispatch_zombies": 0,
+                    "blocking_dispatch_timeouts_total": 0
+                },
+                "integrity": {
+                    "last_ok_ts": 100,
+                    "last_check_ts": 100,
+                    "last_full_check_ts": 100,
+                    "last_check_kind": "Full",
+                    "last_check_outcome": "passed",
+                    "last_full_check_outcome": "passed",
+                    "checks_total": 3,
+                    "failures_total": 0
+                },
+                "lexical_backfill": {
+                    "state": "fresh",
+                    "db_identity": db_path.display().to_string(),
+                    "index_dir": storage_root.join("search_index").display().to_string(),
+                    "indexed_messages": 10,
+                    "source_messages": 10,
+                    "skipped_messages": 0,
+                    "rebuild_in_progress": false
+                },
+                "verdicts": {
+                    "transport_health": { "status": "green", "detail": "ok", "critical": true },
+                    "db_health": { "status": db_status, "detail": "database open/connectivity healthy", "critical": true },
+                    "write_health": { "status": write_status, "detail": "write path schema present and writable", "critical": true },
+                    "semantic_readiness": { "status": "green", "detail": "aligned", "critical": false },
+                    "archive_db_parity": { "status": parity_status, "detail": "git archive/sqlite index within write-behind tolerance", "critical": true },
+                    "doctor_readiness": { "status": "green", "detail": "ok", "critical": false },
+                    "integrity_check": { "status": integrity_status, "detail": integrity_detail, "critical": true }
+                }
+            })
+        };
+
+        let healthy_payload = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "green",
+            "full integrity_check passed",
+        );
+        let synthesized =
+            synthesize_robot_health_probes_from_server(&config, &healthy_payload, 2.345)
+                .expect("healthy live server payload should synthesize robot probes");
+        assert_eq!(synthesized.db_connectivity.status, "ok");
+        assert!((synthesized.db_connectivity.latency_ms - 2.35).abs() < f64::EPSILON);
+        assert_eq!(synthesized.db_file_sanity.probe.status, "ok");
+        assert!(!synthesized.db_file_sanity.unhealthy);
+        assert_eq!(synthesized.db_schema.probe.status, "ok");
+        assert_eq!(synthesized.archive_db_parity.probe.status, "ok");
+        assert_eq!(synthesized.search_index_probe.status, "ok");
+        assert!(!synthesized.search_index_unhealthy);
+        assert!(!synthesized.search_index_degraded);
+        assert_eq!(
+            synthesized
+                .integrity_metrics
+                .expect("integrity")
+                .checks_total,
+            3
+        );
+        assert!(live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &healthy_payload
+        ));
+        let assessment = assess_live_server_health(&config, &healthy_payload, 2.345)
+            .unwrap()
+            .expect("matching live mailbox");
+        assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
+        assert_eq!(assessment.probe.status, "ok");
+
+        // Each of these faults lives in the daemon, not in the CLI's fresh
+        // process-global counters. A successful local DB probe must not make
+        // the robot report greener than the daemon's current observation.
+        for (contributor, reported, expected) in [
+            ("pressure", "red", mcp_agent_mail_core::HealthLevel::Red),
+            ("archive_lag", "red", mcp_agent_mail_core::HealthLevel::Red),
+            (
+                "coalescer_latency",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+            (
+                "retention",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+        ] {
+            let mut payload = healthy_payload.clone();
+            // A stale top-level green cannot erase a stronger named finding.
+            payload["health_level_contributors"] = serde_json::json!([
+                {"name":contributor, "level":reported, "detail":"serving process fault"}
+            ]);
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+                "the real local DB remains healthy in this control"
+            );
+            let assessed = assess_live_server_health(&config, &payload, 0.5)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assessed.level, expected, "{contributor}");
+            assert!(assessed.probe.detail.contains(contributor));
+            if contributor == "pressure" {
+                assert_eq!(assessed.pressure.unwrap().0, expected);
+            }
+        }
+        let mut write_failure = healthy_payload.clone();
+        write_failure["verdicts"]["write_health"]["status"] = "red".into();
+        write_failure["verdicts"]["write_health"]["detail"] =
+            "write circuit is open; reads still succeed".into();
+        assert!(synthesize_robot_health_probes_from_server(&config, &write_failure, 0.5).is_none());
+        assert_eq!(
+            assess_live_server_health(&config, &write_failure, 0.5)
+                .unwrap()
+                .unwrap()
+                .level,
+            mcp_agent_mail_core::HealthLevel::Red,
+            "a local fallback cannot clear the daemon's write failure"
+        );
+        let mut circuit_failure = healthy_payload.clone();
+        circuit_failure["circuit_breakers"] = serde_json::json!({
+            "circuit_state":"closed", "circuit_failures":0,
+            "circuits":[{
+                "subsystem":"git", "state":"open", "failures":9,
+                "threshold":5, "reset_secs":30, "half_open_successes":0,
+                "recommendation":"inspect the archive writer"
+            }]
+        });
+        let assessed = assess_live_server_health(&config, &circuit_failure, 0.5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assessed.level, mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(
+            assessed
+                .probe
+                .detail
+                .contains("git circuit=open (9 failures)")
+        );
+        let circuits = assessed.circuits.expect("daemon circuits retained");
+        assert_eq!(circuits.circuits[0].state, "open");
+        assert_eq!(circuits.circuits[0].failures, 9);
+        circuit_failure["circuit_breakers"]["circuits"][0]["state"] = "unknown".into();
+        assert!(assess_live_server_health(&config, &circuit_failure, 0.5).is_err());
+        for field in ["status", "health_level"] {
+            let mut invalid = healthy_payload.clone();
+            invalid[field] = "unknown".into();
+            assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
+        }
+        let mut invalid = healthy_payload.clone();
+        invalid["health_level_contributors"] = serde_json::json!([
+            {"name":"pressure", "level":"unknown", "detail":"not a verdict"}
+        ]);
+        assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
+
+        // Different mailbox on the server must fall back to local probes.
+        let other_db = temp_dir.path().join("other.sqlite3");
+        let other_payload = sample_server_health(
+            &format!("sqlite:///{}", other_db.display()),
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "green",
+            "full integrity_check passed",
+        );
+        assert!(synthesize_robot_health_probes_from_server(&config, &other_payload, 1.0).is_none());
+        assert!(
+            assess_live_server_health(&config, &other_payload, 1.0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &other_payload
+        ));
+
+        // Red parity or integrity on the server must fall back to local probes.
+        let red_parity = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "red",
+            "green",
+            "full integrity_check passed",
+        );
+        assert!(synthesize_robot_health_probes_from_server(&config, &red_parity, 1.0).is_none());
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &red_parity
+        ));
+
+        // Leaked orphan pages must fall back in `doctor health` so the
+        // `leaked_pages_only` classification line is emitted.
+        let orphan_pages = sample_server_health(
+            &db_url,
+            &storage_root,
+            "green",
+            "green",
+            "green",
+            "yellow",
+            "full integrity_check passed at 100; 4 never-written orphan page(s) are leaked space",
+        );
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &orphan_pages
+        ));
+
+        // A truncated WAL sidecar on disk must force fallback even if the
+        // server's cached verdicts look green.
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = std::path::PathBuf::from(wal_os);
+        std::fs::write(&wal_path, [0_u8; 16]).expect("write truncated wal");
+        assert!(
+            synthesize_robot_health_probes_from_server(&config, &healthy_payload, 1.0).is_none()
+        );
+        assert!(!live_server_health_payload_proves_mailbox_healthy(
+            &db_url,
+            &storage_root,
+            &healthy_payload
+        ));
+    }
+
+    #[test]
     fn robot_search_uses_archive_snapshot_when_live_db_is_stale() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_search_stale.sqlite3");
@@ -25726,6 +30093,8 @@ mod tests {
                     kind: None,
                     importance: None,
                     since: None,
+                    limit: 20,
+                    cursor: None,
                 },
             },
             &db_url,
@@ -25745,6 +30114,69 @@ mod tests {
             live_count, 0,
             "robot search should not mutate the live sqlite index"
         );
+    }
+
+    #[test]
+    fn robot_reservations_use_the_verified_daemon_and_preserve_explicit_server_output() {
+        use crate::reservation_read::tests::{
+            TestReply, mailbox_payload, reservation_read_fixture, with_test_server,
+        };
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for explicit_server in [false, true] {
+            let (project, snapshot) = reservation_read_fixture();
+            let ((result, output), requests) = with_test_server(
+                |config| {
+                    let mut replies = Vec::new();
+                    if !explicit_server {
+                        replies.push(TestReply::Resource(mailbox_payload(config)));
+                    }
+                    replies.extend([
+                        TestReply::Resource(project.clone()),
+                        TestReply::Resource(snapshot),
+                        TestReply::Resource(project),
+                    ]);
+                    if !explicit_server {
+                        replies.push(TestReply::Resource(mailbox_payload(config)));
+                    }
+                    replies
+                },
+                |_| {
+                    let capture = ftui_runtime::StdioCapture::install().unwrap();
+                    let result = handle_robot(RobotArgs {
+                        format: Some(OutputFormat::Json),
+                        json: true,
+                        project: Some("test-project".into()),
+                        agent: Some("BlueLake".into()),
+                        command: RobotSubcommand::Reservations {
+                            agent: None,
+                            all: true,
+                            conflicts: false,
+                            expiring: Some(10),
+                            server: explicit_server,
+                        },
+                    });
+                    (result, capture.drain_to_string())
+                },
+            );
+            assert!(result.is_ok(), "{result:?}");
+            let value: Value = serde_json::from_str(output.trim()).unwrap();
+            assert_eq!(value["_meta"]["project"], "test-project");
+            assert_eq!(value["all_active"][0]["path"], "src/**");
+            assert_eq!(value["my_reservations"][0]["agent"], "BlueLake");
+            let attestation = &value["reservation_read_attestation"];
+            assert_eq!(attestation["state"], "current");
+            assert_eq!(attestation["source"], "mcp_server");
+            if explicit_server {
+                assert!(attestation["database_matches_server"].is_null());
+                assert!(attestation["storage_root_matches_server"].is_null());
+            } else {
+                assert_eq!(attestation["database_matches_server"], true);
+                assert_eq!(attestation["storage_root_matches_server"], true);
+            }
+            assert_eq!(requests.len(), if explicit_server { 3 } else { 5 });
+        }
     }
 
     #[test]
@@ -26211,6 +30643,65 @@ mod tests {
     }
 
     #[test]
+    fn build_reservations_conflicts_view_keeps_the_expiring_set() {
+        // The documented pre-edit check is `--conflicts --expiring 30`.
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let soon = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 20 * 60_000_000);
+        let later = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 1, 'docs/**', 1, 'b', 0, ?, NULL)",
+            &[soon, later],
+        )
+        .expect("insert reservations");
+
+        let (data, actions) = build_reservations(
+            &conn,
+            1,
+            "proj",
+            Some((2, "Bob".to_string())),
+            false,
+            true,
+            Some(30),
+        )
+        .expect("build reservations");
+        assert_eq!(
+            data.expiring_soon
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/auth/**"]
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("renew") && action.contains("src/auth/**")),
+            "{actions:?}"
+        );
+
+        // A shorter window leaves the 20-minute lease out.
+        let (narrow, _actions) = build_reservations(
+            &conn,
+            1,
+            "proj",
+            Some((2, "Bob".to_string())),
+            false,
+            true,
+            Some(10),
+        )
+        .expect("build reservations");
+        assert!(
+            narrow.expiring_soon.is_empty(),
+            "{:?}",
+            narrow.expiring_soon
+        );
+    }
+
+    #[test]
     fn build_reservations_omits_playbooks_when_conflict_free() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -26616,6 +31107,118 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_rejects_invalid_windows_before_opening_a_mailbox() {
+        use mcp_agent_mail_db::search_planner::SearchCursor;
+        for limit in [0, 1001, usize::MAX] {
+            assert!(validate_robot_search_window(limit, None).is_err());
+        }
+        for cursor in [
+            "",
+            "not-a-cursor",
+            "s7ff0000000000000:i1",
+            "s7ff8000000000000:i1",
+        ] {
+            assert!(validate_robot_search_window(20, Some(cursor)).is_err());
+        }
+        for limit in [1, 20, 1000] {
+            let cursor = SearchCursor {
+                score: 0.25,
+                id: 42,
+            }
+            .encode();
+            assert!(validate_robot_search_window(limit, Some(&cursor)).is_ok());
+        }
+    }
+
+    #[test]
+    fn robot_search_cursor_traverses_real_results_without_skipping_filtered_matches() {
+        use mcp_agent_mail_db::sqlmodel_core::Value as DbValue;
+
+        let (temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw("BEGIN IMMEDIATE").expect("begin corpus");
+        for id in 1_i64..=13 {
+            conn.execute_sync(
+                "INSERT INTO messages (id,project_id,sender_id,subject,body_md,created_ts) VALUES (?,1,1,'pagewalk','pagewalk',?)",
+                &[DbValue::BigInt(id), DbValue::BigInt(id * 1_000_000)],
+            ).expect("insert search corpus");
+            conn.execute_sync(
+                "INSERT INTO message_recipients (message_id,agent_id,kind) VALUES (?,2,?)",
+                &[
+                    DbValue::BigInt(id),
+                    DbValue::Text(if id % 3 == 0 { "cc" } else { "to" }.to_string()),
+                ],
+            )
+            .expect("insert recipient");
+        }
+        conn.execute_raw("COMMIT").expect("commit corpus");
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!(
+                "sqlite:///{}",
+                temp_dir
+                    .path()
+                    .join("robot_thread_message_test.sqlite3")
+                    .display()
+            ),
+            storage_root: Some(temp_dir.path().join("archive")),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        })
+        .expect("create real search pool");
+        for (query, kind) in ["pagewalk", "from:Alice"].into_iter().flat_map(|query| {
+            [None, Some("to"), Some("cc")]
+                .into_iter()
+                .map(move |kind| (query, kind))
+        }) {
+            let mut cursor = None;
+            let mut ids = HashSet::new();
+            let mut cursors = HashSet::new();
+            loop {
+                let page = build_search(
+                    &conn,
+                    &pool,
+                    1,
+                    query,
+                    kind,
+                    None,
+                    None,
+                    2,
+                    cursor.as_deref(),
+                )
+                .expect("search page");
+                assert!(page.results.len() <= 2);
+                for row in page.results {
+                    assert!(
+                        ids.insert(row.id),
+                        "a continuation replayed message {}",
+                        row.id
+                    );
+                }
+                let Some(next) = page.next_cursor else { break };
+                assert!(
+                    cursors.insert(next.clone()),
+                    "search cursor did not advance"
+                );
+                assert!(cursors.len() <= 13, "search failed to terminate");
+                cursor = Some(next);
+            }
+            let expected: HashSet<_> = (1_i64..=13)
+                .filter(|id| match kind {
+                    Some("to") => id % 3 != 0,
+                    Some("cc") => id % 3 == 0,
+                    _ => true,
+                })
+                .collect();
+            assert_eq!(
+                ids, expected,
+                "every matching message must be reachable for {query} {kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_build_search_invalid_importance_errors() {
         let (temp_dir, conn) = setup_robot_thread_message_test_db();
         let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
@@ -26637,12 +31240,40 @@ mod tests {
             Some("totally-invalid"),
             None,
             20,
+            None,
         )
         .expect_err("invalid importance should error");
 
         assert!(
             matches!(err, CliError::InvalidArgument(msg) if msg.contains("invalid importance filter"))
         );
+
+        // A list is accepted, as on the server route, and each entry is checked.
+        build_search(
+            &conn,
+            &pool,
+            1,
+            "auth",
+            None,
+            Some("high, urgent"),
+            None,
+            20,
+            None,
+        )
+        .expect("an importance list searches");
+        let err = build_search(
+            &conn,
+            &pool,
+            1,
+            "auth",
+            None,
+            Some("high,bogus"),
+            None,
+            20,
+            None,
+        )
+        .expect_err("one bad entry fails the list");
+        assert!(matches!(err, CliError::InvalidArgument(msg) if msg.ends_with(": bogus")));
     }
 
     #[test]
@@ -27171,7 +31802,9 @@ mod tests {
 
         let latest_two =
             build_thread(&conn, 1, "200", Some(2), None, false).expect("build limited thread");
-        assert_eq!(latest_two.message_count, 2);
+        // message_count is the whole thread; the root is the one left out.
+        assert_eq!(latest_two.message_count, 3);
+        assert_eq!(latest_two.omitted_older, Some(1));
         assert_eq!(latest_two.subject, "Root");
         assert_eq!(latest_two.participants, vec!["Alice", "Bob"]);
         assert_eq!(latest_two.messages[0].subject, "Reply one");
@@ -27213,7 +31846,10 @@ mod tests {
 
         let latest_window =
             build_thread(&conn, 1, "LONG-THREAD", None, None, false).expect("build thread");
-        assert_eq!(latest_window.message_count, 200);
+        // The default window shows the newest 200 of 205 and says so.
+        assert_eq!(latest_window.messages.len(), 200);
+        assert_eq!(latest_window.message_count, 205);
+        assert_eq!(latest_window.omitted_older, Some(5));
         assert_eq!(
             latest_window
                 .messages
@@ -27288,6 +31924,75 @@ mod tests {
         assert_eq!(reply.position, 2);
         assert_eq!(reply.total_in_thread, 2);
         assert_eq!(reply.previous.as_deref(), Some("#300 Alice: Root"));
+    }
+
+    #[test]
+    fn server_message_and_thread_renderers_match_native_context() {
+        use mcp_agent_mail_db::message_context::{
+            message_context_from_conn, thread_context_from_conn,
+        };
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages (id,project_id,sender_id,subject,topic,thread_id,importance,ack_required,created_ts,body_md,attachments) VALUES
+             (300,1,1,'Root','topic',NULL,'normal',0,1000,'Root body','[]'),
+             (301,1,2,'Reply','topic','300','high',1,2000,'Reply body','[{\"name\":\"notes.txt\",\"content_type\":\"text/plain\",\"size\":\"98\"}]'),
+             (302,1,1,'Last',NULL,'300','urgent',1,2000,'Last body','[]')", &[],
+        ).unwrap();
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id,agent_id,kind,read_ts,ack_ts) VALUES
+             (300,2,'to',NULL,NULL),(301,1,'to',NULL,2500),(301,3,'cc',NULL,NULL),(302,2,'to',NULL,2500)", &[],
+        ).unwrap();
+        let project = mcp_agent_mail_db::models::ProjectRow {
+            id: Some(1),
+            slug: "proj".into(),
+            human_key: "/tmp/proj".into(),
+            created_at: 0,
+        };
+        for id in [300, 301, 302] {
+            let snapshot =
+                message_context_from_conn(&conn, &project, id, mcp_agent_mail_db::now_micros())
+                    .unwrap();
+            let mut remote = serde_json::to_value(build_message_from_server(snapshot)).unwrap();
+            let mut local = serde_json::to_value(build_message(&conn, 1, id).unwrap()).unwrap();
+            // Native and server reads can straddle an age-display boundary.
+            remote["age"] = serde_json::Value::Null;
+            local["age"] = serde_json::Value::Null;
+            assert_eq!(remote, local, "message {id}");
+        }
+        for bodies in [false, true] {
+            for limit in [0, 2, 200] {
+                for since in [None, Some(1000)] {
+                    let snapshot = thread_context_from_conn(
+                        &conn,
+                        &project,
+                        "300",
+                        limit,
+                        since,
+                        bodies,
+                        mcp_agent_mail_db::now_micros(),
+                    )
+                    .unwrap();
+                    let mut remote =
+                        serde_json::to_value(build_thread_from_server(snapshot)).unwrap();
+                    let since_iso = since.map(mcp_agent_mail_db::micros_to_iso);
+                    let mut local = serde_json::to_value(
+                        build_thread(&conn, 1, "300", Some(limit), since_iso.as_deref(), bodies)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    for value in [&mut remote, &mut local] {
+                        value["last_activity"] = serde_json::Value::Null;
+                        for message in value["messages"].as_array_mut().unwrap() {
+                            message["age"] = serde_json::Value::Null;
+                        }
+                    }
+                    assert_eq!(
+                        remote, local,
+                        "bodies={bodies} limit={limit} since={since:?}"
+                    );
+                }
+            }
+        }
     }
 
     // ── is_prose_command ────────────────────────────────────────────────

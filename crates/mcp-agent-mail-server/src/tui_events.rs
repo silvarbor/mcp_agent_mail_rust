@@ -330,7 +330,7 @@ pub(crate) fn agent_label_with_width(name: &str, display_name: Option<&str>, wid
     }
     let label_width = width.saturating_sub(address_width.saturating_add(1));
     if ftui::text::display_width(label) <= usize::from(label_width) {
-        return mcp_agent_mail_core::models::format_agent_label(name, Some(label));
+        return format!("{label} {address}");
     }
     format!(
         "{}… {address}",

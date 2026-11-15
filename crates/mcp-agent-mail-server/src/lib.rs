@@ -79,6 +79,7 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
@@ -193,7 +194,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -661,8 +662,15 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 }
 
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Server {
+    build_server_with_startup_workers(config, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_server_with_startup_workers(
+    config: &mcp_agent_mail_core::Config,
+    startup_workers: Option<Arc<StartupWorkers>>,
+) -> fastmcp_server::Server {
     // Wire the config flag into the global atomic gate.
     mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
 
@@ -673,6 +681,9 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     // builder deliberately stays on the underlying dual-era server.
     let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"))
         .on_shutdown(move || {
+            if let Some(workers) = &startup_workers {
+                workers.shutdown();
+            }
             shutdown_runtime_services(&shutdown_config);
         });
 
@@ -1027,12 +1038,21 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
 
 fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     tracing::info!("server transport exited; performing graceful shutdown of background services");
+    // Let independent sleepers stop while earlier services drain. Keep every
+    // join and the mailbox flushes below, in their existing ownership order.
+    integrity_guard::request_shutdown();
+    disk_monitor::request_shutdown();
+    maintenance::request_shutdown();
+    retention::request_shutdown();
     stop_atc_operator_runtime();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    retention::shutdown();
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
+    // A sync interrupted by exit would leave `.git/index.lock` behind.
+    mcp_agent_mail_storage::stop_archive_index_sync(Duration::from_secs(10));
     cleanup_shutdown_sqlite_sidecars(config);
 }
 
@@ -1073,6 +1093,169 @@ fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
     }
 }
 
+/// Startup work belongs to the server whose mailbox authority admitted it.
+/// A listener-bind deadline only stops waiting for readiness; it never releases
+/// ownership of the readiness worker. The scope is declared after the mailbox
+/// locks, so cancellation, errors and unwinding join it before those locks drop.
+#[derive(Default)]
+struct StartupWorkerScope {
+    workers: Arc<StartupWorkers>,
+}
+
+impl Drop for StartupWorkerScope {
+    fn drop(&mut self) {
+        self.workers.shutdown();
+    }
+}
+
+#[derive(Default)]
+struct StartupWorkers {
+    state: Mutex<StartupWorkersState>,
+    joined: Condvar,
+}
+
+#[derive(Default)]
+struct StartupWorkersState {
+    stopping: bool,
+    joining: bool,
+    workers: Vec<(Arc<StartupWorkerControl>, JoinHandle<()>)>,
+}
+
+/// The delay and native pool acquisition share the worker's stop request.
+/// Synchronous filesystem/engine operations already in progress are joined;
+/// the stop flag is checked between operations, never treated as permission
+/// to detach a thread that can still access the mailbox.
+#[derive(Default)]
+struct StartupWorkerControl {
+    stopped: AtomicBool,
+    wait: Mutex<()>,
+    wake: Condvar,
+    native_context: Mutex<Option<Cx>>,
+}
+
+struct StartupWorkerContextGuard<'a>(&'a StartupWorkerControl);
+
+impl Drop for StartupWorkerContextGuard<'_> {
+    fn drop(&mut self) {
+        *lock_mutex(&self.0.native_context) = None;
+    }
+}
+
+impl StartupWorkerControl {
+    fn request_shutdown(&self) {
+        {
+            let _wait = lock_mutex(&self.wait);
+            self.stopped.store(true, Ordering::Release);
+            self.wake.notify_all();
+        }
+        let context = lock_mutex(&self.native_context).clone();
+        if let Some(cx) = context {
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            Err("startup worker cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_delay(&self, delay: Duration) -> bool {
+        let guard = lock_mutex(&self.wait);
+        let _wait = self
+            .wake
+            .wait_timeout_while(guard, delay, |_| !self.stopped.load(Ordering::Acquire))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !self.stopped.load(Ordering::Acquire)
+    }
+
+    fn bind_native_context(&self, cx: &Cx) -> Result<StartupWorkerContextGuard<'_>, String> {
+        let mut context = lock_mutex(&self.native_context);
+        if self.stopped.load(Ordering::Acquire) {
+            drop(context);
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+            return Err("startup worker cancelled".into());
+        }
+        *context = Some(cx.clone());
+        Ok(StartupWorkerContextGuard(self))
+    }
+}
+
+impl StartupWorkers {
+    fn spawn(
+        &self,
+        name: &'static str,
+        work: impl FnOnce(Arc<StartupWorkerControl>) + Send + 'static,
+    ) -> std::io::Result<()> {
+        // Registration and shutdown admission are atomic. No successful spawn
+        // can be lost between creating its thread and retaining its handle.
+        let mut state = lock_mutex(&self.state);
+        if state.stopping {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server startup workers are stopping",
+            ));
+        }
+        let control = Arc::new(StartupWorkerControl::default());
+        let worker_control = Arc::clone(&control);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || work(worker_control))?;
+        state.workers.push((control, handle));
+        Ok(())
+    }
+
+    fn request_shutdown(&self) {
+        let controls: Vec<_> = {
+            let mut state = lock_mutex(&self.state);
+            state.stopping = true;
+            state
+                .workers
+                .iter()
+                .map(|(control, _)| Arc::clone(control))
+                .collect()
+        };
+        for control in controls {
+            control.request_shutdown();
+        }
+    }
+
+    fn shutdown(&self) {
+        self.request_shutdown();
+        let workers = {
+            let mut state = lock_mutex(&self.state);
+            while state.joining {
+                state = self
+                    .joined
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.joining = true;
+            std::mem::take(&mut state.workers)
+        };
+        // Only lifecycle owners call shutdown, never the workers themselves.
+        // Do not hold the manager lock during a join: a TUI starter may still
+        // be registering work, which must receive the stopping refusal.
+        for (_, worker) in workers {
+            if worker.join().is_err() {
+                tracing::warn!("startup worker panicked during server shutdown");
+            }
+        }
+        let mut state = lock_mutex(&self.state);
+        state.joining = false;
+        self.joined.notify_all();
+    }
+}
+
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS: u64 = 8;
 
@@ -1108,10 +1291,20 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
     )
 }
 
-fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+fn run_startup_search_backfill(
+    config: &mcp_agent_mail_core::Config,
+    control: &StartupWorkerControl,
+) {
+    if control.checkpoint().is_err() {
+        return;
+    }
     let backfill_database_url =
         normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+    match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
+        &backfill_database_url,
+        &control.stopped,
+    ) {
+        Ok(_) if control.checkpoint().is_err() => {}
         Ok((indexed, _skipped)) if indexed > 0 => {
             record_startup_search_backfill_completion(config);
             tracing::info!(
@@ -1123,9 +1316,16 @@ fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
             record_startup_search_backfill_completion(config);
         } // nothing to backfill or already up-to-date
         Err(err) => {
+            if control.checkpoint().is_err() {
+                return;
+            }
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+                match mcp_agent_mail_db::search_v3::backfill_from_db_cancellable(
+                    &backfill_database_url,
+                    &control.stopped,
+                ) {
+                    Ok(_) if control.checkpoint().is_err() => {}
                     Ok((indexed, _)) if indexed > 0 => {
                         record_startup_search_backfill_completion(config);
                         tracing::warn!(
@@ -1158,30 +1358,42 @@ fn startup_search_backfill_delay_secs() -> u64 {
     )
 }
 
-fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
+fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    spawn_startup_search_backfill_after(
+        config,
+        workers,
+        Duration::from_secs(startup_search_backfill_delay_secs()),
+    );
+}
+
+fn spawn_startup_search_backfill_after(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    delay: Duration,
+) {
     if STARTUP_SEARCH_BACKFILL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return;
     }
 
     let thread_config = config.clone();
-    let spawn = std::thread::Builder::new()
-        .name("am-search-backfill".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _reset_guard = StartupSearchBackfillResetGuard;
-            let delay_secs = startup_search_backfill_delay_secs();
-            if delay_secs > 0 {
-                tracing::info!(
-                    delay_secs,
-                    "[startup-search] delaying backfill to prioritize startup responsiveness"
-                );
-                std::thread::sleep(Duration::from_secs(delay_secs));
+    // Capturing the guard also resets admission if spawning is refused or
+    // fails before the closure is ever run.
+    let reset_guard = StartupSearchBackfillResetGuard;
+    let spawn = workers.spawn("am-search-backfill", move |control| {
+        let _reset_guard = reset_guard;
+        if !delay.is_zero() {
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                "[startup-search] delaying backfill to prioritize startup responsiveness"
+            );
+            if !control.wait_for_delay(delay) {
+                return;
             }
-            run_startup_search_backfill(&thread_config);
-        });
+        }
+        run_startup_search_backfill(&thread_config, &control);
+    });
 
     if let Err(err) = spawn {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
         tracing::warn!(
             error = %err,
             "{}",
@@ -1190,7 +1402,7 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     }
 }
 
-fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
+fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     // Only initialize when lexical-capable modes are active.
     // This avoids creating the index directory when lexical retrieval is disabled.
     let rollout = &config.search_rollout;
@@ -1217,9 +1429,9 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 return;
             }
             // Backfill on a dedicated worker to keep first-render startup latency low.
-            // Search tool semantics remain robust: this is idempotent and retries with
-            // auto-recovery on recoverable sqlite failures.
-            spawn_startup_search_backfill(config);
+            // Backfill is idempotent; failures leave search to its lazy path.
+            // Database recovery remains an explicit, supervised doctor operation.
+            spawn_startup_search_backfill(config, workers);
         }
         Err(err) => {
             tracing::warn!(
@@ -1269,8 +1481,15 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
     false
 }
 
-fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
-    match mcp_agent_mail_storage::heal_archive_locks(config) {
+fn heal_storage_lock_artifacts(
+    config: &mcp_agent_mail_core::Config,
+    control: Option<&StartupWorkerControl>,
+) {
+    let result = control.map_or_else(
+        || mcp_agent_mail_storage::heal_archive_locks(config),
+        |control| mcp_agent_mail_storage::heal_archive_locks_cancellable(config, &control.stopped),
+    );
+    match result {
         Ok(report) => {
             if !report.locks_quarantined.is_empty() || !report.metadata_quarantined.is_empty() {
                 tracing::info!(
@@ -1286,20 +1505,45 @@ fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
                 );
             }
         }
+        Err(mcp_agent_mail_storage::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            tracing::debug!("[startup-heal] lock scan interrupted by shutdown");
+        }
         Err(err) => {
             tracing::warn!("[startup-heal] lock scan failed: {err}");
         }
     }
 }
 
-fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
+fn start_storage_lock_healing(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     let config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-consistency-probe".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            startup_checks::run_consistency_probe_advisory(&config);
-        });
+    if let Err(error) = workers.spawn("startup-heal", move |control| {
+        if control.checkpoint().is_ok() {
+            heal_storage_lock_artifacts(&config, Some(&control));
+        }
+    }) {
+        tracing::warn!(%error, "could not start archive lock healing worker");
+    }
+}
+
+fn start_advisory_consistency_probe(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+) {
+    let config = config.clone();
+    if let Err(error) = workers.spawn("startup-consistency-probe", move |control| {
+        if control.checkpoint().is_ok() {
+            if let Err(error) = startup_checks::run_consistency_probe_advisory_cancellable(
+                &config,
+                &control.stopped,
+            ) {
+                tracing::debug!(%error, "startup consistency probe interrupted");
+            }
+        }
+    }) {
+        tracing::warn!(%error, "could not start advisory archive consistency probe");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,7 +2007,10 @@ pub fn acquire_mailbox_activity_lock(
     config: &mcp_agent_mail_core::Config,
     mode: MailboxActivityLockMode,
 ) -> std::io::Result<Option<MailboxActivityLockGuard>> {
-    acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)
+    let guard = acquire_mailbox_activity_lock_for_storage_root(&config.storage_root, mode)?;
+    mcp_agent_mail_db::mail_retention::require_complete(&config.storage_root)
+        .map_err(std::io::Error::other)?;
+    Ok(guard)
 }
 
 struct RuntimeMailboxActivityLocks {
@@ -1849,19 +2096,14 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // otherwise race its schema migrations. Retain the pool for the session so
     // tool calls can reuse its initialized connections through the weak cache.
     let _runtime_database_pool = initialize_stdio_database(cx, config).await?;
+    let startup_scope = StartupWorkerScope::default();
 
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    let heal_config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-heal".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            heal_storage_lock_artifacts(&heal_config);
-        });
+    start_storage_lock_healing(config, &startup_scope.workers);
 
     integrity_guard::start(config);
     disk_monitor::start(config);
@@ -1880,7 +2122,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     start_atc_operator_runtime(config);
 
     // Start background backfill for Search V3 if enabled.
-    spawn_startup_search_backfill(config);
+    spawn_startup_search_backfill(config, &startup_scope.workers);
 
     log_active_database(config);
 
@@ -1897,7 +2139,9 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     }
 
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
-    build_server(config).run_stdio_with_cx(cx).await;
+    build_server_with_startup_workers(config, Some(Arc::clone(&startup_scope.workers)))
+        .run_stdio_with_cx(cx)
+        .await;
 
     // run_stdio() returns `!` so the lines below are unreachable today.
     // They are kept as documentation of the intended graceful-shutdown
@@ -1905,6 +2149,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     #[allow(unreachable_code)]
     {
         tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+        startup_scope.workers.shutdown();
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
@@ -2565,6 +2810,7 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     // The standalone headless process owns its signal policy. Embedders using
     // run_http_with_control retain their caller-supplied shutdown authority.
@@ -2586,7 +2832,8 @@ fn run_http_headless_supervisor(
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    let result_rx =
+        spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None, on_ready)?;
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
@@ -2601,7 +2848,69 @@ fn run_http_headless_supervisor(
     result
 }
 
-fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+type HttpReadyCallback = Box<dyn FnOnce(&mcp_agent_mail_core::Config) + Send>;
+
+/// A successful HTTP preflight bound to one immutable configuration snapshot.
+/// Serving consumes this value; callers cannot substitute another config or
+/// reuse a preflight after the first server exits.
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// startup.run()?;
+/// startup.run()?; // the preparation was already consumed
+/// # Ok(()) }
+/// ```
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// let other = mcp_agent_mail_core::Config::default();
+/// startup.run(&other)?; // serving accepts no replacement configuration
+/// # Ok(()) }
+/// ```
+#[must_use]
+pub struct PreparedHttpStartup {
+    config: mcp_agent_mail_core::Config,
+    on_ready: Option<HttpReadyCallback>,
+}
+
+impl PreparedHttpStartup {
+    /// Run once after the first listener passes its readiness self-probe.
+    /// The callback receives the actual bound address (including an assigned
+    /// ephemeral port). It is never run for a failed startup or a restart.
+    pub fn with_ready_callback(
+        mut self,
+        callback: impl FnOnce(&mcp_agent_mail_core::Config) + Send + 'static,
+    ) -> Self {
+        self.on_ready = Some(Box::new(callback));
+        self
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        run_http_supervised(self, None)
+    }
+
+    pub fn run_with_control(
+        self,
+        control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    ) -> std::io::Result<()> {
+        run_http_supervised(self, Some(control_rx))
+    }
+
+    pub fn run_with_tui(self) -> std::io::Result<()> {
+        run_http_with_tui_prepared(self)
+    }
+}
+
+/// Run the complete HTTP startup checks once, before any client setup writes.
+/// Direct server entrypoints also use this constructor; possession of a
+/// successful report alone cannot bypass the checks.
+pub fn prepare_http_startup(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<PreparedHttpStartup> {
+    config.validate_user_env_authority()?;
+    install_crash_marker_panic_hook(config.storage_root.clone());
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
@@ -2612,7 +2921,10 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    Ok(())
+    Ok(PreparedHttpStartup {
+        config: config.clone(),
+        on_ready: None,
+    })
 }
 
 fn boot_check_mode_from_config(
@@ -2786,7 +3098,14 @@ pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
 fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Result<()> {
     let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
-            let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
+            // br-r6psd: this server process normally already holds live
+            // FrankenSQLite pool connections on `path`. Hashing the main inode
+            // through an ad-hoc descriptor would, on close, release every
+            // classic `fcntl` lock they hold (Linux), and its raw format can
+            // never match the lock-neutral record the pool writes (br-oyget).
+            // Use the pool's own descriptor-neutral fingerprint instead.
+            let fingerprint =
+                mcp_agent_mail_db::pool::recovery_breaker_fingerprint(path, Some(&state));
             state.applies_to(&fingerprint).then(|| {
                 format!(
                     "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
@@ -3026,8 +3345,8 @@ impl ArchiveDbDriftSummary {
 }
 
 fn archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive)
 }
 
 fn archive_storage_root_is_authoritative_for_sqlite_path(
@@ -3054,8 +3373,8 @@ fn inspect_archive_db_drift(
         return Ok(None);
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
+    let archive = mcp_agent_mail_tools::tool_util::read_archive_inventory(storage_root);
+    if !mcp_agent_mail_tools::tool_util::read_archive_inventory_has_state(&archive) {
         return Ok(None);
     }
 
@@ -3145,7 +3464,7 @@ impl SnapshotDirGuard {
         let base = preferred_snapshot_temp_dir()?;
         let pid = std::process::id();
         for attempt in 0..32_u32 {
-            let nonce = std::time::SystemTime::now()
+            let nonce = std::time::SystemTime::now() // ubs:ignore — directory collision suffix; create_dir atomically refuses existing paths, and this value grants no authority
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
@@ -3254,6 +3573,11 @@ fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Op
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    // Startup moves staging here when $TMPDIR cannot hold a probe copy
+    // (br-txx8u); every snapshot must follow it.
+    if let Some(fallback) = mcp_agent_mail_db::pool::snapshot_temp_root_fallback() {
+        return validate_snapshot_temp_dir(&fallback, "staging fallback");
+    }
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
             continue;
@@ -3472,15 +3796,16 @@ pub(crate) fn open_observability_sync_db_connection(
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state =
+    let archive_has_state = || {
         archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
-            && archive_inventory_has_state(storage_root);
+            && archive_inventory_has_state(storage_root)
+    };
 
     // Observability must not initialize a configured fresh-start target merely
     // to render counts. If durable archive state exists, derive a private
     // snapshot from it; otherwise report that no read source is available.
     if !resolved_path.exists() {
-        return if archive_has_state {
+        return if archive_has_state() {
             ObservabilitySyncDb::archive_snapshot(storage_root, None, context).map(Some)
         } else {
             Ok(None)
@@ -3522,7 +3847,7 @@ pub(crate) fn open_observability_sync_db_connection(
                 .map(Some)
             }
             Ok(None) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
-            Err(error) if archive_has_state => {
+            Err(error) if archive_has_state() => {
                 // #219: same failure backoff as the drift arm — the probe
                 // failing does not make an O(archive) rebuild per dashboard
                 // tick any cheaper. Serving the (openable) live connection
@@ -3557,7 +3882,7 @@ pub(crate) fn open_observability_sync_db_connection(
             }
             Err(_) => Ok(Some(ObservabilitySyncDb::live(conn, sqlite_path))),
         },
-        Err(error) if archive_has_state => {
+        Err(error) if archive_has_state() => {
             // #219: no live connection exists to fall back on here, but a
             // rebuild that just failed will fail again — surface a fast
             // error instead of replaying the archive every ~1.2 s tick.
@@ -3652,15 +3977,19 @@ impl TuiDeferredWorkerProgress {
         }
     }
 
-    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
         if self.claim_db_start() {
-            start_tui_db_background_workers(config);
+            start_tui_db_background_workers(config, workers);
         }
     }
 
-    fn start_advisory_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_advisory_if_needed(
+        &self,
+        config: &mcp_agent_mail_core::Config,
+        workers: &StartupWorkers,
+    ) {
         if self.claim_advisory_start() {
-            start_advisory_consistency_probe(config);
+            start_advisory_consistency_probe(config, workers);
         }
     }
 }
@@ -3668,6 +3997,7 @@ impl TuiDeferredWorkerProgress {
 struct TuiDeferredWorkerHandle {
     join: Option<std::thread::JoinHandle<()>>,
     progress: Arc<TuiDeferredWorkerProgress>,
+    tui_state: Arc<tui_bridge::TuiSharedState>,
 }
 
 impl TuiDeferredWorkerHandle {
@@ -3678,12 +4008,24 @@ impl TuiDeferredWorkerHandle {
     }
 }
 
+impl Drop for TuiDeferredWorkerHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            // Errors and unwinding must stop the starter before the startup
+            // scope joins its workers or releases mailbox authority. Explicit
+            // joins during headless detach leave this guard inert.
+            self.tui_state.request_shutdown();
+            self.join();
+        }
+    }
+}
+
 fn start_tui_non_db_background_workers(config: &mcp_agent_mail_core::Config) {
     disk_monitor::start(config);
 }
 
-fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
-    init_search_bridge(config);
+fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    init_search_bridge(config, workers);
     cleanup::start(config);
     ack_ttl::start(config);
     tool_metrics::start(config);
@@ -3780,12 +4122,14 @@ fn handle_tui_deferred_background_worker_spawn_failure(
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &Arc<StartupWorkers>,
 ) -> TuiDeferredWorkerHandle {
     let worker_config = config.clone();
     let inline_tui_state = Arc::clone(tui_state);
     let worker_tui_state = Arc::clone(&inline_tui_state);
     let progress = Arc::new(TuiDeferredWorkerProgress::default());
     let worker_progress = Arc::clone(&progress);
+    let workers = Arc::clone(workers);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
@@ -3797,15 +4141,16 @@ fn spawn_tui_deferred_background_workers(
             if !wait_for_tui_db_readiness(&worker_tui_state) {
                 return;
             }
-            worker_progress.start_db_if_needed(&worker_config);
+            worker_progress.start_db_if_needed(&worker_config, &workers);
             if sleep_with_tui_shutdown(&worker_tui_state, TUI_ADVISORY_CONSISTENCY_IDLE_GRACE) {
                 return;
             }
-            worker_progress.start_advisory_if_needed(&worker_config);
+            worker_progress.start_advisory_if_needed(&worker_config, &workers);
         }) {
         Ok(handle) => TuiDeferredWorkerHandle {
             join: Some(handle),
             progress,
+            tui_state: Arc::clone(&inline_tui_state),
         },
         Err(error) => {
             handle_tui_deferred_background_worker_spawn_failure(
@@ -3816,6 +4161,7 @@ fn spawn_tui_deferred_background_workers(
             TuiDeferredWorkerHandle {
                 join: None,
                 progress,
+                tui_state: Arc::clone(&inline_tui_state),
             }
         }
     }
@@ -3824,17 +4170,17 @@ fn spawn_tui_deferred_background_workers(
 fn spawn_tui_readiness_warmup(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &StartupWorkers,
 ) {
     let config = config.clone();
     let tui_state = Arc::clone(tui_state);
     let failure_tui_state = Arc::clone(&tui_state);
-    if let Err(error) = std::thread::Builder::new()
-        .name("tui-readiness-warmup".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check(&config));
-        })
-    {
+    if let Err(error) = workers.spawn("tui-readiness-warmup", move |control| {
+        let result = readiness_check_with_startup_control(&config, &control);
+        if control.checkpoint().is_ok() {
+            handle_tui_readiness_warmup_result(Some(&tui_state), result);
+        }
+    }) {
         handle_tui_readiness_warmup_result(
             Some(&failure_tui_state),
             Err(format!("spawn failed: {error}")),
@@ -3852,9 +4198,7 @@ fn spawn_tui_readiness_warmup(
 /// the installer (br-5mnkl). Overridable via `STARTUP_READINESS_BIND_TIMEOUT_SECS`.
 fn startup_readiness_bind_deadline() -> Duration {
     Duration::from_secs(parse_startup_readiness_bind_deadline_secs(
-        std::env::var("STARTUP_READINESS_BIND_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
+        mcp_agent_mail_core::config::env_value("STARTUP_READINESS_BIND_TIMEOUT_SECS").as_deref(),
     ))
 }
 
@@ -3885,21 +4229,29 @@ fn parse_startup_readiness_bind_deadline_secs(raw: Option<&str>) -> u64 {
 ///   * `/health` honestly reports `warming_up` / `service unavailable` (503)
 ///     until the DB settles, then `ready` (200);
 ///   * if the warmup is still running at the deadline it is left to finish in
-///     the background — never joined — and recovery/diagnosis stay available via
-///     `am doctor`.
+///     the background, still owned and joined by the server's shutdown scope.
+///     Recovery/diagnosis stay available via `am doctor`.
 ///
 /// No data is mutated beyond what `readiness_check` already does; this is the
 /// "bind-degraded + report" contract, not aggressive auto-remediation.
-fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
+fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    run_startup_readiness_with_bind_deadline(config, workers, startup_readiness_bind_deadline());
+}
+
+fn run_startup_readiness_with_bind_deadline(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    bind_deadline: Duration,
+) {
     let cfg = config.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("am-db-readiness".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _ = tx.send(readiness_check(&cfg));
-        });
+    let spawned = workers.spawn("am-db-readiness", move |control| {
+        let _ = tx.send(readiness_check_with_startup_control(&cfg, &control));
+    });
     if let Err(error) = spawned {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return;
+        }
         // Could not even spawn the warmup thread; fall back to an inline
         // (blocking) readiness so we never silently skip migrations. This path
         // is the pre-br-5mnkl behavior and only triggers under thread
@@ -3910,7 +4262,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
         }
         return;
     }
-    match rx.recv_timeout(startup_readiness_bind_deadline()) {
+    match rx.recv_timeout(bind_deadline) {
         Ok(Ok(())) => {
             tracing::debug!("database readiness warmup completed before listener bind");
         }
@@ -3921,19 +4273,20 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup failed; binding the HTTP listener in DB-degraded mode. \
                  /healthz stays live and /health reports unavailable until the DB recovers. \
-                 Run `am doctor --json` to diagnose/repair."
+                 Run `am doctor check --json` to diagnose/repair."
             );
         }
         Err(_timeout) => {
             tracing::warn!(
-                deadline_secs = startup_readiness_bind_deadline().as_secs(),
+                deadline_secs = bind_deadline.as_secs(),
                 db = %config.database_url,
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
-                 background. If this persists, stop the service and run `am doctor --json`."
+                 background. If this persists, stop the service and run `am doctor check --json`."
             );
-            // Detach: let the warmup finish in the background; never join here.
+            // Stop waiting for readiness, not owning it. The server scope
+            // retains the handle and cancels/joins it on shutdown.
         }
     }
 }
@@ -4065,7 +4418,7 @@ fn append_crash_marker(path: &Path, record: &serde_json::Value) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    run_http_supervised(config, None)
+    prepare_http_startup(config)?.run()
 }
 
 /// Run the headless HTTP server exactly like [`run_http`], but stoppable by
@@ -4084,13 +4437,15 @@ pub fn run_http_with_control(
     config: &mcp_agent_mail_core::Config,
     control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
 ) -> std::io::Result<()> {
-    run_http_supervised(config, Some(control_rx))
+    prepare_http_startup(config)?.run_with_control(control_rx)
 }
 
 fn run_http_supervised(
-    config: &mcp_agent_mail_core::Config,
+    startup: PreparedHttpStartup,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -4098,27 +4453,21 @@ fn run_http_supervised(
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: startup probes (inside `prepare_http_runtime_startup`) must
-    // run BEFORE acquiring runtime activity locks.  The probes take an
-    // exclusive flock on the activity lockfile to verify no other process
-    // is running; if we already hold a shared flock from
-    // `acquire_runtime_mailbox_activity_locks`, the exclusive attempt
-    // deadlocks (EAGAIN) against our own process.
-    prepare_http_runtime_startup(config)?;
-
-    // Safe to acquire now -- probes have confirmed we are the sole owner.
+    // Preparation ran the exclusive integrity probe before runtime locks.
+    // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
     // pathologically slow recovery can never wedge the listener bind. The
     // listener always comes up within the bind deadline; `/healthz` stays live
     // and `/health` reports degraded honestly until the DB settles.
-    run_bounded_startup_readiness(config);
+    run_bounded_startup_readiness(config, &startup_scope.workers);
 
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
-    heal_storage_lock_artifacts(config);
-    init_search_bridge(config);
+    heal_storage_lock_artifacts(config, None);
+    init_search_bridge(config, &startup_scope.workers);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4135,7 +4484,7 @@ fn run_http_supervised(
     maintenance::start(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
-    start_advisory_consistency_probe(config);
+    start_advisory_consistency_probe(config, &startup_scope.workers);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
     arm_startup_readiness_fast_path();
@@ -4143,9 +4492,10 @@ fn run_http_supervised(
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone(), control_rx);
+    let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
+    startup_scope.workers.shutdown();
     retention::shutdown();
     tool_metrics::shutdown();
     ack_ttl::shutdown();
@@ -4169,11 +4519,16 @@ fn run_http_supervised(
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    prepare_http_startup(config)?.run_with_tui()
+}
+
+fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<()> {
+    let config = &startup.config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
 
     // Guard against degenerate PTY geometry (e.g. `stty size` => `0 0`) which can
@@ -4183,35 +4538,25 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             "[warn] Detected invalid terminal size ({cols}x{rows}); \
              disabling TUI to avoid runaway CPU (headless HTTP mode)"
         );
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
+
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
 
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: probes must run BEFORE acquiring runtime activity locks.
-    // `probe_integrity` takes an exclusive flock on the activity lockfile;
-    // if we already hold a shared flock the exclusive attempt deadlocks
-    // (EAGAIN) against our own process.
-    let probe_report = startup_checks::run_startup_probes(config);
-    if !probe_report.is_ok() {
-        return Err(std::io::Error::other(probe_report.format_errors()));
-    }
-    ensure_boot_archive_preflight_pass(config)?;
-
-    // Now that probes have confirmed we are the sole owner, acquire the
-    // runtime shared lock for the lifetime of the process.
+    // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
     // ── 2. Pre-paint essentials only ────────────────────────────────
-    heal_storage_lock_artifacts(config);
+    heal_storage_lock_artifacts(config, None);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4244,6 +4589,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         Some(Arc::clone(&tui_state)),
         Some(server_ctl_rx),
         Some(Arc::clone(&supervisor_fail_fast_active)),
+        on_ready,
     ) {
         Ok(result_rx) => result_rx,
         Err(err) => {
@@ -4259,8 +4605,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // Keep first paint fast: screens and the DB poller already degrade
     // gracefully while SQLite is still warming up, so do not block the
     // interactive handoff on migrations/readiness work here.
-    spawn_tui_readiness_warmup(config, &tui_state);
-    let mut deferred_workers = spawn_tui_deferred_background_workers(config, &tui_state);
+    spawn_tui_readiness_warmup(config, &tui_state, &startup_scope.workers);
+    let mut deferred_workers =
+        spawn_tui_deferred_background_workers(config, &tui_state, &startup_scope.workers);
 
     // ── 5. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
@@ -4309,8 +4656,12 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         // leave the thread parked forever while the poller is being stopped.
         deferred_workers.join();
         deferred_workers.progress.start_non_db_if_needed(config);
-        deferred_workers.progress.start_db_if_needed(config);
-        deferred_workers.progress.start_advisory_if_needed(config);
+        deferred_workers
+            .progress
+            .start_db_if_needed(config, &startup_scope.workers);
+        deferred_workers
+            .progress
+            .start_advisory_if_needed(config, &startup_scope.workers);
         // Stop the poller BEFORE clearing the detach latch (finding F8).
         // The latch is the narrow TUI-side release here: while it is set,
         // `wait_for_db_warmup`-style startup waits short-circuit (see
@@ -4332,6 +4683,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             &tui_state,
             HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
         );
+        startup_scope.workers.shutdown();
         drop(http_runtime);
 
         retention::shutdown();
@@ -4356,6 +4708,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // control-channel recv / idle sleep), so this flag alone guarantees an
     // orderly supervisor exit even if the control message below is dropped.
     tui_state.request_shutdown();
+    startup_scope.workers.request_shutdown();
     // Belt-and-suspenders: also deliver the explicit Shutdown control message
     // with a bounded retry instead of a silent-drop `try_send`.
     send_server_shutdown_control(&server_ctl_tx);
@@ -4366,6 +4719,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         &supervisor_result_rx,
         HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
     );
+    startup_scope.workers.shutdown();
     drop(http_runtime);
 
     // Shutdown background workers
@@ -4925,6 +5279,7 @@ fn spawn_http_supervisor_task(
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
     fail_fast_active: Option<Arc<AtomicBool>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_handle = runtime_handle;
@@ -4941,6 +5296,7 @@ fn spawn_http_supervisor_task(
                     config,
                     supervisor_state,
                     control_rx,
+                    on_ready,
                 ),
             )
             .await;
@@ -5236,6 +5592,7 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
@@ -5280,6 +5637,10 @@ async fn run_http_server_supervisor(
     // ready so `systemctl is-active` only reports `active` once clients can
     // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
     sd_notify_ready();
+
+    if let Some(on_ready) = on_ready {
+        on_ready(&config);
+    }
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -6041,20 +6402,25 @@ fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
+    let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
          client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
+         archive_fence_wait_ms={}; archive_fence_holder={fence_holder}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
          blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
-         (archive stages are off the request path since ack-fast: archive \
-         lag cannot cause a tool timeout; archive_commit_queue is \
-         enqueue-to-durable queue latency, not pure git work.)",
+         (the archive write-behind queue and commit queue are off the request \
+         path since ack-fast, and archive_commit_queue is enqueue-to-durable \
+         queue latency, not pure git work; reservation artifacts are written \
+         on the request path and wait for the archive publication fence, \
+         whose oldest live wait is archive_fence_wait_ms.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6064,6 +6430,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
         micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_fence_wait_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.zombies_expired,
@@ -6075,9 +6442,15 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
+    let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder();
     McpError::new(
         McpErrorCode::InternalError,
-        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
+        dispatch_timeout_error_text(
+            method,
+            dispatch_timeout_secs,
+            &diagnostics,
+            fence_holder.as_ref(),
+        ),
     )
 }
 
@@ -6329,6 +6702,9 @@ const BROWSER_TUI_DEFERRED_HTML: &str = concat!(
 
 const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_EXECUTION_CAPACITY: usize = 64;
+const ATC_OPERATOR_COOLDOWN_CAPACITY: usize = 4_096;
+const ATC_EXECUTOR_PROJECT_CAPACITY: usize = 1_024;
+const ATC_OPERATOR_CACHE_KEY_BYTES: usize = 8_192;
 const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ATC_OPERATOR_MIN_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const ATC_ROLLUP_REFRESH_INTERVAL_MICROS: i64 = 300_000_000;
@@ -6674,10 +7050,131 @@ fn record_atc_operator_execution(
 }
 
 fn atc_status_consumes_cooldown(status: &str) -> bool {
-    !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
+    !status.starts_with("failed:")
+        && !matches!(
+            status,
+            "suppressed:missing_project_precondition"
+                | "suppressed:agent_capacity"
+                | "suppressed:conflict_capacity"
+                | "suppressed:agent_coverage_unavailable"
+        )
 }
 
 const ATC_QUEUE_BACKPRESSURE_STATUS: &str = "throttled:pending_queue_capacity";
+
+/// Lifetime-bounded execution history. Expiration uses the longest configured
+/// effect interval, not the interval of the last effect: a later effect may use
+/// a longer interval for the same semantic key. The operator is restarted when
+/// its configuration changes, and every current effect family is bounded by
+/// the advisory, probe and summary intervals from that configuration.
+struct AtcOperatorCooldowns {
+    last_action_by_key: HashMap<String, i64>,
+    retention_micros: i64,
+    capacity: usize,
+}
+
+impl AtcOperatorCooldowns {
+    fn new(retention_micros: i64, capacity: usize) -> Self {
+        Self {
+            last_action_by_key: HashMap::new(),
+            retention_micros: retention_micros.max(0),
+            capacity,
+        }
+    }
+
+    /// Called once per operator tick; work is bounded by the retained capacity.
+    fn prune(&mut self, now_micros: i64) {
+        let retention_micros = self.retention_micros;
+        self.last_action_by_key
+            .retain(|_, last| now_micros.saturating_sub(*last) < retention_micros);
+    }
+
+    fn execute(
+        &mut self,
+        key: &str,
+        family: &str,
+        cooldown_micros: i64,
+        now_micros: i64,
+        execute: impl FnOnce() -> String,
+    ) -> String {
+        // Explicitly disabling a family's cooldown needs no retained history.
+        if cooldown_micros <= 0 {
+            return execute();
+        }
+        // Fail closed if a future policy emits an interval our expiration
+        // horizon cannot honor. Never silently shorten a requested cooldown.
+        if cooldown_micros > self.retention_micros {
+            return "throttled:cooldown_policy_horizon".to_string();
+        }
+        if key.len() > ATC_OPERATOR_CACHE_KEY_BYTES {
+            return "throttled:cooldown_key_capacity".to_string();
+        }
+        if let Some(last) = self.last_action_by_key.get(key) {
+            if now_micros.saturating_sub(*last) < cooldown_micros {
+                return format!("throttled:{family}");
+            }
+        } else if self.last_action_by_key.len() >= self.capacity {
+            // Evicting an unexpired key could allow more mail for that target.
+            // Preserve admitted history and suppress new keys until expiration.
+            return "throttled:cooldown_capacity".to_string();
+        }
+
+        let status = execute();
+        if atc_status_consumes_cooldown(&status) {
+            if let Some(last) = self.last_action_by_key.get_mut(key) {
+                *last = now_micros;
+            } else {
+                self.last_action_by_key.insert(key.to_string(), now_micros);
+            }
+        }
+        status
+    }
+}
+
+/// A bounded success cache for idempotent system-agent registration. Eviction
+/// only repeats the durable identity lookup; it does not remove an agent or
+/// authorize an effect. FIFO keeps hot cache hits allocation-free.
+struct AtcExecutorProjectCache {
+    projects: HashSet<String>,
+    insertion_order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for AtcExecutorProjectCache {
+    fn default() -> Self {
+        Self {
+            projects: HashSet::new(),
+            insertion_order: VecDeque::new(),
+            capacity: ATC_EXECUTOR_PROJECT_CAPACITY,
+        }
+    }
+}
+
+impl AtcExecutorProjectCache {
+    fn ensure(
+        &mut self,
+        project_key: &str,
+        register: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.projects.contains(project_key) {
+            return Ok(());
+        }
+        register()?;
+        // Large valid project keys still work, without defeating the cache's
+        // byte bound. A later use simply repeats the idempotent registration.
+        if self.capacity == 0 || project_key.len() > ATC_OPERATOR_CACHE_KEY_BYTES {
+            return Ok(());
+        }
+        if self.projects.len() >= self.capacity
+            && let Some(oldest) = self.insertion_order.pop_front()
+        {
+            self.projects.remove(&oldest);
+        }
+        self.projects.insert(project_key.to_string());
+        self.insertion_order.push_back(project_key.to_string());
+        Ok(())
+    }
+}
 
 fn atc_effect_subject(effect: &atc::AtcEffectPlan) -> String {
     match effect.semantics.family.as_str() {
@@ -6839,9 +7336,7 @@ fn atc_effect_kind(effect: &atc::AtcEffectPlan) -> Result<EffectKind, String> {
         "routing_suggestion" => Ok(EffectKind::RoutingSuggestion),
         "backpressure" => Ok(EffectKind::Backpressure),
         "no_action" => Ok(EffectKind::NoAction),
-        other => Err(format!(
-            "unsupported ATC effect kind for experience append: {other}"
-        )),
+        _ => Err("unsupported ATC effect kind for experience append".to_string()),
     }
 }
 
@@ -6896,20 +7391,6 @@ fn atc_effect_project_slug(project_key: Option<&str>) -> String {
 
 fn atc_elapsed_micros(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
-fn atc_effect_sampled_input(effect: &atc::AtcEffectPlan) -> serde_json::Value {
-    serde_json::json!({
-        "decision_id": effect.decision_id,
-        "effect_id": effect.effect_id,
-        "kind": effect.kind,
-        "category": effect.category,
-        "agent": effect.agent,
-        "project_key": effect.project_key,
-        "policy_id": effect.policy_id,
-        "policy_revision": effect.policy_revision,
-        "has_message": effect.message.as_deref().is_some_and(|message| !message.trim().is_empty()),
-    })
 }
 
 fn atc_experience_stratum_key(row: &ExperienceRow) -> String {
@@ -7016,9 +7497,7 @@ fn append_atc_experience_for_effect(
             tracing::warn!(
                 event = "atc.insert_experience",
                 error_kind = "build_experience_row",
-                agent_name = %effect.agent,
-                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
-                sampled_input = ?atc_effect_sampled_input(effect),
+                decision_id = effect.decision_id,
                 %error,
                 "failed to build ATC experience row"
             );
@@ -7056,9 +7535,7 @@ fn append_atc_experience_for_effect(
             tracing::warn!(
                 event = "atc.insert_experience",
                 error_kind = "append_experience",
-                agent_name = %effect.agent,
-                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
-                sampled_input = ?atc_effect_sampled_input(effect),
+                decision_id = effect.decision_id,
                 %error,
                 "failed to append ATC experience row"
             );
@@ -7278,40 +7755,11 @@ fn capture_atc_execution_result(
 
     let capture = atc_execution_capture(status);
 
-    // Transition: Planned → Dispatched (effect was handed to executor).
-    // If this fails, we still attempt the second transition because an
-    // orphaned experience stuck in Planned is worse than skipping a step.
-    let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-        &cx,
-        pool,
-        exp_id,
-        ExperienceState::Dispatched,
-        ts_micros,
-        None,
-        None,
-    )) {
-        asupersync::Outcome::Ok(()) => {}
-        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-            field: "state",
-            ..
-        }) => {}
-        asupersync::Outcome::Err(error) => {
-            mcp_agent_mail_core::global_metrics()
-                .atc
-                .record_derivation_error("transition_dispatched");
-            tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched, continuing to final state");
-            // Do NOT return — fall through to the second transition so the
-            // execution result is still captured. An experience in Planned state
-            // with no execution record is worse than a skipped Dispatched step.
-        }
-        _ => {}
-    }
-
-    // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
+    // Validate and persist Planned → Dispatched → execution result atomically.
+    // A rejected context or reason must not leave an intermediate state behind.
     let context_patch = atc_execution_context_patch(&capture, execution_mode, status, ts_micros);
     let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+    match block_on(mcp_agent_mail_db::queries::record_atc_execution_outcome(
         &cx,
         pool,
         exp_id,
@@ -7365,7 +7813,9 @@ fn resolve_reservation_experience(
     since_micros: i64,
     now_micros: i64,
 ) -> Option<ExperienceOutcome> {
-    let event_kind = atc::atc_reservation_outcome_for_agent(&experience.subject, since_micros)?;
+    let project = experience.project_key.as_deref()?;
+    let event_kind =
+        atc::atc_reservation_outcome_for_agent(&experience.subject, project, since_micros)?;
     let (label, correct, actual_loss) = match event_kind {
         atc::ReservationEventKind::Released => ("clean_release", true, 0.0),
         atc::ReservationEventKind::ForceReleased => ("force_released", true, 0.1),
@@ -7382,6 +7832,7 @@ fn resolve_reservation_experience(
         evidence: Some(serde_json::json!({
             "resolution_signal": "reservation_event_log",
             "agent": experience.subject,
+            "project_key": project,
             "event_kind": label,
         })),
     })
@@ -7409,6 +7860,33 @@ fn atc_resolution_outcome_from_activity(
             "latency_micros": agent_active_since - resolution_anchor_micros,
         })),
     })
+}
+
+/// Keep rejected outcome payloads out of request-specific diagnostics. The DB
+/// repeats this check against its current row and atomically promotes/resolves
+/// under the write transaction; this preflight is not the persistence gate.
+fn atc_resolution_content_is_valid(
+    experience: &ExperienceRow,
+    outcome: &ExperienceOutcome,
+    api: &'static str,
+) -> bool {
+    match experience.validate_content_with_outcome(outcome) {
+        Ok(()) => true,
+        Err(category) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("resolution_content_rejected");
+            tracing::warn!(
+                event = "atc.content_rejected",
+                api,
+                experience_id = experience.experience_id,
+                state = %experience.state,
+                category,
+                "ATC outcome rejected before lifecycle mutation"
+            );
+            false
+        }
+    }
 }
 
 fn promote_executed_experience_to_open_for_resolution(
@@ -7489,6 +7967,22 @@ fn sweep_open_experiences_for_resolution(
     now_micros: i64,
     resolution_window_micros: i64,
 ) {
+    sweep_open_experiences_with_before_message_mutation(
+        pool,
+        now_micros,
+        resolution_window_micros,
+        |_| {},
+    );
+}
+
+fn sweep_open_experiences_with_before_message_mutation(
+    pool: &mcp_agent_mail_db::DbPool,
+    now_micros: i64,
+    resolution_window_micros: i64,
+    mut before_message_mutation: impl FnMut(&ExperienceRow),
+) {
+    use mcp_agent_mail_db::queries::AtcMessageOutcomeUpdate;
+
     let config = mcp_agent_mail_core::Config::get();
     if config.atc_write_mode.is_off()
         || atc::atc_kill_switch_active()
@@ -7558,7 +8052,6 @@ fn sweep_open_experiences_for_resolution(
                     event = "atc.sweep.ack_overdue_shadow",
                     experience_id = experience.experience_id,
                     message_id = ack_overdue_candidate.map(|candidate| candidate.message_id),
-                    agent_name = %experience.subject,
                     "shadow: would resolve ack-overdue ATC outcome"
                 );
             }
@@ -7566,92 +8059,52 @@ fn sweep_open_experiences_for_resolution(
         }
 
         if let Some(candidate) = ack_overdue_candidate {
-            let current_row = match block_on(
-                mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
-                    &cx,
-                    pool,
-                    candidate.message_id,
-                ),
-            ) {
-                asupersync::Outcome::Ok(Some(row)) => row,
-                asupersync::Outcome::Ok(None) => {
+            let outcome = build_ack_overdue_message_resolution(experience, candidate, now_micros);
+            if !atc_resolution_content_is_valid(experience, &outcome, "ack_overdue_sweep") {
+                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
+                continue;
+            }
+            before_message_mutation(experience);
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                &cx,
+                pool,
+                experience.experience_id,
+                &outcome,
+            )) {
+                asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Resolved) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    ack_overdue_rows_resolved = ack_overdue_rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved("ack_overdue", &stratum_key);
+                    tracing::info!(
+                        event = "atc.sweep.ack_race_detected",
+                        action = "sweep_won",
+                        message_id = candidate.message_id,
+                        experience_id = experience.experience_id,
+                        "ack-overdue sweep resolved before an ack/read race"
+                    );
+                    tracing::info!(
+                        event = "atc.sweep.ack_overdue_resolved",
+                        message_id = candidate.message_id,
+                        experience_id = experience.experience_id,
+                        age_micros = candidate.age_micros,
+                        attribution_window_micros = candidate.window_micros,
+                        "resolved ack-overdue ATC outcome"
+                    );
+                }
+                asupersync::Outcome::Ok(_) => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
                     tracing::debug!(
                         event = "atc.sweep.ack_race_detected",
-                        action = "row_missing",
+                        action = "already_resolved",
                         message_id = candidate.message_id,
                         experience_id = experience.experience_id,
-                        "message_sent ATC row missing during ack-overdue sweep"
+                        "message outcome resolved before ack-overdue mutation"
                     );
-                    continue;
                 }
-                asupersync::Outcome::Err(error) => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("ack_overdue_fetch");
-                    tracing::warn!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "fetch_failed",
-                        message_id = candidate.message_id,
-                        experience_id = experience.experience_id,
-                        %error,
-                        "failed to fetch message_sent ATC row for ack-overdue sweep"
-                    );
-                    continue;
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
-                }
-            };
-
-            if current_row.state == ExperienceState::Resolved {
-                let existing = current_row
-                    .outcome
-                    .as_ref()
-                    .map(|outcome| outcome.label.as_str())
-                    .unwrap_or("resolved");
-                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                let action = if matches!(existing, "acknowledged" | "read") {
-                    "ack_won"
-                } else {
-                    "already_resolved"
-                };
-                tracing::debug!(
-                    event = "atc.sweep.ack_race_detected",
-                    action,
-                    message_id = candidate.message_id,
-                    experience_id = current_row.experience_id,
-                    outcome = existing,
-                    "ack-overdue sweep saw message outcome already resolved"
-                );
-                continue;
-            }
-
-            if !promote_executed_experience_to_open_for_resolution(
-                pool,
-                current_row.experience_id,
-                current_row.state,
-                now_micros,
-                "failed to transition ack-overdue experience to open",
-            ) {
-                ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                mcp_agent_mail_core::global_metrics()
-                    .atc
-                    .record_derivation_error("ack_overdue_promote");
-                continue;
-            }
-
-            let outcome = build_ack_overdue_message_resolution(&current_row, candidate, now_micros);
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                &cx,
-                pool,
-                current_row.experience_id,
-                &outcome,
-            )) {
-                asupersync::Outcome::Ok(()) => {}
-                asupersync::Outcome::Err(error) => {
+                asupersync::Outcome::Err(_) => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -7660,173 +8113,104 @@ fn sweep_open_experiences_for_resolution(
                         event = "atc.sweep.ack_race_detected",
                         action = "resolve_failed",
                         message_id = candidate.message_id,
-                        experience_id = current_row.experience_id,
-                        %error,
+                        experience_id = experience.experience_id,
                         "failed to resolve ack-overdue ATC outcome"
                     );
-                    continue;
                 }
                 _ => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
                 }
             }
-
-            let updated_row = match block_on(
-                mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
-                    &cx,
-                    pool,
-                    candidate.message_id,
-                ),
-            ) {
-                asupersync::Outcome::Ok(Some(row)) => row,
-                asupersync::Outcome::Err(error) => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("ack_overdue_refetch");
-                    tracing::warn!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "refetch_failed",
-                        message_id = candidate.message_id,
-                        experience_id = current_row.experience_id,
-                        %error,
-                        "failed to refetch message_sent ATC row after ack-overdue resolution"
-                    );
-                    continue;
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    continue;
-                }
-            };
-
-            let resolved_label = updated_row
-                .outcome
-                .as_ref()
-                .map(|outcome| outcome.label.as_str());
-            match resolved_label {
-                Some("ack_overdue") => {
-                    rows_resolved = rows_resolved.saturating_add(1);
-                    ack_overdue_rows_resolved = ack_overdue_rows_resolved.saturating_add(1);
-                    let stratum_key = atc_experience_stratum_key(&updated_row);
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved("ack_overdue", &stratum_key);
-                    tracing::info!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "sweep_won",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        "ack-overdue sweep resolved before an ack/read race"
-                    );
-                    tracing::info!(
-                        event = "atc.sweep.ack_overdue_resolved",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        age_micros = candidate.age_micros,
-                        attribution_window_micros = candidate.window_micros,
-                        importance = candidate.importance,
-                        agent_name = %updated_row.subject,
-                        "resolved ack-overdue ATC outcome"
-                    );
-                }
-                Some("acknowledged" | "read") => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    tracing::info!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "ack_won",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        outcome = resolved_label.unwrap_or("unknown"),
-                        "late ack/read won the race against ack-overdue sweep"
-                    );
-                }
-                _ => {
-                    ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
-                    tracing::debug!(
-                        event = "atc.sweep.ack_race_detected",
-                        action = "unexpected_terminal_state",
-                        message_id = candidate.message_id,
-                        experience_id = updated_row.experience_id,
-                        outcome = resolved_label.unwrap_or("unknown"),
-                        "ack-overdue sweep observed unexpected terminal state"
-                    );
-                }
-            }
-            continue;
-        }
-
-        // Ensure executed experiences transition to open before resolution.
-        // The state machine requires Executed → Open → Resolved.
-        if !promote_executed_experience_to_open_for_resolution(
-            pool,
-            experience.experience_id,
-            experience.state,
-            now_micros,
-            "failed to transition experience to open",
-        ) {
             continue;
         }
 
         let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
         let age_micros = now_micros.saturating_sub(resolution_anchor_micros);
+        let reservation_related = is_reservation_related_experience(experience);
+        let reservation_outcome = if reservation_related {
+            resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
+        } else {
+            None
+        };
+        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
+        // General activity is indexed by agent name, which is only unique
+        // within a project. It cannot establish a reservation outcome: an
+        // unrelated same-name agent may have made the observed tool call.
+        let activity_outcome = if reservation_related {
+            None
+        } else {
+            atc_resolution_outcome_from_activity(experience, agent_active_since)
+        };
+        if let Some(outcome) = reservation_outcome.as_ref().or(activity_outcome.as_ref())
+            && !atc_resolution_content_is_valid(experience, outcome, "resolution_sweep")
+        {
+            continue;
+        }
+
+        // Observed outcomes promote and resolve in one DB transaction. With
+        // no outcome, retain the existing open/wait/expire lifecycle behavior.
+        if reservation_outcome.is_none()
+            && activity_outcome.is_none()
+            && !promote_executed_experience_to_open_for_resolution(
+                pool,
+                experience.experience_id,
+                experience.state,
+                now_micros,
+                "failed to transition experience to open",
+            )
+        {
+            continue;
+        }
 
         // Reservation-specific resolution: check the engine's reservation event
         // log for release/conflict/force-release events that followed this
         // experience's creation (br-bn0vb.10).
-        if is_reservation_related_experience(experience) {
-            if let Some(outcome) =
-                resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
-            {
-                let cx = runtime_request_cx(Budget::INFINITE);
-                match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                    &cx,
-                    pool,
-                    experience.experience_id,
-                    &outcome,
-                )) {
-                    asupersync::Outcome::Ok(()) => {
-                        rows_resolved = rows_resolved.saturating_add(1);
-                        let stratum_key = atc_experience_stratum_key(experience);
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_experience_resolved(&outcome.label, &stratum_key);
-                        tracing::debug!(
-                            event = "atc.sweep.reservation_resolved",
-                            experience_id = experience.experience_id,
-                            outcome = %outcome.label,
-                            age_micros,
-                            agent_name = %experience.subject,
-                            "resolved reservation experience"
-                        );
-                    }
-                    asupersync::Outcome::Err(error) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_derivation_error("resolve_reservation");
-                        tracing::warn!(
-                            experience_id = experience.experience_id,
-                            %error,
-                            "failed to resolve reservation experience"
-                        );
-                    }
-                    _ => {}
+        if let Some(outcome) = reservation_outcome {
+            let cx = runtime_request_cx(Budget::INFINITE);
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
+                &cx,
+                pool,
+                experience.experience_id,
+                &outcome,
+            )) {
+                asupersync::Outcome::Ok(()) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved(&outcome.label, &stratum_key);
+                    tracing::debug!(
+                        event = "atc.sweep.reservation_resolved",
+                        experience_id = experience.experience_id,
+                        outcome = %outcome.label,
+                        age_micros,
+                        agent_name = %experience.subject,
+                        "resolved reservation experience"
+                    );
                 }
-                continue;
+                asupersync::Outcome::Err(error) => {
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_derivation_error("resolve_reservation");
+                    tracing::warn!(
+                        experience_id = experience.experience_id,
+                        %error,
+                        "failed to resolve reservation experience"
+                    );
+                }
+                _ => {}
             }
+            continue;
         }
 
         // Check if the subject agent has been active since this effect was
         // actually dispatched/executed. Agent activity is tracked by the
         // ATC engine.
-        let agent_active_since = atc::atc_agent_last_activity(&experience.subject).unwrap_or(0);
-        if let Some(outcome) = atc_resolution_outcome_from_activity(experience, agent_active_since)
-        {
+        if let Some(outcome) = activity_outcome {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
             let cx = runtime_request_cx(Budget::INFINITE);
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                 &cx,
                 pool,
                 experience.experience_id,
@@ -8033,6 +8417,15 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
         _ => return,
     };
 
+    let outcome = ExperienceOutcome {
+        observed_ts_micros: now_micros,
+        label: label.to_string(),
+        correct,
+        actual_loss: None,
+        regret: None,
+        evidence: Some(evidence),
+    };
+
     // Only resolve Conflict-subsystem experiences.
     for experience in &open_experiences {
         if experience.subsystem != ExperienceSubsystem::Conflict {
@@ -8048,28 +8441,12 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             }
         }
 
-        let outcome = ExperienceOutcome {
-            observed_ts_micros: now_micros,
-            label: label.to_string(),
-            correct,
-            actual_loss: None,
-            regret: None,
-            evidence: Some(evidence.clone()),
-        };
-
-        if !promote_executed_experience_to_open_for_resolution(
-            pool,
-            experience.experience_id,
-            experience.state,
-            now_micros,
-            "failed to transition conflict experience to open before resolution",
-        ) {
+        if !atc_resolution_content_is_valid(experience, &outcome, "reservation_event") {
             continue;
         }
-
         let cx2 = runtime_request_cx(Budget::INFINITE);
         if let asupersync::Outcome::Err(error) =
-            block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+            block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
                 &cx2,
                 pool,
                 experience.experience_id,
@@ -8079,8 +8456,6 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             tracing::warn!(
                 experience_id = experience.experience_id,
                 %error,
-                label,
-                agent,
                 "failed to resolve conflict experience on reservation event"
             );
         }
@@ -8089,24 +8464,22 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
 
 fn ensure_atc_executor_identity(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     project_key: &str,
 ) -> Result<(), String> {
-    if ensured_projects.contains(project_key) {
-        return Ok(());
-    }
-    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let ctx = McpContext::new(cx, 1);
-    runtime.block_on(async {
-        let pool =
-            mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|error| error.to_string())?;
-        let project = mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
-            .await
-            .map_err(|error| error.to_string())?;
-        register_atc_executor_identity(ctx.cx(), &pool, project.id.unwrap_or(0)).await
-    })?;
-    ensured_projects.insert(project_key.to_string());
-    Ok(())
+    ensured_projects.ensure(project_key, || {
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let ctx = McpContext::new(cx, 1);
+        runtime.block_on(async {
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool()
+                .map_err(|error| error.to_string())?;
+            let project =
+                mcp_agent_mail_tools::tool_util::resolve_project(&ctx, &pool, project_key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            register_atc_executor_identity(ctx.cx(), &pool, project.id.unwrap_or(0)).await
+        })
+    })
 }
 
 /// Register the ATC control plane's own `AirTrafficControl` sender identity.
@@ -8145,7 +8518,7 @@ async fn register_atc_executor_identity(
 
 fn execute_atc_advisory_effect(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
@@ -8182,7 +8555,7 @@ fn execute_atc_advisory_effect(
 
 fn execute_atc_probe_effect(
     runtime: &Runtime,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
@@ -8242,7 +8615,7 @@ fn execute_atc_release_effect(
 fn execute_atc_effect(
     runtime: Option<&Runtime>,
     executor_mode: AtcExecutorMode,
-    ensured_projects: &mut HashSet<String>,
+    ensured_projects: &mut AtcExecutorProjectCache,
     effect: &atc::AtcEffectPlan,
 ) -> String {
     match executor_mode {
@@ -8277,6 +8650,13 @@ fn execute_atc_effect(
                 let Some(project_key) = effect.project_key.as_deref() else {
                     return "suppressed:missing_project_precondition".to_string();
                 };
+                // A queued proposal may predate a capacity refusal. Recheck at
+                // execution admission, outside hydration/delivery locks, and
+                // release the engine lock before entering the reservation tool.
+                // A refusal after this boundary does not cancel admitted work.
+                if let Err(reason) = atc::atc_release_capacity_admission() {
+                    return format!("suppressed:{reason}");
+                }
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
                 };
@@ -8504,7 +8884,13 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     }
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
-    let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
+    let mut cooldowns = AtcOperatorCooldowns::new(
+        atc_config
+            .advisory_cooldown_micros
+            .max(atc_config.probe_interval_micros)
+            .max(atc_config.summary_interval_micros),
+        ATC_OPERATOR_COOLDOWN_CAPACITY,
+    );
     let mut last_summary_log_micros = 0_i64;
     // I3 (br-bvq1x.9.3) budget-overrun watchdog accumulators. Loop-local so they
     // persist across ticks and feed the published snapshot / health surface.
@@ -8519,7 +8905,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
     let mut atc_resolution_tick_counter: u64 = 0;
-    let mut executor_registered_projects: HashSet<String> = HashSet::new();
+    let mut executor_registered_projects = AtcExecutorProjectCache::default();
     let mut next_population_sync_micros = 0_i64;
     let mut next_rollup_refresh_micros = 0_i64;
 
@@ -8600,7 +8986,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                         Err(error) => {
                             tracing::warn!(
                                 decision_id = effect.decision_id,
-                                effect_id = %effect.effect_id,
                                 %error,
                                 "failed to append ATC experience"
                             );
@@ -8650,60 +9035,28 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
         }
 
+        cooldowns.prune(now_micros);
         let mut processed_this_tick = 0_usize;
         while processed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
-            let Some(effect) = pending_effects.front() else {
+            let Some(effect) = pending_effects.pop_front() else {
                 break;
             };
-            let cooldown_key = atc_effect_semantic_key(effect);
-            let cooldown_micros = effect.semantics.cooldown_micros.max(0);
-            let throttled = last_action_by_key
-                .get(&cooldown_key)
-                .copied()
-                .is_some_and(|last| {
-                    cooldown_micros > 0 && now_micros.saturating_sub(last) < cooldown_micros
-                });
-            if throttled {
-                let Some(effect) = pending_effects.pop_front() else {
-                    continue;
-                };
-                pending_effect_keys.remove(&cooldown_key);
-                let status = format!("throttled:{}", effect.semantics.family);
-                if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
-                    capture_atc_execution_result(
-                        pool,
-                        effect.experience_id,
-                        executor_mode.as_str(),
-                        &status,
-                        now_micros,
-                    );
-                }
-                let execution =
-                    atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
-                record_atc_operator_execution(
-                    &mut recent_executions,
-                    &mut recent_actions,
-                    &mut visible_actions,
-                    execution,
-                );
-                // Throttled outcomes still perform durable work, so they must
-                // count against the per-tick action budget.
-                processed_this_tick = processed_this_tick.saturating_add(1);
-                continue;
-            }
-            let Some(effect) = pending_effects.pop_front() else {
-                continue;
-            };
+            let cooldown_key = atc_effect_semantic_key(&effect);
             pending_effect_keys.remove(&cooldown_key);
-            let status = execute_atc_effect(
-                executor_runtime.as_ref(),
-                executor_mode,
-                &mut executor_registered_projects,
-                &effect,
+            let status = cooldowns.execute(
+                &cooldown_key,
+                &effect.semantics.family,
+                effect.semantics.cooldown_micros,
+                now_micros,
+                || {
+                    execute_atc_effect(
+                        executor_runtime.as_ref(),
+                        executor_mode,
+                        &mut executor_registered_projects,
+                        &effect,
+                    )
+                },
             );
-            if atc_status_consumes_cooldown(&status) {
-                last_action_by_key.insert(cooldown_key, now_micros);
-            }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
             if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
@@ -8722,6 +9075,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 &mut visible_actions,
                 execution,
             );
+            // Throttled outcomes also perform capture work and consume the
+            // same per-tick action budget as actual execution attempts.
             processed_this_tick = processed_this_tick.saturating_add(1);
         }
 
@@ -9273,6 +9628,12 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
+    stable_tui_diff_config_with(full_redraw_max_interval_from_env())
+}
+
+fn stable_tui_diff_config_with(
+    full_redraw_max_interval: Option<Duration>,
+) -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
     // Explicitly tune the runtime diff path so sparse TUI updates remain
     // incremental and strategy switches do not thrash at overlay boundaries.
     let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
@@ -9300,34 +9661,41 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_dirty_span_config(dirty_spans)
         .with_tile_diff_config(tiles)
         // The TUI runs for days inside mux panes. If the visible terminal buffer
-        // is cleared or desynchronized outside the process, sparse diffs cannot
-        // reconstruct it, so force a bounded physical repaint.
+        // is cleared or desynchronized outside the process (a tmux/zellij pane
+        // swap, a detach/reattach), sparse diffs cannot reconstruct it, so a
+        // wall-clock bound forces a physical repaint whether the UI is idle or
+        // busy.
         //
-        // Two complementary bounds:
-        //  - frame-count: resync every N *rendered* frames. Cheap, but advances
-        //    only while the UI is actively rendering.
-        //  - wall-clock: resync at least every `full_redraw_max_secs` of elapsed
-        //    time, *regardless* of render cadence. This is what bounds visible
-        //    terminal-state desync (incremental-diff corruption, a tmux/zellij
-        //    pane swap, or a detach/reattach) when the TUI is idle or rendering
-        //    sparsely — exactly the case where the frame counter stalls and the
-        //    garbage would otherwise persist on screen. Tunable via
-        //    `AM_TUI_FULL_REDRAW_MAX_SECS` (default 1.0; <= 0 disables).
-        .with_full_redraw_interval_frames(20)
-        .with_full_redraw_max_interval(full_redraw_max_interval_from_env())
+        // That repaint re-emits every cell. A 1 s bound plus a 20-frame bound
+        // made an idle TUI resend the whole screen about once a second
+        // (~65 KB/s on an 86x382 pane; GH#338). The wall-clock bound alone
+        // limits how long a desync stays visible, so the frame-count bound is
+        // off and the default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`;
+        // operators can shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
+        .with_full_redraw_interval_frames(0)
+        .with_full_redraw_max_interval(full_redraw_max_interval)
 }
 
+/// Default wall-clock bound, in seconds, between forced full TUI redraws.
+const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
+
 /// Wall-clock bound between forced physical full redraws (see
-/// [`stable_tui_diff_config`]). Reads `AM_TUI_FULL_REDRAW_MAX_SECS`
-/// (floating-point seconds); defaults to 1.0s. A value <= 0 (or unparseable)
-/// disables the time-based resync, leaving only the frame-count bound.
+/// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    let secs = std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS")
-        .ok()
+    full_redraw_max_interval_from(
+        mcp_agent_mail_core::config::env_value("AM_TUI_FULL_REDRAW_MAX_SECS").as_deref(),
+    )
+}
+
+/// Parse floating-point seconds. Unset or unparseable falls back to
+/// [`DEFAULT_FULL_REDRAW_MAX_SECS`]; a value <= 0, non-finite, or too large
+/// for a `Duration` disables the wall-clock resync.
+fn full_redraw_max_interval_from(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
         .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
-    if secs.is_finite() && secs > 0.0 {
-        Some(Duration::from_secs_f64(secs))
+        .unwrap_or(DEFAULT_FULL_REDRAW_MAX_SECS);
+    if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).ok()
     } else {
         None
     }
@@ -11267,6 +11635,10 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    /// Aggregates the failed-request WARN for repeated 401/404 probes.
+    probe_rejection_log: HttpProbeRejectionLog,
+    /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
+    http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11460,6 +11832,8 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            probe_rejection_log: HttpProbeRejectionLog::default(),
+            http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11565,15 +11939,33 @@ impl HttpState {
         // requests even when the optional high-volume request log is disabled;
         // never include body or authorization data.
         if resp.status >= 400 {
-            tracing::warn!(
-                event = "http_request_error",
-                method = %method_name,
-                path = %path_for_diag,
-                status = resp.status,
-                duration_ms = dur_ms,
-                client_ip = %client_ip.as_deref().unwrap_or("-"),
-                "HTTP request failed"
-            );
+            let client = client_ip.as_deref().unwrap_or("-");
+            match self
+                .probe_rejection_log
+                .admit(client, resp.status, Instant::now())
+            {
+                HttpRejectionLogDecision::Log => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    "HTTP request failed"
+                ),
+                HttpRejectionLogDecision::LogWindowStart { suppressed_before } => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    suppressed_before,
+                    window_secs = HTTP_PROBE_REJECTION_LOG_WINDOW.as_secs(),
+                    "HTTP request failed; further responses with this status to this client within window_secs are counted, not logged"
+                ),
+                HttpRejectionLogDecision::Suppress => {}
+            }
         }
 
         if !needs_request_log {
@@ -11624,6 +12016,11 @@ impl HttpState {
         }
 
         let (path, _query) = split_path_query(&req.uri);
+        // This one versioned bootstrap asset contains only embedded public
+        // code. It must load before the browser can attach mailbox credentials.
+        if let Some(resp) = self.handle_embedded_mail_asset(&req, &path) {
+            return resp;
+        }
         // Legacy parity: health routes bypass bearer auth even when configured.
         //
         // Note: the legacy FastAPI stack used a `/health/` prefix check, but this
@@ -11638,7 +12035,7 @@ impl HttpState {
 
         let auth_cx = self.request_cx();
 
-        // Legacy parity: bearer auth applies to all non-health routes (even unknown paths/methods),
+        // Bearer auth applies to all remaining non-health routes (even unknown paths/methods),
         // so missing/invalid auth yields 401 instead of downstream 404/405/400.
         if let Some(resp) = self.check_bearer_auth_with_cx(&auth_cx, &req).await {
             return resp;
@@ -11657,11 +12054,44 @@ impl HttpState {
         // MCP JSON-RPC path uses, so a wedged mail request can only consume a
         // dispatch permit and a worker thread, never the async runtime.
         if path == "/mail" || path.starts_with("/mail/") {
+            if let Some(resp) = self
+                .check_mail_write_access_with_cx(&auth_cx, &req, &path)
+                .await
+            {
+                return resp;
+            }
             return self.dispatch_mail_route_blocking(req, path).await;
         }
 
         if !self.path_allowed(&path) {
             return self.error_response(&req, 404, "Not Found");
+        }
+
+        // Bind sessions to the caller's authorization before the localhost
+        // POST adapter can synthesize a header. DELETE uses this same principal.
+        let session_principal = self
+            .config
+            .messaging_session_identity
+            .then(|| http_sessions::principal_digest(header_value(&req, "authorization")));
+
+        // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
+        if let Some(principal) = session_principal
+            && matches!(req.method, Http1Method::Delete)
+        {
+            let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
+                .is_some_and(|id| self.http_sessions.terminate(id, principal));
+            if !ended {
+                return self.error_response(&req, 404, "Not Found");
+            }
+            let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+            apply_cors_headers(
+                &mut resp,
+                self.cors_origin(&req),
+                self.config.http_cors_allow_credentials,
+                &self.config.http_cors_allow_methods,
+                &self.config.http_cors_allow_headers,
+            );
+            return resp;
         }
 
         if !matches!(req.method, Http1Method::Post) {
@@ -11708,18 +12138,55 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
-            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-            |resp| HttpResponse::ok().with_json(&resp),
-        );
+        let (session_state, new_session_id) = session_principal.map_or((None, None), |principal| {
+            self.resolve_mcp_session(&req, &json_rpc, principal)
+        });
+        let response = self
+            .dispatch_with_session(json_rpc, session_state)
+            .await
+            .map_or_else(
+                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+                |resp| HttpResponse::ok().with_json(&resp),
+            );
 
-        to_http1_response(
+        let mut out = to_http1_response(
             response,
             self.cors_origin(&req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        )
+        );
+        if let Some(id) = new_session_id {
+            out.headers
+                .push((http_sessions::MCP_SESSION_ID_HEADER.to_string(), id));
+            out.headers.push((
+                "access-control-expose-headers".to_string(),
+                http_sessions::MCP_SESSION_ID_HEADER.to_string(),
+            ));
+        }
+        out
+    }
+
+    /// The MCP session a request belongs to (GH#279, opt-in). `initialize`
+    /// starts a session whose id is returned to the client; any other request
+    /// joins the live session named by its `Mcp-Session-Id` header, provided
+    /// it carries the same authorization the session was created under.
+    /// Otherwise the request is stateless, exactly as with the feature off.
+    fn resolve_mcp_session(
+        &self,
+        req: &Http1Request,
+        request: &JsonRpcRequest,
+        principal: [u8; 32],
+    ) -> (Option<SessionState>, Option<String>) {
+        if request.method == "initialize" {
+            return self
+                .http_sessions
+                .create(principal)
+                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+        }
+        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
+            .and_then(|id| self.http_sessions.lookup(id, principal));
+        (state, None)
     }
 
     fn emit_http_request_log(
@@ -11808,6 +12275,38 @@ impl HttpState {
         Some(resp)
     }
 
+    fn handle_embedded_mail_asset(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
+        if path != templates::MAIL_TAILWIND_ASSET_PATH {
+            return None;
+        }
+        if !matches!(req.method, Http1Method::Get | Http1Method::Head) {
+            let mut resp = self.error_response(req, 405, "Method Not Allowed");
+            resp.headers
+                .push(("allow".to_string(), "GET, HEAD, OPTIONS".to_string()));
+            return Some(resp);
+        }
+        let Some(bytes) =
+            mcp_agent_mail_share::bundle::embedded_viewer_asset("vendor/tailwind.min.js")
+        else {
+            return Some(self.error_response(req, 500, "Embedded asset unavailable"));
+        };
+        let body = if matches!(req.method, Http1Method::Head) {
+            Vec::new()
+        } else {
+            bytes.to_vec()
+        };
+        let mut resp = self.raw_response(req, 200, "text/javascript; charset=utf-8", body);
+        resp.headers.push((
+            "cache-control".to_string(),
+            "public, max-age=31536000, immutable".to_string(),
+        ));
+        resp.headers
+            .push(("content-length".to_string(), bytes.len().to_string()));
+        resp.headers
+            .push(("x-content-type-options".to_string(), "nosniff".to_string()));
+        Some(resp)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_special_routes(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
         match path {
@@ -11851,6 +12350,13 @@ impl HttpState {
                 // archive or diagnostic scans and make a live listener look
                 // dead under contention.
                 body["durability_state"] = serde_json::json!("not_probed");
+                // The write-back latch is one atomic load, so it is cheap enough here.
+                // Still 200: the listener is alive and reads still work, and the
+                // archive reconciler lifts the latch once the failed write-backs
+                // are re-archived, so a supervisor restart loop would not help.
+                if mcp_agent_mail_storage::durability_degraded() {
+                    body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
+                }
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/health/durability" => {
@@ -11866,7 +12372,7 @@ impl HttpState {
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
                 );
-                let body = durability.map_or_else(
+                let mut body = durability.map_or_else(
                     || {
                         serde_json::json!({
                             "durability_state": "unknown",
@@ -11881,6 +12387,11 @@ impl HttpState {
                             "allows_writes": state.allows_writes(),
                         })
                     },
+                );
+                apply_wbq_write_gate(
+                    &mut body,
+                    mcp_agent_mail_storage::durability_degraded()
+                        .then(mcp_agent_mail_storage::wbq_stats),
                 );
                 return Some(self.health_json_response(req, 200, &body));
             }
@@ -12015,6 +12526,53 @@ impl HttpState {
     fn csrf_forbidden(&self, req: &Http1Request, detail: &str) -> Http1Response {
         let body = serde_json::json!({ "error": "forbidden", "detail": detail }).to_string();
         self.raw_response(req, 403, "application/json", body.into_bytes())
+    }
+
+    /// Authorize browser mutations before they can acquire a dispatch permit or
+    /// open the mailbox. Authentication has already run in `handle_inner`.
+    async fn check_mail_write_access_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        path: &str,
+    ) -> Option<Http1Response> {
+        if !matches!(req.method, Http1Method::Post) {
+            return None;
+        }
+        // Keep the existing CSRF rejection ahead of role checks, including
+        // when RBAC or authentication is disabled for a local deployment.
+        if let Some(rejection) = self.mail_csrf_rejection(req) {
+            return Some(rejection);
+        }
+        if !self.config.http_rbac_enabled || self.allow_local_unauthenticated(req) {
+            return None;
+        }
+        let Ok((roles, _)) = self.resolve_rbac_identity_with_cx(cx, req, true).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
+        };
+        if roles
+            .iter()
+            .any(|role| self.config.http_rbac_writer_roles.contains(role))
+        {
+            return None;
+        }
+
+        tracing::warn!(
+            event = "http_rbac_denied",
+            path,
+            roles = %roles.join(","),
+            required = "writer",
+            "RBAC denied mail mutation"
+        );
+        Some(self.json_response(
+            req,
+            403,
+            &serde_json::json!({
+                "error": "forbidden",
+                "detail": "Mail mutations require a configured writer role.",
+                "required_role": "writer",
+            }),
+        ))
     }
 
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
@@ -12247,12 +12805,12 @@ impl HttpState {
         }
 
         let (path, _query) = split_path_query(&req.uri);
-        let is_mail_route = path == "/mail" || path.starts_with("/mail/");
-        let is_web_dashboard_route = path == "/web-dashboard"
-            || path == "/web-dashboard/"
-            || path == "/web-dashboard/state"
-            || path == "/web-dashboard/stream"
-            || path == "/web-dashboard/input";
+        let is_mail_route = path == "/mail" || path.starts_with("/mail/"); // ubs:ignore — public route classification; bearer credentials use has_expected_bearer_header
+        let is_web_dashboard_route = path == "/web-dashboard" // ubs:ignore — public route classification, not credential equality
+            || path == "/web-dashboard/" // ubs:ignore — public route classification, not credential equality
+            || path == "/web-dashboard/state" // ubs:ignore — public route classification, not credential equality
+            || path == "/web-dashboard/stream" // ubs:ignore — public route classification, not credential equality
+            || path == "/web-dashboard/input"; // ubs:ignore — public route classification, not credential equality
         let is_browser_route = is_mail_route || is_web_dashboard_route;
 
         if self.allow_local_unauthenticated(req) {
@@ -12307,9 +12865,9 @@ impl HttpState {
                 "GET"
             };
             let is_browser_json_route = Self::is_mail_json_route(&path, method_str)
-                || path == "/web-dashboard/state"
-                || path == "/web-dashboard/stream"
-                || path == "/web-dashboard/input";
+                || path == "/web-dashboard/state" // ubs:ignore — selects the public unauthorized-response format after credential rejection
+                || path == "/web-dashboard/stream" // ubs:ignore — selects the public unauthorized-response format after credential rejection
+                || path == "/web-dashboard/input"; // ubs:ignore — selects the public unauthorized-response format after credential rejection
             if is_browser_json_route {
                 return Some(self.error_response(req, 401, "Unauthorized"));
             }
@@ -12736,15 +13294,15 @@ to skip auth for local requests.</p>
             .await
     }
 
-    async fn check_rbac_and_rate_limit_with_cx(
+    async fn resolve_rbac_identity_with_cx(
         &self,
         cx: &Cx,
         req: &Http1Request,
-        json_rpc: &JsonRpcRequest,
-    ) -> Option<Http1Response> {
-        let (kind, tool_name) = classify_request(json_rpc);
+        allow_browser_query_token: bool,
+    ) -> Result<(Vec<String>, Option<String>), ()> {
         let is_local_ok = self.allow_local_unauthenticated(req);
-        let has_static_bearer = self.has_expected_bearer_header(req);
+        let has_static_bearer = self.has_expected_bearer_header(req)
+            || (allow_browser_query_token && self.has_expected_query_token(req));
         let local_bypass_jwt_sub = if self.config.http_rate_limit_enabled
             && is_local_ok
             && self.config.http_jwt_enabled
@@ -12771,15 +13329,29 @@ to skip auth for local requests.</p>
             if has_static_bearer {
                 (self.static_bearer_rbac_roles(), None)
             } else {
-                match self.decode_jwt_with_cx(cx, req).await {
-                    Ok(ctx) => (ctx.roles, ctx.sub),
-                    Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
-                }
+                let ctx = self.decode_jwt_with_cx(cx, req).await?;
+                (ctx.roles, ctx.sub)
             }
         } else if has_static_bearer {
             (self.static_bearer_rbac_roles(), None)
         } else {
             (self.unauthenticated_default_rbac_roles(req), None)
+        };
+        Ok((roles, jwt_sub))
+    }
+
+    async fn check_rbac_and_rate_limit_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        json_rpc: &JsonRpcRequest,
+    ) -> Option<Http1Response> {
+        let (kind, tool_name) = classify_request(json_rpc);
+        let is_local_ok = self.allow_local_unauthenticated(req);
+        // Query-token authentication is deliberately limited to browser
+        // routes; it must not grant MCP calls a static token's writer role.
+        let Ok((roles, jwt_sub)) = self.resolve_rbac_identity_with_cx(cx, req, false).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
         };
 
         // RBAC (mirrors legacy python behavior)
@@ -12879,7 +13451,20 @@ to skip auth for local requests.</p>
         None
     }
 
+    /// Stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.dispatch_with_session(request, None).await
+    }
+
+    /// Dispatch one JSON-RPC request. `session` is the persistent state of the
+    /// caller's MCP session (GH#279) when it has one; otherwise each request
+    /// gets fresh, request-local state.
+    async fn dispatch_with_session(
+        &self,
+        request: JsonRpcRequest,
+        session: Option<SessionState>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
@@ -12892,7 +13477,11 @@ to skip auth for local requests.</p>
             let id = request.id.clone();
             let outcome = std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.dispatch_inner(request))
+                    .spawn(|| {
+                        let cx = self.request_cx();
+                        let cancel = DispatchCancel::new();
+                        self.dispatch_inner_with_cx(request, session, &cx, &cancel)
+                    })
                     .join()
                     .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             });
@@ -12939,7 +13528,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| arc_self.dispatch_inner_with_cx(request, session, &worker_cx, &cancel),
         )
         .await;
 
@@ -12951,17 +13540,19 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Synchronous stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx(request, None, &cx, &cancel)
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner_with_cx(
         &self,
         request: JsonRpcRequest,
+        session_state: Option<SessionState>,
         cx: &Cx,
         cancel: &DispatchCancel,
     ) -> Result<serde_json::Value, McpError> {
@@ -12972,8 +13563,19 @@ to skip auth for local requests.</p>
         // fastmcp's router handlers now take a request-scoped `McpContext`
         // instead of a bare `Cx`; the budget travels inside the context
         // (handlers enforce it via `budget_error`) rather than as an
-        // explicit argument.
-        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        // explicit argument. The router derives tool/resource/prompt contexts
+        // from this context, so attach the same session bag used for catalog
+        // filtering; the separate router argument does not install it. Keep
+        // stateless contexts without a bag so macros cannot bind identities
+        // to a session that does not exist.
+        let request_ctx = session_state
+            .as_ref()
+            .map_or_else(
+                || McpContext::new(cx.clone(), request_id),
+                |state| McpContext::with_state(cx.clone(), request_id, state.clone()),
+            )
+            .with_budget_ceiling(budget);
+        let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {
             "initialize" => {
@@ -12991,7 +13593,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_tools_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -13003,7 +13605,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)
@@ -13096,7 +13702,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ));
@@ -13238,7 +13844,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resources_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13248,7 +13854,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resource_templates_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13260,7 +13866,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13280,7 +13886,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_prompts_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -13288,7 +13894,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13804,9 +14410,8 @@ fn append_atc_hot_path_observation_row(
             tracing::warn!(
                 event = "atc.hot_path_observation.append",
                 observation_family,
-                decision_class = %row.decision_class,
-                subject = %row.subject,
-                project_slug = %atc_effect_project_slug(row.project_key.as_deref()),
+                decision_id = row.decision_id,
+                state = %row.state,
                 %error,
                 "failed to append ATC hot-path observation"
             );
@@ -14702,6 +15307,28 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     agent_hint: Option<&str>,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
 ) {
+    record_atc_message_outcome_with_before_mutation(
+        tool_name,
+        call_args,
+        payload,
+        project_hint,
+        agent_hint,
+        atc_db_pool,
+        |_| {},
+    );
+}
+
+fn record_atc_message_outcome_with_before_mutation(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+    before_mutation: impl FnOnce(&ExperienceRow),
+) {
+    use mcp_agent_mail_db::queries::AtcMessageOutcomeUpdate;
+
     let config = mcp_agent_mail_core::Config::get();
     let Some(target_label) = atc_message_resolution_label(tool_name) else {
         return;
@@ -14715,10 +15342,28 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         return;
     };
 
-    let agent_opt = ctx.agent.as_deref();
-    let project_opt = ctx.project.as_deref();
-    let agent = agent_opt.unwrap_or("unknown");
-    let project = project_opt.unwrap_or("unknown");
+    let outcome = build_message_outcome_resolution(
+        target_label,
+        tool_name,
+        message_id,
+        ctx.agent.as_deref(),
+        ctx.project.as_deref(),
+        mcp_agent_mail_db::now_micros(),
+        "message_outcome_signal",
+    );
+    if let Err(category) = outcome.validate_content() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_derivation_error("resolution_content_rejected");
+        tracing::warn!(
+            event = "atc.content_rejected",
+            api = "message_outcome",
+            state = "unfetched",
+            category,
+            "ATC message outcome rejected before lookup or diagnostics"
+        );
+        return;
+    }
     let write_mode = atc_write_mode_label(&config);
     if config.atc_write_mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
@@ -14727,8 +15372,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         tracing::trace!(
             event = "atc.hot_path.note_ack",
             tool = %tool_name,
-            agent,
-            project,
             message_id,
             outcome = target_label,
             write_mode,
@@ -14759,42 +15402,34 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::debug!(
                     event = "atc.hot_path.ack_race_retry",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     attempt_n = attempt,
                     "message outcome row not visible yet; retrying once"
                 );
             }
             asupersync::Outcome::Ok(None) => break,
-            asupersync::Outcome::Err(error) => {
+            asupersync::Outcome::Err(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_fetch");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    %error,
                     "failed to fetch message_sent ATC experience"
                 );
                 return;
             }
-            asupersync::Outcome::Cancelled(reason) => {
+            asupersync::Outcome::Cancelled(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_fetch_cancelled");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    reason = ?reason,
                     "message outcome lookup cancelled"
                 );
                 return;
@@ -14806,8 +15441,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message outcome lookup panicked"
@@ -14825,8 +15458,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::debug!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     outcome = target_label,
                     write_mode,
@@ -14837,37 +15468,29 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.ack_for_unknown_message",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message outcome resolution skipped for unknown message"
                 );
             }
-            asupersync::Outcome::Err(error) => {
+            asupersync::Outcome::Err(_) => {
                 mcp_agent_mail_core::global_metrics()
                     .atc
                     .record_derivation_error("message_outcome_preflight");
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    %error,
                     "failed to classify missing message outcome row"
                 );
             }
-            asupersync::Outcome::Cancelled(reason) => {
+            asupersync::Outcome::Cancelled(_) => {
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
-                    reason = ?reason,
                     "message existence preflight cancelled"
                 );
             }
@@ -14875,8 +15498,6 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 tracing::warn!(
                     event = "atc.hot_path.note_ack",
                     tool = %tool_name,
-                    agent,
-                    project,
                     message_id,
                     write_mode,
                     "message existence preflight panicked"
@@ -14886,329 +15507,108 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         return;
     };
 
-    let now_micros = mcp_agent_mail_db::now_micros();
+    if !atc_resolution_content_is_valid(&experience, &outcome, "message_outcome") {
+        return;
+    }
     let stratum_key = atc_experience_stratum_key(&experience);
-    let existing_label = experience
-        .outcome
-        .as_ref()
-        .map(|outcome| outcome.label.to_ascii_lowercase());
-
-    let apply_outcome = |note: &str| {
-        build_message_outcome_resolution(
-            target_label,
-            tool_name,
-            message_id,
-            agent_opt,
-            project_opt,
-            now_micros,
-            note,
-        )
-    };
-
-    match experience.state {
-        ExperienceState::Executed => {
-            if !promote_executed_experience_to_open_for_resolution(
+    let experience_id = experience.experience_id;
+    // The lookup identifies the row only. Its state can change before this
+    // transaction, so the DB chooses resolution, ACK upgrade, or no-op from
+    // the current stored outcome while holding the write transaction.
+    before_mutation(&experience);
+    match atc_ledger_block_on(|cx| {
+        let outcome = &outcome;
+        async move {
+            mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                &cx,
                 pool,
-                experience.experience_id,
-                experience.state,
-                now_micros,
-                "failed to transition message_sent experience to open before ack/read resolution",
-            ) {
-                return;
-            }
-            let outcome = apply_outcome("resolved_after_execute_promote");
-            let experience_id = experience.experience_id;
-            match atc_ledger_block_on(|cx| {
-                let outcome = &outcome;
-                async move {
-                    mcp_agent_mail_db::queries::resolve_atc_experience(
-                        &cx,
-                        pool,
-                        experience_id,
-                        outcome,
-                    )
-                    .await
-                }
-            }) {
-                asupersync::Outcome::Ok(()) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved(target_label, &stratum_key);
-                    tracing::info!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        latency_micros = atc_elapsed_micros(started_at),
-                        "resolved message_sent ATC experience from ack/read signal"
-                    );
-                }
-                asupersync::Outcome::Err(error) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("message_outcome_resolve");
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        %error,
-                        "failed to resolve promoted message outcome"
-                    );
-                }
-                asupersync::Outcome::Cancelled(reason) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        reason = ?reason,
-                        "message outcome resolve cancelled"
-                    );
-                }
-                asupersync::Outcome::Panicked(_) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        "message outcome resolve panicked"
-                    );
-                }
-            }
+                experience_id,
+                outcome,
+            )
+            .await
         }
-        ExperienceState::Open => {
-            let outcome = apply_outcome("resolved_from_open");
-            let experience_id = experience.experience_id;
-            match atc_ledger_block_on(|cx| {
-                let outcome = &outcome;
-                async move {
-                    mcp_agent_mail_db::queries::resolve_atc_experience(
-                        &cx,
-                        pool,
-                        experience_id,
-                        outcome,
-                    )
-                    .await
-                }
-            }) {
-                asupersync::Outcome::Ok(()) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_experience_resolved(target_label, &stratum_key);
-                    tracing::info!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        latency_micros = atc_elapsed_micros(started_at),
-                        "resolved open message_sent ATC experience from ack/read signal"
-                    );
-                }
-                asupersync::Outcome::Err(error) => {
-                    mcp_agent_mail_core::global_metrics()
-                        .atc
-                        .record_derivation_error("message_outcome_resolve");
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        %error,
-                        "failed to resolve open message outcome"
-                    );
-                }
-                asupersync::Outcome::Cancelled(reason) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        reason = ?reason,
-                        "open message outcome resolve cancelled"
-                    );
-                }
-                asupersync::Outcome::Panicked(_) => {
-                    tracing::warn!(
-                        event = "atc.hot_path.note_ack",
-                        tool = %tool_name,
-                        agent,
-                        project,
-                        message_id,
-                        experience_id_resolved = experience.experience_id,
-                        outcome = target_label,
-                        write_mode,
-                        "open message outcome resolve panicked"
-                    );
-                }
-            }
-        }
-        ExperienceState::Resolved => {
-            let existing = existing_label.as_deref();
-            if target_label == "acknowledged" && matches!(existing, Some("read" | "ack_overdue")) {
-                let (note, event_name, upgrade_reason) = if existing == Some("ack_overdue") {
-                    (
-                        "upgrade_ack_overdue_to_acknowledged",
-                        "atc.hot_path.ack_upgrade_overdue_to_acked",
-                        "upgraded resolved message outcome from ack_overdue to acknowledged",
-                    )
-                } else {
-                    (
-                        "upgrade_read_to_acknowledged",
-                        "atc.hot_path.ack_upgrade_read_to_acked",
-                        "upgraded resolved message outcome from read to acknowledged",
-                    )
-                };
-                let outcome = apply_outcome(note);
-                let experience_id = experience.experience_id;
-                match atc_ledger_block_on(|cx| {
-                    let outcome = &outcome;
-                    async move {
-                        mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
-                            &cx,
-                            pool,
-                            experience_id,
-                            outcome,
-                        )
-                        .await
-                    }
-                }) {
-                    asupersync::Outcome::Ok(()) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_experience_resolved(target_label, &stratum_key);
-                        tracing::info!(
-                            event = event_name,
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id = experience.experience_id,
-                            write_mode,
-                            latency_micros = atc_elapsed_micros(started_at),
-                            upgrade_reason,
-                            "upgraded resolved message outcome"
-                        );
-                    }
-                    asupersync::Outcome::Err(error) => {
-                        mcp_agent_mail_core::global_metrics()
-                            .atc
-                            .record_derivation_error("message_outcome_upgrade");
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            %error,
-                            "failed to upgrade resolved message outcome"
-                        );
-                    }
-                    asupersync::Outcome::Cancelled(reason) => {
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            reason = ?reason,
-                            "message outcome upgrade cancelled"
-                        );
-                    }
-                    asupersync::Outcome::Panicked(_) => {
-                        tracing::warn!(
-                            event = "atc.hot_path.note_ack",
-                            tool = %tool_name,
-                            agent,
-                            project,
-                            message_id,
-                            experience_id_resolved = experience.experience_id,
-                            outcome = target_label,
-                            write_mode,
-                            "message outcome upgrade panicked"
-                        );
-                    }
-                }
-                return;
-            }
-
-            if existing == Some(target_label)
-                || (target_label == "read" && existing == Some("acknowledged"))
-            {
-                tracing::debug!(
-                    event = "atc.hot_path.note_ack",
-                    tool = %tool_name,
-                    agent,
-                    project,
-                    message_id,
-                    experience_id_resolved = experience.experience_id,
-                    outcome = existing.unwrap_or("resolved"),
-                    write_mode,
-                    latency_micros = atc_elapsed_micros(started_at),
-                    "message outcome already resolved; leaving terminal state unchanged"
-                );
-                return;
-            }
-
-            tracing::debug!(
+    }) {
+        asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Resolved) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_experience_resolved(target_label, &stratum_key);
+            tracing::info!(
                 event = "atc.hot_path.note_ack",
                 tool = %tool_name,
-                agent,
-                project,
                 message_id,
-                experience_id_resolved = experience.experience_id,
-                prior_outcome = existing.unwrap_or("unknown"),
+                experience_id_resolved = experience_id,
                 outcome = target_label,
                 write_mode,
-                "resolved message outcome not rewritten for incompatible terminal label"
+                latency_micros = atc_elapsed_micros(started_at),
+                "resolved message_sent ATC experience from ack/read signal"
             );
         }
-        state => {
+        asupersync::Outcome::Ok(
+            update @ (AtcMessageOutcomeUpdate::AcknowledgedAfterRead
+            | AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue),
+        ) => {
+            let event_name = if update == AtcMessageOutcomeUpdate::AcknowledgedAfterRead {
+                "atc.hot_path.ack_upgrade_read_to_acked"
+            } else {
+                "atc.hot_path.ack_upgrade_overdue_to_acked"
+            };
+            // An ACK upgrade corrects a terminal outcome; it does not resolve
+            // another open row or decrement the open-stratum gauge again.
+            tracing::info!(
+                event = event_name,
+                tool = %tool_name,
+                message_id,
+                experience_id,
+                write_mode,
+                latency_micros = atc_elapsed_micros(started_at),
+                "upgraded resolved message outcome to acknowledged"
+            );
+        }
+        asupersync::Outcome::Ok(AtcMessageOutcomeUpdate::Unchanged) => {
             tracing::debug!(
                 event = "atc.hot_path.note_ack",
                 tool = %tool_name,
-                agent,
-                project,
                 message_id,
-                experience_id_resolved = experience.experience_id,
+                experience_id_resolved = experience_id,
                 outcome = target_label,
                 write_mode,
-                state = %state,
-                "message outcome resolution ignored for non-open terminal state"
+                "message outcome already resolved; leaving terminal state unchanged"
+            );
+        }
+        asupersync::Outcome::Err(_) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("message_outcome_resolve");
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "failed to resolve or upgrade message outcome"
+            );
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "message outcome resolve cancelled"
+            );
+        }
+        asupersync::Outcome::Panicked(_) => {
+            tracing::warn!(
+                event = "atc.hot_path.note_ack",
+                tool = %tool_name,
+                message_id,
+                experience_id_resolved = experience_id,
+                outcome = target_label,
+                write_mode,
+                "message outcome resolve panicked"
             );
         }
     }
@@ -15405,7 +15805,25 @@ fn append_message_flow_events(
 #[derive(Debug, Clone, Default)]
 struct DomainEventContext {
     project: Option<String>,
+    // The UI uses slugs, but inference must retain an available full path:
+    // distinct project paths can slugify to the same display label.
+    atc_project: Option<String>,
     agent: Option<String>,
+}
+
+fn resolve_atc_reservation_project(project_key: &str) -> Option<String> {
+    // Successful reservation tools already resolved this project through the
+    // mailbox pool. Reuse that authority without bootstrapping a database or
+    // creating a project from observation post-processing. A slug and its full
+    // path must enter the same exact-keyed conflict graph.
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())?;
+    atc_ledger_block_on(|cx| async move {
+        let ctx = McpContext::new(cx, 0);
+        mcp_agent_mail_tools::tool_util::resolve_existing_project(&ctx, &pool, project_key).await
+    })
+    .ok()
+    .map(|project| project.human_key)
+    .filter(|key| !key.trim().is_empty())
 }
 
 fn resolve_domain_event_context(
@@ -15413,6 +15831,11 @@ fn resolve_domain_event_context(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> DomainEventContext {
+    let atc_project = extract_arg_str(
+        call_args,
+        &["project_key", "project", "human_key", "project_slug"],
+    )
+    .or_else(|| project_hint.map(str::to_string));
     let project = project_hint
         .map(|value| normalize_project_value(value.to_string()))
         .or_else(|| {
@@ -15436,7 +15859,11 @@ fn resolve_domain_event_context(
             ],
         )
     });
-    DomainEventContext { project, agent }
+    DomainEventContext {
+        project,
+        atc_project,
+        agent,
+    }
 }
 
 fn derive_message_domain_events(
@@ -15539,6 +15966,51 @@ fn derive_reservation_granted_domain_events(
     payload: &serde_json::Value,
     ctx: &DomainEventContext,
 ) -> Vec<tui_events::MailEvent> {
+    let events = derive_reservation_grant_event(call_args, payload, ctx);
+    // A fully denied request has no grants, but its blocking edges are the
+    // essential input to deadlock detection. Observe conflicts independently
+    // of the grant event so empty/partial grants cannot hide a wait cycle.
+    // Keep the observed conflict after grant processing: historical grants in
+    // an idempotent replay do not supersede its current conflict snapshot.
+    if let (Some(project), Some(agent), Some(conflicts)) = (
+        ctx.atc_project.as_deref(),
+        ctx.agent.as_deref(),
+        payload
+            .get("conflicts")
+            .and_then(serde_json::Value::as_array),
+    ) {
+        let observations: Vec<atc::AtcConflictObservation> = conflicts
+            .iter()
+            .filter_map(|conflict| {
+                let requested = conflict.get("path")?.as_str()?;
+                let holders = conflict.get("holders")?.as_array()?;
+                Some(holders.iter().filter_map(move |holder| {
+                    Some(atc::AtcConflictObservation {
+                        holder: holder.get("agent")?.as_str()?.to_string(),
+                        requested_path: requested.to_string(),
+                        holder_path_pattern: holder.get("path_pattern")?.as_str()?.to_string(),
+                    })
+                }))
+            })
+            .flatten()
+            .collect();
+        if !observations.is_empty() {
+            atc::atc_note_reservation_conflicts(
+                agent,
+                project,
+                &observations,
+                mcp_agent_mail_db::now_micros(),
+            );
+        }
+    }
+    events
+}
+
+fn derive_reservation_grant_event(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
     let Some(granted) = payload.get("granted").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
@@ -15571,44 +16043,14 @@ fn derive_reservation_granted_domain_events(
     };
     let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
     // Wire reservation grants into ATC conflict graph (br-0qt6e.2.9)
-    atc::atc_note_reservation_granted(
-        &agent_value,
-        &paths,
-        exclusive,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
-
-    // Wire any conflicts into ATC conflict graph (br-0qt6e.2.9)
-    if let Some(conflicts_arr) = payload
-        .get("conflicts")
-        .and_then(serde_json::Value::as_array)
-    {
-        if !conflicts_arr.is_empty() {
-            let observations: Vec<atc::AtcConflictObservation> = conflicts_arr
-                .iter()
-                .filter_map(|c| {
-                    let requested = c.get("path")?.as_str()?;
-                    let holders = c.get("holders")?.as_array()?;
-                    Some(holders.iter().filter_map(move |h| {
-                        Some(atc::AtcConflictObservation {
-                            holder: h.get("agent")?.as_str()?.to_string(),
-                            requested_path: requested.to_string(),
-                            holder_path_pattern: h.get("path_pattern")?.as_str()?.to_string(),
-                        })
-                    }))
-                })
-                .flatten()
-                .collect();
-            if !observations.is_empty() {
-                atc::atc_note_reservation_conflicts(
-                    &agent_value,
-                    project_value,
-                    &observations,
-                    mcp_agent_mail_db::now_micros(),
-                );
-            }
-        }
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_granted(
+            &agent_value,
+            &paths,
+            exclusive,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
     }
 
     vec![tui_events::MailEvent::reservation_granted(
@@ -15643,12 +16085,14 @@ fn derive_release_domain_events(
         paths.push("<all-active>".to_string());
     }
     // Wire reservation releases into ATC conflict graph (br-0qt6e.2.9)
-    atc::atc_note_reservation_released(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_released(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
@@ -15693,12 +16137,14 @@ fn derive_renew_domain_events(
     if paths.is_empty() {
         paths.push("<renewed>".to_string());
     }
-    atc::atc_note_reservation_renewed(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_renewed(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_granted(
         agent_value,
@@ -15741,12 +16187,14 @@ fn derive_force_release_domain_events(
         .or_else(|| ctx.agent.clone())
         .unwrap_or_else(|| "unknown".to_string());
     // Wire force-release into ATC conflict graph (br-bn0vb.7)
-    atc::atc_note_reservation_force_released(
-        &agent_value,
-        &paths,
-        project_value,
-        mcp_agent_mail_db::now_micros(),
-    );
+    if let Some(project) = ctx.atc_project.as_deref() {
+        atc::atc_note_reservation_force_released(
+            &agent_value,
+            &paths,
+            project,
+            mcp_agent_mail_db::now_micros(),
+        );
+    }
 
     vec![tui_events::MailEvent::reservation_released(
         agent_value,
@@ -15867,7 +16315,31 @@ fn derive_domain_events_from_tool_payload(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> Vec<tui_events::MailEvent> {
-    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    let mut ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    if matches!(
+        tool_name,
+        "file_reservation_paths"
+            | "release_file_reservations"
+            | "renew_file_reservations"
+            | "force_release_file_reservation"
+            | "macro_start_session"
+            | "macro_file_reservation_cycle"
+    ) && atc::atc_enabled()
+        && mcp_agent_mail_core::Config::get().atc_write_mode.is_live()
+    {
+        ctx.atc_project = ctx
+            .atc_project
+            .as_deref()
+            .and_then(resolve_atc_reservation_project);
+        if ctx.atc_project.is_none() {
+            // A missing authority must not turn a display slug into trusted
+            // project identity. UI events still render; only ATC inference is
+            // skipped. Off mode and shadow tracing retain their existing paths.
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("reservation_project_resolution");
+        }
+    }
     match tool_name {
         "send_message" | "reply_message" => derive_message_domain_events(payload, &ctx),
         "fetch_inbox" => derive_fetch_inbox_domain_events(payload, &ctx, None),
@@ -16310,6 +16782,13 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, true)
 }
 
+fn readiness_check_with_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    control: &StartupWorkerControl,
+) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, true, Some(control))
+}
+
 #[cfg(test)]
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -16565,6 +17044,31 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+/// The mailbox verdict cannot see the write-back latch (#122), which refuses
+/// every send with `DURABILITY_DEGRADED` until the failed write-backs are
+/// verified in the archive. Without this, `/health/durability` said "healthy",
+/// `allows_writes: true` on a mailbox that had refused all sends for hours (mac
+/// studio, 2026-10-14 after ENOSPC).
+fn apply_wbq_write_gate(
+    body: &mut serde_json::Value,
+    latched: Option<mcp_agent_mail_storage::WbqStats>,
+) {
+    let Some(stats) = latched else {
+        return;
+    };
+    body["durability_state"] =
+        serde_json::json!(mcp_agent_mail_db::DurabilityState::DegradedReadOnly.to_string());
+    body["allows_writes"] = serde_json::json!(false);
+    body["write_gate"] = serde_json::json!({
+        "error_code": "DURABILITY_DEGRADED",
+        "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+        "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+        "recovery": "automatic once the archive reconciler re-archives the failed messages and \
+                     disk pressure is below critical; otherwise a supervised restart, or \
+                     `am doctor repair` after draining the server",
+    });
+}
+
 /// Fast-path mailbox-verdict probe used by `/health/durability` (#94). Returns
 /// `None` for :memory: DBs — those have no on-disk state the verdict engine can
 /// meaningfully inspect, so the readiness check is the only health signal. Any
@@ -16724,6 +17228,10 @@ fn enrich_readiness_response(
     body: &mut serde_json::Value,
 ) {
     body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    body["atc_population_hydration"] = serde_json::json!(atc::atc_population_health_snapshot(
+        config.atc_enabled,
+        mcp_agent_mail_core::timestamps::now_micros(),
+    ));
     let cache = lock_mutex(cache);
     body["database_path"] = cache.database_path.clone();
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -16761,6 +17269,17 @@ fn readiness_check_with_integrity(
     config: &mcp_agent_mail_core::Config,
     run_integrity_check: bool,
 ) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, run_integrity_check, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn readiness_check_with_integrity_and_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    run_integrity_check: bool,
+    control: Option<&StartupWorkerControl>,
+) -> Result<(), String> {
+    let checkpoint = || control.map_or(Ok(()), StartupWorkerControl::checkpoint);
+    checkpoint()?;
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
         None
@@ -16782,6 +17301,7 @@ fn readiness_check_with_integrity(
     {
         let storage_root = std::path::Path::new(&config.storage_root);
         if !sqlite_path.exists() {
+            checkpoint()?;
             let recovery_res = if storage_root.is_dir() {
                 mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
                     sqlite_path,
@@ -16821,12 +17341,14 @@ fn readiness_check_with_integrity(
         cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
 
-    // Borrow the runtime-backed ambient Cx<cap::All> that `Runtime::block_on`
-    // installs (INFINITE budget) rather than the test-only `Cx::for_testing()`
-    // constructor, which is gated behind `test-internals`.
-    let cx = block_on(async {
-        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
-    });
+    // Keep a request context whose cancellation registry outlives checkout.
+    // An ambient root Cx escaped from a completed block_on has already had
+    // its wakers retired, so shutdown cannot wake a later pending acquire.
+    let cx = runtime_request_cx(Budget::INFINITE);
+    let _context_guard = control
+        .map(|control| control.bind_native_context(&cx))
+        .transpose()?;
+    checkpoint()?;
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,
@@ -16845,6 +17367,7 @@ fn readiness_check_with_integrity(
         }
     };
 
+    checkpoint()?;
     if let Err(e) = conn.query_sync("SELECT 1", &[]) {
         let error = e.to_string();
         if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
@@ -16855,6 +17378,7 @@ fn readiness_check_with_integrity(
         return Err(error);
     }
 
+    checkpoint()?;
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
     drop(conn);
 
@@ -16865,6 +17389,7 @@ fn readiness_check_with_integrity(
                 startup_integrity_cache_is_fresh(config, sqlite_path, *fingerprint)
             });
     if run_integrity_check && config.integrity_check_on_startup && !is_memory {
+        checkpoint()?;
         if skip_startup_integrity {
             tracing::debug!(
                 "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
@@ -16873,6 +17398,7 @@ fn readiness_check_with_integrity(
             // Note: If we just recovered above, this is redundant but extremely fast and safe.
             pool.run_startup_integrity_check()
                 .map_err(|e| format!("startup integrity check failed: {e}"))?;
+            checkpoint()?;
             // The guard's first cycle would repeat this quick-check at once; on
             // a large mailbox one costs seconds and a burst of engine threads.
             integrity_guard::note_startup_integrity_probe_completed();
@@ -17517,13 +18043,13 @@ fn apply_cors_headers(
     };
     resp.headers.retain(|(k, _)| {
         let key = k.to_lowercase();
-        key != "access-control-allow-origin"
+        key != "access-control-allow-origin" // ubs:ignore — removes old headers; origin below is filtered by HttpState::cors_origin at every caller
             && key != "access-control-allow-methods"
             && key != "access-control-allow-headers"
-            && key != "access-control-allow-credentials"
+            && key != "access-control-allow-credentials" // ubs:ignore — removes old headers; credentialed origins require the explicit configured allowlist
     });
     resp.headers
-        .push(("access-control-allow-origin".to_string(), origin));
+        .push(("access-control-allow-origin".to_string(), origin)); // ubs:ignore — all callers pass HttpState::cors_origin, which refuses credentialed wildcard reflection
     resp.headers.push((
         "access-control-allow-methods".to_string(),
         cors_list_value(allow_methods),
@@ -17534,7 +18060,7 @@ fn apply_cors_headers(
     ));
     if allow_credentials {
         resp.headers.push((
-            "access-control-allow-credentials".to_string(),
+            "access-control-allow-credentials".to_string(), // ubs:ignore — origin came from HttpState::cors_origin's explicit allowlist when credentials are enabled
             "true".to_string(),
         ));
     }
@@ -17840,6 +18366,66 @@ fn http_request_log_fallback_line(
     format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
 }
 
+/// Window in which repeated 401/404 rejections from one client are counted
+/// instead of logged (br-5804q).
+const HTTP_PROBE_REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Tracked `(client, status)` pairs; beyond this, rejections are logged.
+const HTTP_PROBE_REJECTION_LOG_MAX_KEYS: usize = 1024;
+
+/// Whether to emit the failed-request WARN for one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRejectionLogDecision {
+    /// Not a probe status: always logged.
+    Log,
+    /// First probe rejection of a window, with the count suppressed in the
+    /// previous window for this client and status.
+    LogWindowStart { suppressed_before: u64 },
+    /// A repeat inside the window: counted, not logged.
+    Suppress,
+}
+
+/// Aggregates the failed-request WARN for repeated 401/404 responses per
+/// client (br-5804q, GH#337). An unauthenticated client probing `/mcp`
+/// draws a 401 on every request and then 404s on OAuth `.well-known`
+/// probes, several a minute, which buried real warnings. The first rejection
+/// of each window is logged and says that repeats are counted; the next
+/// logged line carries the count. Other 4xx and every 5xx are always logged.
+#[derive(Default)]
+struct HttpProbeRejectionLog {
+    windows: Mutex<HashMap<(String, u16), (Instant, u64)>>,
+}
+
+impl HttpProbeRejectionLog {
+    fn admit(&self, client_ip: &str, status: u16, now: Instant) -> HttpRejectionLogDecision {
+        if !matches!(status, 401 | 404) {
+            return HttpRejectionLogDecision::Log;
+        }
+        let mut windows = lock_mutex(&self.windows);
+        let key = (client_ip.to_string(), status);
+        if let Some((started, suppressed)) = windows.get_mut(&key) {
+            if now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW {
+                *suppressed += 1;
+                return HttpRejectionLogDecision::Suppress;
+            }
+            let suppressed_before = std::mem::take(suppressed);
+            *started = now;
+            return HttpRejectionLogDecision::LogWindowStart { suppressed_before };
+        }
+        if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            windows.retain(|_, (started, _)| {
+                now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW
+            });
+            if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+                return HttpRejectionLogDecision::Log;
+            }
+        }
+        windows.insert(key, (now, 0));
+        HttpRejectionLogDecision::LogWindowStart {
+            suppressed_before: 0,
+        }
+    }
+}
+
 // render_http_request_panel moved to console.rs (br-1m6a.13)
 
 // ---------------------------------------------------------------------------
@@ -17989,6 +18575,8 @@ const fn http_error_status(
 
 #[cfg(test)]
 mod tests {
+    mod issue374_http;
+
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
@@ -18526,6 +19114,24 @@ mod tests {
         }
     }
 
+    struct SessionStateProbeTool;
+
+    impl fastmcp::ToolHandler for SessionStateProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "session_state_probe".to_string(),
+                description: Some("test-only session-state presence probe".to_string()),
+                ..fastmcp::ToolHandler::definition(&NoopTool)
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"has_session_state": ctx.has_session_state()}).to_string(),
+            }])
+        }
+    }
+
     /// Test tool that always fails with a legacy-coded tool error (br-315wc).
     struct FailingTool {
         code: &'static str,
@@ -18632,16 +19238,106 @@ mod tests {
         (entry.calls, entry.errors, entry.rejections)
     }
 
+    /// `Write` sink whose bytes the test can read while a `TerminalWriter`
+    /// still owns the writer.
+    #[derive(Clone, Default)]
+    struct SharedTerminalSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedTerminalSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Present a full 200x50 screen, then `frames` frames that each change one
+    /// eight-cell "clock" run. Returns, per frame, the bytes it emitted and
+    /// whether the writer forced a full redraw.
+    fn present_clock_ticks(
+        config: ftui_runtime::terminal_writer::RuntimeDiffConfig,
+        frames: usize,
+    ) -> Vec<(usize, bool)> {
+        use ftui_render::cell::Cell;
+        use ftui_render::diff_strategy::DiffStrategy;
+
+        let sink = SharedTerminalSink::default();
+        let mut writer = ftui_runtime::terminal_writer::TerminalWriter::with_diff_config(
+            sink.clone(),
+            ftui::ScreenMode::AltScreen,
+            ftui::UiAnchor::Bottom,
+            ftui::TerminalCapabilities::basic(),
+            config,
+        );
+        writer.set_size(200, 50);
+        let mut buffer = ftui_render::buffer::Buffer::new(200, 50);
+        for y in 0..50_u16 {
+            for x in 0..200_u16 {
+                let letter = char::from(b'a' + u8::try_from((x + y) % 26).unwrap_or(0));
+                buffer.set_raw(x, y, Cell::from_char(letter));
+            }
+        }
+        writer.present_ui(&buffer, None, false).unwrap();
+        assert_eq!(writer.last_diff_strategy(), Some(DiffStrategy::FullRedraw));
+
+        let mut emitted = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let digit = char::from(b'0' + u8::try_from(frame % 10).unwrap_or(0));
+            for x in 190..198_u16 {
+                buffer.set_raw(x, 49, Cell::from_char(digit));
+            }
+            let before = sink.0.borrow().len();
+            writer.present_ui(&buffer, None, false).unwrap();
+            let bytes = sink.0.borrow().len() - before;
+            emitted.push((
+                bytes,
+                writer.last_diff_strategy() == Some(DiffStrategy::FullRedraw),
+            ));
+        }
+        emitted
+    }
+
     #[test]
-    fn stable_tui_diff_config_forces_periodic_terminal_resync() {
-        let config = stable_tui_diff_config();
-        assert_eq!(config.full_redraw_interval_frames, 20);
-        // The wall-clock resync is enabled by default (env unset => 1s), so an
-        // idle / sparsely-rendering TUI still resynchronizes the physical
-        // terminal on a time cadence — not only on rendered-frame count.
+    fn stable_tui_diff_config_emits_only_changed_cells_between_resyncs() {
+        // GH#338: with the default 30 s wall-clock bound, a TUI whose only
+        // change is its status-line clock must not repaint the screen.
+        let config = stable_tui_diff_config_with(full_redraw_max_interval_from(None));
+        assert_eq!(config.full_redraw_interval_frames, 0);
+        assert_eq!(
+            config.full_redraw_max_interval,
+            Some(Duration::from_secs(30))
+        );
+        for (frame, (bytes, full_redraw)) in present_clock_ticks(config, 60).into_iter().enumerate()
+        {
+            assert!(!full_redraw, "frame {frame} was a forced full redraw");
+            assert!(bytes < 512, "frame {frame} emitted {bytes} bytes");
+        }
+
+        // Negative control: the previous 20-frame bound repaints all 10,000
+        // cells after 20 incremental frames.
+        let previous = stable_tui_diff_config_with(None).with_full_redraw_interval_frames(20);
+        let ticks = present_clock_ticks(previous, 25);
+        let first_full = ticks
+            .iter()
+            .position(|(_, full_redraw)| *full_redraw)
+            .expect("the 20-frame bound must force a full redraw within 25 frames");
+        assert_eq!(first_full, 20);
         assert!(
-            config.full_redraw_max_interval.is_some(),
-            "wall-clock terminal resync must be enabled by default"
+            ticks[first_full].0 >= 10_000,
+            "full redraw emitted only {} bytes",
+            ticks[first_full].0
+        );
+
+        // The wall-clock bound is still wired: a zero interval forces every
+        // frame to be a full redraw.
+        let always_due = stable_tui_diff_config_with(Some(Duration::ZERO));
+        assert!(
+            present_clock_ticks(always_due, 2)
+                .iter()
+                .all(|(_, full_redraw)| *full_redraw)
         );
     }
 
@@ -18662,15 +19358,83 @@ mod tests {
     }
 
     #[test]
-    fn full_redraw_max_interval_env_parsing() {
-        // Default (env unset path is covered by the config test above); here we
-        // exercise the pure parsing branches via Duration::from_secs_f64 so the
-        // disable/clamp semantics are pinned without mutating process env.
-        assert_eq!(Duration::from_secs_f64(1.0), Duration::from_millis(1000));
-        // Non-positive / non-finite seconds must disable the bound.
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
-            let enabled = bad.is_finite() && bad > 0.0;
-            assert!(!enabled, "{bad} must disable the wall-clock resync");
+    fn probe_rejection_log_counts_repeats_per_client_and_status() {
+        use HttpRejectionLogDecision::{Log, LogWindowStart, Suppress};
+        // br-5804q (GH#337): one client's stream of 401s and .well-known
+        // 404s logs once per status per window and reports the count later.
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let first = LogWindowStart {
+            suppressed_before: 0,
+        };
+        assert_eq!(log.admit("10.0.0.1", 401, at(0)), first);
+        assert_eq!(log.admit("10.0.0.1", 401, at(1)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 401, at(30)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 404, at(2)), first);
+        assert_eq!(log.admit("10.0.0.2", 401, at(3)), first);
+        assert_eq!(
+            log.admit("10.0.0.1", 401, at(61)),
+            LogWindowStart {
+                suppressed_before: 2
+            }
+        );
+        assert_eq!(log.admit("10.0.0.1", 401, at(62)), Suppress);
+
+        // Negative controls: other statuses are never aggregated.
+        for status in [400, 403, 405, 429, 500, 503] {
+            for _ in 0..3 {
+                assert_eq!(log.admit("10.0.0.1", status, at(5)), Log, "{status}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rejection_log_stays_bounded_and_logs_when_full() {
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        for client in 0..HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            log.admit(&format!("client-{client}"), 401, t0);
+        }
+        // A new client while every window is live is logged, not tracked.
+        assert_eq!(
+            log.admit("late-client", 401, t0),
+            HttpRejectionLogDecision::Log
+        );
+        assert_eq!(
+            lock_mutex(&log.windows).len(),
+            HTTP_PROBE_REJECTION_LOG_MAX_KEYS
+        );
+        // Once windows expire, the map is pruned and tracking resumes.
+        let later = t0 + HTTP_PROBE_REJECTION_LOG_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            log.admit("late-client", 401, later),
+            HttpRejectionLogDecision::LogWindowStart {
+                suppressed_before: 0
+            }
+        );
+        assert_eq!(lock_mutex(&log.windows).len(), 1);
+    }
+
+    #[test]
+    fn full_redraw_max_interval_parsing() {
+        let default = Some(Duration::from_secs(30));
+        assert_eq!(full_redraw_max_interval_from(None), default);
+        assert_eq!(full_redraw_max_interval_from(Some("not-a-number")), default);
+        assert_eq!(
+            full_redraw_max_interval_from(Some(" 0.25 ")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            full_redraw_max_interval_from(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        for disabled in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert_eq!(
+                full_redraw_max_interval_from(Some(disabled)),
+                None,
+                "{disabled} must disable the wall-clock resync"
+            );
         }
     }
 
@@ -18817,6 +19581,7 @@ mod tests {
             archive_wbq_p99_us: 2_000,
             archive_commit_queue_p99_us: 16_778_000,
             git_commit_p99_us: 450_000,
+            archive_fence_wait_us: 0,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -18826,16 +19591,64 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("archive_fence_wait_ms=0; archive_fence_holder=none;"));
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
+    }
+
+    /// br-9bwnb: a reservation that timed out behind the archive publication
+    /// fence names the fence, its live wait and its holder, and the text no
+    /// longer claims that archive work cannot cause a tool timeout.
+    #[test]
+    fn dispatch_timeout_text_names_a_live_archive_fence_wait_and_its_holder() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::ArchiveFence,
+            stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
+            pool_acquire_p99_us: 3_000,
+            database_write_p99_us: 6_000,
+            archive_wbq_p99_us: 0,
+            archive_commit_queue_p99_us: 1_650_000,
+            git_commit_p99_us: 630_000,
+            archive_fence_wait_us: 29_400_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
+                timeouts_total: 13,
+            },
+        };
+        let holder = mcp_agent_mail_storage::ArchiveFenceHolder {
+            thread: "wbq-drain (ThreadId(7))".to_string(),
+            site: "crates/mcp-agent-mail-storage/src/lib.rs:9316:20".to_string(),
+            held_for: Duration::from_millis(29_500),
+        };
+
+        let text =
+            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        assert!(text.contains("stage=archive_publication_fence"), "{text}");
+        assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
+        assert!(
+            text.contains(
+                "archive_fence_holder=wbq-drain (ThreadId(7)) at \
+                 crates/mcp-agent-mail-storage/src/lib.rs:9316:20 for 29500 ms;"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("archive lag cannot cause a tool timeout"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -19455,6 +20268,159 @@ mod tests {
         assert!(message.contains("run repair"), "got: {message}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock() {
+        const TEST: &str =
+            "tests::stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock";
+        fn live_services() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    [
+                        "integrity-guard",
+                        "disk-monitor",
+                        "archive-mainten",
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-acknow",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopServices<'a>(&'a mcp_agent_mail_core::Config);
+        impl Drop for StopServices<'_> {
+            fn drop(&mut self) {
+                shutdown_runtime_services(self.0);
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let _cleanup = StopServices(&config);
+        integrity_guard::start(&config);
+        disk_monitor::start(&config);
+        maintenance::start(&config);
+        retention::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_services().len() != 8 {
+            assert!(
+                Instant::now() < deadline,
+                "all eight real service workers must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        std::thread::scope(|scope| {
+            // Hold the actual first shutdown lock. Without early notifications,
+            // the other services keep sleeping until this lock is released.
+            let operator = lock_mutex(&ATC_OPERATOR_RUNTIME);
+            let shutdown = scope.spawn(|| shutdown_runtime_services(&config));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !live_services().is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let stopped_before_release = live_services().is_empty();
+            let waiting_for_operator = !shutdown.is_finished();
+            // Release before joining or asserting, including on a failed control.
+            drop(operator);
+            shutdown.join().expect("join shared shutdown");
+            assert!(
+                waiting_for_operator,
+                "shared shutdown must wait for its owner"
+            );
+            assert!(
+                stopped_before_release,
+                "sleeping services did not stop while the operator lock was held"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_joins_all_retention_workers_before_closing_mailbox() {
+        const TEST: &str =
+            "tests::stdio_shutdown_joins_all_retention_workers_before_closing_mailbox";
+        fn live_retention_workers() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    [
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-ack",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopRetention;
+        impl Drop for StopRetention {
+            fn drop(&mut self) {
+                retention::shutdown();
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        assert!(live_retention_workers().is_empty());
+        let _cleanup = StopRetention;
+        retention::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_retention_workers().len() != 5 {
+            assert!(
+                Instant::now() < deadline,
+                "all five real workers must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown_runtime_services(&config);
+        // A joined thread's procfs entry may briefly outlive its user code.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !live_retention_workers().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "shared shutdown left retention workers alive: {:?}",
+                live_retention_workers()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn stdio_database_bootstrap_installs_schema_before_background_workers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -19525,6 +20491,197 @@ mod tests {
             assert!(error.to_string().contains("newer"), "{error}");
         });
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
+    }
+
+    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Runtime workers can rehydrate Config from the environment. Keep
+        // their whole lifetime in a private process, even under cargo test.
+        let dir = tempfile::tempdir().expect("private worker environment");
+        let config_dir = dir.path().join("config").join("mcp-agent-mail");
+        std::fs::create_dir_all(&config_dir).expect("private configuration directory");
+        std::fs::write(config_dir.join("config.env"), "")
+            .expect("prevent fallback to the operator configuration");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env(
+                "DATABASE_URL",
+                mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &dir.path().join("mailbox.sqlite3"),
+                ),
+            )
+            .env("STORAGE_ROOT", dir.path().join("archive"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "0")
+            .env("AM_ATC_ENABLED", "false")
+            .env("ATC_LEARNING_DISABLED", "1")
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(dir.path())
+            .output()
+            .expect("execute isolated runtime test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{stdout}");
+        true
+    }
+
+    fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        // Only the isolated child that run_prepared_http_test_in_child spawns
+        // calls this; its private DATABASE_URL and STORAGE_ROOT reach Config
+        // through the ordinary env parsing rather than a raw re-read (GH#340).
+        // Outside that child the env is not private: refuse instead of
+        // resolving the operator's default mailbox.
+        assert!(
+            std::env::var_os("AM_PREPARED_HTTP_STARTUP_TEST_CHILD").is_some(),
+            "prepared_http_test_config runs only inside the isolated child"
+        );
+        let isolated = mcp_agent_mail_core::Config::from_env();
+        let config = mcp_agent_mail_core::Config {
+            database_url: isolated.database_url,
+            storage_root: isolated.storage_root,
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_bearer_token: None,
+            tui_enabled: false,
+            atc_enabled: false,
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            initialize_stdio_database(&cx, &config)
+                .await
+                .expect("seed real mailbox schema");
+        });
+        config
+    }
+
+    #[test]
+    fn prepared_http_startup_runs_probes_once_and_callback_after_readiness() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let expected_storage = config.storage_root.clone();
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        startup_checks::take_startup_work_counts();
+        let startup = prepare_http_startup(&config)
+            .expect("real full preflight")
+            .with_ready_callback(move |bound| {
+                // A real connection must be possible before a setup writer runs.
+                let connected =
+                    std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
+                        .is_ok();
+                *callback_observed.lock().expect("callback result") =
+                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
+            });
+        assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
+        // Mutation of the caller's config cannot retarget an existing token.
+        config.storage_root = dir.path().join("different-archive");
+        config.http_host = "invalid.invalid".to_string();
+        startup
+            .run_with_control(control_rx)
+            .expect("serve and drain");
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+        let observation = observed.lock().expect("callback result");
+        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        assert_eq!(storage, &expected_storage);
+        assert_ne!(*port, 0, "callback must receive actual bound port");
+        assert!(*connected, "callback must follow listener bind");
+        assert!(
+            !config.storage_root.exists(),
+            "caller mutation must not retarget startup"
+        );
+    }
+
+    #[test]
+    fn prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(false);
+    }
+
+    #[test]
+    fn prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(true);
+    }
+
+    fn assert_prepared_http_bind_failure(use_tui_entrypoint: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let available = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        config.http_port = available.local_addr().expect("address").port();
+        drop(available);
+        let setup_path = dir.path().join("client-config.json");
+        std::fs::write(&setup_path, b"original client setup").expect("seed setup");
+        let callback_path = setup_path.clone();
+        let startup = prepare_http_startup(&config)
+            .expect("preflight on available port")
+            .with_ready_callback(move |_| {
+                std::fs::write(callback_path, b"rewritten setup").expect("write setup");
+            });
+        startup_checks::take_startup_work_counts();
+        // Deterministically lose the port after preflight, before actual bind.
+        let _occupied = std::net::TcpListener::bind(("127.0.0.1", config.http_port))
+            .expect("occupy prepared port");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let result = if use_tui_entrypoint {
+            startup.run_with_tui()
+        } else {
+            startup.run_with_control(control_rx)
+        };
+        let error = result.expect_err("bind must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+        assert_eq!(
+            std::fs::read(setup_path).expect("setup after failure"),
+            b"original client setup"
+        );
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+    }
+
+    #[test]
+    fn prepared_http_startup_direct_entrypoints_keep_preflight_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: dir.path().join("archive"),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_path: "invalid-without-leading-slash".to_string(),
+            ..Default::default()
+        };
+        assert!(prepare_http_startup(&config).is_err());
+        assert!(run_http(&config).is_err());
+        assert!(run_http_with_tui(&config).is_err());
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(run_http_with_control(&config, rx).is_err());
     }
 
     fn config_for_boot_check_storage(
@@ -20508,6 +21665,286 @@ first body
     }
 
     #[test]
+    fn startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries() {
+        const TEST: &str =
+            "tests::startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let mut config = prepared_http_test_config();
+        config.integrity_check_on_startup = false;
+        let pool = create_pool(&DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("one-connection readiness pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+
+        for tui in [false, true] {
+            let held = block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("hold the actual readiness pool's sole connection");
+            held.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                .expect("native schema remains usable");
+            let scope = StartupWorkerScope::default();
+            let state = tui_bridge::TuiSharedState::new(&config);
+            if tui {
+                spawn_tui_readiness_warmup(&config, &state, &scope.workers);
+            } else {
+                // Exercise the same headless readiness worker after its bind
+                // wait expires. The production wrapper keeps the 20s default.
+                run_startup_readiness_with_bind_deadline(
+                    &config,
+                    &scope.workers,
+                    Duration::from_millis(10),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let parked = loop {
+                pool.sample_pool_stats_now();
+                if mcp_agent_mail_core::global_metrics()
+                    .db
+                    .pool_pending_requests
+                    .load()
+                    != 0
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let retained = lock_mutex(&scope.workers.state)
+                .workers
+                .iter()
+                .any(|(_, worker)| !worker.is_finished());
+            let workers = Arc::clone(&scope.workers);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let (finished_while_held, pending_after_stop) = std::thread::scope(|threads| {
+                let shutdown = threads.spawn(move || {
+                    if tui {
+                        scope.workers.shutdown();
+                    }
+                    // The headless case exercises the same ownership guard
+                    // used on an early return after the bind wait expired.
+                    drop(scope);
+                    done_tx.send(()).unwrap();
+                });
+                let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                pool.sample_pool_stats_now();
+                let pending = mcp_agent_mail_core::global_metrics()
+                    .db
+                    .pool_pending_requests
+                    .load();
+                // Release and reap even if cancellation is broken, so a
+                // negative control fails without leaving an orphan waiter.
+                drop(held);
+                shutdown.join().expect("join readiness shutdown");
+                (finished, pending)
+            });
+            assert!(
+                parked,
+                "readiness must reach a real pending pool acquisition"
+            );
+            assert!(
+                retained,
+                "bind timeout must retain the active readiness worker"
+            );
+            assert!(
+                finished_while_held,
+                "shutdown waited for the foreign pool lease"
+            );
+            assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
+            assert!(lock_mutex(&workers.state).workers.is_empty());
+            assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
+
+            let retry = StartupWorkerScope::default();
+            let retry_state = tui_bridge::TuiSharedState::new(&config);
+            spawn_tui_readiness_warmup(&config, &retry_state, &retry.workers);
+            let ready = retry_state.wait_for_db_ready(Duration::from_secs(20));
+            retry.workers.shutdown();
+            assert!(ready, "a later startup must acquire the same native pool");
+            let conn = block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("pool reusable");
+            conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+                .expect("mailbox still readable after cancelled readiness");
+        }
+    }
+
+    #[test]
+    fn startup_search_delay_is_owned_and_next_startup_indexes_retained_mail() {
+        const TEST: &str =
+            "tests::startup_search_delay_is_owned_and_next_startup_indexes_retained_mail";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open retained mailbox");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'first', 'first', 1), (2, 'second', 'second', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+             (1, 1, 'BlueLake', 'test', 'test', 1, 1), (2, 2, 'RedFox', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (1, 1, 1, 'retainedstartupmail', 'first project', 1), \
+             (2, 2, 2, 'retainedstartupmail', 'second project', 2);",
+        ).expect("seed retained mail in two projects");
+        drop(conn);
+        mcp_agent_mail_db::search_v3::init_bridge(&config.storage_root.join("search_index"))
+            .expect("real Tantivy index");
+        let delayed = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &delayed.workers, Duration::from_secs(8));
+        assert!(STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        let started = Instant::now();
+        delayed.workers.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown slept through the startup delay"
+        );
+        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        let bridge = mcp_agent_mail_db::search_v3::get_bridge().unwrap();
+        let query =
+            mcp_agent_mail_db::search_planner::SearchQuery::messages("retainedstartupmail", 1);
+        assert!(
+            bridge.search(&query).is_empty(),
+            "cancelled delay must not publish documents"
+        );
+
+        let retry = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &retry.workers, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let completed = !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire);
+        retry.workers.shutdown();
+        assert!(completed, "next startup backfill must complete");
+        let first = bridge.search(&query);
+        let second = bridge.search(&mcp_agent_mail_db::search_planner::SearchQuery::messages(
+            "retainedstartupmail",
+            2,
+        ));
+        assert_eq!(first.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(second.iter().map(|hit| hit.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn startup_advisory_and_healer_workers_complete_before_scope_release() {
+        const TEST: &str =
+            "tests::startup_advisory_and_healer_workers_complete_before_scope_release";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'probe', 'probe', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, 'real advisory probe', 'retained body', 1000000);",
+        ).unwrap();
+        drop(conn);
+        let project = config.storage_root.join("projects/probe");
+        std::fs::create_dir_all(&project).unwrap();
+        let stale = project.join("stale.lock");
+        std::fs::write(&stale, b"preserved stale lock evidence").unwrap();
+        let authority =
+            acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Shared)
+                .unwrap();
+        let scope = StartupWorkerScope::default();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let complete = loop {
+            let registry = lock_mutex(&scope.workers.state);
+            let complete = registry.workers.len() == 2
+                && registry
+                    .workers
+                    .iter()
+                    .all(|(_, worker)| worker.is_finished());
+            drop(registry);
+            if complete || Instant::now() >= deadline {
+                break complete;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        scope.workers.shutdown();
+        assert!(complete, "actual one-shot startup work did not finish");
+        assert!(!stale.exists());
+        let evidence = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stale.lock.startup-quarantine-")
+            })
+            .expect("healer must preserve the real lock artifact");
+        assert_eq!(
+            std::fs::read(evidence).unwrap(),
+            b"preserved stale lock evidence"
+        );
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .needs_reindex_total
+                .load(),
+            1
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        std::fs::write(&stale, b"later server owns this artifact").unwrap();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        assert_eq!(
+            std::fs::read(stale).unwrap(),
+            b"later server owns this artifact"
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        drop(scope);
+        drop(authority);
+        acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Exclusive)
+            .expect("mailbox authority can pass to the next owner");
+    }
+
+    #[test]
+    fn deferred_starter_drop_joins_before_first_paint_and_preserves_explicit_detach() {
+        let config = mcp_agent_mail_core::Config::default();
+        for detach in [false, true] {
+            let scope = StartupWorkerScope::default();
+            let state = tui_bridge::TuiSharedState::new(&config);
+            let mut starter =
+                spawn_tui_deferred_background_workers(&config, &state, &scope.workers);
+            let progress = Arc::clone(&starter.progress);
+            if detach {
+                state.request_headless_detach();
+                starter.join();
+                assert!(state.take_headless_detach_requested());
+            }
+            let before_drop = Instant::now();
+            drop(starter);
+            assert!(before_drop.elapsed() < Duration::from_secs(2));
+            assert_eq!(state.is_shutdown_requested(), !detach);
+            assert!(!progress.non_db.load(Ordering::Acquire));
+            assert!(!progress.db.load(Ordering::Acquire));
+            assert!(!progress.advisory.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn init_search_bridge_skips_startup_backfill_for_memory_db() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
@@ -20521,7 +21958,8 @@ first body
             ..mcp_agent_mail_core::Config::default()
         };
 
-        init_search_bridge(&config);
+        let startup_scope = StartupWorkerScope::default();
+        init_search_bridge(&config, &startup_scope.workers);
 
         assert!(config.storage_root.join("search_index").exists());
         assert!(
@@ -21159,7 +22597,7 @@ first body
         }
     }
 
-    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    fn with_serialized_tool_dispatch_env<F, T>(overrides: &[(&str, &str)], f: F) -> T
     where
         F: FnOnce(String) -> T,
     {
@@ -21183,13 +22621,20 @@ first body
             .expect("tool dispatch project root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            || f(project_key),
-        )
+        let mut env_overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env_overrides.extend_from_slice(overrides);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
+            let result = f(project_key);
+            // Drain queued archive writes while their storage root still
+            // exists. A write that exhausts its retries against the deleted
+            // tempdir sets the process-wide durability flag, and every later
+            // send in this binary is then refused with DURABILITY_DEGRADED.
+            mcp_agent_mail_storage::wbq_flush();
+            result
+        })
     }
 
     fn with_serialized_dispatch_permits<F, T>(f: F) -> T
@@ -22603,7 +24048,7 @@ first body
         let mut effect = sample_probe_effect();
         effect.project_key = None;
         effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
 
         assert_eq!(
             execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
@@ -22616,7 +24061,7 @@ first body
         let mut effect = sample_probe_effect();
         effect.project_key = None;
         effect.semantics.cooldown_key = "liveness_probe:-:AlphaAgent".to_string();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
 
         assert_eq!(
             execute_atc_effect(
@@ -22632,11 +24077,84 @@ first body
     #[test]
     fn execute_atc_effect_live_probe_requires_runtime_instead_of_probe_intent() {
         let effect = sample_probe_effect();
-        let mut ensured_projects = HashSet::new();
+        let mut ensured_projects = AtcExecutorProjectCache::default();
         assert_eq!(
             execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect),
             "failed:executor_unavailable"
         );
+    }
+
+    #[test]
+    fn queued_atc_release_rechecks_capacity_before_dispatch() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_LIMIT", "1")],
+            || {
+                atc::reset_global_atc_state_for_test(&config);
+                atc::atc_register_agent("AlphaAgent", "claude-code");
+                let mut effect = sample_probe_effect();
+                effect.kind = "release_reservations_requested".to_string();
+                effect.category = "liveness".to_string();
+                effect.semantics = sample_effect_semantics(
+                    "reservation_release",
+                    "AlphaAgent",
+                    effect.project_key.as_deref(),
+                );
+                let mut ensured_projects = AtcExecutorProjectCache::default();
+                assert_eq!(
+                    execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect,),
+                    "failed:executor_unavailable",
+                    "a full engine with complete coverage still admits release execution"
+                );
+
+                // The stored effect is unchanged; coverage becomes incomplete
+                // while it waits for the executor, without another planning tick.
+                atc::atc_register_agent("BeyondCapacity", "codex-cli");
+                let mut cooldowns = AtcOperatorCooldowns::new(i64::MAX, 4);
+                let status = cooldowns.execute(
+                    &effect.semantics.cooldown_key,
+                    &effect.semantics.family,
+                    effect.semantics.cooldown_micros,
+                    effect.timestamp_micros,
+                    || {
+                        execute_atc_effect(
+                            None,
+                            AtcExecutorMode::Live,
+                            &mut ensured_projects,
+                            &effect,
+                        )
+                    },
+                );
+                assert_eq!(status, "suppressed:agent_capacity");
+                assert!(cooldowns.last_action_by_key.is_empty());
+                assert!(ensured_projects.projects.is_empty());
+                let capture = atc_execution_capture(&status);
+                assert_eq!(capture.state, ExperienceState::Suppressed);
+                assert_eq!(capture.classification, "policy_suppression");
+                assert!(matches!(
+                    capture.non_execution_reason,
+                    Some(NonExecutionReason::SafetyGate { ref gate_name, .. })
+                        if gate_name == "agent_capacity"
+                ));
+                for (mode, expected) in [
+                    (AtcExecutorMode::Shadow, "suppressed:executor_mode_shadow"),
+                    (AtcExecutorMode::DryRun, "suppressed:executor_mode_dry_run"),
+                    (
+                        AtcExecutorMode::Canary,
+                        "suppressed:executor_mode_canary_release",
+                    ),
+                ] {
+                    assert_eq!(
+                        execute_atc_effect(None, mode, &mut ensured_projects, &effect),
+                        expected
+                    );
+                }
+            },
+        );
+        atc::reset_global_atc_state_for_test(&config);
     }
 
     #[test]
@@ -22901,6 +24419,16 @@ first body
         assert!(!atc_status_consumes_cooldown(
             "suppressed:missing_project_precondition"
         ));
+        for status in [
+            "suppressed:agent_capacity",
+            "suppressed:conflict_capacity",
+            "suppressed:agent_coverage_unavailable",
+        ] {
+            assert!(!atc_status_consumes_cooldown(status));
+            let capture = atc_execution_capture(status);
+            assert_eq!(capture.state, ExperienceState::Suppressed);
+            assert_eq!(capture.classification, "policy_suppression");
+        }
     }
 
     #[test]
@@ -23109,6 +24637,419 @@ first body
                 .and_then(serde_json::Value::as_str),
             Some("executed")
         );
+    }
+
+    fn atc_rows_fingerprint(rows: &[mcp_agent_mail_db::sqlmodel_core::Row]) -> String {
+        // Keep the complete ordered schema and typed cells, not Row's Debug
+        // representation of its freshly randomized column lookup HashMap.
+        let contents = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.column_names().collect::<Vec<_>>(),
+                    row.values().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("{contents:?}")
+    }
+
+    fn reopened_atc_content_snapshot(primary_path: &str) -> String {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path);
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independently reopen ATC sidecar");
+        let rows = verify
+            .query_sync("SELECT * FROM atc_experiences ORDER BY experience_id", &[])
+            .expect("read all persisted ATC fields");
+        let rollups = verify
+            .query_sync(
+                "SELECT * FROM atc_experience_rollups ORDER BY stratum_key",
+                &[],
+            )
+            .expect("read persisted ATC rollups");
+        format!(
+            "{}\n{}",
+            atc_rows_fingerprint(&rows),
+            atc_rows_fingerprint(&rollups)
+        )
+    }
+
+    #[test]
+    fn reopened_atc_fingerprint_is_stable_and_detects_real_privacy_and_rollup_cells() {
+        let dir = tempfile::tempdir().expect("fingerprint fixture").keep();
+        let db_path = dir.join("atc-fingerprint.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let pool = create_pool(&DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_str}"),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("private fingerprint pool");
+        let cx = Cx::for_testing();
+        let row = sample_resolution_experience(1_700_000_000_000_000, None, None);
+        block_on(mcp_agent_mail_db::queries::append_atc_experience(
+            &cx, &pool, &row,
+        ))
+        .into_result()
+        .expect("append fingerprint control");
+        block_on(mcp_agent_mail_db::queries::update_atc_experience_rollup(
+            &cx,
+            &pool,
+            "liveness:probe:0",
+            "liveness",
+            "probe",
+            0,
+            ExperienceState::Resolved,
+            true,
+            0.5,
+            0.0,
+            200_000,
+            1_700_000_000_500_000,
+        ))
+        .into_result()
+        .expect("seed nonempty fingerprint rollup");
+        let before = reopened_atc_content_snapshot(&db_path_str);
+        for _ in 0..3 {
+            assert!(
+                reopened_atc_content_snapshot(&db_path_str) == before,
+                "unchanged independent reopen changed the fingerprint"
+            );
+        }
+
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path_str);
+        {
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+                .expect("private fingerprint writer");
+            let changed = writer
+                .execute_sync(
+                    "UPDATE atc_experiences SET privacy_classification = 'metadata_only'",
+                    &[],
+                )
+                .expect("change persisted field absent from ExperienceRow");
+            assert_eq!(changed, 1, "control must change exactly one stored row");
+        }
+        let after_cell = reopened_atc_content_snapshot(&db_path_str);
+        assert!(
+            before != after_cell,
+            "fingerprint missed a real privacy cell mutation"
+        );
+        assert!(
+            reopened_atc_content_snapshot(&db_path_str) == after_cell,
+            "mutated row must remain stable across independent reopens"
+        );
+        {
+            let writer = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+                .expect("private rollup fingerprint writer");
+            let changed = writer
+                .execute_sync(
+                    "UPDATE atc_experience_rollups SET total_count = total_count + 1",
+                    &[],
+                )
+                .expect("change a persisted rollup cell");
+            assert_eq!(changed, 1, "control must change exactly one rollup row");
+        }
+        let after_rollup = reopened_atc_content_snapshot(&db_path_str);
+        assert!(
+            after_cell != after_rollup,
+            "fingerprint missed a real rollup cell mutation"
+        );
+        assert!(
+            reopened_atc_content_snapshot(&db_path_str) == after_rollup,
+            "mutated rollup must remain stable across independent reopens"
+        );
+    }
+
+    fn reopened_atc_message_outcome(primary_path: &str) -> ExperienceOutcome {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary_path);
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independently reopen message outcome sidecar");
+        let rows = verify
+            .query_sync("SELECT state, outcome_json FROM atc_experiences", &[])
+            .expect("read persisted message outcome");
+        assert_eq!(rows.len(), 1, "message feedback must not duplicate the row");
+        assert_eq!(
+            rows[0].get_named::<String>("state").expect("stored state"),
+            "resolved"
+        );
+        let outcome_json = rows[0]
+            .get_named::<String>("outcome_json")
+            .expect("stored outcome JSON");
+        serde_json::from_str(&outcome_json).expect("decode persisted message outcome")
+    }
+
+    #[derive(Clone, Default)]
+    struct AtcFeedbackLogCapture {
+        events: Arc<Mutex<Vec<String>>>,
+        next_span_id: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[derive(Default)]
+    struct AtcFeedbackLogFields(String);
+
+    impl tracing::field::Visit for AtcFeedbackLogFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            write!(&mut self.0, "{}={value:?} ", field.name()).expect("format captured field");
+        }
+    }
+
+    impl tracing::Subscriber for AtcFeedbackLogCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self
+                .next_span_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = AtcFeedbackLogFields::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("feedback log capture lock")
+                .push(fields.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn atc_server_content_rejection_preserves_sidecar_before_state_promotion() {
+        const CANARY: &str = "ghp_ATC_SYNTHETIC_SERVER_CANARY_20261027";
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-content-boundary.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let database_url = format!("sqlite:///{db_path_str}");
+        let pool = create_pool(&DbPoolConfig {
+            database_url: database_url.clone(),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("file-backed ATC fixture");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("AM_ATC_EXECUTOR_MODE", "canary"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let config = mcp_agent_mail_core::Config::get();
+                assert!(atc_durable_writes_enabled(
+                    config.atc_write_mode,
+                    AtcExecutorMode::from_env(),
+                    Some(&pool),
+                    false,
+                ));
+                let cx = Cx::for_testing();
+                let now = mcp_agent_mail_db::now_micros();
+                let observation = build_message_sent_observation_row(
+                    "privacy-project",
+                    7401,
+                    "BlueHarbor",
+                    &["GreenCanyon".to_string()],
+                    Some("privacy-canary"),
+                    &serde_json::json!({
+                        "subject": CANARY,
+                        "body_md": CANARY,
+                        "ack_required": true,
+                        "importance": "normal",
+                    }),
+                    now,
+                );
+                append_atc_hot_path_observation_row(&pool, &observation, "message_sent");
+                let stored = block_on(
+                    mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, &pool, 7401),
+                )
+                .into_result()
+                .expect("read server observation")
+                .expect("ordinary server metrics persist");
+                assert_eq!(stored.state, ExperienceState::Executed);
+                let baseline = reopened_atc_content_snapshot(&db_path_str);
+                assert!(
+                    !baseline.contains(CANARY),
+                    "message content must not enter ATC"
+                );
+
+                let mut rejected = observation;
+                rejected.decision_id = 7402;
+                rejected.effect_id = 7402;
+                rejected.evidence_summary = CANARY.to_string();
+                append_atc_hot_path_observation_row(&pool, &rejected, "message_sent");
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == baseline,
+                    "rejected server append changed persisted rows or rollups"
+                );
+
+                let ack_payload = serde_json::json!({ "message_id": 7401 });
+                let rejected_ack_args = serde_json::json!({
+                    "project_key": "privacy-project",
+                    "agent_name": CANARY,
+                    "message_id": 7401,
+                });
+                record_atc_message_outcome_from_tool_payload_with_pool(
+                    "acknowledge_message",
+                    Some(&rejected_ack_args),
+                    &ack_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == baseline,
+                    "rejected message outcome promoted or changed the stored row"
+                );
+                let valid_ack_args = serde_json::json!({
+                    "project_key": "privacy-project",
+                    "agent_name": "GreenCanyon",
+                    "message_id": 7401,
+                });
+                record_atc_message_outcome_from_tool_payload_with_pool(
+                    "acknowledge_message",
+                    Some(&valid_ack_args),
+                    &ack_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                let resolved = block_on(
+                    mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, &pool, 7401),
+                )
+                .into_result()
+                .expect("read resolved server observation")
+                .expect("resolved observation exists");
+                assert_eq!(resolved.state, ExperienceState::Resolved);
+                assert_eq!(resolved.outcome.as_ref().unwrap().label, "acknowledged");
+
+                let mut conflict = sample_resolution_experience(now, Some(now), Some(now));
+                conflict.experience_id = 0;
+                conflict.decision_id = 7501;
+                conflict.effect_id = 7501;
+                conflict.state = ExperienceState::Executed;
+                conflict.subsystem = ExperienceSubsystem::Conflict;
+                let stored_conflict = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                    &cx, &pool, &conflict,
+                ))
+                .into_result()
+                .expect("append conflict fixture");
+                let before_conflict = reopened_atc_content_snapshot(&db_path_str);
+                for (label, evidence) in [
+                    (CANARY, serde_json::json!({ "reservation_count": 1 })),
+                    (
+                        "reservation_granted",
+                        serde_json::json!({ "nested": [{ "credential": CANARY }] }),
+                    ),
+                ] {
+                    resolve_conflict_experiences_on_reservation_event(
+                        &pool,
+                        &stored_conflict.subject,
+                        stored_conflict.project_key.as_deref().unwrap(),
+                        label,
+                        true,
+                        evidence,
+                    );
+                    assert!(
+                        reopened_atc_content_snapshot(&db_path_str) == before_conflict,
+                        "rejected reservation outcome changed state or rollups"
+                    );
+                }
+                resolve_conflict_experiences_on_reservation_event(
+                    &pool,
+                    &stored_conflict.subject,
+                    stored_conflict.project_key.as_deref().unwrap(),
+                    "reservation_granted",
+                    true,
+                    serde_json::json!({ "reservation_count": 1, "conflict_count": 0 }),
+                );
+                let mut planned = sample_resolution_experience(now, None, None);
+                planned.experience_id = 0;
+                planned.decision_id = 7601;
+                planned.effect_id = 7601;
+                planned.state = ExperienceState::Planned;
+                let stored_planned = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                    &cx, &pool, &planned,
+                ))
+                .into_result()
+                .expect("append planned execution fixture");
+                let before_execution = reopened_atc_content_snapshot(&db_path_str);
+                capture_atc_execution_result(
+                    &pool,
+                    Some(stored_planned.experience_id),
+                    "canary",
+                    &format!("failed:{CANARY}"),
+                    now + 1,
+                );
+                assert!(
+                    reopened_atc_content_snapshot(&db_path_str) == before_execution,
+                    "rejected execution context left a dispatched row behind"
+                );
+                capture_atc_execution_result(
+                    &pool,
+                    Some(stored_planned.experience_id),
+                    "canary",
+                    "executed",
+                    now + 2,
+                );
+                let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx, &pool, None, 10,
+                ))
+                .into_result()
+                .expect("read final execution state");
+                assert_eq!(open.len(), 1);
+                assert_eq!(open[0].experience_id, stored_planned.experience_id);
+                assert_eq!(open[0].state, ExperienceState::Executed);
+                assert_eq!(open[0].dispatched_ts_micros, Some(now + 2));
+                assert_eq!(open[0].executed_ts_micros, Some(now + 2));
+
+                let sample = HealthSample {
+                    observed_at: Instant::now(),
+                    value: fetch_atc_experience_health(&database_url)
+                        .expect("ATC health inventory"),
+                };
+                let health = atc_experience_health_json(
+                    &database_url,
+                    config.atc_experience_max_rows,
+                    config.atc_write_mode,
+                    Some(&sample),
+                );
+                assert_eq!(health["storage"], "sidecar");
+                assert_eq!(health["raw_row_count"], 3);
+                assert_eq!(health["quick_check"], "ok");
+                assert!(!health.to_string().contains(CANARY));
+                assert!(!reopened_atc_content_snapshot(&db_path_str).contains(CANARY));
+            },
+        );
+        mcp_agent_mail_core::Config::reset_cached();
     }
 
     #[test]
@@ -23321,12 +25262,12 @@ first body
                             Some("https://a.example.test" | "https://b.example.test")
                         );
                     assert_eq!(
-                        response_header(&response, "access-control-allow-origin"),
+                        response_header(&response, "access-control-allow-origin"), // ubs:ignore — asserts allowed, denied and missing origins across real handler responses
                         origin.filter(|_| allowed),
                         "origin authorization for {path}"
                     );
                     assert_eq!(
-                        response_header(&response, "access-control-allow-credentials"),
+                        response_header(&response, "access-control-allow-credentials"), // ubs:ignore — verifies credentials appear only for explicitly allowed test origins
                         allowed.then_some("true"),
                         "credential authorization for {path}"
                     );
@@ -23358,7 +25299,7 @@ first body
         let resp = block_on(state.handle(req));
         assert!(resp.status == 200 || resp.status == 204);
         assert_eq!(
-            response_header(&resp, "access-control-allow-origin"),
+            response_header(&resp, "access-control-allow-origin"), // ubs:ignore — wildcard test explicitly disables credentials and checks their absence below
             Some("*")
         );
         assert_eq!(
@@ -23369,7 +25310,7 @@ first body
             response_header(&resp, "access-control-allow-headers"),
             Some("*")
         );
-        assert!(response_header(&resp, "access-control-allow-credentials").is_none());
+        assert!(response_header(&resp, "access-control-allow-credentials").is_none()); // ubs:ignore — negative assertion forbids credentials on this wildcard response
         assert_eq!(response_header(&resp, "vary"), Some("Origin"));
     }
 
@@ -23620,6 +25561,702 @@ first body
             resp.status, 401,
             "missing bearer auth must 401 before overseer JSON parsing"
         );
+    }
+
+    fn mail_rbac_test_config() -> mcp_agent_mail_core::Config {
+        mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            http_bearer_token: Some("mail-rbac-static".to_string()),
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("mail-rbac-jwt".to_string()),
+            http_jwt_jwks_url: None,
+            http_jwt_issuer: None,
+            http_jwt_audience: None,
+            http_jwt_algorithms: vec!["HS256".to_string()],
+            http_jwt_role_claim: "role".to_string(),
+            http_rbac_enabled: true,
+            http_rbac_default_role: "reader".to_string(),
+            http_rbac_reader_roles: vec!["reader".to_string()],
+            // A configured role, not a hard-coded spelling of "writer".
+            http_rbac_writer_roles: vec!["mail-operator".to_string()],
+            http_allow_localhost_unauthenticated: false,
+            http_rate_limit_enabled: false,
+            http_cors_origins: Vec::new(),
+            ..mcp_agent_mail_core::Config::from_env()
+        }
+    }
+
+    fn mail_rbac_post(uri: &str, authorization: Option<&str>, body: &str) -> Http1Request {
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(authorization) = authorization {
+            headers.push(("Authorization", authorization));
+        }
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            uri,
+            &headers,
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = body.as_bytes().to_vec();
+        req
+    }
+
+    #[test]
+    fn mail_conversations_reject_invalid_auth_before_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            let forged_jwt = format!(
+                "Bearer {}",
+                hs256_token(b"wrong-secret", &serde_json::json!({"role": "reader"}))
+            );
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+                "/mail/2/threads?token=wrong-token",
+                "/mail/2/thread?thread_id=shared&token=wrong-token",
+            ] {
+                for authorization in [None, Some("Bearer wrong-token"), Some(forged_jwt.as_str())] {
+                    let headers: Vec<_> = authorization
+                        .map(|value| ("Authorization", value))
+                        .into_iter()
+                        .collect();
+                    let req = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &headers,
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    let resp = block_on(state.handle(req));
+                    assert_eq!(resp.status, 401, "unauthenticated conversation route {uri}");
+                    assert_eq!(
+                        response_header(&resp, "content-type"),
+                        Some("text/html; charset=utf-8")
+                    );
+                    assert!(
+                        !database_path.exists(),
+                        "refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "refused {uri} must not create archive artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    fn with_mail_conversation_http_fixture<F, Fut>(f: F)
+    where
+        F: FnOnce(Arc<HttpState>, mcp_agent_mail_db::DbPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let state = Arc::new(build_state(mail_rbac_test_config()));
+                // Exercise the real bounded HTTP dispatch worker, as serve-http does.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        // A numeric slug must not be interpreted as another project's row ID.
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, '2', '/synthetic/conversations-numeric-slug', 1), \
+                         (2, 'other-project', '/synthetic/conversations-other', 1), \
+                         (3, 'empty-project', '/synthetic/conversations-empty', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), \
+                         (2, 2, 'BlueLake', 'test', 'test', 1, 1), \
+                         (3, 1, 'GreenLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts) VALUES \
+                         (1, 1, 1, 'shared', 'Numeric slug conversation', 'PRIVATE_NUMERIC_PROJECT_BODY', 1), \
+                         (2, 1, 1, 'shared', 'Numeric slug reply', 'PRIVATE_NUMERIC_REPLY_BODY', 2), \
+                         (3, 2, 2, 'shared', 'Other project conversation', 'PRIVATE_OTHER_PROJECT_BODY', 3), \
+                         (4, 1, 1, '2', 'Literal numeric conversation', 'LITERAL_NUMERIC_THREAD_BODY', 4), \
+                         (5, 1, 1, NULL, 'Standalone conversation', 'STANDALONE_THREAD_BODY', 5), \
+                         (6, 1, 1, 'topic/a+b?c#%2F', 'Encoded identifier conversation', 'ENCODED_THREAD_BODY', 6), \
+                         (7, 1, 1, '.', 'Dot identifier conversation', 'DOT_THREAD_BODY', 7), \
+                         (8, 1, 1, '..', 'Double dot conversation', 'DOUBLE_DOT_THREAD_BODY', 8)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 3)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed conversation fixture");
+                    }
+                    drop(conn);
+                    f(state, pool).await;
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_conversations_allow_authenticated_readers_and_isolate_projects() {
+        with_mail_conversation_http_fixture(|state, pool| async move {
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            for (uri, authorization, present, absent) in [
+                (
+                    "/mail/2/threads",
+                    Some(reader.as_str()),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads",
+                    Some("Bearer mail-rbac-static"),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads?token=mail-rbac-static",
+                    None,
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/other-project/threads",
+                    Some(reader.as_str()),
+                    "Other project conversation",
+                    "Numeric slug reply",
+                ),
+                (
+                    "/mail/2/thread?thread_id=shared",
+                    Some(reader.as_str()),
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                ),
+                (
+                    "/mail/other-project/thread/shared?token=mail-rbac-static",
+                    None,
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+            ] {
+                let headers: Vec<_> = authorization
+                    .map(|value| ("Authorization", value))
+                    .into_iter()
+                    .collect();
+                let req = make_request_with_peer_addr(
+                    Http1Method::Get,
+                    uri,
+                    &headers,
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let resp = state.handle(req).await;
+                assert_eq!(
+                    resp.status, 200,
+                    "authorized conversation route {uri}: {:?}",
+                    resp.body
+                );
+                assert_eq!(
+                    response_header(&resp, "content-type"),
+                    Some("text/html; charset=utf-8")
+                );
+                let html = std::str::from_utf8(&resp.body).expect("rendered conversation HTML");
+                assert!(html.contains(present), "{uri} must contain {present}");
+                assert!(!html.contains(absent), "{uri} must not leak {absent}");
+                if uri.contains("/threads") {
+                    assert!(html.contains("Project Threads"));
+                    assert!(
+                        !html.contains("PRIVATE_"),
+                        "thread summaries must not load message bodies"
+                    );
+                }
+            }
+            let cx = Cx::current().expect("fixture context");
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("verification checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                 (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads",
+                    &[],
+                )
+                .expect("verify read-only browsing");
+            assert_eq!(
+                rows[0].get_named::<i64>("messages").expect("message count"),
+                8
+            );
+            assert_eq!(rows[0].get_named::<i64>("reads").expect("read count"), 0);
+        });
+    }
+
+    #[test]
+    fn mail_conversations_http_keeps_canonical_keys_and_read_only_routes() {
+        with_mail_conversation_http_fixture(|state, _pool| async move {
+            for (uri, present, absent) in [
+                (
+                    "/mail/2/thread/2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_REPLY_BODY",
+                ),
+                (
+                    "/mail/2/thread/5",
+                    "STANDALONE_THREAD_BODY",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread/topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=.",
+                    "DOT_THREAD_BODY",
+                    "DOUBLE_DOT_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=..",
+                    "DOUBLE_DOT_THREAD_BODY",
+                    "Encoded identifier conversation",
+                ),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, 200,
+                    "canonical thread route {uri}: {:?}",
+                    resp.body
+                );
+                let html = std::str::from_utf8(&resp.body).expect("thread HTML");
+                assert!(html.contains(present), "{uri} must resolve {present}");
+                assert!(!html.contains(absent), "{uri} must not merge {absent}");
+            }
+            for (uri, status) in [
+                ("/mail/empty-project/threads", 200),
+                ("/mail/missing-project/threads", 404),
+                ("/mail/other-project/thread/2", 404),
+                ("/mail/2/thread/missing-thread", 404),
+                ("/mail/2/thread?thread_id=missing-thread", 404),
+                ("/mail/2/thread", 400),
+                ("/mail/2/thread?thread_id=", 400),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, status,
+                    "conversation route {uri}: {:?}",
+                    resp.body
+                );
+            }
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+            ] {
+                let resp = state
+                    .handle(mail_rbac_post(uri, Some("Bearer mail-rbac-static"), "{}"))
+                    .await;
+                assert_eq!(
+                    resp.status, 405,
+                    "conversation browsing must be GET-only: {uri}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mail_post_rbac_rejects_before_cold_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            assert!(!database_path.exists());
+            assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+
+            for role in ["reader", "unknown", "writer"] {
+                let token = hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": role}));
+                let auth = format!("Bearer {token}");
+                for (uri, body) in [
+                    ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                    ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                    (
+                        "/mail/p/overseer/send",
+                        r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#,
+                    ),
+                    ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                ] {
+                    let resp = block_on(state.handle(mail_rbac_post(uri, Some(&auth), body)));
+                    assert_eq!(resp.status, 403, "role={role}, route={uri}");
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&resp.body).expect("structured mail refusal");
+                    assert_eq!(payload["required_role"], "writer");
+                    assert_eq!(payload["error"], "forbidden");
+                    assert!(
+                        !database_path.exists(),
+                        "a refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "a refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "a refused {uri} must not create archive or lease artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_rows_and_accepts_configured_writers() {
+        async fn snapshot(
+            cx: &Cx,
+            pool: &mcp_agent_mail_db::DbPool,
+        ) -> (i64, i64, i64, i64, String) {
+            let conn = pool
+                .acquire(cx)
+                .await
+                .into_result()
+                .expect("snapshot checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                     (SELECT COUNT(*) FROM agents) AS agents, \
+                     (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads, \
+                     (SELECT COUNT(*) FROM message_recipients) AS recipients, \
+                     (SELECT status FROM project_sibling_suggestions WHERE id = 1) AS sibling",
+                    &[],
+                )
+                .expect("read mutation witnesses");
+            let row = rows.first().expect("snapshot row");
+            (
+                row.get_named("messages").expect("message count"),
+                row.get_named("agents").expect("agent count"),
+                row.get_named("reads").expect("read receipt count"),
+                row.get_named("recipients").expect("recipient count"),
+                row.get_named("sibling").expect("sibling state"),
+            )
+        }
+
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let config = mail_rbac_test_config();
+                let storage_root = config.storage_root.clone();
+                let state = Arc::new(build_state(config));
+                // The server sets this, and it sends mail posts to a blocking
+                // worker. Inline, the archive scan's blocking task has no
+                // runtime worker to start on.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, 'p', '/synthetic/mail-rbac', 1), (2, 'q', '/synthetic/mail-rbac-other', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), (2, 1, 'BlueLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (1, 1, 1, 'First', 'Body', 1), (2, 1, 1, 'Second', 'Body', 2), \
+                         (3, 1, 1, 'Third', 'Body', 3)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 2), (2, 2), (3, 2)",
+                        "INSERT INTO project_sibling_suggestions \
+                         (id, project_a_id, project_b_id, score, created_ts, evaluated_ts) \
+                         VALUES (1, 1, 2, 0.9, 1, 1)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed real mailbox rows");
+                    }
+                    drop(conn);
+                    let before = snapshot(&cx, &pool).await;
+                    assert_eq!(before, (3, 2, 0, 3, "suggested".to_string()));
+                    let archive_entries_before = std::fs::read_dir(&storage_root)
+                        .expect("seeded archive directory")
+                        .count();
+                    let reader = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+                    );
+                    let writer = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "mail-operator"}))
+                    );
+                    let overseer_body = r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#;
+                    for (uri, body) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                        ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                        ("/mail/p/overseer/send", overseer_body),
+                        ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                    ] {
+                        let resp = state.handle(mail_rbac_post(uri, Some(&reader), body)).await;
+                        assert_eq!(resp.status, 403, "reader must not mutate {uri}");
+                        assert_eq!(snapshot(&cx, &pool).await, before, "denied route {uri}");
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root).expect("archive directory").count(),
+                        archive_entries_before,
+                        "denied requests must not create archive artifacts"
+                    );
+
+                    let get = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        "/mail/api/unified-inbox",
+                        &[("Authorization", reader.as_str())],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    assert_eq!(state.handle(get).await.status, 200, "reader GET stays available");
+                    assert_eq!(snapshot(&cx, &pool).await, before);
+
+                    // Exercise the actual write handler for all three accepted
+                    // credentials, including browser-only query authentication.
+                    for (uri, auth, id) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", Some(writer.as_str()), 1),
+                        ("/mail/p/inbox/BlueLake/mark-read", Some("Bearer mail-rbac-static"), 2),
+                        ("/mail/p/inbox/BlueLake/mark-read?token=mail-rbac-static", None, 3),
+                    ] {
+                        let body = format!(r#"{{"message_ids":[{id}]}}"#);
+                        let resp = state.handle(mail_rbac_post(uri, auth, &body)).await;
+                        assert_eq!(resp.status, 200, "authorized route {uri}: {:?}", resp.body);
+                        assert_eq!(snapshot(&cx, &pool).await.2, id);
+                    }
+                    let sent = state.handle(mail_rbac_post(
+                        "/mail/p/overseer/send?token=mail-rbac-static",
+                        Some(&reader),
+                        overseer_body,
+                    )).await;
+                    assert_eq!(sent.status, 200, "browser static token retains writer authority");
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 3, 4, "suggested".to_string()));
+                    let sibling = state.handle(mail_rbac_post(
+                        "/mail/api/projects/1/siblings/2",
+                        Some("Bearer mail-rbac-static"),
+                        r#"{"action":"confirm"}"#,
+                    )).await;
+                    assert_eq!(sibling.status, 200);
+                    let all_read = state.handle(mail_rbac_post(
+                        "/mail/p/inbox/BlueLake/mark-all-read",
+                        Some(&writer),
+                        "{}",
+                    )).await;
+                    assert_eq!(all_read.status, 200);
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 4, 4, "confirmed".to_string()));
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_auth_csrf_and_local_policy() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let state = build_state(config.clone());
+            let uri = "/mail/p/overseer/send";
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            let writer = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+            let expired = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator", "exp": 1})
+                )
+            );
+            let wrong_secret = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"other-secret",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+
+            for auth in [
+                None,
+                Some("Bearer malformed"),
+                Some(expired.as_str()),
+                Some(wrong_secret.as_str()),
+            ] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.headers.retain(|(name, _)| name != "Content-Type");
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 401, "authentication precedes CSRF and roles");
+            }
+            let invalid_query = block_on(state.handle(mail_rbac_post(
+                "/mail/p/overseer/send?token=wrong-token",
+                None,
+                "not json",
+            )));
+            assert_eq!(invalid_query.status, 401);
+
+            let mut non_json = mail_rbac_post(uri, Some(&reader), "not json");
+            non_json.headers.retain(|(name, _)| name != "Content-Type");
+            let resp = block_on(state.handle(non_json));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(
+                payload["detail"],
+                "mutating mail requests require Content-Type: application/json"
+            );
+            assert!(
+                payload.get("required_role").is_none(),
+                "CSRF refusal stays first"
+            );
+            let mut cross_origin = mail_rbac_post(uri, Some(&writer), "not json");
+            cross_origin.headers.extend([
+                ("Host".to_string(), "mail.example.test".to_string()),
+                (
+                    "Origin".to_string(),
+                    "https://other.example.test".to_string(),
+                ),
+            ]);
+            let resp = block_on(state.handle(cross_origin));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(payload["detail"], "cross-origin request rejected");
+
+            // Query tokens authenticate the browser only. A valid reader JWT
+            // must not gain writer privileges by adding the same token to MCP.
+            let mut mcp = mail_rbac_post("/api?token=mail-rbac-static", Some(&reader), "");
+            mcp.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": "send_message", "arguments": {}})),
+                1_i64,
+            ))
+            .unwrap();
+            assert_eq!(block_on(state.handle(mcp)).status, 403);
+            assert_eq!(
+                block_on(state.handle(mail_rbac_post(
+                    "/api?token=mail-rbac-static",
+                    None,
+                    "not json",
+                )))
+                .status,
+                401
+            );
+
+            // These permitted requests reach the real handler's JSON parser;
+            // the deliberately invalid body keeps the policy controls read-only.
+            let disabled = build_state(mcp_agent_mail_core::Config {
+                http_rbac_enabled: false,
+                ..config.clone()
+            });
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&reader), "not json"))).status,
+                400
+            );
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&expired), "not json"))).status,
+                401
+            );
+
+            let static_only = build_state(mcp_agent_mail_core::Config {
+                http_jwt_enabled: false,
+                ..config.clone()
+            });
+            for (path, auth) in [
+                (uri, Some("Bearer mail-rbac-static")),
+                ("/mail/p/overseer/send?token=mail-rbac-static", None),
+            ] {
+                assert_eq!(
+                    block_on(static_only.handle(mail_rbac_post(path, auth, "not json"))).status,
+                    400,
+                    "static credentials retain writer roles with JWT disabled"
+                );
+            }
+
+            let local = build_state(mcp_agent_mail_core::Config {
+                http_allow_localhost_unauthenticated: true,
+                ..config.clone()
+            });
+            for auth in [None, Some("Bearer malformed")] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+                assert_eq!(
+                    block_on(local.handle(req)).status,
+                    400,
+                    "explicit local bypass remains complete"
+                );
+            }
+            let mut forwarded = mail_rbac_post(uri, Some(&reader), "not json");
+            forwarded.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            forwarded
+                .headers
+                .push(("X-Forwarded-For".to_string(), "10.0.0.1".to_string()));
+            assert_eq!(
+                block_on(local.handle(forwarded)).status,
+                403,
+                "forwarding disables local bypass"
+            );
+
+            let no_auth = build_state(mcp_agent_mail_core::Config {
+                http_bearer_token: None,
+                http_jwt_enabled: false,
+                ..config
+            });
+            let mut loopback = mail_rbac_post(uri, None, "not json");
+            loopback.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            assert_eq!(
+                block_on(no_auth.handle(loopback)).status,
+                400,
+                "direct no-auth loopback keeps writer access"
+            );
+            assert_eq!(
+                block_on(no_auth.handle(mail_rbac_post(uri, None, "not json"))).status,
+                403,
+                "remote no-auth clients keep the default reader role"
+            );
+        });
     }
 
     #[test]
@@ -23976,7 +26613,27 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(|project_key| {
+        with_serialized_tool_dispatch_env(&[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "0")], |_| {
+            // Use the real checkout as the project; the helper still isolates
+            // every mailbox/archive write, with ephemeral-root protection on.
+            let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace root")
+                .canonicalize()
+                .expect("existing project root");
+            assert!(project_root.is_dir());
+            assert!(!mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(
+                &project_root
+            ));
+            let project_key = project_root
+                .to_str()
+                .expect("project root UTF-8")
+                .to_string();
+            assert!(!mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(
+                &project_key
+            ));
+            assert!(!mcp_agent_mail_core::ephemeral::ephemeral_project_roots_allowed());
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -23991,7 +26648,9 @@ first body
                 1_i64,
             ));
             assert!(
-                ensure_project.is_ok(),
+                ensure_project
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "ensure_project should succeed before contact flow: {ensure_project:?}"
             );
 
@@ -24010,7 +26669,9 @@ first body
                 2_i64,
             ));
             assert!(
-                register_sender.is_ok(),
+                register_sender
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "sender registration should succeed: {register_sender:?}"
             );
 
@@ -24029,7 +26690,9 @@ first body
                 3_i64,
             ));
             assert!(
-                register_recipient.is_ok(),
+                register_recipient
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "recipient registration should succeed: {register_recipient:?}"
             );
 
@@ -24047,7 +26710,9 @@ first body
                 4_i64,
             ));
             assert!(
-                request_contact.is_ok(),
+                request_contact
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "request_contact should accept documented from_agent/to_agent fields unchanged: {request_contact:?}"
             );
         });
@@ -24079,6 +26744,206 @@ first body
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "expected tools list result"
+        );
+    }
+
+    /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
+    /// `Mcp-Session-Id`; requests that send it back share the session's agent
+    /// identity (verified without a token, even fail-closed), cannot change
+    /// another agent's contact policy, and keep the policy intact on refusal.
+    /// Stateless requests do not share bindings, and `DELETE` ends the session.
+    #[test]
+    fn opt_in_http_sessions_carry_identity_across_requests() {
+        with_serialized_tool_dispatch_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+                // The project lives in a `.tmpXXXXXX` tempdir, which the
+                // ephemeral-root guard refuses by default (GH#349).
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            |project_key| {
+                // Explicit auth configuration isolates this test from host
+                // settings and exercises localhost header synthesis.
+                let mut state = build_state(mcp_agent_mail_core::Config {
+                    http_rbac_enabled: false,
+                    http_bearer_token: Some("session-test-token".into()),
+                    http_allow_localhost_unauthenticated: true,
+                    http_jwt_enabled: false,
+                    ..mcp_agent_mail_core::Config::from_env()
+                });
+                Arc::get_mut(&mut state.router)
+                    .expect("test owns the router")
+                    .add_tool(SessionStateProbeTool)
+                    .expect("admit the state probe");
+                let post =
+                    |method: &str, params: serde_json::Value, id: i64, session: Option<&str>| {
+                        let headers: Vec<(&str, &str)> = session
+                            .map(|session| vec![("Mcp-Session-Id", session)])
+                            .unwrap_or_default();
+                        let mut req = make_request_with_peer_addr(
+                            Http1Method::Post,
+                            "/api",
+                            &headers,
+                            Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                        );
+                        req.body =
+                            serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
+                                .expect("serialize json-rpc");
+                        block_on(state.handle(req))
+                    };
+                let tool =
+                    |name: &str, arguments: serde_json::Value, id: i64, session: Option<&str>| {
+                        let resp = post(
+                            "tools/call",
+                            serde_json::json!({"name": name, "arguments": arguments}),
+                            id,
+                            session,
+                        );
+                        assert_eq!(resp.status, 200, "{name}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json-rpc body");
+                        let result = body["result"].clone();
+                        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+                        let failed = body.get("error").is_some()
+                            || result["isError"].as_bool().unwrap_or(false);
+                        // A JSON-RPC error has no tool text; keep the whole body
+                        // so a failed assertion shows why.
+                        let payload = serde_json::from_str::<serde_json::Value>(text)
+                            .unwrap_or_else(|_| body.clone());
+                        (failed, payload)
+                    };
+
+                let init = post(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "session-test", "version": "1"},
+                    }),
+                    1,
+                    None,
+                );
+                assert_eq!(init.status, 200);
+                let session = response_header(&init, "mcp-session-id")
+                    .expect("initialize mints a session id")
+                    .to_string();
+
+                for (header, expected) in [
+                    (Some(session.as_str()), true),
+                    (None, false),
+                    (Some("unknown-session"), false),
+                ] {
+                    let (failed, presence) =
+                        tool("session_state_probe", serde_json::json!({}), 10, header);
+                    assert!(!failed, "{presence}");
+                    assert_eq!(presence["has_session_state"], expected);
+                }
+
+                let (failed, project) = tool(
+                    "ensure_project",
+                    serde_json::json!({"human_key": project_key}),
+                    2,
+                    Some(&session),
+                );
+                assert!(!failed, "ensure_project failed: {project}");
+                let identity = serde_json::json!({
+                    "project_key": project_key,
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "return_registration_token": false,
+                });
+                let (failed, alice) =
+                    tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                assert!(!failed, "{alice}");
+                let alice = alice["name"].as_str().expect("alice").to_string();
+                let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                assert!(!failed, "{bob}");
+                let bob = bob["name"].as_str().expect("bob").to_string();
+                let (failed, policy) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                    5,
+                    None,
+                );
+                assert!(!failed, "{policy}");
+
+                let (failed, refusal) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "block_all"}),
+                    6,
+                    Some(&session),
+                );
+                assert!(
+                    failed,
+                    "a bound session cannot change another agent's policy"
+                );
+                assert_eq!(refusal["error"]["type"], "SESSION_IDENTITY_MISMATCH");
+
+                let send_args = serde_json::json!({
+                    "project_key": project_key,
+                    "sender_name": alice,
+                    "to": [bob],
+                    "subject": "hello",
+                    "body_md": "sent from a session",
+                });
+                let (failed, receipt) = tool("send_message", send_args.clone(), 7, Some(&session));
+                assert!(
+                    !failed,
+                    "refused block_all must leave Bob reachable: {receipt}"
+                );
+                assert_eq!(receipt["verified_sender"], true);
+                assert_eq!(receipt["sender_verification"], "session");
+
+                let (failed, _) = tool("send_message", send_args.clone(), 8, None);
+                assert!(failed, "a stateless request has no session identity");
+
+                let mut alias_probe = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Mcp-Session-Id", session.as_str())],
+                    Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                );
+                alias_probe.body = serde_json::to_vec(&JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({"name": "session_state_probe", "arguments": {}})),
+                    12_i64,
+                ))
+                .expect("serialize alias session probe");
+                let alias_response = block_on(state.handle(alias_probe));
+                assert_eq!(alias_response.status, 200);
+                let alias_body: serde_json::Value =
+                    serde_json::from_slice(&alias_response.body).expect("alias response");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        alias_body["result"]["content"][0]["text"]
+                            .as_str()
+                            .expect("alias probe text"),
+                    )
+                    .expect("alias probe result")["has_session_state"],
+                    true,
+                    "the base-path adapter must preserve session identity across aliases"
+                );
+
+                let mut end = make_request_with_peer_addr(
+                    Http1Method::Delete,
+                    "/api",
+                    &[("Mcp-Session-Id", session.as_str())],
+                    Some(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                );
+                end.body = Vec::new();
+                assert_eq!(block_on(state.handle(end)).status, 204);
+                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
+                assert!(failed, "an ended session has no identity");
+                let (failed, presence) = tool(
+                    "session_state_probe",
+                    serde_json::json!({}),
+                    11,
+                    Some(&session),
+                );
+                assert!(!failed, "{presence}");
+                assert_eq!(presence["has_session_state"], false);
+            },
         );
     }
 
@@ -25137,12 +28002,12 @@ first body
         );
         let resp = block_on(state.handle(req));
         assert!(
-            resp.status != 401,
+            resp.status != 401, // ubs:ignore — public HTTP status assertion for preflight, not comparison of authentication material
             "OPTIONS preflight must not require bearer auth, got {}",
             resp.status
         );
         assert!(
-            resp.status == 200 || resp.status == 204,
+            resp.status == 200 || resp.status == 204, // ubs:ignore — public HTTP status assertion for preflight, not comparison of authentication material
             "expected 200 or 204 for OPTIONS preflight, got {}",
             resp.status
         );
@@ -29335,6 +32200,25 @@ first body
     }
 
     #[test]
+    fn health_readiness_exposes_disabled_atc_population_without_changing_admission() {
+        with_serialized_health_route(|| {
+            let config = mcp_agent_mail_core::Config {
+                atc_enabled: false,
+                ..isolated_health_config()
+            };
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let response = block_on(state.handle(req));
+            assert_eq!(response.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["status"], "ready");
+            assert_eq!(body["atc_population_hydration"]["status"], "disabled");
+            assert!(body["atc_population_hydration"]["progress"].is_null());
+            assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
+        });
+    }
+
+    #[test]
     fn health_root_alias_returns_ready_json() {
         with_serialized_health_route(|| {
             let config = isolated_health_config();
@@ -29449,6 +32333,42 @@ first body
                 .and_then(|v| v.as_bool())
                 .is_some(),
             "body must include allows_writes bool: {body}"
+        );
+    }
+
+    #[test]
+    fn health_durability_reports_the_wbq_write_latch() {
+        let healthy = || {
+            serde_json::json!({
+                "durability_state": "healthy",
+                "allows_reads": true,
+                "allows_writes": true,
+            })
+        };
+        let mut unlatched = healthy();
+        apply_wbq_write_gate(&mut unlatched, None);
+        assert_eq!(unlatched, healthy());
+
+        let mut latched = healthy();
+        apply_wbq_write_gate(
+            &mut latched,
+            Some(mcp_agent_mail_storage::WbqStats {
+                enqueued: 1188,
+                drained: 1188,
+                errors: 1,
+                fallbacks: 0,
+                unrecoverable_errors: 1,
+                last_unrecoverable_error_us: 1_792_012_964_761_918,
+            }),
+        );
+        assert_eq!(latched["durability_state"], "degraded_read_only");
+        assert_eq!(latched["allows_reads"], true);
+        assert_eq!(latched["allows_writes"], false);
+        assert_eq!(latched["write_gate"]["error_code"], "DURABILITY_DEGRADED");
+        assert_eq!(latched["write_gate"]["wbq_unrecoverable_errors_total"], 1);
+        assert_eq!(
+            latched["write_gate"]["wbq_last_unrecoverable_error_us"],
+            1_792_012_964_761_918_u64
         );
     }
 
@@ -30283,6 +33203,142 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(configured, i64::from(INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS));
+    }
+
+    /// br-r6psd: child side of a cross-process lock probe. `F_GETLK` reports
+    /// only a conflicting lock owned by ANOTHER process and never takes one,
+    /// so the probe cannot perturb the parent. Run it only in the re-executed
+    /// child: opening and closing the probed inode in the parent would itself
+    /// release the parent's classic `fcntl` locks on Linux.
+    #[cfg(target_os = "linux")]
+    fn fd_close_lock_probe_reports_foreign_conflict(
+        path: &Path,
+        start: nix::libc::off_t,
+        len: nix::libc::off_t,
+    ) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("child opens the probed inode");
+        let short = |value: nix::libc::c_int| {
+            nix::libc::c_short::try_from(value).expect("fcntl lock constant fits c_short")
+        };
+        let mut query = nix::libc::flock {
+            l_type: short(nix::libc::F_WRLCK),
+            l_whence: short(nix::libc::SEEK_SET),
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETLK(&mut query))
+            .expect("non-mutating F_GETLK probe");
+        query.l_type != short(nix::libc::F_UNLCK)
+    }
+
+    /// br-r6psd regression (Linux): the raw TUI/metrics/observability open
+    /// guard runs inside the server process, beside live FrankenSQLite pool
+    /// connections. With nonclean durable breaker authority on disk it must
+    /// compare fingerprints without opening the live main inode. The raw
+    /// `recovery_breaker::fingerprint_db` it used to call opens, hashes and closes it, which
+    /// releases every classic `fcntl` lock this process holds there, so a
+    /// separate process stops seeing the parent's RESERVED/SHARED locks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_live_open_guard_preserves_same_process_franken_main_inode_locks() {
+        const CHILD_PATH_ENV: &str = "AM_TEST_RAW_GUARD_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "tests::raw_live_open_guard_preserves_same_process_franken_main_inode_locks";
+        const CHILD_WITNESS: &str = "raw-guard-lock-probe conflict=";
+        // SQLite's lock-byte page: PENDING (0x4000_0000), RESERVED (+1) and
+        // the 510-byte SHARED range (+2 .. +512).
+        const LOCK_PAGE_START: nix::libc::off_t = 0x4000_0000;
+        const LOCK_PAGE_LEN: nix::libc::off_t = 512;
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let conflict = fd_close_lock_probe_reports_foreign_conflict(
+                Path::new(&path),
+                LOCK_PAGE_START,
+                LOCK_PAGE_LEN,
+            );
+            println!("{CHILD_WITNESS}{conflict}");
+            return;
+        }
+
+        fn child_observes_parent_main_lock(db_path: &Path) -> bool {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", CHILD_TEST_NAME, "--nocapture"])
+                .env(CHILD_PATH_ENV, db_path)
+                .output()
+                .expect("run main-inode child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: {output:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict = stdout
+                .lines()
+                // libtest prints `test <name> ... ` ahead of the child's output on the same line.
+                .find_map(|line| line.split_once(CHILD_WITNESS).map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("child filter ran no causal lock probe: {stdout}"));
+            verdict.split_whitespace().next() == Some("true")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("raw-guard-lock.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use main-inode rollback locking");
+        writer
+            .execute_raw("CREATE TABLE guard_lock_fixture (value INTEGER NOT NULL);")
+            .expect("create guard fixture table");
+        writer
+            .execute_raw("INSERT INTO guard_lock_fixture (value) VALUES (7);")
+            .expect("seed guard fixture row");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let mut sidecar = db_path.clone().into_os_string();
+            sidecar.push(suffix);
+            assert!(
+                Path::new(&sidecar).is_file(),
+                "precondition: FrankenSQLite namespace sidecar {suffix} marks a Franken-managed family"
+            );
+        }
+
+        // Nonclean durable authority recorded for a different (lock-neutral
+        // format) generation: the guard must consult it, and it must not apply.
+        let other_generation = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: format!("4096:fdc10ce1{}", "0".repeat(56)),
+            consecutive_failures: 1,
+            last_failure_unix: 1,
+            last_failure_reason: "br-r6psd fd-close regression fixture".to_string(),
+            tripped: false,
+            attempt_in_progress: false,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &other_generation)
+            .expect("persist nonclean breaker authority");
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent RESERVED writer lock");
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "precondition: a separate process must observe the parent's live main-inode lock"
+        );
+
+        guard_raw_live_sqlite_engine_open(&db_path, "br-r6psd fd-close regression")
+            .expect("breaker history for another generation must not refuse a healthy family");
+
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "the raw-open guard must not release this process's live FrankenSQLite main-inode locks"
+        );
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("end the parent writer transaction");
+        drop(writer);
     }
 
     #[test]
@@ -33051,6 +36107,304 @@ first body
     }
 
     #[test]
+    fn message_feedback_interleavings_keep_ack_and_count_one_resolution() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("message feedback race fixtures");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("AM_ATC_EXECUTOR_MODE", "canary"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let cx = Cx::for_testing();
+                for initial_state in [ExperienceState::Executed, ExperienceState::Open] {
+                    for (incoming, competing) in [
+                        ("acknowledged", "read"),
+                        ("acknowledged", "ack_overdue"),
+                        ("read", "acknowledged"),
+                        ("ack_overdue", "acknowledged"),
+                    ] {
+                        // ATC uses a fixed sidecar name within the mailbox
+                        // directory, so each interleaving needs its own parent.
+                        let case_dir = dir
+                            .path()
+                            .join(format!("{initial_state}-{incoming}-{competing}"));
+                        std::fs::create_dir(&case_dir).expect("isolated feedback case directory");
+                        let db_path = case_dir.join("storage.sqlite3");
+                        let db_path_str = db_path.to_string_lossy().into_owned();
+                        let pool = create_pool(&DbPoolConfig {
+                            database_url: format!("sqlite:///{db_path_str}"),
+                            min_connections: 0,
+                            max_connections: 1,
+                            warmup_connections: 0,
+                            ..Default::default()
+                        })
+                        .expect("file-backed message feedback fixture");
+                        let now = mcp_agent_mail_db::now_micros();
+                        let observation = build_message_sent_observation_row(
+                            "feedback-race-project",
+                            8401,
+                            "RedFox",
+                            &["BlueLake".to_string()],
+                            Some("feedback-race"),
+                            &serde_json::json!({
+                                "ack_required": true,
+                                "importance": "urgent",
+                            }),
+                            now - ACK_OVERDUE_WINDOW_URGENT_MICROS - 10,
+                        );
+                        append_atc_hot_path_observation_row(&pool, &observation, "message_sent");
+                        let stored = block_on(
+                            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(
+                                &cx, &pool, 8401,
+                            ),
+                        )
+                        .into_result()
+                        .expect("fetch race fixture")
+                        .expect("send observation exists");
+                        if initial_state == ExperienceState::Open {
+                            block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+                                &cx,
+                                &pool,
+                                stored.experience_id,
+                                ExperienceState::Open,
+                                stored.created_ts_micros + 1,
+                                None,
+                                None,
+                            ))
+                            .into_result()
+                            .expect("prepare open message feedback fixture");
+                        }
+                        let args = serde_json::json!({
+                            "project_key": "feedback-race-project",
+                            "agent_name": "BlueLake",
+                            "message_id": 8401,
+                        });
+                        let payload = serde_json::json!({ "message_id": 8401 });
+                        let before_metrics = mcp_agent_mail_core::global_metrics().atc.snapshot();
+                        let mut competing_snapshot = None;
+                        let mut before_mutation = |prefetched: &ExperienceRow| {
+                            assert_eq!(prefetched.state, initial_state);
+                            assert!(competing_snapshot.is_none(), "race hook must run once");
+                            if competing == "ack_overdue" {
+                                sweep_open_experiences_for_resolution(&pool, now, i64::MAX / 4);
+                            } else {
+                                let tool = if competing == "read" {
+                                    "mark_message_read"
+                                } else {
+                                    "acknowledge_message"
+                                };
+                                record_atc_message_outcome_from_tool_payload_with_pool(
+                                    tool,
+                                    Some(&args),
+                                    &payload,
+                                    None,
+                                    None,
+                                    Some(&pool),
+                                );
+                            }
+                            assert_eq!(reopened_atc_message_outcome(&db_path_str).label, competing);
+                            competing_snapshot = Some(reopened_atc_content_snapshot(&db_path_str));
+                        };
+                        if incoming == "ack_overdue" {
+                            sweep_open_experiences_with_before_message_mutation(
+                                &pool,
+                                now,
+                                i64::MAX / 4,
+                                &mut before_mutation,
+                            );
+                        } else {
+                            let tool = if incoming == "read" {
+                                "mark_message_read"
+                            } else {
+                                "acknowledge_message"
+                            };
+                            record_atc_message_outcome_with_before_mutation(
+                                tool,
+                                Some(&args),
+                                &payload,
+                                None,
+                                None,
+                                Some(&pool),
+                                &mut before_mutation,
+                            );
+                        }
+                        let competing_snapshot = competing_snapshot.expect("race hook ran");
+                        let final_outcome = reopened_atc_message_outcome(&db_path_str);
+                        assert_eq!(final_outcome.label, "acknowledged");
+                        assert!(final_outcome.correct);
+                        let acknowledged_snapshot = reopened_atc_content_snapshot(&db_path_str);
+                        if competing == "acknowledged" {
+                            assert!(
+                                acknowledged_snapshot == competing_snapshot,
+                                "the winning ACK must preserve every stored cell"
+                            );
+                        } else {
+                            assert!(
+                                acknowledged_snapshot != competing_snapshot,
+                                "ACK upgrade must change the stored outcome"
+                            );
+                        }
+                        let resolved_count = before_metrics.experiences_resolved_total + 1;
+                        let after_metrics = mcp_agent_mail_core::global_metrics().atc.snapshot();
+                        assert_eq!(after_metrics.experiences_resolved_total, resolved_count);
+                        let stratum = atc_experience_stratum_key(&stored);
+                        let open_before = before_metrics
+                            .experiences_open_by_stratum
+                            .get(&stratum)
+                            .copied()
+                            .unwrap_or_default();
+                        assert_eq!(
+                            after_metrics
+                                .experiences_open_by_stratum
+                                .get(&stratum)
+                                .copied()
+                                .unwrap_or_default(),
+                            open_before.saturating_sub(1)
+                        );
+
+                        for tool in ["acknowledge_message", "mark_message_read"] {
+                            record_atc_message_outcome_from_tool_payload_with_pool(
+                                tool,
+                                Some(&args),
+                                &payload,
+                                None,
+                                None,
+                                Some(&pool),
+                            );
+                        }
+                        sweep_open_experiences_for_resolution(&pool, now, i64::MAX / 4);
+                        assert!(
+                            reopened_atc_content_snapshot(&db_path_str) == acknowledged_snapshot,
+                            "replayed feedback must preserve persisted rows and rollups"
+                        );
+                        assert_eq!(
+                            mcp_agent_mail_core::global_metrics()
+                                .atc
+                                .snapshot()
+                                .experiences_resolved_total,
+                            resolved_count,
+                            "replayed signals must not count another resolution"
+                        );
+                    }
+                }
+            },
+        );
+        mcp_agent_mail_core::Config::reset_cached();
+    }
+
+    #[test]
+    fn message_feedback_rejects_metadata_before_missing_terminal_or_shadow_logs() {
+        const CANARY: &str = "ghp_ATC_SYNTHETIC_FEEDBACK_LOG_CANARY_20261027";
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("feedback log privacy fixtures");
+        for mode in ["live", "shadow"] {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("AM_ATC_WRITE_MODE", mode),
+                    ("AM_ATC_EXECUTOR_MODE", "canary"),
+                ],
+                || {
+                    mcp_agent_mail_core::Config::reset_cached();
+                    let case_dir = dir.path().join(format!("feedback-log-{mode}"));
+                    std::fs::create_dir(&case_dir).expect("isolated feedback privacy directory");
+                    let db_path = case_dir.join("storage.sqlite3");
+                    let db_path_str = db_path.to_string_lossy().into_owned();
+                    let pool = create_pool(&DbPoolConfig {
+                        database_url: format!("sqlite:///{db_path_str}"),
+                        min_connections: 0,
+                        max_connections: 1,
+                        warmup_connections: 0,
+                        ..Default::default()
+                    })
+                    .expect("file-backed feedback privacy fixture");
+                    let cx = Cx::for_testing();
+                    let now = mcp_agent_mail_db::now_micros();
+                    let observation = build_message_sent_observation_row(
+                        "feedback-privacy-project",
+                        8501,
+                        "RedFox",
+                        &["BlueLake".to_string()],
+                        Some("feedback-privacy"),
+                        &serde_json::json!({ "ack_required": true }),
+                        now,
+                    );
+                    let stored = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                        &cx,
+                        &pool,
+                        &observation,
+                    ))
+                    .into_result()
+                    .expect("prepare privacy observation");
+                    let acknowledged = build_message_outcome_resolution(
+                        "acknowledged",
+                        "acknowledge_message",
+                        8501,
+                        Some("BlueLake"),
+                        Some("feedback-privacy-project"),
+                        now + 1,
+                        "privacy fixture",
+                    );
+                    block_on(mcp_agent_mail_db::queries::resolve_atc_message_outcome(
+                        &cx,
+                        &pool,
+                        stored.experience_id,
+                        &acknowledged,
+                    ))
+                    .into_result()
+                    .expect("prepare terminal privacy observation");
+                    let baseline = reopened_atc_content_snapshot(&db_path_str);
+                    let capture = AtcFeedbackLogCapture::default();
+                    tracing::subscriber::with_default(capture.clone(), || {
+                        for message_id in [8501, 8502] {
+                            for metadata_field in ["agent_name", "project_key"] {
+                                let mut args = serde_json::json!({
+                                    "project_key": "feedback-privacy-project",
+                                    "agent_name": "BlueLake",
+                                    "message_id": message_id,
+                                });
+                                args[metadata_field] = serde_json::json!(CANARY);
+                                record_atc_message_outcome_from_tool_payload_with_pool(
+                                    "acknowledge_message",
+                                    Some(&args),
+                                    &serde_json::json!({ "message_id": message_id }),
+                                    None,
+                                    None,
+                                    Some(&pool),
+                                );
+                            }
+                        }
+                    });
+                    let events = capture.events.lock().expect("captured feedback events");
+                    assert!(events.iter().all(|event| !event.contains(CANARY)));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| {
+                                event.contains("atc.content_rejected")
+                                    && event
+                                        .contains("outcome.evidence contains a suspected secret")
+                            })
+                            .count(),
+                        4,
+                        "each rejected signal must report only its static category"
+                    );
+                    assert!(
+                        reopened_atc_content_snapshot(&db_path_str) == baseline,
+                        "rejected feedback changed stored rows or rollups"
+                    );
+                },
+            );
+        }
+        mcp_agent_mail_core::Config::reset_cached();
+    }
+
+    #[test]
     fn ack_overdue_window_mapping_matches_importance_tiers() {
         assert_eq!(
             atc_ack_overdue_window_micros(Some("urgent")),
@@ -33600,6 +36954,246 @@ first body
             }
             other => panic!("expected ReservationGranted event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn atc_denied_reservations_reach_deadlock_detection_and_scoped_resolution() {
+        const CHILD: &str = "AM_TEST_ATC_RESERVATION_FEEDBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // ATC write mode is a process-lifetime choice. Keep the real tool,
+            // engine and sidecar fixture isolated from other tests and mailboxes.
+            let dir = tempfile::Builder::new()
+                .prefix("am-atc-reservation-feedback-")
+                .tempdir()
+                .expect("private reservation feedback fixture");
+            std::fs::create_dir(dir.path().join("project-alpha")).expect("private project root");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::atc_denied_reservations_reach_deadlock_detection_and_scoped_resolution",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(
+                    "DATABASE_URL",
+                    format!("sqlite:///{}", dir.path().join("mail.sqlite3").display()),
+                )
+                .env("STORAGE_ROOT", dir.path().join("archive"))
+                .env("AM_ATC_ENABLED", "true")
+                .env("AM_ATC_WRITE_MODE", "live")
+                .env("AM_ATC_EXECUTOR_MODE", "shadow")
+                .env("ATC_LEARNING_DISABLED", "0")
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .current_dir(dir.path())
+                .output()
+                .expect("run isolated ATC reservation feedback test");
+            assert!(
+                output.status.success(),
+                "ATC reservation feedback failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let config = mcp_agent_mail_core::Config::get();
+        atc::init_global_atc(&config);
+        let pool = {
+            let request_pool =
+                mcp_agent_mail_tools::tool_util::get_db_pool().expect("real mailbox pool");
+            // Retain the fixture's engine, not one request's writer lease,
+            // across the independent tool calls below.
+            (*request_pool).clone()
+        };
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = std::env::current_dir()
+            .expect("fixture directory")
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned();
+        let project = block_on(mcp_agent_mail_db::queries::ensure_project(
+            &cx,
+            &pool,
+            &project_key,
+        ))
+        .into_result()
+        .expect("project");
+        let project_id = project.id.expect("project ID");
+        for (name, path) in [("BlueLake", "src/a.rs"), ("RedFox", "src/b.rs")] {
+            block_on(mcp_agent_mail_db::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                name,
+                "codex-cli",
+                "test",
+                None,
+                None,
+                None,
+            ))
+            .into_result()
+            .expect("registered owner");
+            let granted = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                &ctx,
+                project_key.clone(),
+                name.to_string(),
+                vec![path.to_string()],
+                Some(3600),
+                Some(true),
+                Some("ATC conflict regression".to_string()),
+                None,
+            ))
+            .expect("seed real held lease");
+            let granted: serde_json::Value = serde_json::from_str(&granted).expect("grant JSON");
+            assert_eq!(granted["granted"].as_array().expect("grants").len(), 1);
+            atc::atc_register_agent_with_project(name, "codex-cli", Some(&project_key));
+        }
+
+        // Tools accept either spelling. Both denials must enter one graph.
+        for (name, path, identifier) in [
+            ("BlueLake", "src/b.rs", &project_key),
+            ("RedFox", "src/a.rs", &project.slug),
+        ] {
+            let response = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                &ctx,
+                identifier.clone(),
+                name.to_string(),
+                vec![path.to_string()],
+                Some(3600),
+                Some(true),
+                None,
+                None,
+            ))
+            .expect("real reservation denial response");
+            let payload: serde_json::Value = serde_json::from_str(&response).expect("tool JSON");
+            assert_eq!(payload["granted"], serde_json::json!([]));
+            assert_eq!(payload["conflicts"].as_array().expect("conflicts").len(), 1);
+            let call_args = serde_json::json!({
+                "project_key": identifier,
+                "agent_name": name,
+                "paths": [path],
+            });
+            let events = derive_domain_events_from_tool_result(
+                "file_reservation_paths",
+                Some(&call_args),
+                &serde_json::json!({ "content": [{ "type": "text", "text": response }] }),
+                Some(&project.slug),
+                Some(name),
+            );
+            assert!(events.is_empty(), "denial must not fabricate a grant event");
+        }
+        let report = atc::atc_tick_report(mcp_agent_mail_db::now_micros()).expect("ATC tick");
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert!(
+            report.effects.iter().any(|effect| {
+                effect.semantics.family == "deadlock_remediation"
+                    && effect.project_key.as_deref() == Some(project_key.as_str())
+            }),
+            "fully denied real requests must produce a correctly scoped deadlock advisory"
+        );
+
+        // Same-name experiences in another project must not inherit this
+        // project's release. Reopen the durable sidecar after the actual sweep.
+        let anchor = mcp_agent_mail_db::now_micros();
+        let other_project = format!("{project_key}-other");
+        for (id, scope) in [(1_u64, &project_key), (2_u64, &other_project)] {
+            let mut row = ExperienceBuilder::new(
+                9_000 + id,
+                9_000 + id,
+                format!("scope-trace-{id}"),
+                format!("scope-claim-{id}"),
+                format!("scope-evidence-{id}"),
+                ExperienceSubsystem::Conflict,
+                "reservation_release",
+                "BlueLake",
+                EffectKind::Release,
+                "release_reservations",
+                vec![("Blocked".to_string(), 1.0)],
+                0.0,
+                "reservation feedback scope",
+                true,
+                false,
+            )
+            .project_key(scope)
+            .build(0, anchor);
+            row.state = ExperienceState::Executed;
+            row.dispatched_ts_micros = Some(anchor);
+            row.executed_ts_micros = Some(anchor);
+            block_on(mcp_agent_mail_db::queries::append_atc_experience(
+                &cx, &pool, &row,
+            ))
+            .into_result()
+            .expect("persist scoped experience");
+        }
+        let release = block_on(
+            mcp_agent_mail_tools::reservations::release_file_reservations(
+                &ctx,
+                project.slug.clone(),
+                "BlueLake".to_string(),
+                None,
+                None,
+            ),
+        )
+        .expect("release actual held lease");
+        let release_args = serde_json::json!({
+            "project_key": project.slug,
+            "agent_name": "BlueLake",
+        });
+        let events = derive_domain_events_from_tool_result(
+            "release_file_reservations",
+            Some(&release_args),
+            &serde_json::json!({ "content": [{ "type": "text", "text": release }] }),
+            Some(&project.slug),
+            Some("BlueLake"),
+        );
+        assert_eq!(events.len(), 1);
+        // The real dispatch path also observes general tool activity after
+        // domain events. That unscoped timestamp must not resolve the other
+        // project's same-name reservation experience through the fallback.
+        let activity_at = mcp_agent_mail_db::now_micros().max(anchor + 1);
+        atc::atc_observe_activity_with_project("BlueLake", Some(&project.slug), activity_at);
+        assert_eq!(atc::atc_agent_last_activity("BlueLake"), Some(activity_at));
+        assert_eq!(
+            atc::atc_tick_report(activity_at)
+                .expect("tick after slug-based release")
+                .summary
+                .deadlock_cycles,
+            0,
+            "release by slug must clear conflicts observed through the full path"
+        );
+        sweep_open_experiences_for_resolution(&pool, activity_at, 600_000_000);
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(pool.sqlite_path());
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar)
+            .expect("independent sidecar reopen");
+        let rows = verify
+            .query_sync(
+                "SELECT project_key, state, outcome_json FROM atc_experiences ORDER BY effect_id",
+                &[],
+            )
+            .expect("read durable outcomes");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get_named::<String>("project_key").unwrap(),
+            project_key
+        );
+        assert_eq!(rows[0].get_named::<String>("state").unwrap(), "resolved");
+        let outcome: serde_json::Value =
+            serde_json::from_str(&rows[0].get_named::<String>("outcome_json").unwrap())
+                .expect("resolved outcome");
+        assert_eq!(outcome["label"], "clean_release");
+        assert_eq!(
+            rows[1].get_named::<String>("project_key").unwrap(),
+            other_project
+        );
+        assert_eq!(rows[1].get_named::<String>("state").unwrap(), "open");
+        assert!(
+            rows[1]
+                .get_named::<Option<String>>("outcome_json")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -35125,7 +38719,7 @@ first body
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret);
         let validation = HttpState::jwt_validation(vec![jsonwebtoken::Algorithm::HS256]);
         let decoded =
-            jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation);
+            jsonwebtoken::decode::<serde_json::Value>(&valid_token, &decoding_key, &validation); // ubs:ignore — test uses the production HS256 validation and actual correct signing key; wrong-key rejection follows
         assert!(decoded.is_ok(), "valid token verifiable with correct key");
 
         // Invalid token (wrong secret): must be rejected even with stale cache.
@@ -35136,7 +38730,7 @@ first body
         )
         .unwrap();
         let decoded =
-            jsonwebtoken::decode::<serde_json::Value>(&wrong_token, &decoding_key, &validation);
+            jsonwebtoken::decode::<serde_json::Value>(&wrong_token, &decoding_key, &validation); // ubs:ignore — deliberate wrong-key test requires verification to reject the forged token
         assert!(
             decoded.is_err(),
             "invalid token must be rejected even with stale cache"
@@ -35152,6 +38746,17 @@ first body
         assert_eq!(
             state.server_info.name, COMPAT_SERVER_NAME,
             "COMPAT LOCK: build_server() must produce the locked server name"
+        );
+        assert_eq!(state.router.tools_count(), 45);
+        let templates = state.router.resource_templates();
+        assert_eq!(templates.len(), 25);
+        assert_eq!(
+            templates
+                .iter()
+                .filter(|template| template.uri_template.starts_with("resource://project/"))
+                .map(|template| template.uri_template.as_str())
+                .collect::<Vec<_>>(),
+            ["resource://project/{slug}"]
         );
     }
 
@@ -35206,6 +38811,86 @@ first body
     }
 
     // ── D3: query-parameter token auth for /mail ─────────────────
+
+    #[test]
+    fn mail_tailwind_asset_serves_embedded_bytes_without_opening_a_mailbox() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("must-not-be-created");
+        let state = build_state(mcp_agent_mail_core::Config {
+            database_url: "unsupported://asset-must-not-open-db".to_string(),
+            storage_root: absent.clone(),
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        let req = make_request(Http1Method::Get, templates::MAIL_TAILWIND_ASSET_PATH, &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 407_279);
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&resp.body))
+        );
+        assert_eq!(integrity, templates::MAIL_TAILWIND_INTEGRITY);
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == "content-type" && value == "text/javascript; charset=utf-8"
+        }));
+        let html = templates::render_template("error.html", serde_json::json!({"message":"test"}))
+            .unwrap()
+            .replace("&#x2f;", "/");
+        assert!(html.contains(&format!("src=\"{}\"", templates::MAIL_TAILWIND_ASSET_PATH)));
+        assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+        assert!(!html.contains("https://cdn.tailwindcss.com"));
+        assert!(
+            !absent.exists(),
+            "static serving must not create mailbox state"
+        );
+    }
+
+    #[test]
+    fn mail_tailwind_asset_only_exposes_the_exact_public_asset() {
+        let state = build_state(mcp_agent_mail_core::Config {
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        for path in [
+            "/mail",
+            "/mail/static/vendor_manifest.json",
+            "/mail/static/tailwind-3.4.16.min.js",
+            "/mail/static/../storage.sqlite3",
+            "/mail/static/tailwind-3.4.17.min.js/extra",
+        ] {
+            let resp = block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+            assert_eq!(resp.status, 401, "private or unknown route {path}");
+        }
+        let resp = block_on(state.handle(make_request(
+            Http1Method::Post,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(resp.status, 405);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(name, value)| name == "allow" && value == "GET, HEAD, OPTIONS")
+        );
+        let head = block_on(state.handle(make_request(
+            Http1Method::Head,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(head.status, 200);
+        assert_eq!(head.body, Vec::<u8>::new());
+        assert!(
+            head.headers
+                .iter()
+                .any(|(name, value)| { name == "content-length" && value == "407279" })
+        );
+    }
 
     #[test]
     fn mail_route_accepts_query_token_when_bearer_configured() {
@@ -37167,12 +40852,240 @@ first body
 }
 
 #[cfg(test)]
+mod atc_operator_cache_tests {
+    use super::{
+        ATC_EXECUTOR_PROJECT_CAPACITY, ATC_OPERATOR_CACHE_KEY_BYTES,
+        ATC_OPERATOR_COOLDOWN_CAPACITY, AtcExecutorProjectCache, AtcOperatorCooldowns,
+    };
+
+    #[test]
+    fn cooldown_churn_never_evicts_live_history_or_executes_overflow() {
+        let mut cache = AtcOperatorCooldowns::new(100, ATC_OPERATOR_COOLDOWN_CAPACITY);
+        let mut executions = 0;
+        for index in 0..ATC_OPERATOR_COOLDOWN_CAPACITY {
+            assert_eq!(
+                cache.execute(&format!("agent-{index}"), "advisory", 100, 0, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "executed"
+            );
+        }
+        cache.prune(99);
+        for index in 0..20_000 {
+            assert_eq!(
+                cache.execute(&format!("overflow-{index}"), "advisory", 100, 99, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "throttled:cooldown_capacity"
+            );
+            assert_eq!(
+                cache.execute("agent-0", "advisory", 100, 99, || {
+                    executions += 1;
+                    "executed".to_string()
+                }),
+                "throttled:advisory"
+            );
+        }
+        assert_eq!(executions, ATC_OPERATOR_COOLDOWN_CAPACITY);
+        assert_eq!(
+            cache.last_action_by_key.len(),
+            ATC_OPERATOR_COOLDOWN_CAPACITY
+        );
+        assert_eq!(cache.last_action_by_key["agent-0"], 0);
+
+        cache.prune(100);
+        assert!(cache.last_action_by_key.is_empty());
+        assert_eq!(
+            cache.execute("overflow-0", "advisory", 100, 100, || {
+                executions += 1;
+                "executed".to_string()
+            }),
+            "executed"
+        );
+        assert_eq!(executions, ATC_OPERATOR_COOLDOWN_CAPACITY + 1);
+    }
+
+    #[test]
+    fn cooldown_retention_preserves_later_longer_intervals_and_refreshes_existing_keys() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 0, || "executed".to_string()),
+            "executed"
+        );
+        cache.prune(11);
+        assert_eq!(cache.last_action_by_key.len(), 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 50, 11, || panic!("too early")),
+            "throttled:probe"
+        );
+        assert_eq!(
+            cache.execute("other", "probe", 10, 11, || panic!("cache is full")),
+            "throttled:cooldown_capacity"
+        );
+        assert_eq!(
+            cache.execute("agent", "probe", 50, 50, || "executed".to_string()),
+            "executed",
+            "an existing key may refresh while all slots are occupied"
+        );
+        cache.prune(100);
+        assert_eq!(cache.last_action_by_key["agent"], 50);
+        cache.prune(149);
+        assert_eq!(cache.last_action_by_key.len(), 1);
+        cache.prune(150);
+        assert!(cache.last_action_by_key.is_empty());
+    }
+
+    #[test]
+    fn cooldown_failures_retry_without_consuming_capacity_and_zero_intervals_do_not_accumulate() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        for status in [
+            "failed:executor_unavailable",
+            "suppressed:missing_project_precondition",
+        ] {
+            assert_eq!(
+                cache.execute("agent", "probe", 10, 0, || status.to_string()),
+                status
+            );
+            assert!(cache.last_action_by_key.is_empty());
+        }
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 0, || {
+                "suppressed:executor_mode_shadow".to_string()
+            }),
+            "suppressed:executor_mode_shadow"
+        );
+        assert_eq!(
+            cache.execute("agent", "probe", 10, 1, || panic!(
+                "shadow history is retained"
+            )),
+            "throttled:probe"
+        );
+        for index in 0..10_000 {
+            assert_eq!(
+                cache.execute(&format!("no-cooldown-{index}"), "advisory", 0, 1, || {
+                    "executed".to_string()
+                }),
+                "executed"
+            );
+        }
+        assert_eq!(cache.last_action_by_key.len(), 1);
+    }
+
+    #[test]
+    fn cooldown_clock_reversal_overflow_and_unrepresentable_policy_fail_closed() {
+        let mut cache = AtcOperatorCooldowns::new(100, 1);
+        assert_eq!(
+            cache.execute("agent", "probe", 100, i64::MAX - 50, || "executed"
+                .to_string()),
+            "executed"
+        );
+        for now in [i64::MIN, i64::MAX] {
+            cache.prune(now);
+            assert_eq!(cache.last_action_by_key.len(), 1);
+            assert_eq!(
+                cache.execute("agent", "probe", 100, now, || panic!("cooldown still live")),
+                "throttled:probe"
+            );
+        }
+        assert_eq!(
+            cache.execute("agent", "probe", 101, 0, || panic!("unsupported horizon")),
+            "throttled:cooldown_policy_horizon"
+        );
+        assert_eq!(
+            cache.execute(
+                &"a".repeat(ATC_OPERATOR_CACHE_KEY_BYTES + 1),
+                "probe",
+                10,
+                0,
+                || panic!("oversized key"),
+            ),
+            "throttled:cooldown_key_capacity"
+        );
+    }
+
+    #[test]
+    fn executor_project_churn_bounds_cache_and_rechecks_evicted_identity() {
+        let mut cache = AtcExecutorProjectCache::default();
+        let mut registrations = 0;
+        cache
+            .ensure("first", || {
+                registrations += 1;
+                Ok(())
+            })
+            .unwrap();
+        for _ in 0..10_000 {
+            cache
+                .ensure("first", || panic!("cached registration"))
+                .unwrap();
+        }
+        for index in 0..ATC_EXECUTOR_PROJECT_CAPACITY {
+            cache
+                .ensure(&format!("project-{index}"), || {
+                    registrations += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(cache.projects.len() <= ATC_EXECUTOR_PROJECT_CAPACITY);
+            assert_eq!(cache.projects.len(), cache.insertion_order.len());
+        }
+        assert!(!cache.projects.contains("first"));
+        cache
+            .ensure("first", || {
+                registrations += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(registrations, ATC_EXECUTOR_PROJECT_CAPACITY + 2);
+        assert_eq!(cache.projects.len(), ATC_EXECUTOR_PROJECT_CAPACITY);
+        assert!(
+            cache
+                .insertion_order
+                .iter()
+                .all(|key| cache.projects.contains(key))
+        );
+    }
+
+    #[test]
+    fn executor_project_failures_do_not_evict_success_and_large_keys_are_not_retained() {
+        let mut cache = AtcExecutorProjectCache {
+            capacity: 1,
+            ..AtcExecutorProjectCache::default()
+        };
+        cache.ensure("live", || Ok(())).unwrap();
+        assert_eq!(
+            cache.ensure("failed", || Err("retry me".to_string())),
+            Err("retry me".to_string())
+        );
+        assert!(cache.projects.contains("live"));
+        let oversized = "p".repeat(ATC_OPERATOR_CACHE_KEY_BYTES + 1);
+        let mut registrations = 0;
+        for _ in 0..2 {
+            cache
+                .ensure(&oversized, || {
+                    registrations += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(registrations, 2);
+        assert_eq!(cache.projects.len(), 1);
+        assert!(cache.projects.contains("live"));
+        cache.ensure("failed", || Ok(())).unwrap();
+        assert!(!cache.projects.contains("live"));
+        assert!(cache.projects.contains("failed"));
+        assert_eq!(cache.projects.len(), cache.insertion_order.len());
+    }
+}
+
+#[cfg(test)]
 mod atc_identity_tests {
     //! GH#226: the ATC control plane must be able to register its own
     //! `AirTrafficControl` sender identity even though that name can never
     //! pass the adjective+noun `register_agent` validator.
 
-    use super::register_atc_executor_identity;
+    use super::{AtcExecutorProjectCache, register_atc_executor_identity};
     use asupersync::{Cx, Outcome};
     use fastmcp_core::block_on;
     use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, queries};
@@ -37206,6 +41119,77 @@ mod atc_identity_tests {
                 crate::atc::ATC_AGENT_NAME
             )
         );
+    }
+
+    #[test]
+    fn executor_project_cache_eviction_reuses_the_same_durable_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = make_test_pool(&tmp);
+        let cx = Cx::for_testing();
+        let mut cache = AtcExecutorProjectCache {
+            capacity: 1,
+            ..AtcExecutorProjectCache::default()
+        };
+        let projects: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let root = tmp.path().join(name);
+                std::fs::create_dir_all(&root).unwrap();
+                let key = root.to_string_lossy().into_owned();
+                let project = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                    &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+                    || match block_on(queries::ensure_project(&cx, &pool, &key)) {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure_project failed: {other:?}"),
+                    },
+                );
+                (key, project.id.expect("project id"))
+            })
+            .collect();
+        let first_key = &projects[0].0;
+        let first_id = projects[0].1;
+        cache
+            .ensure(first_key, || {
+                block_on(register_atc_executor_identity(&cx, &pool, first_id))
+            })
+            .unwrap();
+        let original = match block_on(queries::get_agent(
+            &cx,
+            &pool,
+            first_id,
+            crate::atc::ATC_AGENT_NAME,
+        )) {
+            Outcome::Ok(agent) => agent,
+            other => panic!("initial system agent missing: {other:?}"),
+        };
+
+        cache
+            .ensure(&projects[1].0, || {
+                block_on(register_atc_executor_identity(&cx, &pool, projects[1].1))
+            })
+            .unwrap();
+        assert!(!cache.projects.contains(first_key));
+        cache
+            .ensure(first_key, || {
+                block_on(register_atc_executor_identity(&cx, &pool, first_id))
+            })
+            .unwrap();
+        let repeated = match block_on(queries::get_agent(
+            &cx,
+            &pool,
+            first_id,
+            crate::atc::ATC_AGENT_NAME,
+        )) {
+            Outcome::Ok(agent) => agent,
+            other => panic!("re-registered system agent missing: {other:?}"),
+        };
+        assert_eq!(repeated.id, original.id);
+        assert_eq!(repeated.inception_ts, original.inception_ts);
+        assert_eq!(repeated.last_active_ts, original.last_active_ts);
+        assert_eq!(repeated.registration_token, original.registration_token);
+        assert_eq!(repeated.retired_at, original.retired_at);
+        assert_eq!(cache.projects.len(), 1);
+        assert_eq!(cache.insertion_order.len(), 1);
     }
 
     #[test]

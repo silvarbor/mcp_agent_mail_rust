@@ -638,6 +638,7 @@ fn capture_snapshot(
                     redaction_policy: None,
                     track_telemetry: false,
                     search_engine: Some(eng),
+                    surface: None,
                 };
                 // execute_search returns ScopedSearchResponse; extract inner results
                 match execute_search(&cx, &pool, &sq, &opts).await {
@@ -645,6 +646,7 @@ fn capture_snapshot(
                         // Convert ScopedSearchResponse to SearchResponse shape
                         SearchResponse {
                             results: scoped.results.into_iter().map(|sr| sr.result).collect(),
+                            ranking: scoped.ranking,
                             next_cursor: scoped.next_cursor,
                             explain: scoped.explain,
                             assistance: scoped.assistance,

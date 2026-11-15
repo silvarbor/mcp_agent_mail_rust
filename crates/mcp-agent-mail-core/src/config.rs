@@ -347,6 +347,11 @@ pub struct Config {
     pub read_cache_entries_per_category: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
+    /// Run periodic integrity checks, automatic backups and database maintenance.
+    /// Independent of the boot-time probe (default: true).
+    pub integrity_guard_enabled: bool,
+    /// Seconds between background quick-check cycles (default: 300, minimum: 1).
+    pub integrity_quick_check_interval_seconds: u64,
     /// Hours between periodic full `PRAGMA integrity_check` runs
     /// (default: 1, 0 = disabled).
     ///
@@ -403,6 +408,8 @@ pub struct Config {
     pub db_maintenance_enabled: bool,
     pub db_checkpoint_interval_secs: u64,
     pub db_analyze_interval_secs: u64,
+    // Compacts only the isolated ATC telemetry sidecar. Main-mailbox VACUUM
+    // requires an explicit offline `am doctor vacuum --yes` (GH#372).
     pub db_vacuum_interval_secs: u64,
     pub db_journal_size_limit_bytes: u64,
 
@@ -525,6 +532,18 @@ pub struct Config {
     /// a receipt that omits message payload fields. This remains opt-in so the
     /// default MCP/Python-parity send contract is unchanged.
     pub messaging_fail_closed_send_profile: bool,
+    /// Opt-in MCP session-bound agent identity (GH#279,
+    /// `MESSAGING_SESSION_IDENTITY`).
+    ///
+    /// When enabled, an MCP session (one stdio process, or one Streamable
+    /// HTTP session identified by `Mcp-Session-Id`) remembers the agent
+    /// identities it established (`create_agent_identity`, or a
+    /// `register_agent` that created the agent). A bound agent is a verified
+    /// sender in that session without a `sender_token` in the transcript, and
+    /// a session that holds an identity in a project cannot act as another
+    /// agent of that project by naming it. Off by default: the trusted-local,
+    /// stateless contract is unchanged.
+    pub messaging_session_identity: bool,
 
     // Message size limits (bytes). 0 = unlimited.
     pub max_message_body_bytes: usize,
@@ -983,16 +1002,29 @@ impl SearchRolloutConfig {
     /// Applies kill switch degradation (e.g., Hybrid -> Lexical if semantic disabled).
     #[must_use]
     pub fn effective_engine(&self, surface: &str) -> SearchEngine {
-        let base = self
-            .surface_overrides
+        self.allowed_engine(self.configured_engine(surface))
+    }
+
+    /// The engine configured for `surface` (its override, else the global
+    /// engine) before the kill switches are applied.
+    #[must_use]
+    pub fn configured_engine(&self, surface: &str) -> SearchEngine {
+        self.surface_overrides
             .get(surface)
             .copied()
-            .unwrap_or(self.engine);
+            .unwrap_or(self.engine)
+    }
 
-        // Apply kill switch degradation
-        match base {
-            SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Lexical,
-            SearchEngine::Hybrid | SearchEngine::Auto if !self.semantic_enabled => {
+    /// `engine` with the kill switches applied: while semantic search is
+    /// disabled, every semantic-capable engine runs lexical. This also
+    /// governs an explicit per-query request, so asking for an engine cannot
+    /// bypass the switch.
+    #[must_use]
+    pub const fn allowed_engine(&self, engine: SearchEngine) -> SearchEngine {
+        match engine {
+            SearchEngine::Semantic | SearchEngine::Hybrid | SearchEngine::Auto
+                if !self.semantic_enabled =>
+            {
                 SearchEngine::Lexical
             }
             other => other,
@@ -1292,9 +1324,47 @@ fn current_exe_is_cargo_test_artifact() -> bool {
     std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "deps")
+        .is_some_and(path_has_cargo_test_artifact_layout)
+}
+
+/// Cargo test/bench artifact locations, from the executable path alone:
+///
+/// * `<target>/<profile>/deps/<name>-<hash>` (the classic layout), and
+/// * `<target>/<profile>/build/<package>/<hash>/out/<name>-<hash>` (the
+///   build-dir layout of the pinned nightly, also where RCH-relocated test
+///   binaries run from; GH#340). There no binary lives under `deps/`, so a
+///   `deps`-only check left every integration-test binary outside this crate
+///   undetected under plain `cargo test`.
+///
+/// Shipped binaries (`<target>/<profile>/am`, `~/.local/bin/am`) match neither.
+fn path_has_cargo_test_artifact_layout(exe: &Path) -> bool {
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        return true;
+    }
+    let in_build_out_dir = parent.file_name().is_some_and(|name| name == "out")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "build");
+    in_build_out_dir
+        && exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(has_cargo_metadata_hash_suffix)
+}
+
+/// `<name>-<16 hex digits>` (optionally `.exe`): the hash Cargo appends to
+/// test and bench artifacts. Build-script outputs in `out/` carry no such tag.
+fn has_cargo_metadata_hash_suffix(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    stem.rsplit_once('-').is_some_and(|(name, hash)| {
+        !name.is_empty() && hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    })
 }
 
 /// When this process is running under a test harness and `storage_root`
@@ -1578,6 +1648,8 @@ impl Default for Config {
             read_cache_entries_per_category: CacheProfile::Balanced
                 .read_cache_entries_per_category(),
             integrity_check_on_startup: true,
+            integrity_guard_enabled: true,
+            integrity_quick_check_interval_seconds: 300,
             integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
@@ -1612,7 +1684,7 @@ impl Default for Config {
             db_maintenance_enabled: true,
             db_checkpoint_interval_secs: 300, // passive WAL checkpoint every 5 min
             db_analyze_interval_secs: 21_600, // refresh planner stats every 6 h
-            db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
+            db_vacuum_interval_secs: 86_400,  // ATC sidecar only, daily (0 disables)
             // 16 MiB WAL truncation cap: an automatic checkpoint over the cap is
             // promoted to TRUNCATE. Every fresh engine connection rescans the whole
             // WAL, so a smaller WAL is cheaper per send (br-v0ucm, br-yzk37).
@@ -1723,6 +1795,7 @@ impl Default for Config {
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
             messaging_fail_closed_send_profile: false,
+            messaging_session_identity: false,
 
             // Message size limits
             max_message_body_bytes: 1_048_576,   // 1 MiB
@@ -2128,6 +2201,13 @@ impl Config {
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
         );
+        config.integrity_guard_enabled =
+            env_bool("INTEGRITY_GUARD_ENABLED", config.integrity_guard_enabled);
+        config.integrity_quick_check_interval_seconds = env_u64(
+            "INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS",
+            config.integrity_quick_check_interval_seconds,
+        )
+        .max(1);
 
         // Periodic SQLite maintenance knobs (bead K4). Each interval is in
         // seconds; 0 disables that op (and `DB_MAINTENANCE_ENABLED=false`
@@ -2476,6 +2556,10 @@ impl Config {
         config.messaging_fail_closed_send_profile = env_bool(
             "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
             config.messaging_fail_closed_send_profile,
+        );
+        config.messaging_session_identity = env_bool(
+            "MESSAGING_SESSION_IDENTITY",
+            config.messaging_session_identity,
         );
 
         // Message size limits
@@ -3501,6 +3585,14 @@ fn process_env_override_value(key: &str) -> Option<String> {
 static TEST_SERIALIZER: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+thread_local! {
+    /// Set while this thread is inside an override scope. Locking
+    /// `TEST_SERIALIZER` again from the same thread never returns, and every
+    /// later scope in the binary then queues behind it.
+    static IN_PROCESS_ENV_OVERRIDE_SCOPE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 struct ProcessEnvOverrideGuard {
     previous: Vec<(String, Option<String>)>,
 }
@@ -3523,14 +3615,23 @@ impl Drop for ProcessEnvOverrideGuard {
             }
         }
         global_config_cache_reset();
+        IN_PROCESS_ENV_OVERRIDE_SCOPE.set(false);
     }
 }
 
+/// Panics when called from inside another override scope on the same thread
+/// (including the isolated-storage-root helpers): pass every override to the
+/// outer scope instead.
 #[doc(hidden)]
 pub fn with_process_env_overrides_for_test<R>(
     overrides: &[(&str, &str)],
     f: impl FnOnce() -> R,
 ) -> R {
+    assert!(
+        !IN_PROCESS_ENV_OVERRIDE_SCOPE.get(),
+        "nested env-override scope: this thread already holds one and would deadlock \
+         the test binary; pass these overrides to the outer scope"
+    );
     let _lock = TEST_SERIALIZER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3550,6 +3651,7 @@ pub fn with_process_env_overrides_for_test<R>(
 
     global_config_cache_reset();
     let restore = ProcessEnvOverrideGuard { previous };
+    IN_PROCESS_ENV_OVERRIDE_SCOPE.set(true);
     let result = f();
     drop(restore);
     result
@@ -5757,23 +5859,111 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Index just past the `}` matching the `{` at `open`. Braces inside
-    /// string/char literals are not special-cased; the scanned blocks keep
-    /// them balanced.
+    /// comments and string, raw-string and char literals do not count: the
+    /// server's test module holds unbalanced ones (JSON fragments), and a
+    /// module that never closes is not stripped at all.
     fn matching_brace_end(source: &str, open: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
         let mut depth = 0usize;
-        for (offset, ch) in source[open..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
+        let mut at = open;
+        while at < bytes.len() {
+            at = match bytes[at] {
+                b'{' => {
+                    depth += 1;
+                    at + 1
+                }
+                b'}' => {
                     depth = depth.checked_sub(1)?;
                     if depth == 0 {
-                        return Some(open + offset + 1);
+                        return Some(at + 1);
+                    }
+                    at + 1
+                }
+                b'/' if bytes.get(at + 1) == Some(&b'/') => source[at..]
+                    .find('\n')
+                    .map_or(bytes.len(), |line| at + line),
+                b'/' if bytes.get(at + 1) == Some(&b'*') => block_comment_end(bytes, at)?,
+                b'"' => string_end(bytes, at + 1)?,
+                b'r' if opens_raw_literal(bytes, at) => {
+                    raw_string_end(source, at + 1).unwrap_or(at + 1)
+                }
+                b'\'' => char_literal_end(source, at).unwrap_or(at + 1),
+                _ => at + 1,
+            };
+        }
+        None
+    }
+
+    /// `r` at `at` starts a raw string (`r"`, `r#"`, `br"`) or a raw
+    /// identifier, not the tail of an identifier such as `bar`.
+    fn opens_raw_literal(bytes: &[u8], at: usize) -> bool {
+        let ends_identifier = at.checked_sub(1).is_some_and(|prev| {
+            let byte = bytes[prev];
+            (byte.is_ascii_alphanumeric() || byte == b'_') && byte != b'b'
+        });
+        !ends_identifier && matches!(bytes.get(at + 1), Some(b'"' | b'#'))
+    }
+
+    /// Past the `*/` closing the (nesting) block comment opened at `at`.
+    fn block_comment_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+        let mut nesting = 0usize;
+        while at + 1 < bytes.len() {
+            match (bytes[at], bytes[at + 1]) {
+                (b'/', b'*') => {
+                    nesting += 1;
+                    at += 2;
+                }
+                (b'*', b'/') => {
+                    nesting -= 1;
+                    at += 2;
+                    if nesting == 0 {
+                        return Some(at);
                     }
                 }
-                _ => {}
+                _ => at += 1,
             }
         }
         None
+    }
+
+    /// Past the unescaped `"` at or after `at`.
+    fn string_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'"' => return Some(at + 1),
+                _ => at += 1,
+            }
+        }
+        None
+    }
+
+    /// Past a raw string whose hashes/quote start at `at` (just after `r`),
+    /// or `None` when `r#` is a raw identifier rather than a string.
+    fn raw_string_end(source: &str, at: usize) -> Option<usize> {
+        let hashes = source[at..].bytes().take_while(|b| *b == b'#').count();
+        let body = at + hashes;
+        if source.as_bytes().get(body) != Some(&b'"') {
+            return None;
+        }
+        let close = format!("\"{}", "#".repeat(hashes));
+        source[body + 1..]
+            .find(&close)
+            .map(|end| body + 1 + end + close.len())
+    }
+
+    /// Past the char literal opening at `at`, or `None` for a lifetime/label.
+    fn char_literal_end(source: &str, at: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        if bytes.get(at + 1) == Some(&b'\\') {
+            // Skip the escaped character itself (it may be a quote), then
+            // the rest of the escape (`\u{7b}`) up to the closing quote.
+            let escaped = at + 2 + source[at + 2..].chars().next()?.len_utf8();
+            return source[escaped..].find('\'').map(|end| escaped + end + 1);
+        }
+        let ch = source[at + 1..].chars().next()?;
+        let close = at + 1 + ch.len_utf8();
+        (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
     }
 
     /// `source` without the item that starts at `header` (through the `}`
@@ -6063,6 +6253,11 @@ mod tests {
             "Python-DB discovery needs the raw URL; Config substitutes the Rust default when unset",
         ),
         (
+            "STORAGE_ROOT",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "explicit-vs-default provenance: the installed hook bakes in only an explicitly configured root and computes the default itself at commit time",
+        ),
+        (
             "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
             "mcp-agent-mail-guard/src/lib.rs",
             "git hook contract: the guard gates on the committing process env, like the hook script",
@@ -6097,6 +6292,31 @@ mod tests {
         assert_eq!(
             raw_rereads(&names, &sources),
             vec![("FOO_KNOB".to_string(), "a.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_module_stripping_skips_braces_in_literals_and_comments() {
+        let source = r##"fn before() { var("KEEP_BEFORE"); }
+#[cfg(test)]
+mod tests {
+    const OPEN: &str = "{\"jsonrpc\"";
+    const RAW: &str = r#"}"{"#;
+    const BYTE: u8 = b'{';
+    const ESC: char = '\u{7b}';
+    const QUOTE: char = '\'';
+    fn life<'a>(x: &'a str) -> &'a str { x } // }
+    /* { /* } */ */
+    fn read() { var("TEST_ONLY"); }
+}
+fn after() { var("KEEP_AFTER"); }
+"##;
+        let stripped = strip_inline_test_modules(source);
+        assert!(stripped.contains("KEEP_BEFORE"), "{stripped}");
+        assert!(!stripped.contains("TEST_ONLY"), "{stripped}");
+        assert!(
+            stripped.contains("KEEP_AFTER"),
+            "the module must end at its own brace: {stripped}"
         );
     }
 
@@ -7309,6 +7529,40 @@ mod tests {
     }
 
     #[test]
+    fn integrity_guard_and_startup_flags_resolve_independently() {
+        assert!(Config::default().integrity_guard_enabled);
+        assert_eq!(
+            Config::default().integrity_quick_check_interval_seconds,
+            300
+        );
+        for (startup, guard, maintenance) in [
+            ("false", "true", "true"),
+            ("true", "false", "true"),
+            ("false", "true", "false"),
+        ] {
+            with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[
+                    ("INTEGRITY_CHECK_ON_STARTUP", startup),
+                    ("INTEGRITY_GUARD_ENABLED", guard),
+                    ("DB_MAINTENANCE_ENABLED", maintenance),
+                    ("INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS", "0"),
+                ],
+                |_| {
+                    let config = Config::from_env();
+                    assert_eq!(config.integrity_check_on_startup, startup == "true");
+                    assert_eq!(config.integrity_guard_enabled, guard == "true");
+                    assert_eq!(config.db_maintenance_enabled, maintenance == "true");
+                    assert_eq!(config.integrity_quick_check_interval_seconds, 1);
+                    let flag = crate::flags::find_flag("INTEGRITY_GUARD_ENABLED").unwrap();
+                    let snapshot = crate::flags::flag_snapshot(&config, flag);
+                    assert_eq!(snapshot.current_value, guard);
+                    assert_eq!(snapshot.source, "env");
+                },
+            );
+        }
+    }
+
+    #[test]
     fn isolated_default_storage_root_helper_redirects_default_root_into_tempdir() {
         // br-99aih: the helper must hand tests a default storage root that is
         // (a) the default root by every definition the guard uses, (b) not
@@ -7375,6 +7629,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nested_env_override_scope_panics_instead_of_deadlocking() {
+        let nested = std::panic::catch_unwind(|| {
+            with_isolated_default_storage_root_for_test(|_| {
+                with_process_env_overrides_for_test(&[("HTTP_PORT", "48124")], || ());
+            });
+        });
+        let message = nested.expect_err("a nested scope must not proceed");
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| message.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("nested env-override scope"), "{message}");
+
+        // The unwound outer scope released the lock and restored its keys.
+        let (port, storage_root) =
+            with_process_env_overrides_for_test(&[("HTTP_PORT", "48125")], || {
+                (
+                    Config::from_env().http_port,
+                    process_env_override_value("STORAGE_ROOT"),
+                )
+            });
+        assert_eq!(port, 48125);
+        assert_eq!(storage_root, None);
+    }
+
     // -----------------------------------------------------------------------
     // C2/C3 — test-mode guard against default storage_root fall-through
     // -----------------------------------------------------------------------
@@ -7404,6 +7685,40 @@ mod tests {
                 guard_against_default_storage_root_in_test_mode(&explicit);
             },
         );
+    }
+
+    #[test]
+    fn cargo_test_artifacts_are_recognised_in_both_layouts() {
+        // GH#340: the pinned nightly (and RCH-relocated binaries) run tests from
+        // `build/<package>/<hash>/out/`, where a `deps`-only check missed them.
+        for test_binary in [
+            "/w/target/debug/deps/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-storage/62e7a103e31a8cdc/out/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-db/fffffffffffffff0/out/mcp_agent_mail_db-a1b2c3d4e5f60718",
+            "/w/target/debug/build/mcp-agent-mail-cli/0123456789abcdef/out/it-0123456789abcdef.exe",
+        ] {
+            assert!(
+                path_has_cargo_test_artifact_layout(Path::new(test_binary)),
+                "{test_binary} is a cargo test artifact"
+            );
+        }
+        // Shipped binaries, build-script outputs and look-alikes must never be
+        // mistaken for a test harness (the guard would then refuse real use).
+        for not_a_test in [
+            "/home/u/.local/bin/am",
+            "/w/target/release/am",
+            "/w/target/debug/mcp-agent-mail",
+            "/w/target/debug/build/zstd-sys/0123456789abcdef/out/libzstd.a",
+            "/w/target/debug/build/pkg/0123456789abcdef/out/gen-notahexhash12",
+            "/w/target/debug/build/pkg/out/it-0123456789abcdef",
+            "/srv/out/it-0123456789abcdef",
+            "am",
+        ] {
+            assert!(
+                !path_has_cargo_test_artifact_layout(Path::new(not_a_test)),
+                "{not_a_test} is not a cargo test artifact"
+            );
+        }
     }
 
     #[test]
@@ -7852,6 +8167,35 @@ mod tests {
             SearchEngine::Hybrid
         );
         assert_eq!(cfg.effective_engine("other_tool"), SearchEngine::Legacy);
+    }
+
+    #[test]
+    fn allowed_engine_applies_the_kill_switch_to_explicit_requests() {
+        let disabled = SearchRolloutConfig::default();
+        assert!(!disabled.semantic_enabled, "semantic search is opt-in");
+        for requested in [
+            SearchEngine::Semantic,
+            SearchEngine::Hybrid,
+            SearchEngine::Auto,
+        ] {
+            assert_eq!(disabled.allowed_engine(requested), SearchEngine::Lexical);
+        }
+        let enabled = SearchRolloutConfig {
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(
+            enabled.allowed_engine(SearchEngine::Hybrid),
+            SearchEngine::Hybrid
+        );
+        assert_eq!(
+            enabled.allowed_engine(SearchEngine::Auto),
+            SearchEngine::Auto
+        );
+        assert_eq!(
+            disabled.allowed_engine(SearchEngine::Lexical),
+            SearchEngine::Lexical
+        );
     }
 
     #[test]
@@ -8366,5 +8710,58 @@ mod tests {
         assert!(log_level_silences_dependency_warnings("off"));
         assert!(!log_level_silences_dependency_warnings("warn"));
         assert!(!log_level_silences_dependency_warnings("debug"));
+    }
+
+    /// br-kp1in.20: auxiliary runtime knobs (`AM_GIT_FLOCK_TIMEOUT_SECS`,
+    /// `AM_GIT_BINARY`, `AM_IDEMPOTENCY_RETENTION_SECS`, `STARTUP_READINESS_BIND_TIMEOUT_SECS`,
+    /// `AM_TUI_THREAD_PAGE_SIZE`, `AM_TUI_FULL_REDRAW_MAX_SECS`) route through
+    /// `env_value` / `infra_env_value` so `config.env` reaches them.
+    #[test]
+    fn user_config_env_reaches_flock_timeout_and_git_binary_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_config = tmp.path().join("xdg-config");
+        let app_config_dir = xdg_config.join(XDG_APP_DIR);
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&app_config_dir).expect("create app config dir");
+        std::fs::write(
+            app_config_dir.join("config.env"),
+            "AM_GIT_FLOCK_TIMEOUT_SECS=77\n\
+             AM_GIT_BINARY=/custom/git/from/user/config/env\n\
+             AM_IDEMPOTENCY_RETENTION_SECS=3600\n\
+             STARTUP_READINESS_BIND_TIMEOUT_SECS=45\n\
+             AM_TUI_THREAD_PAGE_SIZE=150\n\
+             AM_TUI_FULL_REDRAW_MAX_SECS=12.5\n",
+        )
+        .expect("write config.env");
+
+        let home_str = home.to_string_lossy().into_owned();
+        let xdg_str = xdg_config.to_string_lossy().into_owned();
+        with_process_env_overrides_for_test(
+            &[
+                ("HOME", home_str.as_str()),
+                ("XDG_CONFIG_HOME", xdg_str.as_str()),
+            ],
+            || {
+                assert_eq!(crate::git_lock::flock_timeout_secs(), 77);
+                assert_eq!(
+                    infra_env_value("AM_GIT_BINARY").as_deref(),
+                    Some("/custom/git/from/user/config/env")
+                );
+                assert_eq!(
+                    env_value("AM_IDEMPOTENCY_RETENTION_SECS").as_deref(),
+                    Some("3600")
+                );
+                assert_eq!(
+                    env_value("STARTUP_READINESS_BIND_TIMEOUT_SECS").as_deref(),
+                    Some("45")
+                );
+                assert_eq!(env_value("AM_TUI_THREAD_PAGE_SIZE").as_deref(), Some("150"));
+                assert_eq!(
+                    env_value("AM_TUI_FULL_REDRAW_MAX_SECS").as_deref(),
+                    Some("12.5")
+                );
+            },
+        );
     }
 }

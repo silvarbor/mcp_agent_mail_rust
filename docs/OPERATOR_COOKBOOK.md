@@ -81,6 +81,78 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
+only that startup probe. The background guard remains enabled and starts its
+first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,
+minimum 1). The integrity verdict stays yellow with the configured skip and
+scheduled time until a full check passes; a failed check stays red. The full
+check cadence remains `INTEGRITY_CHECK_INTERVAL_HOURS` (default 1; `0` disables
+scheduled full checks).
+
+Keep `INTEGRITY_GUARD_ENABLED=true` to retain periodic checks and automatic
+backups. Setting it to `false` disables the entire worker, including database
+maintenance. To disable only checkpoint/ANALYZE/VACUUM/journal-size maintenance,
+use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
+take effect when the server starts. Existing service overrides remain an
+operator decision; inspect them before changing a deployment.
+
+### Verify a mailbox before upgrading [read-only]
+
+Use the installed binary and the same `STORAGE_ROOT` and `DATABASE_URL` as
+the service. Stop the service gracefully through its supervisor and prevent
+automatic restarts while inspecting or copying the mailbox. Then run:
+
+```bash
+am doctor locks --json
+am doctor drain --json
+am doctor check --json
+am doctor archive-verify --json
+am doctor backups --json
+```
+
+Inspect `safe_to_mutate` in the drain report; its exit code alone does not
+prove the owner has stopped. Resolve findings before upgrading. Preserve an
+offline copy of the entire storage directory and, if the database lives
+elsewhere, its complete database family, including WAL, SHM, engine sidecars,
+and recovery artifacts. Keep the old binary and the diagnostic output. Copy
+only while all mailbox writers remain stopped; copying the main SQLite file
+alone can omit committed WAL data.
+
+There is no required standalone forced-checkpoint command in this procedure.
+Do not delete WAL, SHM, certificate, or namespace files to make an upgrade
+start. `am doctor check` is verification, not a promise to checkpoint or
+migrate. Start the new binary with the same configuration, then repeat the
+checks and review startup logs. Preserve the offline copy until verification
+passes. A support bundle can retain sanitized diagnostic evidence:
+
+```bash
+am doctor support-bundle --output-dir /abs/path/upgrade-evidence --json
+```
+
+For GH#357, startup may reconcile archive-ahead state before normal pool
+migrations. Bounded replay now prepares its required additive message columns
+transactionally through canonical SQLite before querying them; the ordinary
+migration runner subsequently records the migrations and performs dependent
+work. When columns are added, canonical record materialization preserves
+legacy row values before runtime reads resume. Replay rechecks missing IDs in
+its write transaction and leaves already present messages untouched. If
+post-apply inventories still disagree, the reconcile fails without
+reconstructing; a primary that passed its health check keeps serving, with the
+drift left pending for the periodic retry. The startup warning says to run
+`am doctor health`, then `am doctor reconstruct --yes` to retry under
+supervision.
+A replay/schema error rolls back and stops reconciliation without
+reconstructing a healthy primary. Existing corruption recovery still has its
+separate health checks and recovery admission controls.
+
+Archive-ahead means inventory drift, not confirmed corruption. A successful
+reconciliation message does not establish damage. The reported 984-versus-982
+upgrade discrepancy has not been reproduced here; stale WAL certification is
+an unverified hypothesis. Keep the complete pre-upgrade database family and
+logs if inventories disagree. Do not infer missing committed rows from an
+`immutable=1` read of a main file when a populated WAL exists: that mode ignores
+the WAL.
+
 ## 3. Register a named operator agent [stateful]
 
 **Goal:** Create or refresh an explicit agent identity for a project.
@@ -108,6 +180,75 @@ metadata for that exact agent name.
 or omit `--name` and let the CLI generate one. If the project key is wrong, the
 agent will be registered in the wrong archive namespace.
 
+### Change an existing identity's reaper exemption
+
+Preview the metadata change before applying it:
+
+```bash
+PROJECT=/abs/path/project
+AGENT=BlueLake
+
+am agents set-reaper-exempt \
+  --project "$PROJECT" --agent "$AGENT" --exempt false --dry-run --json
+```
+
+The preview reports `before.reaper_exempt`, `after.reaper_exempt`, and
+`would_change`; `changed` and `archive_written` remain false. It reads an existing
+mailbox and does not register a project or identity. Missing or ambiguous
+project/agent names are refused.
+
+For the stateful operation, gracefully stop the mailbox owner through its usual
+supervisor, then inspect `am doctor locks --json` and `am doctor drain --json`.
+Confirm `safe_to_mutate` before applying:
+
+```bash
+am agents set-reaper-exempt \
+  --project "$PROJECT" --agent "$AGENT" --exempt false --json
+```
+
+The command holds the existing mailbox ownership locks through the database and
+archive updates, and refuses an unsupported live-owner write. It changes only
+the exemption flag and its archived profile field. Registration credentials,
+agent ID, program/model/task, pane binding, retirement/deregistration state, and
+last-active time are preserved. Credentials are never included in the receipt.
+Use `--exempt true` to explicitly protect an identity from the inactivity reaper;
+existing exemptions remain sticky until explicitly changed.
+
+A repeated request reports `changed: false`. It still checks the archive, so the
+same command can repair a missing or stale profile after an earlier partial
+failure. A missing profile is recreated from non-secret identity metadata;
+malformed, mismatched, or symlinked profiles are refused. If the database flag
+committed but archive publication failed, the command exits with an error
+containing `db_committed=true`; resolve the reported archive problem and retry
+the same command. Restart the mailbox service after the maintenance window.
+
+The reaper itself rechecks eligibility in its write transaction. An identity
+that becomes active or exempt after a sweep selects it is preserved, and the
+sweep reports it in `skipped_changed_count` rather than `reaped_count`.
+
+### Merge two keys of one repository with `am projects adopt`
+
+`am projects adopt SOURCE TARGET` prints a plan and changes nothing. With
+`--apply` it re-keys the source project's agents, messages and file
+reservations to the target, moves its product links, moves the source's archive
+files into the target's archive, and records the source slug in the target's
+`aliases.json`. It refuses when an agent name exists in both projects. Applying
+needs exclusive local mailbox ownership, like the reaper-exemption change
+above.
+
+Both keys must resolve to the same Git common directory: two worktrees of one
+repository, or two directories inside one checkout. The plan's last line says
+which case applies:
+
+- `- Plan status: executable; rerun with --apply to perform it` (exit 0)
+- `- Plan status: refused; nothing was changed` (exit 1, with or without
+  `--apply`)
+
+There is no supported re-key for a project key that is not inside a Git
+repository, such as a plain coordination directory. Keep using the existing
+key. If a new key is needed, register agents under it; the old project's
+messages stay readable under the old key.
+
 ## 4. Triage urgent inbox items and ack backlog [read-only]
 
 **Goal:** See what needs attention first for one operator.
@@ -117,12 +258,13 @@ PROJECT=/abs/path/project
 AGENT=BlueLake
 
 am robot status --project "$PROJECT" --agent "$AGENT" --format toon
-am robot inbox --project "$PROJECT" --agent "$AGENT" --urgent --format md
+am robot inbox --project "$PROJECT" --agent "$AGENT" --urgent --format toon
 am robot inbox --project "$PROJECT" --agent "$AGENT" --ack-overdue --format toon
 ```
 
-**Expected output:** A compact status summary, then a human-readable urgent
-inbox view, then a focused list of ack-overdue items.
+**Expected output:** A compact status summary, then the urgent inbox, then a
+focused list of ack-overdue items. (`--format md` is only accepted by
+`am robot thread` and `am robot message`.)
 
 **Troubleshooting:** If the inbox comes back empty unexpectedly, confirm the
 agent name spelling with `am agents list --project "$PROJECT"`. If the mailbox
@@ -164,7 +306,7 @@ print((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec='sec
 PY
 )"
 
-am robot timeline --project "$PROJECT" --agent "$AGENT" --since "$SINCE" --format md
+am robot timeline --project "$PROJECT" --source "$AGENT" --since "$SINCE" --format toon
 am robot analytics --project "$PROJECT" --agent "$AGENT" --format toon
 ```
 
@@ -210,6 +352,152 @@ for the named paths, and a broader list of active reservations in the project.
 **Troubleshooting:** If you see a conflict, wait for the TTL to expire or
 coordinate in-thread with the holder before editing. Do not work around the
 reservation by touching the file anyway.
+
+### Read reservations through an already running server
+
+A healthy server can keep serving its admitted database connections while a
+new CLI read-only connection is refused with `database is busy (recovery in
+progress)` (GH#368). Select the existing server's authoritative MCP resource
+with `--server`; this read mode never opens, migrates, repairs, or reconstructs
+the local mailbox and does not require restarting the owner.
+
+```bash
+PROJECT=/abs/path/project
+export AGENT_MAIL_URL=http://127.0.0.1:8765/mcp/
+# Supply the existing server credential through AGENT_MAIL_TOKEN or
+# HTTP_BEARER_TOKEN when authentication is enabled; do not disable server auth.
+
+am reservations --project "$PROJECT" --all --json --server
+am file_reservations active "$PROJECT" --server
+am robot navigate "resource://file_reservations?project=$PROJECT&active_only=true" \
+  --project "$PROJECT" --json --server
+```
+
+`--server` is also supported by `am robot reservations` and by
+`am file_reservations list`, `soon`, and `conflicts`. JSON fields, table columns,
+agent filtering, expiry warnings, conflict detection, and navigation ordering
+remain the same. Reservation attestation identifies `source: "mcp_server"`;
+the database/archive comparison fields are null because no local database was
+read.
+
+Without `--server`, `am reservations`, `am robot reservations` and
+`am file_reservations list`, `active`, `soon` and `conflicts` first try a
+loopback server whose reported database and storage root match the CLI's own
+configuration. The probe has a 2 s timeout. If such a server answers, the read
+goes through it and its authentication, protocol and identity failures are
+errors. If no server answers, or the server is older and does not report its
+mailbox, or it serves a different mailbox, the command reads the local files
+directly. With `WORKTREES_ENABLED` and a Git `PROJECT_IDENTITY_MODE`, an
+absolute project path always uses the direct read. `am robot navigate` reads
+directly unless `--server` is given. Use `--server` when automation must never
+fall back to the local files.
+
+The endpoint follows the existing client configuration (`AGENT_MAIL_URL`, or
+the configured `HTTP_HOST`, `HTTP_PORT`, and `HTTP_PATH` with existing local
+owner discovery). `AGENT_MAIL_TOKEN` takes precedence over the existing
+configured/service bearer token. Select the intended endpoint explicitly when
+more than one mailbox is available. The CLI verifies the stored project ID,
+slug, human key, creation timestamp, and agent roster before and after reading;
+an absolute project path must match the stored path, including canonical path
+aliases. Navigation rejects a URI project that disagrees with `--project` or
+`AGENT_MAIL_PROJECT`. It does not infer a different project from a colliding
+slug or create a missing project. An explicit `--agent` must be present in the
+verified roster. Complete snapshots include retired reservation holders; on
+older servers, explicit agent selection uses the available-agent directory.
+
+For project-wide automation, use `am reservations --all --json --server`:
+`--all` includes every agent's active reservations, not released history.
+`am file_reservations active` remains a text view with a default display limit
+of 50 rows.
+
+Authentication failure, an unavailable server, changed/mismatched identity,
+redirects, malformed responses, and incomplete lists exit nonzero without
+printing a reservation result or falling back to local/archive data. Automation
+must check the exit status before using stdout or deciding that no leases exist.
+
+**Server protocol and completeness:** A snapshot-capable server returns the
+project, holder identities, and complete reservation set from one database
+read scope. The client validates the snapshot's version, completeness marker,
+row count, project and holder IDs, timestamps, and requested active/history
+scope. A snapshot is bounded to 10,000 reservations and holder identities and
+4 MiB of JSON; exceeding a bound is an error, never a truncated success.
+
+**Large reservation histories (GH#377):** `am file_reservations list <project>
+--all` now handles that specific capacity refusal by requesting a materialized
+paged snapshot from the same authenticated endpoint. This also applies when
+the matching local daemon is selected automatically. The running server must
+contain the paged-snapshot implementation; upgrade and restart older servers.
+The CLI never substitutes an unverified local database after a server refusal.
+
+The server captures the entire bounded history in one database read scope and
+releases that connection before serving cached pages. Concurrent inserts,
+deletes, releases, and renewals cannot move page boundaries or change an
+already-captured row. The result is complete **as of that capture**, not as of
+the last HTTP request. A fresh read sees later changes. Project recreation,
+mailbox engine replacement, or changed project/agent authority still causes
+the read to fail closed.
+
+The larger snapshot is bounded to 100,000 reservations and holder identities,
+64 MiB of serialized pages (including repeated identity metadata), and at most
+250 reservations / 4 MiB per response. Pages may be short because of bytes;
+only `next_offset: null` signals the terminal page. One row or the required
+identity metadata that cannot fit a page is rejected explicitly. The server
+keeps at most four snapshots and 128 MiB of serialized cache data, counting
+in-progress captures against capacity. Tokens expire after 300 seconds without
+refresh and are lost on server restart. Capacity, expiry, authentication, or
+validation errors discard accumulated rows; retry the command from the start.
+The CLI also bounds the read to 1,024 page requests and a 300-second deadline.
+
+For a raw MCP client, start with
+`resource://file_reservations/<slug>?snapshot_pages=true&active_only=false&format=json`.
+Validate `schema_version: 1` and `consistency: "materialized_snapshot"`, then
+continue with the same URI plus `snapshot_token=<returned-token>` and
+`offset=<next_offset>`. The token, captured timestamp, project, full holder
+roster, history scope, and total count remain identical across every page.
+Check contiguous offsets, exact counts, and ascending `(created_ts, id)` order;
+do not publish a complete result until the terminal page accounts for the
+entire `total_count`. Each continuation passes normal server authentication.
+Neither `limit` nor `snapshot` is accepted alongside `snapshot_pages=true`.
+
+Pages advertising `supports_release: true` support explicit cache cleanup.
+After consuming or abandoning a snapshot, use the same URI with
+`snapshot_token=<returned-token>&snapshot_release=true`, omitting `offset`.
+The authenticated response identifies the token and reports `released: true`
+when it frees the entry, or `released: false` when the token is already gone.
+Repeating release is safe; a known token with the wrong project or mailbox
+scope is rejected without removing it. Normal page reads remain repeatable
+until release or expiry. The CLI automatically attempts this cleanup with a
+two-second request timeout, without replacing a successful result or the
+original read error if cleanup fails. This allows repeated large-history reads
+to reuse the cache immediately. Process termination, lost authorization, and
+older paged servers without the capability still rely on the 300-second expiry.
+
+An already-running v0.3.39 server supports only ordinary resource pages and
+ignores the newer `snapshot` parameter. A newer client recognizes only a
+successful, well-formed array response as that older protocol. It discards
+this initial response, which may contain only the default 20 rows, then reads
+the same resource from the same authenticated endpoint with explicit
+`limit=250&offset=0`. Only a short page (at most 249 matching reservations) is
+accepted as complete. A full 250-row page is refused even when a smaller CLI
+display or navigation limit was requested. The project and available-agent
+roster are still verified before and after the read. This path needs a client
+containing the server-read implementation, but no server restart or mailbox
+change. The released v0.3.39 CLI itself does not have `--server`.
+
+An authentication/transport error, unrelated RPC error, invalid envelope, or
+malformed snapshot object never causes protocol negotiation. Only a recognized
+snapshot-capacity refusal enables the new history path. The client does not
+combine independent OFFSET pages, change endpoints, or read local storage
+after a refusal. Numeric JSON-RPC codes and bounded, sanitized server reasons
+remain visible; unrelated rejections no longer suggest checking authentication.
+Keep automation blocked if it cannot establish a complete result. Active-only
+safety reads retain the original single-snapshot limits; larger sets on an
+older server still require an upgraded server or an independently successful
+direct read for a complete safety decision.
+
+Navigation sorts the verified complete result into its existing newest-first
+order before applying `limit`/`offset`. These reads observe reservation state;
+they do not prevent later lease changes or make subsequent cleanup atomic.
 
 ## 9. Release a crashed agent's reservations [stateful]
 
@@ -294,7 +582,7 @@ archive.
 
 ```bash
 PROJECT=/abs/path/project
-OUT=~/mailbox-share.zip
+OUT=~/mailbox-share
 AGE_RECIPIENT=age1example...
 
 am share export --output "$OUT" --project "$PROJECT" --dry-run
@@ -302,9 +590,15 @@ am share export --output "$OUT" --project "$PROJECT" --zip --age-recipient "$AGE
 am share verify "$OUT"
 ```
 
-**Expected output:** The dry run summarizes what would be exported, the real
-export writes the bundle to `OUT`, and verify confirms the resulting archive is
-well-formed.
+**Expected output:** The dry run summarizes what would be exported. The real
+export writes the bundle directory to `OUT` and the encrypted archive beside it
+(`$OUT.zip.age`; `$OUT.zip` without `--age-recipient`). `am share verify` checks
+a bundle directory, not an archive: to check what you will ship, run
+`am share decrypt "$OUT.zip.age"` (it writes `$OUT.zip`), unzip that, and verify
+the unpacked directory. It hashes every file the export wrote against the
+manifest (`Files valid`), so with a signature the whole bundle is covered; the
+hosting config the deploy wizard rewrites per provider (`_headers`,
+`_redirects`, `.nojekyll`) is left out.
 
 **Troubleshooting:** If you need a different scrub profile or chunking behavior,
 add the relevant `am share export` flags explicitly. Use a real Age recipient
@@ -339,7 +633,7 @@ am doctor check "$PROJECT" --format toon
 am doctor backups --format toon
 
 # Reliability diagnostics (all read-only; run before any mutating repair):
-am doctor health --format json        # one-line multi-verdict health rollup
+am doctor health                      # one-line multi-verdict health rollup; exit 1 on findings
 am doctor locks --json                # owner intelligence: who holds the mailbox (live/wedged/stale)
 am doctor drain                       # is it safe_to_mutate right now? (no live owner)
 am doctor mcp-selftest --format json  # live MCP round-trip self-test
@@ -349,13 +643,272 @@ am doctor support-bundle --json       # sanitized incident bundle for maintainer
 
 **Expected output:** `doctor check` reports archive or database problems, and
 `doctor backups` lists any available backup snapshots or recovery artifacts.
+With `--json`, `--format json`, or `--format toon`, `doctor check` exits 0 when
+it produces the report, including reports with `healthy: false`. Scripts must
+inspect the top-level `healthy` field. Table output exits 1 when `healthy` is
+false; use `am doctor health` for a simple exit-status health gate. An installer
+smoke test that checks only the structured command's exit 0 proves report
+execution; mailbox health requires reading the result or running the health gate.
 `doctor locks` / `doctor drain` tell you whether a live `am` still owns the
 mailbox — `repair` and `reconstruct` refuse while a live owner is present, so
 drain it via your supervisor first (never kill `am` directly).
+`doctor health` prints `warn: reservation parity: reconciling N ...` and exits
+0 when the only reservation drift is releases the server's background
+reconciler is visibly republishing (one repaired within the last 10 minutes).
+If that reconciler is not running or has stopped making progress, health exits
+1 and names the `am doctor fix --only ... --yes` command that repairs the drift.
 
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
+
+### Automatic backup retention and actual disk reclamation
+
+Successful automatic publication runs retention immediately, including during
+long-running server operation. On supported Unix systems the default policy
+physically removes superseded periodic backup generations when verification
+and filesystem checks establish that doing so preserves recovery. Rotation of
+incident evidence into `doctor/reclaimable/` remains a move: those bytes still
+occupy the filesystem.
+
+`AM_BACKUP_KEEP_COUNT` requests the newest three generations per backup kind by
+default, with a minimum of one. For periodic backups, this is one window across
+images beside the database and eligible images in native
+`doctor/reclaimable/rotation-*/` directories. Dated periodic generations are
+ordered by their filename timestamps and collision suffixes, independently of
+directory names or copy-preserved modification times. The current `.bak`
+publication slot retains its modification-time ordering and counts toward that
+window; it and the exact verified recovery generation remain protected even
+when they fall outside it. Automatic deletion accepts only strict
+timestamped periodic names, requires a fully verified newer restore point and
+a valid standalone candidate, and proves common mailbox scope through a
+matching nonempty database lineage or an exact byte-for-byte match to the
+verified restore point. These checks apply to resident and historical files.
+Companion recovery state, changed files, unsafe paths, or observed active
+readers cause refusal. On Linux this includes memory mappings whose file
+descriptors have already closed. A bad backup cannot become disposable merely
+because its filename looks old.
+
+On Linux, retention retries a denied descriptor, mapping or surviving-worker
+inventory once after 5 ms, within the same bounded scan. Retained process and
+task directory descriptors prevent PID reuse from redirecting that inspection.
+A persistent same-user denial is recorded as **unobservable readers**, not proof
+that the process is unrelated to the backup. Scanning continues: any observable reader
+still refuses deletion, as do malformed or unreadable process identity, scan
+exhaustion, and other IO errors. The cleaner's current descriptor table is
+strictly inspected first, before verification opens a candidate, preserving
+same-process SQLite locks. Every worker's descriptor table is inspected because
+a worker can unshare its table while its leader remains alive. Shared memory
+mappings are reused only after a successful nonempty inventory. A matching
+exclusive kernel flock identifies the cleaner's own retained descriptor across
+its threads; another reader reusing that descriptor number is still protected.
+
+Retention also performs the no-open current-thread check before selecting its
+verified restore point. That read-only selection checks actual POSIX lock
+records on every matching descriptor in the current descriptor table. It
+permits unlocked identity handles retained by the backup producer, while
+protecting POSIX locks on both the eventual pin and earlier candidates that
+verification would reject. Opening and closing such a candidate just to reject
+it could otherwise release a same-process POSIX lock. Descriptor-specific
+flock and OFD locks are not released by that independent open/close operation.
+Unavailable descriptor inventory, incomplete records or unrecognized lock
+data cause refusal. The full reader and mapping checks before deleting a
+candidate remain unchanged.
+If no verified fallback can be selected after a reader refusal, admission
+fails; the blocked pin does not count as missing verification or authorize a
+repair export.
+The existing shared-authority protocol for cooperating restore readers is
+unchanged.
+
+Automatic-export cleanup carries the retained parent-directory admission
+through preparation, publication and failure handling. Snapshot authority
+compares its captured directory handle with that retained parent before
+selecting a pin, and keeps the binding for later checks. A replaced parent
+pathname refuses cleanup of both backup files and empty rotation directories;
+it cannot lend the displaced directory's lease to a replacement mailbox.
+Standalone rotation acquires and binds its own parent admission.
+
+For a fully verified, superseded periodic snapshot only, this uncertainty need
+not block retention. Under exclusive snapshot and recovery authority, an owned,
+single-link file in an owned directory without group/world write access may be
+**unlinked**, with every verification and namespace check above still required.
+An external process's existing descriptor, `O_PATH` handle or memory mapping
+keeps the original inode and its bytes alive; the original pathname disappears,
+and reopening that pathname is not guaranteed. Cooperating Agent Mail restore
+readers remain excluded by snapshot authority. Retention never truncates or
+overwrites an unseen reader's bytes. Incident evidence, generic file cleanup,
+and empty-directory cleanup retain the strict same-owner visibility policy.
+
+The report distinguishes these successful unlinks with
+`unlinks_with_unobserved_readers` and `bytes_unlinked_with_unobserved_readers`.
+Their allocation is unknown and is not added to `bytes_reclaimed`: a hidden
+reader may retain blocks until its last descriptor or mapping closes. Namespace
+removal and directory-sync uncertainty are accounted separately. No reader scan,
+including a complete one, makes `bytes_reclaimed` a measured free-space delta.
+Session-daemon names, different groups, and capability changes do not prove
+that inherited descriptors or mappings have closed. A terminated thread-group
+leader is skipped only when kernel evidence proves its own descriptor table
+and address space are gone; surviving workers are still inspected. Cleanup
+uses the mounted `/proc/self` PID when excluding its own retained descriptor,
+so an ancestor procfs mount does not make it count itself as another reader.
+This inspection is bounded and best-effort for noncooperating external opens;
+snapshot authority supplies the separate exclusion for cooperating publishers
+and restore readers. Permission uncertainty grants no deletion authority by
+itself and never makes a generic reclaim operation safe.
+
+Retention inventories both resident backups and material already accumulated
+under `doctor/reclaimable/`. Native historical rotation files are eligible only
+inside generated `rotation-YYYYMMDDTHHMMSSZ[-N]` directories, with the same
+verification and scope proof as resident candidates. A recreated mailbox's
+older lineage remains protected unless it is an exact duplicate. Recorded recovery
+runs, including the offline script's `rotated-backups-*` and
+`proactive-staging-*` directories, retain their complete manifest, action logs,
+and payloads for inspection, resume, or restore. Successful move receipts do
+not authorize deletion. Unrecognized material and failed or interrupted backup
+stages remain recovery evidence.
+
+Empty native rotation directories are also removed, including directories
+emptied by the current reclamation pass. This releases directory inodes as well
+as backup-file storage. Cleanup inspects only immediate, strictly named native
+rotation directories and uses an empty-directory removal through retained
+directory handles. Unknown directories, nested trees, manifests, and active
+directory readers or staging operations remain protected. A bounded empty-only
+sweep runs before the full backup inventory, so an old installation with more
+than 16,384 empty rotation directories can drain over successive passes instead
+of remaining permanently blocked by the inventory limit. Each rotation removes
+at most 128 empty directories across its pre-inventory and post-reclamation
+sweeps. Explicit `AM_BACKUP_ROTATION_DELETE=false` also disables this cleanup.
+
+Automatic exporters also have admission limits so refused reclamation cannot
+silently produce unlimited new copies. The periodic count limit is
+`keep_count + 3`, including retained historical periodic files. The projected
+logical byte limit is the larger of 512 MiB and
+`(keep_count + 3) × (current database bytes + WAL bytes)`. Existing periodic
+images and the full observed `doctor/reclaimable/` footprint count toward that
+byte limit; a proposed publication also reserves one current database-plus-WAL
+estimate. Separate staging admission and disk-headroom checks still apply.
+Metadata inspection now uses the same bounded staging namespace as backup
+exports. Legacy `.snapshot-inspect-*.sqlite3` files left beside the database
+by older interrupted inspections also spend the parent-wide staging count
+and byte budget. They remain uncertain recovery evidence; automatic retention
+does not delete them. A failed inspection preserves its new staging directory
+and reports that path, while successful metadata publication removes it.
+The periodic retention window can shorten to restore count or byte capacity,
+while preserving the publication slot and verified recovery generation. It
+uses the same generation ordering as keep-window selection: the oldest
+eligible image goes first, including numeric collision suffixes across resident
+and parked locations. Directory spelling and copied mtimes cannot promote a
+newer dated collision ahead of an older one for deletion. Only
+confirmed removals reduce that calculation; an ordinary candidate-local refusal
+before mutation cannot prevent cleanup from considering another safely
+superseded generation in the window. Loss of the shared snapshot or namespace
+authority still stops the pass.
+These are bounds on cooperating automatic producers, not a filesystem quota
+on operator exports or other programs.
+
+An old oversized backlog with missing or stale verification metadata may need
+a fresh verified publication before any safe deletion can proceed. The
+per-mailbox automatic-backup journal durably reserves **one** such repair export
+after live verification and exclusive snapshot admission, immediately before
+the first backup mutation. An ordinary export also passes its disk-headroom
+check first; preserving stale companion recovery files can spend the allowance
+before that later check. A reader or a failed live check can therefore defer
+without spending the allowance. Once export begins, a crash, failed backup
+validation, or failed metadata publication does not replenish that allowance.
+Further over-budget exports remain refused
+until the next attempt's ordinary admission check observes sufficient retained
+count and byte capacity after cleanup. Completion and post-attempt cleanup never
+replenish the durable repair allowance: an unlink with unconfirmed durability
+can make a pathname inventory look smaller without confirming reusable capacity.
+Existing failed-stage admission is checked first. A
+refused export still permits independently admitted, bounded reclamation of
+superseded backups, including when interrupted staging or an unavailable
+journal prevents publication, or when the producer refuses disk headroom or
+fails verification before publishing. This leaves the preserved operation evidence
+and export retry state intact. Do not remove the journal or authority lock to
+bypass a refusal: inspect the preserved evidence and resolve the underlying
+retention, permission, or verification finding.
+
+Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
+retention and disables the extra repair export; automatic publication stops at
+the same admission limits when staging cannot release space. Leaving the
+variable unset enables the verified periodic reclamation policy. Setting it
+to `true` also allows incident-backup reclamation. On Unix, this requires an
+older, standalone SQLite image with a fully verified successor, matching
+mailbox lineage or exact duplicate bytes, and the same pin, hardlink, and
+namespace checks used for periodic generations, plus the strict same-owner
+reader-visibility policy. Corrupt or insufficiently
+verified incident evidence stays available even with explicit deletion enabled.
+Platforms without the verified descriptor-bound deletion boundary preserve
+incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
+
+Retention also holds the existing database recovery election from selection
+through reclamation. A live recovery, an occupied legacy `.recovery.lock`, or
+an unresolved recovery receipt ending in `.pending` prevents cleanup. The
+verified survivor's inode, links, timestamps, and companion state are checked
+again before each destructive operation. Explicit CLI restore holds the same
+election before copying its backup, so retention cannot remove its source
+during staging. Resolve pending recovery operations through recovery tooling;
+removing their markers does not establish that their evidence is disposable.
+
+Startup and publication logs report `bytes_staged`, `bytes_deleted`,
+`bytes_reclaimed`, and `bytes_retained`; scheduled retention also reports
+`empty_directories_deleted` separately from backup payload counts and bytes.
+Staged and retained values are logical file lengths still occupying storage.
+Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
+count the allocated blocks associated with verified backup unlinks without
+recorded reader uncertainty. The latter
+is not a measurement of the
+filesystem's free-space delta: filesystem snapshots and shared storage can
+retain blocks independently. Refused operations retain their byte accounting.
+An incomplete backup namespace inventory refuses backup-file mutations and
+marks totals as lower bounds; the separately admitted empty-directory sweep
+can still make progress.
+Uncertain moves or unlinks have separate counters rather than being reported
+as successful reclamation. If a rename or unlink completed but its durability
+or namespace validation failed, the current pass stops further mutations and
+refuses backup publication. The apparent absence of a pathname cannot override
+that unconfirmed result. Each cleanup pass attempts at most 128 periodic
+candidates, with a candidate-byte budget of the larger of 512 MiB and the
+current database's size. One oversized candidate can still be attempted so a
+large mailbox can make progress. Verifying the pinned restore point adds I/O
+beyond that candidate budget. A shared progress cursor keeps refused older
+files from repeatedly preventing examination of the remaining backlog.
+Explicit incident reclamation has a separate 128-candidate allowance and the
+same candidate-byte limit, so incident verification cannot spend the periodic
+queue's entire cleanup allowance.
+Bounded cleanup passes can leave more work for a later attempt; the publication
+limit remains in force while that work is pending.
+
+Startup cleanup also has a wall-clock budget. Its early empty-directory sweep
+checks the deadline before acquiring authority. After inventory finishes for
+retained counts and bytes, a further deadline check precedes admission of new
+backup-file reclamation and survivor verification work. If the budget has
+expired, it preserves the remaining files for a later pass and reports
+`deadline_reached`; deferral alone does not report an admission refusal or create
+snapshot/recovery control files.
+This is a cooperative budget: it does not interrupt an operation already
+underway or impose a hard limit on inventory, a syscall, or a SQLite check.
+
+`am doctor health` prints a `backup_retention:` line for this state. It reads
+`storage.sqlite3.bak.meta.json` the way a verified backup would and computes
+the producer's count and byte footprint with the same rule as admission. An
+unversioned sidecar written by v0.3.13 through v0.3.30 is a warning: the next
+verified backup keeps it as a `.legacy-<sha256>.json` sibling and replaces it.
+Health fails (exit 1) when verified backups cannot replace the sidecar
+(malformed, foreign, from a newer format, or not a regular file), because
+verified backups then keep failing and rotation keeps every backup generation.
+It also fails when the footprint is at the publication limit, because
+automatic backups are then paused. For an unrecognized sidecar, move it aside
+and keep it as evidence; the next verified backup records fresh metadata.
+While automatic backups are paused, retention can delete superseded
+generations only after a verified backup has recorded current metadata, and
+the server makes at most one verified repair backup while over the limit. If
+health still does not show `snapshot_metadata=current` after the next backup
+attempt, stop the server and remove old `storage.sqlite3.bak.<timestamp>`
+files by hand, keeping `storage.sqlite3.bak` and the newest few. Generations
+that retention cannot tie to this mailbox also stay where they are; if
+`backup_images` stops falling, remove them the same way.
 
 ## 14. Plan archive pack maintenance [read-only]
 
@@ -401,3 +954,364 @@ saved baseline file you can compare later.
 **Troubleshooting:** If you only care about a subset, rerun with `--filter`.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
+
+## 16. Save and diagnose a private mailbox archive [read-only preview; stateful save]
+
+**Goal:** Complete a restorable backup within an existing maintenance window,
+and identify the expensive phase when it does not finish. These observations
+address the visibility gap in
+[GH#365](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/365);
+they do not establish the cause of the reporter's earlier slow saves.
+
+**Build requirement:** Check the actual binary's command help. The installed
+v0.3.39 from that report does not expose these progress and diagnostic options,
+and a newer source build may still report package version `0.3.39`:
+
+```bash
+# From a checkout containing these changes, with the default target directory:
+cargo build --locked --release -p mcp-agent-mail-cli --features portable --bin am
+./target/release/am archive save --help
+```
+
+If `CARGO_TARGET_DIR` is customized, use the binary from that directory.
+Confirm that help lists `--progress`, `--diagnostics`, `--compression-level`,
+`--exclude-recovery`, and `--dry-run`. Help does not create an archive. Use that exact
+binary for the examples below, keeping the existing command's project
+selectors, working directory, mailbox configuration, and timeout.
+
+Use the same `DATABASE_URL` and `STORAGE_ROOT` as the service. Archives are saved
+under `archived_mailbox_states/` in the detected project root. Keep output and
+captured logs outside `STORAGE_ROOT` when possible. If the output directory is
+inside storage, save excludes that exact subtree to avoid including previous
+backups or its own temporary ZIP. The output directory cannot be the storage
+root itself. Relative paths and directory aliases are resolved for this check.
+Stop writers gracefully through the existing supervisor and confirm ownership
+with `am doctor locks --json` and `am doctor drain --json`; inspect
+`safe_to_mutate`, not just the exit status.
+Keep the supervisor's recovery/startup tail and the existing outage deadline.
+Run these commands only against an isolated replica or in the already scheduled
+backup window; diagnosing a previous timeout does not require another daytime
+archive attempt.
+
+```bash
+am archive save --label nightly --scrub-preset archive --progress text
+
+# For a scheduled job, retain structured phase records alongside its log:
+am archive save --label nightly --progress json \
+  2>/abs/path/backup-evidence/archive-save.stderr.log
+
+# Independent coarse-phase heartbeats, without the cooperative progress stream:
+am archive save --label nightly --progress off --diagnostics \
+  2>/abs/path/backup-evidence/archive-save.stderr.log
+```
+
+Text progress is enabled by default and goes to stderr, including when the
+command runs without a terminal. `--progress json` emits structured progress
+records; other error or warning diagnostics may also appear on stderr.
+`--progress off` suppresses progress. The final archive path and success
+summary remain on stdout. `--diagnostics` is a separate, optional stream that
+is off by default. It can be combined with any progress mode.
+
+### Preview the selected storage [read-only]
+
+Use the same mailbox configuration and working directory as the scheduled job:
+
+```bash
+am archive save --dry-run
+am archive save --dry-run --exclude-recovery
+```
+
+The preview reads filesystem metadata without opening SQLite, acquiring
+mailbox activity locks, creating a snapshot, compressing files, or writing an
+archive. It reports regular-file counts and bytes, selected recovery-copy totals,
+selected and excluded bytes, and the selected compression level. A running
+service can change the files during the scan. These totals are not a
+compressed-size forecast, an integrity check, or a measurement of snapshot CPU
+time. A large omitted-byte total does not establish which phase caused an
+earlier timeout.
+
+The preview does not validate attachment references against a database
+snapshot; an actual save performs that check before applying the optional
+recovery-copy exclusion. Run the preview before the maintenance window while
+retaining the supervised stop/save/restart procedure and bounded timeout for
+the real backup.
+
+### Interpreting the phases
+
+| Progress phase | Diagnostic phase | Work being measured |
+|----------------|------------------|---------------------|
+| `prepare`, `mailbox_lock` | `prepare` | Validate arguments and paths, then acquire mailbox activity locks before reading the source |
+| `source_reconciliation` | `snapshot_source` | Compare the live database with the canonical archive and, if needed, reconstruct a private source; this may traverse archives and execute SQL before the main snapshot copy |
+| `snapshot_prepare` | `snapshot` | Validate paths and prepare private staging for an unscoped lossless image |
+| `snapshot_source_open` | `snapshot` | Open the resolved source through its guarded read-only engine |
+| `snapshot_full_copy` | `snapshot` | Copy the full primary database, including committed WAL state, into a fresh private SQLite image |
+| `snapshot_neutralize` | `snapshot` | Settle only the private image and retire its engine handoff sidecars |
+| `snapshot_validate` | `snapshot` | Check the private image and gather mailbox counts |
+| `snapshot_publish` | `snapshot` | Publish the completed private SQLite image to the save's staging location |
+| `snapshot_copy` | `snapshot` | Read one consistent engine-owned transaction into a selected projection for a scoped or scrubbed export |
+| `snapshot_scope` | `filter` | Apply project selection to a projected snapshot when requested |
+| `snapshot_scrub` | `scrub` | Apply the selected scrub policy; the default `archive` preset preserves private recovery state |
+| `snapshot_compact` | `finalize` | Produce the standalone projected snapshot; private backups build no additional viewer FTS indexes or materialized tables |
+| `recovery_exclusion_check` | `archive_metadata` | Check the optional recovery-copy policy against the primary database path and both attachment path fields |
+| `metadata` | `archive_metadata` | Read snapshot metadata and prepare archive metadata |
+| `storage_inventory` | `storage_enumeration` | Enumerate selected regular storage files and their sizes, including recovery history |
+| `compress_snapshot`, `compress_storage`, `finalize_zip` | `zip_writing` | Write metadata, snapshot, and storage payloads, then finish the ZIP central directory |
+| `verify_zip` | `archive_verification` | Read back the completed ZIP and verify its members before publication |
+| `publish` | `publication` | Sync the completed, verified ZIP, publish without replacing an existing destination, and sync parent directories on Unix |
+
+Storage inventory precedes ZIP writing. The diagnostic `zip_writing` phase is
+one continuous occurrence across the three finer compression/finalization
+phases, followed by `archive_verification` and then `publication`.
+The unscoped lossless image uses `snapshot_prepare` through
+`snapshot_publish`, all under the coarse `snapshot` diagnostic. Project filters
+or other scrub presets use the projected copy/scope/scrub/compact path.
+
+Elapsed phase time measures this invocation. It is not an estimate of the
+remaining maintenance window. A single SQL operation can take time between
+progress callbacks; the last phase identifies where to investigate, while
+process CPU and I/O samples help determine whether work is continuing.
+Progress records carry `schema_version: 1`, the phase, a state such as
+`started`, `progress`, `completed`, `cancelled`, or `failed`, and elapsed times.
+File/byte counters reset for each phase; projected snapshot `rows_copied` counts
+rows in the named table. A native full copy can spend time inside one database
+statement without per-table row counts. `recovery_files` and `recovery_bytes`
+count selected regular files beneath only `doctor/forensics/` and
+`doctor/reclaimable/`; they do not classify the whole `doctor/` tree. Omitted
+files contribute to `excluded_files` and `excluded_bytes` in metadata and the
+dry-run report. Retain completed records to compare totals across phases.
+Verification reads payloads again;
+its phase-local byte count is verification work, not additional archive input.
+The `snapshot_bytes` and `archive_bytes` fields are size gauges retained across
+phase changes.
+
+Cooperative progress is rate-limited to a two-second interval between
+checkpoints, with immediate boundary records. It is not an independent timer
+that proves a blocked operation is responsive. Cancellation is checked between
+SQL pages and filesystem copy chunks; an individual database statement or
+blocking filesystem call may still delay shutdown, so keep the supervisor's
+hard limit. On Unix, the first SIGINT/SIGTERM requests cleanup at a checkpoint;
+a second termination signal uses its default termination behavior and may leave
+unpublished temporary files.
+
+### Optional independent diagnostics and privacy
+
+`--diagnostics` writes records prefixed `archive_save_diagnostic` to stderr.
+Coarse phase start, completion, and failure records are immediate. While a
+phase runs, an independent reporter emits at most one periodic `running`
+record per five seconds on its cadence; a periodic record may be close to a
+phase boundary. `heartbeat=1` means that worker started. `heartbeat=0` means
+it could not start and only boundary records are available. Elapsed times use
+a monotonic clock, and numeric values saturate instead of wrapping.
+
+Diagnostic work counters accumulate across the whole invocation:
+
+| Counter | Meaning |
+|---------|---------|
+| `storage_files` | Selected regular storage files discovered by inventory |
+| `storage_bytes` | Sum of their observed sizes |
+| `storage_size_unknown` | Unknown selected-file sizes; the current inventory requires metadata and fails rather than silently selecting an unknown size |
+| `zip_files` | Entries whose input payload was fully accepted, including metadata and snapshot entries |
+| `zip_bytes` | Uncompressed payload bytes accepted at progress checkpoints, including a partial current entry; verification reads do not increase this counter |
+| `snapshot_bytes` | Most recently observed snapshot size, a gauge rather than a running sum |
+| `archive_bytes` | Observed compressed size of the completed ZIP, also a gauge |
+
+A zero size gauge may mean it has not yet been measured, and a snapshot can
+shrink during finalization. Even after an entry's input is fully accepted,
+compression or central-directory output may remain until ZIP writing completes.
+These are observations rather than a completion percentage or an ETA.
+
+SQLite work can continue while file and byte counters stay unchanged. A
+heartbeat proves that the diagnostic reporter is running, not that the current
+operation is advancing. Forced termination cannot reliably emit a failure
+record. Phase timing alone does not prove a deadlock, establish a reconciliation
+backlog, or attribute cost to recovery-directory size.
+
+The progress records and prefixed diagnostic records contain fixed
+phase/status/schema names and numeric times or counters. They do not include
+paths, project selectors, labels, message bodies, credentials, SQL, or raw
+errors. Normal command output and existing warnings/errors may still contain
+operator details. To retain only the coarse diagnostics for review:
+
+```bash
+rg '^archive_save_diagnostic ' /abs/path/backup-evidence/archive-save.stderr.log \
+  > /abs/path/backup-evidence/archive-save.diagnostics.log
+```
+
+Enabling diagnostics does not change payload selection, scrub policy,
+compression, locking, or the maintenance deadline.
+
+The snapshot source decision may reconstruct a private database if the live
+index is missing or behind authoritative archive state. That is separate from
+the daemon's periodic message, identity, and reservation reconcilers. Historical
+`deferred reconcile` warnings count retries, often of the same entity; their
+line count is not the number of outstanding repairs.
+
+### Safe diagnostics for an existing run [read-only]
+
+On Linux, sample the actual archive-save PID from the supervisor during its
+already scheduled invocation. Do not launch another save just to collect these
+observations:
+
+```bash
+SAVE_PID=12345  # replace with the verified archive-save process ID
+date --iso-8601=seconds
+cat "/proc/$SAVE_PID/io"
+cat "/proc/$SAVE_PID/stat"
+find "/proc/$SAVE_PID/fd" -mindepth 1 -maxdepth 1 -type l -printf '.' | wc -c
+```
+
+Record samples at a modest interval, such as the existing 60-second sampling
+plan, together with phase output and the supervisor's CPU/wall-time summary.
+Retain the PID's start time from `/proc/PID/stat` so PID reuse is not mistaken
+for continuation of the same run. Permission errors or process exit mean the
+sample is unavailable, not zero activity.
+
+`rchar`/`wchar` report read/write activity including cached I/O;
+`read_bytes`/`write_bytes` describe storage I/O and can remain flat when data is
+cached. Growing CPU time with little storage I/O can be SQL computation or
+compression. A fixed temporary database size or unchanged mtime does not prove
+a deadlock or identify the active SQL statement. Descriptor counts show resource
+growth but do not measure completion. Treat these as supporting observations;
+the named phase and its counters provide the attribution. Keep file-descriptor
+targets and mailbox paths private if collecting additional local detail.
+
+Existing native diagnostics answer narrower questions:
+
+| Command | What it can establish | What it does not establish |
+|---------|-----------------------|----------------------------|
+| `am doctor locks --json` / `am doctor drain --json` | Current ownership and whether the mailbox is drained | Which archive-save phase is consuming CPU |
+| `am doctor check --json` | Database/namespace health and archive inventory findings | That an archive save will finish within its deadline |
+| `am doctor archive-scan --json` | Archive hygiene findings | A current, deduplicated reconciler backlog or ZIP integrity |
+| `am doctor archive-verify --json` | Read-only comparison of archive artifacts with SQLite | Verification of a saved mailbox ZIP; commit provenance is not checked by this pass |
+| `am doctor artifacts --json` / `am doctor backups --json` | Recovery and backup inventory | Permission to discard an old-looking artifact |
+| `am doctor reclaim --dry-run --json` | A preview of recovery-debris consolidation | A reduction in archived bytes: move-only consolidation still leaves those bytes under `doctor/reclaimable/` |
+
+Run diagnostics at an appropriate existing inspection point; full archive
+comparison itself traverses and reads data. The v0.3.39 binary in the report
+has no archive-save phase-progress flag, and these health commands cannot
+retroactively identify the expensive phase of an earlier invocation. A healthy
+result is evidence against the specific failures checked, not a reason to run
+an unrequested repair or reconstruct operation.
+
+### Recovery history, compression, and verification
+
+Compression settings range from `0` through `9`; the default is `6`.
+`--compression-level 1` trades a larger ZIP for less compression work, level `0`
+uses uncompressed ZIP storage, and levels `1` through `9` use deflate with
+increasing compression effort. Compare
+phase times and output sizes on isolated copies of the same fixture before
+changing a production maintenance budget. A smaller archive is not necessarily
+faster to produce, and host CPU contention affects wall time independently of
+archive contents. For such a comparison, preserve the full recovery history:
+
+```bash
+am archive save --label compression-comparison --scrub-preset archive \
+  --compression-level 1 --progress json
+```
+
+By default, all regular files under top-level `doctor/`, including forensic
+bundles and `doctor/reclaimable/`, remain included. They may contain unique
+recovery evidence or the bytes needed by a later undo. Their size alone does
+not prove they caused a timeout, and age or a filename containing `reclaimable`
+is not sufficient proof that they can be omitted. ZIP64 supports large
+individual recovery files as well as archives with many members.
+
+`--exclude-recovery` is an explicit opt-in policy; its visible alias is
+`--exclude-recovery-artifacts`. Both omit only the exact
+`STORAGE_ROOT/doctor/forensics/` and `STORAGE_ROOT/doctor/reclaimable/` trees
+from the new ZIP. They do not prune, move, or delete source evidence or alter
+existing backups. Retain the original generations or make a separate evidence
+backup when they are still needed for investigation or rollback. Do not select
+this policy when the backup must preserve complete recovery history.
+
+The rest of `doctor/` remains included. In particular,
+`doctor/backlog_dead_letter.jsonl` can contain serialized writes that have not
+been applied to the archive, and `doctor/reservation-reconcile.json` records
+reconciliation progress. `doctor/archive-quarantine/`, `doctor/quarantine/`,
+recovery receipts, unknown files, `.archive_backlog/`, regular message and
+attachment files, and Git history remain covered by the normal storage
+traversal. A project's nested `doctor/` directory and similarly named paths
+such as `doctor/forensics-extra/` are also retained. Do not replace the narrow
+policy with a blanket `doctor/` exclusion.
+
+Save refuses exclusion if the configured primary database or either attachment
+path (`path` or `original_path`) in the selected snapshot points into an
+omitted tree. The check handles normalized paths and filesystem aliases.
+Unreadable attachment metadata also prevents exclusion because safety cannot
+be established. Rerun without the flag to retain those files. These checks do
+not establish that historical evidence is no longer needed for a separate
+investigation or rollback.
+
+Recovery bytes already stored in Git objects may still be included; exclusion
+is not an erasure or redaction policy. Metadata records the compression level,
+recovery-history policy, omitted storage paths, and selected/excluded byte
+counts. These settings do not change the scrub preset or restore command.
+
+The automatically excluded output subtree prevents recursive backup growth.
+The dedicated SQLite snapshot remains included, while the embedded live
+database and its sidecars are excluded from the storage payload. Storage
+symlinks are not dereferenced. Snapshot staging lives beneath the excluded
+output directory, and any private source staging within storage is explicitly
+omitted. If no regular storage files are selected, an explicit `storage_repo/`
+directory entry preserves the restore format and is checked by ZIP verification.
+
+For a complete private mailbox backup, use the default `archive` scrub preset
+without `--project`. This path preserves the resolved primary database's full
+schema and data, including additional application tables, columns, indexes,
+triggers, and identity state outside the share viewer's schema. Project filters
+and other scrub presets intentionally produce selected or sanitized database
+projections. Archive metadata records `database.source_kind`: if it is
+`ArchiveSnapshot`, source resolution first reconstructed the mailbox from
+storage, so the existing reconstruction limits still apply to that resolved
+source. The full-image guarantee concerns the primary database; separate
+runtime telemetry such as an external `atc.sqlite3` is not added automatically.
+
+The current FrankenSQLite implementation materializes the database row image
+in memory during `VACUUM INTO`; this is not a constant-memory snapshot algorithm.
+Measure memory as well as elapsed time for a representative replica. ZIP
+compression streams the separate storage files through bounded buffers. Source
+authority changes during the native copy can still cause a safe refusal, so
+the existing mailbox quiescence procedure remains necessary.
+
+The `archive` preset is intended for a private backup and preserves sensitive
+mailbox state. `--project` scopes the SQLite snapshot, while the selected storage
+tree is included for restoration. A mailbox archive is therefore not a
+sanitized share bundle; use the share/export workflow in section 11 for
+publication. Published share bundles still build their viewer artifacts.
+
+Before publication, save compares every ZIP member's name and uncompressed
+size with the expected inventory, then reads each entry through EOF to check
+its CRC, including the required snapshot and metadata members. This deliberate
+verification pass consumes additional I/O and decompression work; its time is
+reported separately. A failed or cancelled save does not replace an existing
+good archive.
+
+New ZIPs use owner-only permissions on Unix because private backups contain
+registration credentials and mail. Publication uses the existing atomic
+no-replace move: a competing backup, directory, or dangling symlink at the
+chosen destination cannot be overwritten. The completed file is flushed before
+the move, and parent directory updates are synced on Unix. Windows retains the
+file flush and atomic no-replace move.
+
+Before verification succeeds, a handled failure or cooperative cancellation
+cleans up partial temporary ZIP output. Forced termination can still leave
+unpublished temporary files. Source recovery evidence and existing good
+archives are not removed by this cleanup.
+
+If publication or its durability check fails, save reports failure and retains
+the verified ZIP's staging directory for inspection. An already-published
+destination is preserved. The error identifies both locations; inspect them
+before retrying instead of assuming that no archive was created.
+
+ZIP verification establishes container integrity. It does not prove that the
+runtime database engine can restore and use the snapshot. Meaningful recovery
+tests must also restore into an isolated mailbox and inspect database rows,
+message/attachment files, and recovery evidence. `am archive restore --dry-run`
+only prints the proposed destination and preservation operations. It does not
+decompress every entry, verify the SQLite snapshot, or prove that restoration
+will succeed. Preserve existing good archives until the new archive has passed
+the required restore checks.
+
+The completed component checks, paired compression measurements, and remaining
+native test gates for issue #365 are recorded in
+[Archive issue #365: validation record](ARCHIVE_365_VALIDATION.md).

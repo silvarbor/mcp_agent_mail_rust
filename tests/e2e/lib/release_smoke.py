@@ -25,12 +25,28 @@ control, usually the previous release) runs the same phases:
                  every 10 s window, fetch_inbox p99 under budget, zero dispatch
                  zombies, zero EMFILE, zero HTTP server restarts, no archive
                  re-root, and archive convergence after the load stops.
+  swarm          >= 60 agents, each with its own MCP session, over 3 projects
+                 for >= 8 minutes (send to 2 peers, fetch, ack, reserve +
+                 release, search), SIGKILL + restart at the midpoint: zero
+                 acknowledged-id loss, independent integrity_check ok,
+                 bounded descriptors, zero zombies, WBQ progress in every
+                 window, send/reserve/release p99 under budget with zero
+                 30 s dispatch timeouts or tool errors, no connection errors
+                 outside the kill window, and archive convergence after load.
+  archive_contention (optional) a second full-strength swarm with recurring
+                 thread digests interleaved with unique threads across the
+                 same 3 projects. Retains every swarm gate and independently
+                 witnesses both classes of acknowledged traffic per project.
 
 It exists because two opposite defects reached artifacts in September 2026
 while every in-process suite was green: v0.3.36 leaked descriptors to EMFILE
-within a minute of mixed load, and a main build wedged its archive drain.
+within a minute of mixed load, and a main build wedged its archive drain. The
+swarm phase exists because shipped v0.3.38 passed every other phase but, at
+60 agents, timed reservation tools out at 30 s and left crash orphans out of
+the archive for hours (br-kp1in.34, br-kp1in.35, br-9bwnb).
 
-Usage:  release_smoke.py --bin PATH [--control-bin PATH] --out DIR
+Usage:  release_smoke.py --bin PATH [--control-bin PATH] [--control-first]
+                        [--archive-contention] --out DIR
 Exit 0 only when every phase of the CANDIDATE passes. A phase that raises
 before recording a failure, or runs with looser-than-release knobs, is
 NO_VERDICT, which also fails. The control arm is recorded, never gating.
@@ -39,14 +55,18 @@ NO_VERDICT, which also fails. The control arm is recorded, never gating.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import random
 import re
 import resource
+import select
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -69,6 +89,26 @@ SOAK_WINDOW_SECS = 10
 # "fetch_inbox p99 is under budget"). Change only through the AGENTS.md
 # gate-defect rule, publishing what the change admits.
 FETCH_INBOX_P99_BUDGET_S = 2.0
+# Swarm phase (br-kp1in.34). Release minimums; fewer agents or a shorter run
+# can only produce NO_VERDICT. AM_RELEASE_SMOKE_SWARM_AGENTS=0 skips the phase
+# for development runs (also NO_VERDICT).
+RELEASE_MIN_SWARM_AGENTS = 60
+RELEASE_MIN_SWARM_SECS = 480
+SWARM_AGENTS = int(os.environ.get("AM_RELEASE_SMOKE_SWARM_AGENTS",
+                                  str(RELEASE_MIN_SWARM_AGENTS)))
+SWARM_SECS = int(os.environ.get("AM_RELEASE_SMOKE_SWARM_SECS", str(RELEASE_MIN_SWARM_SECS)))
+SWARM_PROJECTS = 3
+# A connection cut by the deliberate SIGKILL is not a failure when the call was
+# in flight at the kill or started before the restarted server had answered
+# for this many seconds.
+SWARM_KILL_GRACE_S = 5.0
+# Predeclared on 2026-10-08 before any candidate was measured with this phase
+# (br-kp1in.34). An interactive agent that waits longer than this for a lease
+# or a send retries and amplifies load. Change only through the AGENTS.md
+# gate-defect rule, publishing what the change admits.
+SWARM_TOOL_P99_BUDGET_S = 5.0
+SWARM_GATED_TOOLS = ("send_message", "file_reservation_paths", "release_file_reservations")
+DISPATCH_TIMEOUT_MARKER = "timed out after"
 HTTP_RESTART_MARKERS = (
     "HTTP server instance exited unexpectedly; restarting",
     "HTTP server auto-restarted",
@@ -96,8 +136,573 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+ELF_MACHINES = {0x3E: "x86_64", 0xB7: "aarch64"}
+
+
+def elf_target(data: bytes) -> str | None:
+    """`<arch>-static` or `<arch>-dynamic` for a little-endian ELF64 image.
+
+    install.sh ships the static musl archive on x86_64 and the glibc archive
+    elsewhere, so a receipt must say which one it measured. A PT_INTERP
+    program header means a dynamic loader is required.
+    """
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return None
+    arch = ELF_MACHINES.get(int.from_bytes(data[18:20], "little"), "unknown")
+    phoff = int.from_bytes(data[32:40], "little")
+    phentsize = int.from_bytes(data[54:56], "little")
+    phnum = int.from_bytes(data[56:58], "little")
+    for i in range(phnum):
+        start = phoff + i * phentsize
+        if start + 4 > len(data):
+            return None
+        if int.from_bytes(data[start:start + 4], "little") == 3:  # PT_INTERP
+            return f"{arch}-dynamic"
+    return f"{arch}-static"
+
+
+def cpu_governors() -> list[str]:
+    paths = Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
+    return sorted({p.read_text().strip() for p in paths}) or ["unavailable"]
+
+
 def has_emfile(text: str) -> bool:
     return any(marker in text for marker in EMFILE_MARKERS)
+
+
+INITIALIZE_PARAMS = {"protocolVersion": "2025-06-18", "capabilities": {},
+                     "clientInfo": {"name": "release-smoke", "version": "1"}}
+
+
+def mcp_post(url: str, session: str | None, rid: int, method: str, params: dict | None,
+             timeout: float) -> tuple[dict, str | None]:
+    """One JSON-RPC request over MCP Streamable HTTP: (response, Mcp-Session-Id)."""
+    body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
+                       "params": params or {}}).encode()
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        sid = r.headers.get("Mcp-Session-Id")
+        raw = r.read().decode()
+    if raw.lstrip().startswith("{"):
+        return json.loads(raw), sid
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:].strip()), sid
+    raise RuntimeError(f"unparseable response: {raw[:300]}")
+
+
+def tool_result(resp: dict) -> tuple[bool, object]:
+    """(is_error, payload) of a tools/call response; JSON-RPC errors are errors."""
+    if "error" in resp:
+        return True, resp["error"]
+    res = resp["result"]
+    text = "".join(c.get("text", "") for c in res.get("content", []))
+    try:
+        payload: object = json.loads(text)
+    except ValueError:
+        payload = text
+    return bool(res.get("isError")), payload
+
+
+def archive_routing(value: object) -> dict[str, list[str]]:
+    """Normalize only complete arrays of recipient names, never object keys."""
+    if not isinstance(value, dict):
+        raise ValueError("routing is not an object")
+    roles = {}
+    for role in ("to", "cc", "bcc"):
+        names = value[role]
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("routing is not arrays of names")
+        roles[role] = sorted(names)
+    if not any(roles.values()):
+        raise ValueError("routing has no recipients")
+    return roles
+
+
+def archive_file_bytes(storage: Path, path: Path, deadline: float) -> bytes:
+    """Read an ordinary archive copy without following a known symlink."""
+    relative = path.relative_to(storage)
+    if any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError("invalid archive copy path")
+    parent = storage
+    for component in relative.parts[:-1]:
+        if parent.is_symlink():
+            raise ValueError("archive copy ancestor symlink")
+        parent /= component
+    if parent.is_symlink():
+        raise ValueError("archive copy ancestor symlink")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("archive copy is not a regular file")
+        chunks = []
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("archive observation deadline")
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+class ArchiveCommitSnapshot:
+    """One immutable HEAD inventory and one bounded streaming Git reader.
+
+    A working-tree file or staged blob is not durable publication. Verify the
+    real committed object as well as its name, mode and exact working bytes.
+    Canonical/outbox copies often share an OID, so read each immutable blob only
+    once in this observation. No index refresh, repair or per-message Git spawn.
+    """
+
+    def __init__(self, storage: Path, deadline: float):
+        self.storage = storage
+        self.deadline = deadline
+        self.reader: subprocess.Popen | None = None
+        self.buffer = bytearray()
+        self.verified = set()
+        git_dir = storage / ".git"
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise ValueError("archive has no private Git directory")
+        self.command = ["git", "--no-replace-objects", f"--git-dir={git_dir}",
+                        f"--work-tree={storage}"]
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GIT_")}
+        self.env.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
+        self.head = self.run("rev-parse", "--verify", "HEAD^{commit}").strip().decode("ascii")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.head):
+            raise ValueError("invalid archive commit identity")
+        self.algorithm = "sha1" if len(self.head) == 40 else "sha256"
+        self.entries = {}
+        inventory = self.run("ls-tree", "-rz", "--full-tree", self.head, "--", "projects")
+        for record in inventory.split(b"\0"):
+            if not record:
+                continue
+            metadata, path = record.split(b"\t", 1)
+            mode, kind, oid = metadata.decode("ascii").split()
+            name = path.decode("utf-8")
+            if name in self.entries or not re.fullmatch(r"[0-9a-f]{" + str(len(self.head)) + "}", oid):
+                raise ValueError("invalid committed archive inventory")
+            self.entries[name] = (mode, kind, oid)
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("archive observation deadline")
+        return remaining
+
+    def run(self, *args: str) -> bytes:
+        return subprocess.run([*self.command, *args], env=self.env, check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=self.remaining()).stdout
+
+    def read_more(self) -> None:
+        assert self.reader is not None and self.reader.stdout is not None
+        descriptor = self.reader.stdout.fileno()
+        if not select.select([descriptor], [], [], self.remaining())[0]:
+            raise TimeoutError("archive Git object deadline")
+        data = os.read(descriptor, 64 * 1024)
+        if not data:
+            raise ValueError("incomplete committed archive object")
+        self.buffer.extend(data)
+
+    def read_exact(self, count: int) -> bytes:
+        while len(self.buffer) < count:
+            self.read_more()
+        result = bytes(self.buffer[:count])
+        del self.buffer[:count]
+        return result
+
+    def verify(self, path: Path, raw: bytes) -> bool:
+        self.remaining()
+        entry = self.entries.get(path.relative_to(self.storage).as_posix())
+        if entry is None or entry[0] not in ("100644", "100755") or entry[1] != "blob":
+            return False
+        oid = entry[2]
+        header = f"blob {len(raw)}\0".encode("ascii")
+        digest = hashlib.new(self.algorithm, header)
+        digest.update(raw)
+        if digest.hexdigest() != oid:
+            return False
+        if oid in self.verified:
+            return True
+        if self.reader is None:
+            self.reader = subprocess.Popen([*self.command, "cat-file", "--batch"],
+                                           env=self.env, stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           bufsize=0)
+        assert self.reader.stdin is not None
+        self.reader.stdin.write((oid + "\n").encode("ascii"))
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > 1024:
+                raise ValueError("invalid committed object header")
+            self.read_more()
+        end = self.buffer.index(b"\n")
+        observed = self.read_exact(end + 1).rstrip(b"\n").decode("ascii").split()
+        if observed != [oid, "blob", str(len(raw))]:
+            raise ValueError("committed archive object missing or wrong type/size")
+        digest = hashlib.new(self.algorithm, header)
+        left = len(raw)
+        while left:
+            self.remaining()
+            chunk = self.read_exact(min(left, 64 * 1024))
+            digest.update(chunk)
+            left -= len(chunk)
+        if self.read_exact(1) != b"\n" or digest.hexdigest() != oid:
+            raise ValueError("committed archive object identity mismatch")
+        self.verified.add(oid)
+        return True
+
+    def close(self) -> None:
+        if self.reader is None:
+            return
+        try:
+            if self.reader.stdin is not None:
+                try:
+                    self.reader.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            try:
+                self.reader.wait(timeout=max(0, min(1, self.deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                self.reader.kill()
+                self.reader.wait()
+        finally:
+            if self.reader.stdout is not None:
+                self.reader.stdout.close()
+
+
+def observe_message_bundle(storage: Path, project: Path, canonical: Path, raw: bytes,
+                           wanted: dict, committed: ArchiveCommitSnapshot | None,
+                           deadline: float, detail: dict) -> None:
+    """Check all direct deliveries, including redacted BCC inboxes, passively."""
+    def component(name: str) -> str:
+        name = name.strip()
+        if not name or name in (".", "..") or any(char in name for char in ("/", "\\", "\0")):
+            raise ValueError("invalid mailbox identity")
+        return name
+
+    dated = canonical.relative_to(project / "messages")
+    sender = component(wanted["from"])
+    copies = [(canonical, "canonical"), (project / "agents" / sender / "outbox" / dated, "outbox")]
+    recipients = set(wanted["to"] + wanted["cc"] + wanted["bcc"])
+    copies.extend((project / "agents" / component(name) / "inbox" / dated, "inbox")
+                  for name in sorted(recipients) if not name.startswith("project:"))
+    front, _, body = raw[8:].partition(b"\n---\n\n")
+    inbox = json.loads(front)
+    inbox["bcc"] = []
+    for path, kind in copies:
+        witness = {"id": wanted["id"], "copy": kind}
+        try:
+            observed = raw if kind == "canonical" else archive_file_bytes(storage, path, deadline)
+            if kind == "inbox":
+                envelope, separator, observed_body = observed[8:].partition(b"\n---\n\n")
+                equal = (observed.startswith(b"---json\n") and bool(separator) and observed_body == body
+                         and json.dumps(json.loads(envelope), sort_keys=True)
+                         == json.dumps(inbox, sort_keys=True))
+            else:
+                equal = observed == raw
+            if not equal:
+                detail["bundle_mismatches"].append(witness)
+            elif committed is not None and committed.verify(path, observed):
+                detail["committed_copies"] += 1
+            elif committed is not None:
+                detail["uncommitted_copies"].append(witness)
+        except FileNotFoundError:
+            detail["missing_copies"].append(witness)
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError):
+            detail["bundle_mismatches"].append(witness)
+
+
+def archive_db_parity(storage: Path, database: Path,
+                      deadline: float | None = None) -> tuple[bool, dict]:
+    """Compare working and committed canonical/mailbox copies with one DB snapshot.
+
+    No server request is made: polling health during the quiet interval can
+    exercise the very read-driven recovery that this qualification excludes.
+    Counts alone cannot detect a replaced id, body or recipient (br-kp1in.35).
+    Canonical bytes alone cannot prove mailbox delivery or a completed Git
+    commit (GH#353); missing-copy and uncommitted-bundle controls retain the
+    previous oracle's false positives. Attachment metadata is compared here,
+    but this observer does not independently inspect attachment file contents.
+    Returned diagnostics contain ids and fixed field names, never message content.
+    One pinned Git tree and streaming object reader serve the whole observation;
+    an advancing HEAD requires a later complete observation. No Git index is
+    refreshed and no per-message Git subprocess is spawned. SQLite progress,
+    Git subprocesses/pipe reads and ordinary-file reads share the deadline. These
+    cooperative checks cannot interrupt a blocked OS filesystem operation or
+    prove safety against an adversarial directory replacement race.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + RELEASE_CONVERGE_SECS
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("archive observation deadline")
+
+    detail: dict = {"db_messages": 0, "archive_messages": 0, "invalid_files": 0,
+                    "missing_ids": [], "extra_ids": [], "duplicate_ids": [],
+                    "mismatches": [], "unverifiable_reply_ids": [], "missing_copies": [],
+                    "bundle_mismatches": [], "uncommitted_copies": [], "committed_copies": 0}
+    expected = {}
+    absent_reply = set()
+    try:
+        check_deadline()
+        conn = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True,
+                               timeout=min(1, max(0, deadline - time.monotonic())))
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            conn.execute("BEGIN")
+            messages = conn.execute(
+                "SELECT m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, m.importance, "
+                "m.ack_required, m.created_ts, m.attachments, m.recipients_json, "
+                "m.archive_metadata_json, p.slug, p.human_key, a.name AS sender_name "
+                "FROM messages m JOIN projects p ON p.id=m.project_id "
+                "LEFT JOIN agents a ON a.id=m.sender_id").fetchall()
+            projects_by_message = {row["id"]: row["project_id"] for row in messages}
+            recipients = {}
+            recipient_ids = {}
+            recipient_names = {}
+            for row in conn.execute(
+                    "SELECT r.message_id, r.agent_id, r.kind, a.name, a.project_id "
+                    "FROM message_recipients r LEFT JOIN agents a ON a.id=r.agent_id"):
+                check_deadline()
+                message_id, agent_id, name = row["message_id"], row["agent_id"], row["name"]
+                if (message_id not in projects_by_message or type(agent_id) is not int or agent_id <= 0
+                        or not isinstance(name, str) or not name or row["kind"] not in ("to", "cc", "bcc")
+                        or row["project_id"] != projects_by_message[message_id]):
+                    raise ValueError("invalid or orphaned delivery identity")
+                ids = recipient_ids.setdefault(message_id, set())
+                names = recipient_names.setdefault(message_id, set())
+                if agent_id in ids or name.lower() in names:
+                    raise ValueError("duplicate delivery identity")
+                ids.add(agent_id)
+                names.add(name.lower())
+                roles = recipients.setdefault(row["message_id"], {"to": [], "cc": [], "bcc": []})
+                roles[row["kind"]].append(name)
+            # Shared-mailbox routing is one explicit delivery, never a fan-out
+            # into per-agent rows and never BCC. Observe it in this same snapshot.
+            project_deliveries = set()
+            for row in conn.execute(
+                    "SELECT d.message_id, d.project_id, d.kind, p.slug "
+                    "FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id=d.project_id"):
+                check_deadline()
+                message_id = row["message_id"]
+                if (message_id not in projects_by_message or message_id in project_deliveries
+                        or row["project_id"] != projects_by_message[message_id]
+                        or not isinstance(row["slug"], str) or not row["slug"]
+                        or row["kind"] not in ("to", "cc")):
+                    raise ValueError("invalid or orphaned project delivery")
+                project_deliveries.add(message_id)
+                roles = recipients.setdefault(message_id, {"to": [], "cc": [], "bcc": []})
+                roles[row["kind"]].append("project:" + row["slug"])
+            # An inner project join must not silently hide orphaned DB rows.
+            if len(messages) != conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]:
+                raise ValueError("orphaned message project")
+        finally:
+            conn.close()
+        detail["db_messages"] = len(messages)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        for row in messages:
+            check_deadline()
+            if (type(row["id"]) is not int or row["id"] <= 0
+                    or not isinstance(row["sender_name"], str) or not row["sender_name"]
+                    or type(row["ack_required"]) is not int or row["ack_required"] not in (0, 1)
+                    or type(row["created_ts"]) is not int):
+                raise ValueError("invalid message identity or scalar metadata")
+            durable = archive_routing(recipients.get(row["id"], {}))
+            cached = json.loads(row["recipients_json"])
+            # Only the exact legacy {} default allows fallback. Populated cache
+            # entries must agree with every durable recipient and its role.
+            roles = durable if isinstance(cached, dict) and not cached else archive_routing(cached)
+            if roles != durable:
+                raise ValueError("cached routing conflicts with delivery rows")
+            attachments = json.loads(row["attachments"])
+            if not isinstance(attachments, list):
+                raise ValueError("attachments are not an array")
+            envelope = {"id": row["id"], "from": row["sender_name"],
+                        "project": row["human_key"], "project_slug": row["slug"],
+                        "subject": row["subject"], "body_md": row["body_md"],
+                        "thread_id": row["thread_id"], "topic": row["topic"],
+                        "importance": row["importance"], "ack_required": bool(row["ack_required"]),
+                        "created": epoch + timedelta(microseconds=row["created_ts"]),
+                        "attachments": attachments}
+            for role in ("to", "cc", "bcc"):
+                envelope[role] = roles[role]
+            # The production durable reply record accepts {} or {reply_to:id}.
+            # NULL is legacy unknown authority, not evidence of a fresh send.
+            raw_metadata = row["archive_metadata_json"]
+            if raw_metadata is None:
+                detail["unverifiable_reply_ids"].append(row["id"])
+            else:
+                metadata = json.loads(raw_metadata)
+                if not isinstance(metadata, dict) or set(metadata) - {"reply_to"}:
+                    raise ValueError("unsupported archive metadata")
+                if "reply_to" in metadata:
+                    parent = metadata["reply_to"]
+                    if (type(parent) is not int or parent <= 0 or parent == row["id"]
+                            or not isinstance(row["thread_id"], str) or not row["thread_id"]):
+                        raise ValueError("invalid durable reply parent")
+                    envelope["reply_to"] = parent
+                else:
+                    absent_reply.add(row["id"])
+            expected[row["id"]] = envelope
+    except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError) as error:
+        detail["db_error"] = type(error).__name__
+        if time.monotonic() >= deadline:
+            detail["deadline_exceeded"] = True
+        return False, detail
+
+    seen = set()
+    projects = storage / "projects"
+    committed = None
+    try:
+        check_deadline()
+        if storage.is_symlink() or projects.is_symlink():
+            raise ValueError("archive root symlink")
+        try:
+            committed = ArchiveCommitSnapshot(storage, deadline)
+            detail["git_head"] = committed.head
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            detail["git_error"] = type(error).__name__
+            if time.monotonic() >= deadline:
+                raise TimeoutError("archive observation deadline") from error
+
+        def walk_error(error: OSError) -> None:
+            raise error  # os.walk otherwise silently omits unreadable subtrees
+
+        for project in projects.iterdir() if projects.exists() else ():
+            check_deadline()
+            messages_root = project / "messages"
+            if project.is_symlink() or messages_root.is_symlink():
+                detail["invalid_files"] += 1
+                continue
+            if not messages_root.is_dir():
+                continue
+            for directory, directories, files in os.walk(messages_root, followlinks=False,
+                                                        onerror=walk_error):
+                check_deadline()
+                parent = Path(directory)
+                for name in directories[:]:
+                    if parent.joinpath(name).is_symlink():
+                        detail["invalid_files"] += 1
+                        directories.remove(name)
+                    elif parent == messages_root and name == "threads":
+                        directories.remove(name)  # derived thread views are not canonical messages
+                for name in files:
+                    check_deadline()
+                    if not name.endswith(".md"):
+                        continue
+                    detail["archive_messages"] += 1
+                    path = parent / name
+                    try:
+                        if path.is_symlink():
+                            raise ValueError("canonical symlink")
+                        raw = archive_file_bytes(storage, path, deadline)
+                        check_deadline()
+                        if not raw.startswith(b"---json\n"):
+                            raise ValueError("missing envelope")
+                        front, separator, body = raw[8:].partition(b"\n---\n\n")
+                        if not separator:
+                            raise ValueError("missing body boundary")
+                        actual = json.loads(front)
+                        message_id = actual["id"]
+                        suffix = re.search(r"__(\d+)\.md$", name)
+                        if type(message_id) is not int or message_id <= 0 or not suffix:
+                            raise ValueError("invalid canonical id")
+                        if int(suffix.group(1)) != message_id:
+                            raise ValueError("filename/envelope id mismatch")
+                        if message_id in seen:
+                            detail["duplicate_ids"].append(message_id)
+                        seen.add(message_id)
+                        actual["body_md"] = body.decode("utf-8")  # preserve all significant whitespace
+                        actual["created"] = datetime.fromisoformat(actual["created"].replace("Z", "+00:00"))
+                        actual.update(archive_routing(actual))
+                        if (type(actual.get("ack_required")) is not bool
+                                or not isinstance(actual.get("attachments"), list)):
+                            raise ValueError("invalid archived scalar or attachment metadata")
+                        if "reply_to" in actual:
+                            parent_id = actual["reply_to"]
+                            if (type(parent_id) is not int or parent_id <= 0 or parent_id == message_id
+                                    or not isinstance(actual.get("thread_id"), str)
+                                    or not actual["thread_id"]):
+                                raise ValueError("invalid archived reply parent")
+                        wanted = expected.get(message_id)
+                        if wanted is not None:
+                            fields = [key for key, value in wanted.items() if actual.get(key) != value]
+                            # Python considers True == 1, including inside an
+                            # attachment object; JSON preserves that type distinction.
+                            if ("attachments" not in fields
+                                    and json.dumps(actual["attachments"], sort_keys=True)
+                                    != json.dumps(wanted["attachments"], sort_keys=True)):
+                                fields.append("attachments")
+                            if project.name != wanted["project_slug"]:
+                                fields.append("canonical_project")
+                            if message_id in absent_reply and "reply_to" in actual:
+                                fields.append("reply_to")
+                            if fields:
+                                detail["mismatches"].append({"id": message_id, "fields": fields})
+                            else:
+                                observe_message_bundle(storage, project, path, raw, wanted,
+                                                       committed, deadline, detail)
+                    except TimeoutError:
+                        raise
+                    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                        detail["invalid_files"] += 1
+        check_deadline()
+        if committed is not None:
+            detail["git_objects_verified"] = len(committed.verified)
+            if committed.run("rev-parse", "--verify", "HEAD^{commit}").strip().decode("ascii") != committed.head:
+                detail["git_head_changed"] = True
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        detail["archive_error"] = type(error).__name__
+        if time.monotonic() >= deadline:
+            detail["deadline_exceeded"] = True
+        return False, detail
+    finally:
+        if committed is not None:
+            committed.close()
+    detail["missing_ids"] = sorted(expected.keys() - seen)
+    detail["extra_ids"] = sorted(seen - expected.keys())
+    ok = (detail["db_messages"] == detail["archive_messages"]
+          and not any(detail[key] for key in
+                      ("invalid_files", "missing_ids", "extra_ids", "duplicate_ids", "mismatches",
+                       "unverifiable_reply_ids", "missing_copies", "bundle_mismatches",
+                       "uncommitted_copies"))
+          and "git_error" not in detail and not detail.get("git_head_changed"))
+    return ok, detail
+
+
+class Session:
+    """One agent's own MCP session against a server URL (swarm agents do not
+    share one, as real agents do not)."""
+
+    def __init__(self, url: str):
+        self.url = url
+        self.sid: str | None = None
+        self.rid = 0
+        self.initialized = False
+
+    def call(self, tool: str, args: dict, timeout: float = 60) -> tuple[bool, object]:
+        if not self.initialized:
+            self.rid += 1
+            _, self.sid = mcp_post(self.url, None, self.rid, "initialize", INITIALIZE_PARAMS,
+                                   timeout)
+            self.initialized = True
+        self.rid += 1
+        resp, sid = mcp_post(self.url, self.sid, self.rid, "tools/call",
+                             {"name": tool, "arguments": args}, timeout)
+        self.sid = sid or self.sid
+        return tool_result(resp)
 
 
 class Arm:
@@ -142,13 +747,13 @@ class Arm:
             _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(1024, hard), hard))
 
-        log_file = self.server_log.open("ab")
-        self.proc = subprocess.Popen(
-            [str(self.binary), "serve-http", "--host", "127.0.0.1", "--port",
-             str(self.port), "--no-auth", "--no-tui"],
-            cwd=self.root, env=self.env(), stdout=log_file, stderr=log_file,
-            preexec_fn=soft_limit_1024,
-        )
+        with self.server_log.open("ab") as log_file:
+            self.proc = subprocess.Popen(
+                [str(self.binary), "serve-http", "--host", "127.0.0.1", "--port",
+                 str(self.port), "--no-auth", "--no-tui"],
+                cwd=self.root, env=self.env(), stdout=log_file, stderr=log_file,
+                preexec_fn=soft_limit_1024,
+            )
         deadline = time.time() + 120
         while time.time() < deadline:
             try:
@@ -204,44 +809,21 @@ class Arm:
         with self.lock:
             self.rid += 1
             rid = self.rid
-        body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
-                           "params": params or {}}).encode()
-        headers = {"Content-Type": "application/json",
-                   "Accept": "application/json, text/event-stream"}
-        if self.session:
-            headers["Mcp-Session-Id"] = self.session
-        req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            sid = r.headers.get("Mcp-Session-Id")
-            if sid:
-                self.session = sid
-            raw = r.read().decode()
-        if raw.lstrip().startswith("{"):
-            return json.loads(raw)
-        for line in raw.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[5:].strip())
-        raise RuntimeError(f"unparseable response: {raw[:300]}")
+        resp, sid = mcp_post(self.url, self.session, rid, method, params, timeout)
+        if sid:
+            self.session = sid
+        return resp
 
     def initialize(self) -> None:
-        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                "clientInfo": {"name": "release-smoke", "version": "1"}})
+        self.rpc("initialize", INITIALIZE_PARAMS)
         try:
             self.rpc("notifications/initialized")
         except Exception:  # notification replies are optional
             pass
 
     def call(self, tool: str, args: dict, timeout: float = 60) -> tuple[bool, object]:
-        resp = self.rpc("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
-        if "error" in resp:
-            return True, resp["error"]
-        res = resp["result"]
-        text = "".join(c.get("text", "") for c in res.get("content", []))
-        try:
-            payload: object = json.loads(text)
-        except ValueError:
-            payload = text
-        return bool(res.get("isError")), payload
+        return tool_result(self.rpc("tools/call", {"name": tool, "arguments": args},
+                                    timeout=timeout))
 
     def read_resource(self, uri: str) -> tuple[bool, object]:
         resp = self.rpc("resources/read", {"uri": uri})
@@ -259,26 +841,29 @@ class Arm:
             raise RuntimeError(f"health_check failed: {payload}")
         return payload
 
-    def archive_db_counts(self) -> tuple[int | None, int | None, str]:
-        """(archive, db, detail); counts are None when health cannot report them."""
-        try:
-            detail = self.health()["semantic_readiness"]["detail"]
-        except Exception as ex:  # a sick server must not erase the verdict
-            return None, None, f"{type(ex).__name__}: {ex}"[:400]
-        counts = [int(n) for n in re.findall(r"messages=(\d+)", detail)]
-        if len(counts) != 2:
-            return None, None, detail[:400]
-        return counts[0], counts[1], detail[:400]
-
-    def wait_converged(self, bound_s: int, poll_s: int) -> tuple[bool, str]:
-        deadline = time.time() + bound_s
+    def wait_converged(self, bound_s: int, poll_s: int,
+                       client_threads: list[threading.Thread] | None = None) -> tuple[bool, str]:
+        started = time.monotonic()
+        deadline = started + bound_s
         while True:
-            archive, db, detail = self.archive_db_counts()
-            if archive is not None and archive == db:
-                return True, f"archive={archive} db={db}"
-            if time.time() >= deadline:
-                return False, f"archive={archive} db={db} last={detail}"
-            time.sleep(poll_s)
+            active = sum(thread.is_alive() for thread in client_threads or [])
+            if active:
+                ok, detail = False, {"active_client_threads": active,
+                                     "convergence_unobserved": True}
+            else:
+                ok, detail = archive_db_parity(self.root / "storage", self.db_path, deadline)
+            now = time.monotonic()
+            detail.update(elapsed_s=round(now - started, 3), bound_s=bound_s,
+                          no_mcp_requests=not active, within_bound=now <= deadline)
+            with (self.root / "out" / "archive_convergence.jsonl").open("a") as trace:
+                trace.write(json.dumps({"ok": ok and now <= deadline, **detail}) + "\n")
+            if active:
+                return False, json.dumps(detail, sort_keys=True)
+            if ok and now <= deadline:
+                return True, json.dumps(detail, sort_keys=True)
+            if now >= deadline:
+                return False, json.dumps(detail, sort_keys=True)
+            time.sleep(min(poll_s, deadline - now))
 
     def offline_integrity_check(self) -> tuple[bool, object]:
         """Full PRAGMA integrity_check by C SQLite on the stopped server's file."""
@@ -675,27 +1260,353 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
     return extra
 
 
+# --- swarm (br-kp1in.34) -----------------------------------------------------
+# Pure judgement helpers first, so the assertion logic is unit-tested
+# (scripts/tests/test_release_smoke_swarm.py) without a server.
+
+def classify_call(is_error: bool, payload: object) -> str:
+    """ok | timeout (the server's 30 s dispatch deadline) | tool_error."""
+    if not is_error:
+        return "ok"
+    return "timeout" if DISPATCH_TIMEOUT_MARKER in json.dumps(payload, default=str) else "tool_error"
+
+
+def in_kill_window(start: float, end: float, kill_t: float | None,
+                   restarted_t: float | None, grace_s: float = SWARM_KILL_GRACE_S) -> bool:
+    """True for a call the deliberate SIGKILL could have cut: it was still in
+    flight at the kill, and it began before the restarted server had been
+    answering for `grace_s`. Only connection failures are excused this way."""
+    if kill_t is None or restarted_t is None:
+        return False
+    return end >= kill_t and start <= restarted_t + grace_s
+
+
+def percentile(values: list, q: float) -> float | None:
+    s = sorted(values)
+    return s[min(len(s) - 1, int(len(s) * q))] if s else None
+
+
+def swarm_tool_stats(records: list, kill_t: float | None, restarted_t: float | None) -> dict:
+    """records: (tool, start, end, outcome, code) with outcome in ok | timeout |
+    tool_error | conn_error. Latency covers every answered call (a timed-out
+    call counts at its full duration); connection errors inside the kill window
+    are excused, every other one is a failure."""
+    stats: dict = {}
+    for tool, start, end, outcome, code in records:
+        s = stats.setdefault(tool, {"n": 0, "durations": [], "timeouts": 0, "tool_errors": {},
+                                    "conn_errors": 0, "kill_window": 0})
+        if outcome == "conn_error":
+            if in_kill_window(start, end, kill_t, restarted_t):
+                s["kill_window"] += 1
+            else:
+                s["conn_errors"] += 1
+            continue
+        s["n"] += 1
+        s["durations"].append(end - start)
+        if outcome == "timeout":
+            s["timeouts"] += 1
+        elif outcome == "tool_error":
+            s["tool_errors"][code] = s["tool_errors"].get(code, 0) + 1
+    for s in stats.values():
+        d = s.pop("durations")
+        s["p50_s"] = percentile(d, 0.5)
+        s["p99_s"] = percentile(d, 0.99)
+        s["max_s"] = max(d) if d else None
+    return stats
+
+
+def drain_stalled_windows(samples: list) -> list:
+    """Windows in which work queued at the window's start saw no drain progress.
+    samples: (t, drained_total, depth) from ONE server process (drained_total
+    restarts at zero after a restart, so segments are judged separately)."""
+    bad = []
+    for prev, cur in zip(samples, samples[1:]):
+        if prev[2] > 0 and cur[1] <= prev[1]:
+            bad.append({"t": round(cur[0]), "drained_total": cur[1],
+                        "depth_at_open": prev[2], "depth_at_close": cur[2]})
+    return bad
+
+
+def error_code(payload: object) -> str:
+    text = json.dumps(payload, default=str)
+    m = re.search(r'"type":\s*"([A-Z_]+)"', text)
+    return m.group(1) if m else text[:60]
+
+
+def swarm_knob_shortfall(agents: int, secs: int) -> str | None:
+    """Why a swarm with these knobs cannot PASS, or None at release strength."""
+    if agents >= RELEASE_MIN_SWARM_AGENTS and secs >= RELEASE_MIN_SWARM_SECS:
+        return None
+    return (f"swarm {agents} agents x {secs}s is below the release minimum "
+            f"{RELEASE_MIN_SWARM_AGENTS} x {RELEASE_MIN_SWARM_SECS}s")
+
+
+def swarm_thread_id(agent: int, sequence: int, sampled: int, sparse_conflicts: bool) -> str:
+    """Keep the original seeded workload, or interleave mutable shared paths
+    with distinct threads. Offset each agent so a burst does not put every
+    client on the shared digest at once. Unique names never alias another
+    agent's send, including after its MCP session is renewed after SIGKILL.
+    """
+    if not sparse_conflicts:
+        return f"swarm-{sampled}"
+    if (agent + sequence) % 16 == 0:
+        return "swarm-contention-shared"
+    return f"swarm-contention-{agent}-{sequence}"
+
+
+def phase_swarm(arm: Arm, state: dict, c: list, *, sparse_conflicts: bool = False) -> dict:
+    phase_name = "archive_contention" if sparse_conflicts else "swarm"
+    extra: dict = {"agents": SWARM_AGENTS, "secs": SWARM_SECS,
+                   "thread_workload": "sparse_conflicts" if sparse_conflicts else "shared_50"}
+    shortfall = swarm_knob_shortfall(SWARM_AGENTS, SWARM_SECS)
+    if shortfall:
+        extra["cannot_pass"] = shortfall
+    if SWARM_AGENTS <= 0 or SWARM_SECS <= 0:
+        return extra  # skipped: no checks, so NO_VERDICT
+    log_offset = arm.server_log.stat().st_size if arm.server_log.exists() else 0
+    projects = []
+    for k in range(SWARM_PROJECTS):
+        p = arm.root / f"swarm{k + 1}"
+        p.mkdir(exist_ok=True)
+        e, _ = arm.call("ensure_project", {"human_key": str(p)})
+        projects.append(str(p))
+    agents: list = []  # (project, name)
+    for k in range(SWARM_AGENTS):
+        proj = projects[k % SWARM_PROJECTS]
+        e, a = arm.call("register_agent", {"project_key": proj, "program": "swarm",
+                                           "model": "smoke"})
+        if not e and isinstance(a, dict) and a.get("name"):
+            agents.append((proj, a["name"]))
+    check(c, f"register {SWARM_AGENTS} swarm agents", len(agents) == SWARM_AGENTS,
+          f"{len(agents)}/{SWARM_AGENTS}")
+    peers: dict = {}
+    for proj, name in agents:
+        peers.setdefault(proj, []).append(name)
+
+    records: list = []
+    error_samples: dict = {}  # "tool CODE" -> up to 3 truncated error payloads
+    acked: list = []
+    lock = threading.Lock()
+    stop = threading.Event()
+    restarting = threading.Event()
+    clock = {"kill_t": None, "restarted_t": None}
+    send_workload = {proj: {"shared_attempts": 0, "unique_attempts": 0,
+                            "shared_ok": 0, "unique_ok": 0} for proj in projects}
+
+    def timed(sess: Session, tool: str, args: dict) -> tuple[bool, object] | None:
+        if stop.is_set():
+            return None  # do not launch another read after the load stops
+        send_kind = None
+        if tool == "send_message":
+            send_kind = ("shared" if not sparse_conflicts
+                         or args["thread_id"] == "swarm-contention-shared" else "unique")
+            with lock:
+                send_workload[args["project_key"]][send_kind + "_attempts"] += 1
+        t0 = time.time()
+        try:
+            e, p = sess.call(tool, args, timeout=60)
+        except Exception as ex:  # connection refused/reset (SIGKILL) or client timeout
+            with lock:
+                records.append((tool, t0, time.time(), "conn_error", type(ex).__name__))
+            return None
+        outcome = classify_call(e, p)
+        code = error_code(p) if outcome != "ok" else ""
+        with lock:
+            records.append((tool, t0, time.time(), outcome, code))
+            if send_kind and outcome == "ok":
+                send_workload[args["project_key"]][send_kind + "_ok"] += 1
+            if code:  # a code alone cannot name the failing site; keep a few payloads
+                kept = error_samples.setdefault(f"{tool} {code}", [])
+                if len(kept) < 3:
+                    kept.append(json.dumps(p, default=str)[:600])
+        return e, p
+
+    def agent_loop(idx: int) -> None:
+        proj, me = agents[idx]
+        rnd = random.Random(idx)  # recorded seed per agent: the plan replays
+        sess = Session(arm.url)
+        others = [n for n in peers[proj] if n != me]
+        send_sequence = 0
+        while not stop.is_set():
+            if restarting.is_set():
+                time.sleep(0.2)
+                continue
+            r = timed(sess, "send_message", {
+                # ubs:ignore -- seeded peer scheduling, never secret/key/token generation.
+                "project_key": proj, "sender_name": me, "to": rnd.sample(others, k=min(2, len(others))),
+                "subject": f"swarm {me} {rnd.randrange(1 << 30)}",
+                "body_md": "swarm body " * rnd.randint(1, 40),
+                "thread_id": swarm_thread_id(idx, send_sequence, rnd.randint(1, 50),
+                                              sparse_conflicts),
+                "ack_required": rnd.random() < 0.25})
+            send_sequence += 1
+            if r is None:
+                sess = Session(arm.url)
+                time.sleep(0.5)
+                continue
+            if not r[0]:
+                mid = deliveries_id(r[1])
+                if mid is not None:
+                    with lock:
+                        acked.append(mid)
+            r = timed(sess, "fetch_inbox", {"project_key": proj, "agent_name": me, "limit": 10})
+            if r is not None and not r[0] and isinstance(r[1], list):
+                for m in r[1][:3]:
+                    if isinstance(m, dict) and m.get("ack_required") and not m.get("ack_ts"):
+                        timed(sess, "acknowledge_message", {"project_key": proj,
+                                                            "agent_name": me,
+                                                            "message_id": m.get("id")})
+            if rnd.random() < 0.3:
+                path = [f"src/mod{rnd.randint(1, 30)}/**"]
+                timed(sess, "file_reservation_paths", {"project_key": proj, "agent_name": me,
+                                                       "paths": path, "ttl_seconds": 300,
+                                                       "exclusive": True})
+                timed(sess, "release_file_reservations", {"project_key": proj,
+                                                          "agent_name": me, "paths": path})
+            if rnd.random() < 0.1:
+                timed(sess, "search_messages", {"project_key": proj, "query": "swarm body",
+                                                "limit": 10})
+            time.sleep(rnd.uniform(0.0, 0.3))
+
+    started = time.time()
+    threads = [threading.Thread(target=agent_loop, args=(k,), daemon=True)
+               for k in range(len(agents))]
+    for t in threads:
+        t.start()
+    segments: list = [[]]  # WBQ samples per server process
+    fds_max = 0
+    zombies_max = 0
+    unobserved = 0
+    kill_at = started + SWARM_SECS / 2
+    while time.time() - started < SWARM_SECS:
+        time.sleep(SOAK_WINDOW_SECS)
+        if clock["kill_t"] is None and time.time() >= kill_at:
+            restarting.set()
+            clock["kill_t"] = time.time()
+            arm.kill(signal.SIGKILL)
+            arm.start()
+            clock["restarted_t"] = time.time()
+            restarting.clear()
+            segments.append([])
+            continue
+        try:
+            fds_max = max(fds_max, arm.sqlite_fds())
+            h = arm.health()
+            zombies_max = max(zombies_max, h["timeout_diagnostics"]["blocking_dispatch_zombies"])
+            segments[-1].append((time.time(), h["queues"]["wbq"]["drained_total"],
+                                 h["queues"]["wbq"]["depth"]))
+        except Exception:  # a server too sick to answer health is judged by its windows
+            unobserved += 1
+    stop.set()
+    clients_deadline = time.monotonic() + 120
+    for t in threads:
+        t.join(timeout=max(0, clients_deadline - time.monotonic()))
+    active_clients = sum(t.is_alive() for t in threads)
+    check(c, "all swarm clients stop before the quiet interval", active_clients == 0,
+          {"active_client_threads": active_clients})
+    if active_clients:
+        extra.update(active_client_threads=active_clients, quiet_interval_observed=False)
+        return extra  # no quiet or archive-convergence claim from a live client
+    load_secs = time.time() - started
+    # Every call, so a latency tail can be placed in time (restart, backup, checkpoint).
+    with (arm.root / "out" / f"{phase_name}_calls.jsonl").open("w") as f:
+        for tool, start, end, outcome, code in records:
+            f.write(json.dumps([tool, round(start - started, 3), round(end - start, 3),
+                                outcome, code]) + "\n")
+    stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
+    if sparse_conflicts:
+        check(c, "each project acknowledges repeated shared and unique thread traffic",
+              all(s["shared_ok"] >= 2 and s["unique_ok"] >= 1 for s in send_workload.values()),
+              send_workload)
+    stalled = [w for seg in segments for w in drain_stalled_windows(seg)]
+    for tool in SWARM_GATED_TOOLS:
+        s = stats.get(tool, {})
+        check(c, f"{tool} p99 <= {SWARM_TOOL_P99_BUDGET_S}s at {len(agents)} agents",
+              s.get("n", 0) > 0 and s["p99_s"] <= SWARM_TOOL_P99_BUDGET_S,
+              {k: s.get(k) for k in ("n", "p50_s", "p99_s", "max_s")})
+    timeouts = {t: s["timeouts"] for t, s in stats.items() if s["timeouts"]}
+    check(c, "zero 30 s dispatch timeouts", not timeouts, timeouts)
+    tool_errors = {t: s["tool_errors"] for t, s in stats.items() if s["tool_errors"]}
+    check(c, "zero tool errors", not tool_errors, tool_errors)
+    conn = {t: s["conn_errors"] for t, s in stats.items() if s["conn_errors"]}
+    check(c, "no connection errors outside the SIGKILL window", not conn, conn)
+    check(c, f"WBQ drained_total advances in every {SOAK_WINDOW_SECS}s window with queued work",
+          sum(len(s) for s in segments) >= 4 and not stalled and unobserved == 0,
+          f"samples={[len(s) for s in segments]} unobserved={unobserved} stalled={stalled[:5]}")
+    check(c, f"storage.sqlite3 descriptors bounded (<= {FD_BOUND})", fds_max <= FD_BOUND,
+          f"max={fds_max}")
+    check(c, "no dispatch zombies", zombies_max == 0, f"max={zombies_max}")
+    ok, detail = arm.wait_converged(CONVERGE_SECS, 10, client_threads=threads)
+    check(c, f"archive converges to DB after the swarm without client reads "
+             f"(<= {CONVERGE_SECS}s)", ok, detail)
+    log_text = arm.server_log.read_text(errors="replace")[log_offset:]
+    restarts = [m for m in HTTP_RESTART_MARKERS if m in log_text]
+    check(c, "zero HTTP server restarts and no EMFILE", not restarts and not has_emfile(log_text),
+          {"markers": restarts, "emfile": has_emfile(log_text)})
+    check(c, "server exits within 60 s of SIGTERM", arm.kill(signal.SIGTERM))
+    ok, detail = arm.offline_integrity_check()
+    check(c, "full PRAGMA integrity_check ok (independent C SQLite, server stopped)", ok, detail)
+    present: set = set()
+    try:
+        con = sqlite3.connect(f"file:{arm.db_path}?mode=ro", uri=True, timeout=30)
+        try:
+            present = {r[0] for r in con.execute("SELECT id FROM messages")}
+        finally:
+            con.close()
+    except sqlite3.Error as ex:
+        present = set()
+        detail = f"{type(ex).__name__}: {ex}"
+    lost = sorted(set(acked) - present)
+    check(c, f"all {len(acked)} acknowledged swarm sends survive SIGKILL", acked and not lost,
+          f"lost={lost[:10]}")
+    arm.start()
+    extra.update({
+        "agents_registered": len(agents), "load_secs": round(load_secs, 1),
+        "kill_at_s": round(clock["kill_t"] - started, 1) if clock["kill_t"] else None,
+        "restart_s": (round(clock["restarted_t"] - clock["kill_t"], 2)
+                      if clock["kill_t"] and clock["restarted_t"] else None),
+        "acked_sends": len(acked), "sends_per_s": round(len(acked) / load_secs, 2),
+        "tools": stats, "tool_error_samples": error_samples, "sqlite_fds_max": fds_max,
+        "send_workload": send_workload,
+        "zombies_max": zombies_max, "wbq_samples": [len(s) for s in segments],
+        "stalled_windows": len(stalled)})
+    if CONVERGE_SECS > RELEASE_CONVERGE_SECS:
+        extra["cannot_pass"] = f"convergence bound {CONVERGE_SECS}s is looser than release"
+    return extra
+
+
+def phase_archive_contention(arm: Arm, state: dict, c: list) -> dict:
+    return phase_swarm(arm, state, c, sparse_conflicts=True)
+
+
 PHASES = (("flow", phase_flow), ("cross_project", phase_cross_project),
-          ("storm", phase_storm), ("crash", phase_crash), ("soak", phase_soak))
+          ("storm", phase_storm), ("crash", phase_crash), ("soak", phase_soak),
+          ("swarm", phase_swarm))
 
 
-def run_arm(name: str, binary: Path, out: Path) -> dict:
+def run_arm(name: str, binary: Path, out: Path, *, archive_contention: bool = False) -> dict:
     # A fresh directory per run: never delete earlier evidence.
     root = out / f"{name}-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     arm = Arm(name, binary, root)
+    phases = PHASES + (("archive_contention", phase_archive_contention),) if archive_contention else PHASES
+    # Host load is recorded per arm: a verdict measured on a saturated shared
+    # host is a signal to re-run, never a pass or a clean loss.
+    with binary.open("rb") as f:
+        target = elf_target(f.read(1 << 16))
     result: dict = {"arm": name, "binary": str(binary), "binary_sha256": sha256(binary),
-                    "phases": {}}
+                    "binary_target": target,
+                    "loadavg_start": Path("/proc/loadavg").read_text().split()[:3], "phases": {}}
     try:
         version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
                                  timeout=60, env=arm.env())
         result["binary_version"] = (version.stdout or version.stderr).strip()[:200]
         arm.start()
         result["server_exe_sha256"] = sha256(Path(f"/proc/{arm.pid()}/exe"))
-        soft, hard = open(f"/proc/{arm.pid()}/limits").read().split("Max open files")[1].split()[:2]
+        soft, hard = Path(f"/proc/{arm.pid()}/limits").read_text().split("Max open files")[1].split()[:2]
         result["server_nofile_soft_hard"] = [soft, hard]
         result["server_threads_start"] = arm.threads()
         state: dict = {}
-        for phase_name, phase in PHASES:
+        for phase_name, phase in phases:
             log(f"{name}: phase {phase_name}")
             c: list = []
             extra: dict = {}
@@ -725,8 +1636,9 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
             if "WAL-FEC" in line)
     except OSError:
         pass
+    result["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
     verdicts = [p.get("verdict") for p in result["phases"].values()]
-    result["verdict"] = ("PASS" if len(verdicts) == len(PHASES)
+    result["verdict"] = ("PASS" if len(verdicts) == len(phases)
                          and all(v == "PASS" for v in verdicts)
                          and result["clean_shutdown"] else "FAIL")
     return result
@@ -736,19 +1648,40 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--bin", required=True, type=Path, help="candidate `am` binary")
     ap.add_argument("--control-bin", type=Path, help="control binary (e.g. previous release)")
+    ap.add_argument("--control-first", action="store_true",
+                    help="run the control first to alternate A/B order across retained invocations")
+    ap.add_argument("--archive-contention", action="store_true",
+                    help="also run a full swarm with sparse shared-thread path conflicts")
     ap.add_argument("--out", required=True, type=Path, help="output directory for the receipt")
     args = ap.parse_args()
+    if args.control_first and not args.control_bin:
+        ap.error("--control-first requires --control-bin")
     args.out.mkdir(parents=True, exist_ok=True)
-    receipt = {"schema_version": 2,
+    receipt = {"schema_version": 3,
+               "harness_sha256": sha256(Path(__file__)),
+               "convergence_source": "independent read-only SQLite and committed canonical/inbox/outbox Git content; no MCP polling",
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               "host": socket.gethostname(), "soak_secs": SOAK_SECS,
+               "host": socket.gethostname(), "cpu_governors": cpu_governors(),
+               "soak_secs": SOAK_SECS,
                "converge_secs": CONVERGE_SECS,
-               "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S, "arms": []}
-    receipt["arms"].append(run_arm("candidate", args.bin.resolve(), args.out))
+               "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S,
+               "swarm_agents": SWARM_AGENTS, "swarm_secs": SWARM_SECS,
+               "swarm_tool_p99_budget_s": SWARM_TOOL_P99_BUDGET_S,
+               "archive_contention": args.archive_contention,
+               "loadavg_start": Path("/proc/loadavg").read_text().split()[:3], "arms": []}
+    schedule = [("candidate", args.bin.resolve())]
     if args.control_bin:
-        receipt["arms"].append(run_arm("control", args.control_bin.resolve(), args.out))
+        schedule.append(("control", args.control_bin.resolve()))
+    if args.control_first:
+        schedule.reverse()
+    receipt["arm_order"] = [name for name, _ in schedule]
+    for name, binary in schedule:
+        receipt["arms"].append(run_arm(name, binary, args.out,
+                                        archive_contention=args.archive_contention))
     receipt["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    receipt["candidate_verdict"] = receipt["arms"][0]["verdict"]
+    receipt["loadavg_end"] = Path("/proc/loadavg").read_text().split()[:3]
+    receipt["candidate_verdict"] = next(arm["verdict"] for arm in receipt["arms"]
+                                          if arm["arm"] == "candidate")
     (args.out / "release_smoke_receipt.json").write_text(json.dumps(receipt, indent=2))
     log(f"receipt: {args.out / 'release_smoke_receipt.json'}")
     for arm in receipt["arms"]:

@@ -1,0 +1,537 @@
+//! Bounded retry debt and source-aware conflict hints for profile recovery.
+//!
+//! A transient archive failure must not disappear behind the roster watermark.
+//! Retaining a profile payload would be unsafe: retirement or deregistration
+//! can change before the next attempt. Every scheduled ID is read afresh by
+//! the ordinary source and publication checks in the parent module.
+//! Stable conflicts retain only an ID and digest of freshly observed authority,
+//! never an archived payload or permission to skip the next authority read.
+
+mod checkpoint;
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::StorageError;
+
+const MAX_RETRY_IDS: usize = 1024;
+const MAX_CONFLICT_IDS: usize = 1024;
+const MAX_READY_PER_BATCH: usize = 16;
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub(super) struct Failure {
+    pub(super) detail: String,
+    pub(super) transient: bool,
+    pub(super) conflict_fingerprint: Option<String>,
+}
+
+impl Failure {
+    pub(super) fn source_unavailable(error: impl std::fmt::Display) -> Self {
+        Self::transient(super::source_error(error))
+    }
+
+    pub(super) fn transient(detail: String) -> Self {
+        Self {
+            detail,
+            transient: true,
+            conflict_fingerprint: None,
+        }
+    }
+
+    /// Only a conflict proven from bounded, readable source/archive evidence
+    /// can supply this witness. Rendered error text alone grants no suppression.
+    pub(super) const fn conflict(detail: String, fingerprint: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+            conflict_fingerprint: Some(fingerprint),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+            conflict_fingerprint: None,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(detail: &str) -> Self {
+        detail.to_string().into()
+    }
+}
+
+/// Resource exhaustion is an operational failure, not conflicting identity
+/// evidence. Keep the ID on the bounded retry lane so a recovered filesystem
+/// does not have to wait for the entire roster to wrap before its tombstone
+/// or retirement is archived. Never retain the payload from the failed turn.
+fn retryable_io_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ResourceBusy
+            | ErrorKind::StorageFull
+            | ErrorKind::QuotaExceeded
+            | ErrorKind::OutOfMemory
+    ) || crate::recovery::is_file_descriptor_exhaustion(error)
+}
+
+impl From<StorageError> for Failure {
+    fn from(error: StorageError) -> Self {
+        // Classify the typed error before rendering it. An identity conflict
+        // mentioning a lock is not permission to put it on the fast lane.
+        let transient = matches!(
+            &error,
+            StorageError::LockContention { .. }
+                | StorageError::LockTimeout(_)
+                | StorageError::GitIndexLock { .. }
+        ) || matches!(&error, StorageError::Io(error)
+            if retryable_io_error(error));
+        Self {
+            detail: error.to_string(),
+            transient,
+            conflict_fingerprint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictEntry {
+    id: i64,
+    fingerprint: String,
+}
+
+impl ConflictEntry {
+    fn is_valid(&self) -> bool {
+        self.id > 0
+            && self.fingerprint.len() == 64
+            && self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Best-effort suppression, separate from mandatory transient retry debt.
+/// Entries are FIFO and bounded: more than 1024 distinct conflicts can evict
+/// old hints and therefore repeat their diagnostics. Saturation never blocks
+/// roster progress, removes retry obligations, or changes archive evidence.
+#[derive(Debug, Default)]
+pub(super) struct ConflictCache {
+    entries: VecDeque<ConflictEntry>,
+}
+
+impl ConflictCache {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn matches(&self, id: i64, fingerprint: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.id == id && entry.fingerprint == fingerprint)
+    }
+
+    pub(super) fn forget(&mut self, id: i64) {
+        self.entries.retain(|entry| entry.id != id);
+    }
+
+    /// Return whether retaining this new witness evicted another ID. Repeated
+    /// observations of the same witness do not refresh its FIFO position.
+    pub(super) fn remember(&mut self, id: i64, fingerprint: String) -> bool {
+        if self.matches(id, &fingerprint) {
+            return false;
+        }
+        let entry = ConflictEntry { id, fingerprint };
+        debug_assert!(entry.is_valid(), "conflict witnesses must be canonical");
+        self.forget(id);
+        let evicted = self.entries.len() == MAX_CONFLICT_IDS;
+        if evicted {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+        evicted
+    }
+}
+
+#[derive(Debug)]
+struct Entry {
+    id: i64,
+    attempts: u32,
+    ready_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RetryQueue {
+    entries: VecDeque<Entry>,
+    // The roster watermark and retry debt are one atomic scheduling snapshot.
+    // Keep its lifetime lock and restore-once state with the private queue.
+    persistence: checkpoint::Persistence,
+}
+
+impl RetryQueue {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn contains(&self, id: i64) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
+    /// Reserve capacity logically before attempting a previously unseen ID.
+    /// The single cursor owner cannot consume this slot concurrently. A full
+    /// queue stops new scan work, not retries, and never evicts unresolved debt.
+    pub(super) fn can_admit(&self, id: i64) -> bool {
+        self.entries.len() < MAX_RETRY_IDS || self.contains(id)
+    }
+
+    /// Select without removing. Cancellation, exhausted repair budgets, and
+    /// failed admission leave every unattempted obligation in the queue.
+    pub(super) fn ready_ids(&self, now: Instant) -> Vec<i64> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.ready_at <= now)
+            .take(MAX_READY_PER_BATCH)
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    pub(super) fn forget(&mut self, id: i64) {
+        self.entries.retain(|entry| entry.id != id);
+    }
+
+    /// First refusal is eligible in the next batch, never a second attempt in
+    /// the current batch. Repeated failures rotate behind other ready IDs and
+    /// back off exponentially, capped at the normal one-minute worker cadence.
+    pub(super) fn defer(&mut self, id: i64, now: Instant) {
+        assert!(
+            self.can_admit(id),
+            "profile retry capacity must precede admission"
+        );
+        let previous = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .and_then(|index| self.entries.remove(index));
+        let attempts = previous.map_or(0, |entry| entry.attempts.saturating_add(1));
+        let delay = if attempts == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1_u64 << attempts.saturating_sub(1).min(6)).min(MAX_BACKOFF)
+        };
+        self.entries.push_back(Entry {
+            id,
+            attempts,
+            ready_at: now + delay,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Candidate {
+    pub(super) id: i64,
+    pub(super) retry: bool,
+}
+
+/// Both inputs have already been bounded so their sum is at most the original
+/// 32-candidate batch. Alternate lanes rather than letting a four-repair budget
+/// be consumed exclusively by retries or by continuously registered identities.
+pub(super) fn interleave(
+    scan: Vec<i64>,
+    retries: Vec<i64>,
+    mut prefer_retry: bool,
+) -> Vec<Candidate> {
+    let capacity = scan.len().saturating_add(retries.len());
+    let mut scan = scan.into_iter();
+    let mut retries = retries.into_iter();
+    let mut result = Vec::with_capacity(capacity);
+    loop {
+        let candidate = if prefer_retry {
+            retries
+                .next()
+                .map(|id| Candidate { id, retry: true })
+                .or_else(|| scan.next().map(|id| Candidate { id, retry: false }))
+        } else {
+            scan.next()
+                .map(|id| Candidate { id, retry: false })
+                .or_else(|| retries.next().map(|id| Candidate { id, retry: true }))
+        };
+        let Some(candidate) = candidate else { break };
+        prefer_retry = !candidate.retry;
+        result.push(candidate);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_witnesses_are_scoped_to_id_and_exact_inputs() {
+        let mut conflicts = ConflictCache::default();
+        let before = "a".repeat(64);
+        let after = "b".repeat(64);
+        assert!(!conflicts.remember(7, before.clone()));
+        assert!(conflicts.matches(7, &before));
+        assert!(!conflicts.matches(8, &before));
+        assert!(!conflicts.matches(7, &after));
+        assert!(!conflicts.remember(8, before.clone()));
+        assert!(!conflicts.remember(7, after.clone()));
+        assert_eq!(conflicts.len(), 2);
+        assert!(!conflicts.matches(7, &before));
+        assert!(conflicts.matches(7, &after));
+        conflicts.forget(7);
+        assert_eq!(conflicts.len(), 1);
+        assert!(!conflicts.matches(7, &after));
+        assert!(conflicts.matches(8, &before));
+    }
+
+    #[test]
+    fn conflict_cache_is_bounded_fifo_without_refresh_on_unchanged_observations() {
+        let mut conflicts = ConflictCache::default();
+        let limit = i64::try_from(MAX_CONFLICT_IDS).unwrap();
+        let fingerprint = "a".repeat(64);
+        for id in 1..=limit {
+            assert!(!conflicts.remember(id, fingerprint.clone()));
+        }
+        for _ in 0..316 {
+            assert!(conflicts.matches(1, &fingerprint));
+            assert!(!conflicts.remember(1, fingerprint.clone()));
+        }
+        assert!(conflicts.remember(limit + 1, fingerprint.clone()));
+        assert_eq!(conflicts.len(), MAX_CONFLICT_IDS);
+        assert!(!conflicts.matches(1, &fingerprint));
+        assert!(conflicts.matches(2, &fingerprint));
+        assert!(conflicts.matches(limit + 1, &fingerprint));
+        assert!(conflicts.remember(limit + 2, fingerprint.clone()));
+        assert!(!conflicts.matches(2, &fingerprint));
+        conflicts.forget(3);
+        assert!(!conflicts.remember(limit + 3, fingerprint));
+        assert_eq!(conflicts.len(), MAX_CONFLICT_IDS);
+    }
+
+    #[test]
+    fn failure_text_and_typed_infrastructure_errors_never_supply_conflict_witnesses() {
+        let detail = "archived deregistration conflicts with the live ledger; preserved";
+        for failure in [
+            Failure::from(detail),
+            Failure::from(StorageError::InvalidPath(detail.into())),
+            Failure::from(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                detail,
+            ))),
+            Failure::transient(detail.into()),
+        ] {
+            assert!(failure.conflict_fingerprint.is_none());
+        }
+        let fingerprint = "a".repeat(64);
+        let conflict = Failure::conflict(detail.into(), fingerprint.clone());
+        assert!(!conflict.transient);
+        assert_eq!(
+            conflict.conflict_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
+
+    #[test]
+    fn retry_backoff_is_bounded_and_selection_does_not_consume_debt() {
+        let now = Instant::now();
+        let mut queue = RetryQueue::default();
+        queue.defer(7, now);
+        assert_eq!(queue.ready_ids(now), [7]);
+        assert_eq!(queue.ready_ids(now), [7]);
+        queue.defer(7, now);
+        assert!(queue.ready_ids(now).is_empty());
+        assert_eq!(queue.ready_ids(now + Duration::from_secs(1)), [7]);
+        for _ in 0..100 {
+            queue.defer(7, now);
+        }
+        assert_eq!(queue.len(), 1);
+        assert!(
+            queue
+                .ready_ids(now + MAX_BACKOFF - Duration::from_nanos(1))
+                .is_empty()
+        );
+        assert_eq!(queue.ready_ids(now + MAX_BACKOFF), [7]);
+        queue.forget(7);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn full_retry_queue_preserves_every_obligation_and_still_admits_retries() {
+        let now = Instant::now();
+        let mut queue = RetryQueue::default();
+        for id in 1..=i64::try_from(MAX_RETRY_IDS).unwrap() {
+            assert!(queue.can_admit(id));
+            queue.defer(id, now);
+        }
+        assert!(!queue.can_admit(10_000));
+        assert!(queue.can_admit(1));
+        queue.defer(1, now);
+        assert_eq!(queue.len(), MAX_RETRY_IDS);
+        assert!(queue.contains(1));
+        assert!(queue.contains(i64::try_from(MAX_RETRY_IDS).unwrap()));
+        assert_eq!(queue.ready_ids(now), (2..=17).collect::<Vec<_>>());
+        queue.forget(2);
+        assert!(queue.can_admit(10_000));
+    }
+
+    #[test]
+    fn retry_and_history_lanes_both_progress_under_small_repair_budgets() {
+        for prefer_retry in [false, true] {
+            let candidates = interleave(vec![100, 101, 102], vec![1, 2, 3], prefer_retry);
+            assert_eq!(candidates.len(), 6);
+            for pair in candidates.as_chunks::<2>().0 {
+                assert_ne!(pair[0].retry, pair[1].retry);
+            }
+            assert_eq!(
+                candidates
+                    .iter()
+                    .filter(|item| item.retry)
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(
+                candidates
+                    .iter()
+                    .filter(|item| !item.retry)
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
+                [100, 101, 102]
+            );
+        }
+        assert!(interleave(Vec::new(), Vec::new(), true).is_empty());
+        assert_eq!(
+            interleave(vec![9], Vec::new(), true),
+            [Candidate {
+                id: 9,
+                retry: false
+            }]
+        );
+        assert_eq!(
+            interleave(Vec::new(), vec![9], false),
+            [Candidate { id: 9, retry: true }]
+        );
+    }
+
+    #[test]
+    fn only_typed_transient_storage_errors_enter_the_fast_lane() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let failure = Failure::from(StorageError::Io(std::io::Error::new(kind, "busy")));
+            assert!(failure.transient);
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let failure = Failure::from(StorageError::Io(std::io::Error::new(kind, "evidence")));
+            assert!(!failure.transient);
+        }
+        assert!(
+            !Failure::from(StorageError::InvalidPath(
+                "publication fence busy is not identity authority".into()
+            ))
+            .transient
+        );
+        assert!(!Failure::from("agent source is ambiguous").transient);
+    }
+
+    #[test]
+    fn resource_pressure_keeps_lifecycle_debt_without_erasing_other_ids() {
+        use std::io::ErrorKind;
+
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(Failure::from(StorageError::Io(error)).transient);
+        }
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::ResourceBusy,
+            ErrorKind::StorageFull,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::OutOfMemory,
+        ] {
+            let error = StorageError::Io(std::io::Error::new(kind, "profile publication failed"));
+            let detail = error.to_string();
+            let failure = Failure::from(error);
+            assert!(
+                failure.transient,
+                "{kind:?} must retain lifecycle retry debt"
+            );
+            assert_eq!(
+                failure.detail, detail,
+                "do not disguise pressure as lock contention"
+            );
+
+            let now = Instant::now();
+            let mut queue = RetryQueue::default();
+            queue.defer(7, now);
+            queue.defer(8, now);
+            queue.defer(7, now);
+            assert_eq!(queue.ready_ids(now), [8]);
+            assert_eq!(queue.ready_ids(now + Duration::from_secs(1)), [8, 7]);
+            assert_eq!(queue.len(), 2);
+            queue.forget(7);
+            assert_eq!(queue.ready_ids(now + MAX_BACKOFF), [8]);
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsafe_artifacts_do_not_enter_resource_pressure_retries() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::AlreadyExists,
+            ErrorKind::NotADirectory,
+            ErrorKind::Unsupported,
+        ] {
+            let failure = Failure::from(StorageError::Io(std::io::Error::new(
+                kind,
+                "disk full; quota exceeded; interrupted; retry me",
+            )));
+            assert!(
+                !failure.transient,
+                "{kind:?} must not gain retry authority from text"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_enospc_is_not_misclassified_as_conflicting_profile_evidence() {
+        use std::io::Write as _;
+
+        let mut full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("Linux ENOSPC fixture");
+        let error = full.write_all(b"retained lifecycle update").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert!(retryable_io_error(&error));
+        let failure = Failure::from(StorageError::Io(error));
+        assert!(failure.transient);
+        let now = Instant::now();
+        let mut queue = RetryQueue::default();
+        queue.defer(7, now);
+        assert_eq!(queue.ready_ids(now), [7]);
+        assert_eq!(queue.len(), 1);
+    }
+}

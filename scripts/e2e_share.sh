@@ -5,6 +5,12 @@
 #   am e2e run --project . share
 # Compatibility fallback:
 #   AM_E2E_FORCE_LEGACY=1 ./scripts/e2e_test.sh share
+# Required real-crypto lane against an already built candidate (no build):
+#   bash scripts/e2e_share.sh --crypto-only all /absolute/path/to/am
+# Causal publication-only example (real age, actual candidate CLI):
+#   bash scripts/e2e_share.sh --crypto-only race-concurrent /absolute/path/to/am
+# Optional local dependency absence only: AM_SHARE_REQUIRE_AGE=0. A present
+# dependency failing is always a failure, never a skip (br-kp1in.48).
 #
 # This suite verifies:
 # - Export creates a bundle with manifest.json, mailbox.sqlite3, viewer/
@@ -28,8 +34,704 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
+# Shared real-age fixture/CLI runner. Secrets travel over a no-echo PTY to age
+# and stdin to am; neither secrets nor raw child output enter evidence files.
+share_crypto_matrix() {
+    local am_binary="$1"
+    local selected_case="$2"
+    local workspace="$3"
+    if ! command -v python3 >/dev/null 2>&1; then
+        if [ "${AM_SHARE_REQUIRE_AGE:-1}" != "0" ]; then
+            e2e_fail "required real-age lane: python3 is absent"
+            return 1
+        fi
+        e2e_skip "optional real-age lane: python3 is absent"
+        return 77
+    fi
+    AM_SHARE_REQUIRE_AGE="${AM_SHARE_REQUIRE_AGE:-1}" python3 - \
+        "${am_binary}" "${selected_case}" "${workspace}" "${E2E_ARTIFACT_DIR}" "${BASH_SOURCE[0]}" <<'PY'
+import errno
+import hashlib
+import itertools
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+am, selected, workspace, artifact_dir, source_path = sys.argv[1:]
+am = str(Path(am).resolve())
+root = Path(workspace)
+report_path = Path(artifact_dir) / "crypto.json"
+report = {
+    "schema": "am-share-crypto-v1",
+    "claim": "real-age to real-am interoperability and bounded publication refusal probes",
+    "concurrent_publication": "not selected or not yet completed",
+    "publication_cases_completed": [],
+    "native_platform": sys.platform,
+    "windows_publication": "not covered by this Unix CLI lane; requires native evidence",
+    "selected_case": selected,
+    "workspace": str(root),
+    "tools": {},
+    "harness_sha256": hashlib.sha256(Path(source_path).read_bytes()).hexdigest(),
+    "commands": [],
+    "cases": [],
+}
+secret_values = []
+required = os.environ.get("AM_SHARE_REQUIRE_AGE", "1") != "0"
+home = root / "home"
+home.mkdir(mode=0o700)
+environment = dict(os.environ, AM_INTERFACE_MODE="cli", NO_COLOR="1",
+                   HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+                   STORAGE_ROOT=str(root / "mailbox"), DATABASE_URL=f"sqlite:///{root}/unused.db")
+
+
+class Failure(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Failure(message)
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def witness(path):
+    path = Path(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    result = {
+        "exists": True,
+        "size": metadata.st_size,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "links": metadata.st_nlink,
+    }
+    if stat.S_ISLNK(metadata.st_mode):
+        result.update(kind="symlink", target=os.readlink(path))
+    elif stat.S_ISREG(metadata.st_mode):
+        result.update(kind="file", sha256=digest(path))
+    elif stat.S_ISDIR(metadata.st_mode):
+        result.update(kind="directory")
+    else:
+        result.update(kind="other")
+    return result
+
+
+def no_secret_output(stdout, stderr):
+    require(not any(secret in stdout or secret in stderr for secret in secret_values),
+            "a subprocess exposed secret material; its output was suppressed")
+
+
+def run(argv, secret=None):
+    argv = [str(arg) for arg in argv]
+    receipt = {"argv": argv, "secret_input": "stdin" if secret else None}
+    report["commands"].append(receipt)
+    started = time.monotonic()
+    # ubs:ignore — local callers supply only the explicit candidate or discovered age/keygen argv, with no shell or request-selected executable.
+    child = subprocess.Popen(argv, stdin=subprocess.PIPE if secret else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=environment, start_new_session=True)
+    try:
+        stdout, stderr = child.communicate(secret + b"\n" if secret else None, timeout=45)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        receipt.update(status="timeout", completed=False)
+        raise Failure("crypto subprocess exceeded 45 seconds") from None
+    receipt.update(status=child.returncode, completed=True,
+                   elapsed_ms=round((time.monotonic() - started) * 1000),
+                   stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+    no_secret_output(stdout, stderr)
+    return child.returncode, stdout, stderr
+
+
+def publication_wrapper(real_age):
+    directory = root / "publication-wrapper"
+    directory.mkdir(mode=0o700)
+    wrapper = directory / "age"
+    require("\n" not in sys.executable and " " not in sys.executable,
+            "publication wrapper requires an unambiguous Python interpreter path")
+    wrapper.write_text("#!" + sys.executable + "\n" + '''import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+real_age = os.environ["AM_SHARE_TEST_REAL_AGE"]
+if sys.argv[1:] == ["--version"]:
+    os.execv(real_age, [real_age, "--version"])
+
+# The real cryptographic operation owns the inherited stdin/stdout handles.
+# Only its successful completion is delayed on return to the candidate.
+result = subprocess.run([real_age] + sys.argv[1:], check=False)
+if result.returncode != 0:
+    sys.exit(result.returncode)
+barrier = Path(os.environ["AM_SHARE_TEST_PUBLICATION_BARRIER"])
+with (barrier / "completed.json").open("x", encoding="utf-8") as receipt:
+    json.dump({"real_age_status": result.returncode, "completed": True,
+               "boundary": "real age completed; wrapper has not returned"}, receipt)
+with (barrier / "ready").open("xb"):
+    pass
+deadline = time.monotonic() + 60
+while not (barrier / "release").exists():
+    if time.monotonic() >= deadline:
+        sys.exit(124)
+    time.sleep(0.01)
+sys.exit(0)
+''', encoding="utf-8")
+    wrapper.chmod(0o700)
+    report["publication_wrapper"] = {
+        "path": str(wrapper), "sha256": digest(wrapper),
+        "real_age": str(real_age),
+        "scope": "PATH and rendezvous variables supplied only to candidate children",
+    }
+    return directory
+
+
+def start_publication_child(encrypted, destination, barrier, wrapper_dir):
+    barrier.mkdir(mode=0o700)
+    argv = [str(arg) for arg in (am, "share", "decrypt", encrypted,
+                                 "--identity", identity, "--output", destination)]
+    receipt = {"argv": argv, "operation": "identity decrypt publication",
+               "secret_input": None, "barrier": str(barrier), "completed": False}
+    report["commands"].append(receipt)
+    child_env = dict(environment,
+                     PATH=str(wrapper_dir) + os.pathsep + environment.get("PATH", ""),
+                     AM_SHARE_TEST_REAL_AGE=str(age),
+                     AM_SHARE_TEST_PUBLICATION_BARRIER=str(barrier))
+    # ubs:ignore — the local operator explicitly selects this candidate executable; publication fixture arguments stay separate and no shell is used.
+    child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=child_env, start_new_session=True)
+    return child, receipt, time.monotonic()
+
+
+def finish_publication_child(process):
+    child, receipt, started = process
+    try:
+        stdout, stderr = child.communicate(timeout=45)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        stdout, stderr = child.communicate()
+        receipt.update(status=child.returncode, completed=True, timed_out=True,
+                       stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+        no_secret_output(stdout, stderr)
+        raise Failure("publication candidate exceeded 45 seconds") from None
+    receipt.update(status=child.returncode, completed=True,
+                   elapsed_ms=round((time.monotonic() - started) * 1000),
+                   stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+    no_secret_output(stdout, stderr)
+    return child.returncode
+
+
+def wait_for_publication_boundary(process, barrier):
+    child, receipt, _ = process
+    deadline = time.monotonic() + 45
+    while not (barrier / "ready").exists():
+        if child.poll() is not None:
+            finish_publication_child(process)
+            raise Failure("candidate exited before the real age completion boundary")
+        require(time.monotonic() < deadline, "real age completion boundary timed out")
+        time.sleep(0.01)
+    completion = json.loads((barrier / "completed.json").read_text(encoding="utf-8"))
+    receipt["real_age_completion"] = completion
+    require(completion.get("completed") and completion.get("real_age_status") == 0,
+            "publication barrier did not witness successful real age completion")
+    require(child.poll() is None, "candidate escaped the publication barrier")
+
+
+def release_publication(barrier):
+    with (barrier / "release").open("xb"):
+        pass
+
+
+def retained_publication_artifacts(directory):
+    artifacts = []
+    paths = list(itertools.islice(directory.rglob("*"), 257))
+    require(len(paths) <= 256, "publication fixture exceeded artifact inventory bound")
+    for path in sorted(paths):
+        artifacts.append({"path": str(path.relative_to(directory)), "witness": witness(path)})
+    return artifacts
+
+
+def require_retained_plaintext(artifacts, plaintext_digest):
+    for artifact in artifacts:
+        relative = Path(artifact["path"])
+        if not any(part.startswith(".age-decrypt.") for part in relative.parts):
+            continue
+        metadata = artifact["witness"]
+        if metadata.get("kind") == "file" and metadata.get("sha256") == plaintext_digest:
+            require(metadata["mode"] == 0o600, "retained plaintext stage is not private")
+            parent = str(relative.parent)
+            require(any(item["path"] == parent and item["witness"].get("mode") == 0o700
+                        and item["witness"].get("kind") == "directory"
+                        for item in artifacts), "retained plaintext directory is not private")
+            return
+    raise Failure("publication refusal did not retain its completed private plaintext stage")
+
+
+def run_terminal(argv, secret, prompts):
+    # The child owns a real controlling terminal and must disable echo itself.
+    # No captured terminal bytes or supplied secrets enter the receipt.
+    import pty
+    import select
+    import termios
+
+    argv = [str(arg) for arg in argv]
+    receipt = {"argv": argv, "secret_input": "terminal, echo disabled"}
+    report["commands"].append(receipt)
+    pid, terminal = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(root)
+            # ubs:ignore python.taint.command -- only the explicit E2E candidate or fixed discovered age executable is selected by local callers.
+            os.execvpe(argv[0], argv, environment)
+        finally:
+            os._exit(127)
+    captured = bytearray()
+    pending = bytearray()
+    phase = 0
+    started = time.monotonic()
+    deadline = started + 45
+    reaped = False
+    status = None
+    try:
+        while True:
+            require(time.monotonic() < deadline, "crypto terminal exceeded 45 seconds")
+            readable, _, _ = select.select([terminal], [], [], 0.05)
+            if readable:
+                try:
+                    chunk = os.read(terminal, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    chunk = b""
+                if not chunk:
+                    break
+                require(len(captured) + len(chunk) <= 1024 * 1024,
+                        "crypto terminal exceeded its output bound")
+                captured.extend(chunk)
+                pending.extend(chunk)
+            if phase < len(prompts) and prompts[phase] in pending:
+                if not termios.tcgetattr(terminal)[3] & termios.ECHO:
+                    os.write(terminal, secret + b"\n")
+                    phase += 1
+                    pending.clear()
+        while True:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                reaped = True
+                break
+            require(time.monotonic() < deadline, "crypto terminal child did not exit")
+            time.sleep(0.01)
+        no_secret_output(bytes(captured), b"")
+        require(phase == len(prompts), "crypto terminal exited before answering its prompts")
+        return os.waitstatus_to_exitcode(status)
+    finally:
+        if not reaped:
+            # The leader is still owned/unreaped, so its process-group id
+            # cannot be reused for an unrelated process before this cleanup.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _, status = os.waitpid(pid, 0)
+            receipt["forced_stop"] = True
+        receipt.update(status=os.waitstatus_to_exitcode(status), completed=True,
+                       elapsed_ms=round((time.monotonic() - started) * 1000),
+                       terminal_bytes=len(captured), prompts_answered=phase)
+        os.close(terminal)
+
+
+def encrypt_passphrase(age, source, destination, secret, armored=False):
+    argv = [age, "-p"] + (["-a"] if armored else [])
+    argv += ["-o", str(destination), str(source)]
+    status = run_terminal(argv, secret, [b"Enter passphrase", b"Confirm passphrase"])
+    require(status == 0, "real age passphrase encryption failed; terminal output suppressed")
+
+
+def perform_case(name, encrypted, destination, identity=None, secret=None,
+                 expect_success=True, default_output=False, terminal_input=False):
+    identity_before = identity.read_bytes() if identity is not None else None
+    before = {"original": witness(original), "ciphertext": witness(encrypted),
+              "destination": witness(destination)}
+    case = {"name": name, "before": before}
+    report["cases"].append(case)
+    argv = [am, "share", "decrypt", encrypted]
+    if identity is not None:
+        argv += ["--identity", identity]
+    else:
+        argv += ["--passphrase"]
+    if not default_output:
+        argv += ["--output", destination]
+    if terminal_input:
+        status = run_terminal(argv, secret, [b"Enter passphrase:"])
+    else:
+        status, _, _ = run(argv, secret)
+    after = {"original": witness(original), "ciphertext": witness(encrypted),
+             "destination": witness(destination)}
+    case.update(status=status, after=after)
+    require(before["original"] == after["original"], "original fixture changed")
+    require(before["ciphertext"] == after["ciphertext"], "ciphertext fixture changed")
+    if identity is not None:
+        require(identity.read_bytes() == identity_before, "identity file changed")
+        case["identity_preserved"] = True
+    if expect_success:
+        require(status == 0, name + ": am did not decrypt successfully")
+        require(not before["destination"]["exists"], "positive destination was not distinct")
+        require(after["destination"].get("sha256") == before["original"]["sha256"],
+                name + ": plaintext bytes differ")
+        require(after["destination"]["mode"] == 0o600,
+                name + ": plaintext is not private (0600)")
+    else:
+        require(status == 1, name + ": expected decryption refusal (exit 1)")
+        require(before["destination"] == after["destination"],
+                name + ": failed decryption published or changed plaintext")
+    case["passed"] = True
+
+
+def perform_publication_case(name, wrapper_dir):
+    directory = root / "publication" / name
+    directory.mkdir(mode=0o700)
+    parent = directory / "parent"
+    parent.mkdir(mode=0o700)
+    destination = parent / "output.zip"
+    sentinel = directory / "outside-sentinel"
+    sentinel.write_bytes(b"outside sentinel must survive\x00" + secrets.token_bytes(32))
+    source_paths = {"original": original, "ciphertext": identity_cipher, "identity": identity,
+                    "outside_sentinel": sentinel}
+    case = {"name": name, "operation": "share decrypt --identity",
+            "candidate_sha256": report["tools"]["am"]["sha256"],
+            "fixture": str(directory), "before": {}}
+    report["cases"].append(case)
+    children = []
+    barriers = [directory / "first-barrier"]
+    protected_destination = None
+    retained_destination = None
+    loser_digest = None
+    try:
+        if name == "race-concurrent":
+            peer_original = directory / "peer-original.zip"
+            peer_original.write_bytes(b"different concurrent payload\x00" + secrets.token_bytes(131147))
+            peer_cipher = directory / "peer.zip.age"
+            status, recipient, _ = run([keygen, "-y", identity])
+            require(status == 0, "concurrent fixture recipient derivation failed")
+            status, _, _ = run([age, "-r", recipient.decode("ascii").strip(),
+                                "-o", peer_cipher, peer_original])
+            require(status == 0, "concurrent real-age fixture encryption failed")
+            source_paths.update(peer_original=peer_original, peer_ciphertext=peer_cipher)
+            loser_digest = digest(peer_original)
+            barriers.append(directory / "second-barrier")
+        case["before"] = {label: witness(path) for label, path in source_paths.items()}
+        case["before"]["destination"] = witness(destination)
+        require(not case["before"]["destination"]["exists"],
+                "publication destination was not initially absent")
+        children.append(start_publication_child(identity_cipher, destination,
+                                                barriers[0], wrapper_dir))
+        if name == "race-concurrent":
+            children.append(start_publication_child(peer_cipher, destination,
+                                                    barriers[1], wrapper_dir))
+        for process, barrier in zip(children, barriers):
+            wait_for_publication_boundary(process, barrier)
+        case["at_completion_boundary"] = {
+            "destination": witness(destination),
+            "real_age_completed": len(children),
+            "candidates_waiting_before_publication": len(children),
+        }
+        require(not case["at_completion_boundary"]["destination"]["exists"],
+                "candidate published before its real-age subprocess completed")
+
+        if name == "race-regular":
+            with destination.open("xb") as output:
+                output.write(b"concurrent destination must survive\x00" + secrets.token_bytes(32))
+            protected_destination = witness(destination)
+        elif name == "race-dangling-symlink":
+            destination.symlink_to("missing-target")
+            protected_destination = witness(destination)
+        elif name == "race-sentinel-symlink":
+            destination.symlink_to(sentinel)
+            protected_destination = witness(destination)
+        elif name == "race-parent":
+            retained_parent = directory / "retained-parent"
+            parent.rename(retained_parent)
+            parent.mkdir(mode=0o700)
+            stages = [entry for entry in retained_parent.iterdir()
+                      if entry.name.startswith(".age-decrypt.") and entry.is_dir()]
+            require(len(stages) == 1, "parent race did not identify one private decrypt stage")
+            staged_files = [entry for entry in stages[0].iterdir() if entry.is_file()]
+            require(len(staged_files) == 1, "parent race did not identify one staged payload")
+            substitute_stage = parent / stages[0].name
+            substitute_stage.mkdir(mode=0o700)
+            substitute_payload = substitute_stage / staged_files[0].name
+            with substitute_payload.open("xb") as output:
+                output.write(b"substituted stage must survive\x00" + secrets.token_bytes(32))
+            source_paths["substituted_stage_payload"] = substitute_payload
+            case["before"]["substituted_stage_payload"] = witness(substitute_payload)
+            # Keep the substitute destination absent: a path-based hard-link
+            # fix must not pass merely because an occupied leaf blocks it.
+            # Recreating the old stage spelling makes ambient-path reuse fail
+            # this causal probe even if publication itself is no-replace.
+            protected_destination = witness(destination)
+            retained_destination = retained_parent / destination.name
+            case["retained_original_parent"] = str(retained_parent)
+        case["planted_destination"] = protected_destination
+
+        release_publication(barriers[0])
+        first_status = finish_publication_child(children[0])
+        case["candidate_statuses"] = [first_status]
+        if name == "race-concurrent":
+            require(first_status == 0, "first concurrent publisher did not complete")
+            first_winner = witness(destination)
+            case["first_complete_winner"] = first_winner
+            require(first_winner.get("sha256") == case["before"]["original"]["sha256"],
+                    "first concurrent publisher did not publish complete verified bytes")
+            release_publication(barriers[1])
+            second_status = finish_publication_child(children[1])
+            case["candidate_statuses"].append(second_status)
+            require(second_status == 1, "second concurrent publisher did not refuse")
+            require(witness(destination) == first_winner,
+                    "losing concurrent publisher changed the winner's bytes or inode")
+        elif name == "race-parent":
+            retained_output = witness(retained_destination)
+            case["retained_parent_output"] = retained_output
+            if first_status == 0:
+                require(retained_output.get("sha256") == case["before"]["original"]["sha256"],
+                        "renamed-parent publication did not stay in its retained authority")
+                require(retained_output.get("mode") == 0o600,
+                        "retained-parent plaintext is not private")
+                case["parent_swap_result"] = "complete output under retained original parent"
+            else:
+                require(first_status == 1 and not retained_output["exists"],
+                        "parent substitution refusal published an unexpected output")
+                case["parent_swap_result"] = "refused; complete private stage retained"
+        else:
+            require(first_status == 1, "raced destination was not refused")
+        if protected_destination is not None:
+            require(witness(destination) == protected_destination,
+                    "publication changed a raced destination or substituted parent entry")
+    finally:
+        # Terminate only children created by this case. Fixtures and staged
+        # bytes are deliberately retained, including on an assertion failure.
+        for child, receipt, started in children:
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if not receipt.get("completed"):
+                stdout, stderr = child.communicate()
+                receipt.update(status=child.returncode, completed=True, forced_stop=True,
+                               elapsed_ms=round((time.monotonic() - started) * 1000),
+                               stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+                no_secret_output(stdout, stderr)
+        case["after"] = {label: witness(path) for label, path in source_paths.items()}
+        case["after"]["destination"] = witness(destination)
+        case["retained_artifacts"] = retained_publication_artifacts(directory)
+    for label in source_paths:
+        require(case["before"][label] == case["after"][label],
+                "publication race changed an original fixture, key, ciphertext, or sentinel")
+    if name == "race-concurrent":
+        require_retained_plaintext(case["retained_artifacts"], loser_digest)
+        require(case["after"]["destination"].get("mode") == 0o600,
+                "concurrent winner plaintext is not private")
+    elif name != "race-parent" or case["candidate_statuses"][0] != 0:
+        require_retained_plaintext(case["retained_artifacts"], case["before"]["original"]["sha256"])
+    case["passed"] = True
+    report["publication_cases_completed"].append(name)
+    if name == "race-concurrent":
+        report["concurrent_publication"] = "two real CLI decryptions; exactly one complete winner"
+
+
+exit_code = 0
+try:
+    cases = ["identity-default", "identity-explicit", "passphrase", "passphrase-armored", "passphrase-terminal",
+             "wrong-passphrase", "wrong-identity", "tampered-passphrase", "tampered-identity",
+             "existing-output", "race-regular", "race-dangling-symlink",
+             "race-sentinel-symlink", "race-parent", "race-concurrent"]
+    require(selected == "all" or selected in cases, "unknown crypto scenario")
+    missing = [tool for tool in ("age", "age-keygen") if shutil.which(tool) is None]
+    if os.name != "posix":
+        missing.append("Unix PTY support")
+    if missing:
+        report.update(status="failed" if required else "skipped",
+                      reason="missing dependencies: " + ", ".join(missing))
+        exit_code = 1 if required else 77
+    else:
+        age = str(Path(shutil.which("age")).resolve())
+        keygen = str(Path(shutil.which("age-keygen")).resolve())
+        for label, executable in (("age", age), ("age-keygen", keygen), ("am", am)):
+            status, stdout, stderr = run([executable, "--version"])
+            require(status == 0, label + " --version failed")
+            report["tools"][label] = {
+                "path": str(Path(executable).resolve()),
+                "sha256": digest(Path(executable).resolve()),
+                "version": (stdout + stderr).decode("utf-8", "replace").strip()[:200],
+            }
+        for directory in ("original", "ciphertext", "outputs", "identities", "publication"):
+            (root / directory).mkdir(mode=0o700)
+        original = root / "original" / "bundle.zip"
+        # More than two age payload chunks: late corruption must not publish
+        # the already-decrypted prefix. The unique source is never overwritten.
+        original.write_bytes(secrets.token_bytes(2 * 65536 + 73))
+        original_before = witness(original)
+        passphrase = b"  " + secrets.token_hex(24).encode("ascii") + b" \t"
+        wrong_passphrase = b"wrong-" + secrets.token_hex(24).encode("ascii")
+        secret_values.extend([passphrase, passphrase.strip(), wrong_passphrase])
+        identity = root / "identities" / "identity.txt"
+        wrong_identity = root / "identities" / "wrong-identity.txt"
+        identity_cipher = root / "ciphertext" / "identity.zip.age"
+        passphrase_cipher = root / "ciphertext" / "passphrase.zip.age"
+        armored_cipher = root / "ciphertext" / "armored.zip.age"
+        wrapper_dir = None
+
+        def need_identity():
+            if identity_cipher.exists():
+                return
+            for key_path in (identity, wrong_identity):
+                status, _, _ = run([keygen, "-o", key_path])
+                require(status == 0, "real age-keygen failed")
+                secret_values.extend(line for line in key_path.read_bytes().splitlines()
+                                     if line.startswith(b"AGE-SECRET-KEY-"))
+            status, public_key, _ = run([keygen, "-y", identity])
+            require(status == 0 and public_key.strip().startswith(b"age1"),
+                    "real age-keygen did not return an age recipient")
+            status, _, _ = run([age, "-r", public_key.decode("ascii").strip(),
+                                "-o", identity_cipher, original])
+            require(status == 0, "real age recipient encryption failed")
+
+        def need_passphrase(armored=False):
+            destination = armored_cipher if armored else passphrase_cipher
+            if not destination.exists():
+                encrypt_passphrase(age, original, destination, passphrase, armored)
+                if not armored:
+                    # Retain both wrong implementations as real-dependency
+                    # controls: -d -p and stdin-only -d cannot provide this
+                    # secret to official age in a session without a terminal.
+                    for flags in (["-d", "-p"], ["-d"]):
+                        control = root / "outputs" / ("unsupported-" + str(len(flags)) + ".zip")
+                        status, _, _ = run([age, *flags, "-o", control, destination], passphrase)
+                        require(status != 0 and (not control.exists() or digest(control) != digest(original)), # ubs:ignore — compares test file digests to reject an invalid age invocation, not an authentication secret
+                                "unsupported age stdin secret exchange unexpectedly succeeded")
+            return destination
+
+        for case_name in cases if selected == "all" else [selected]:
+            output = root / "outputs" / (case_name + ".zip")
+            if case_name.startswith("race-"):
+                need_identity()
+                if wrapper_dir is None:
+                    wrapper_dir = publication_wrapper(age)
+                perform_publication_case(case_name, wrapper_dir)
+            elif case_name.startswith("identity-"):
+                need_identity()
+                use_default = case_name == "identity-default"
+                if use_default:
+                    output = identity_cipher.with_suffix("")
+                perform_case(case_name, identity_cipher, output, identity=identity,
+                             default_output=use_default)
+            elif case_name in ("passphrase", "passphrase-armored", "passphrase-terminal"):
+                encrypted = need_passphrase(case_name == "passphrase-armored")
+                perform_case(case_name, encrypted, output, secret=passphrase,
+                             terminal_input=case_name == "passphrase-terminal")
+            elif case_name == "wrong-passphrase":
+                perform_case(case_name, need_passphrase(), output, secret=wrong_passphrase,
+                             expect_success=False)
+            elif case_name == "wrong-identity":
+                need_identity()
+                perform_case(case_name, identity_cipher, output, identity=wrong_identity,
+                             expect_success=False)
+            elif case_name.startswith("tampered-"):
+                passphrase_mode = case_name == "tampered-passphrase"
+                if passphrase_mode:
+                    encrypted = need_passphrase()
+                else:
+                    need_identity()
+                    encrypted = identity_cipher
+                pristine = witness(encrypted)
+                for mutation in ("corrupted", "truncated"):
+                    damaged = root / "ciphertext" / (case_name + "-" + mutation + ".age")
+                    data = bytearray(encrypted.read_bytes())
+                    if mutation == "corrupted":
+                        data[-1] ^= 1
+                    else:
+                        data = data[:-1]
+                    damaged.write_bytes(data)
+                    destination = root / "outputs" / (case_name + "-" + mutation + ".zip")
+                    perform_case(case_name + "-" + mutation, damaged, destination,
+                                 identity=None if passphrase_mode else identity,
+                                 secret=passphrase if passphrase_mode else None,
+                                 expect_success=False)
+                require(pristine == witness(encrypted), "pristine ciphertext changed")
+            elif case_name == "existing-output":
+                need_identity()
+                need_passphrase()
+                for mode, encrypted in (("identity", identity_cipher),
+                                        ("passphrase", passphrase_cipher)):
+                    destination = root / "outputs" / ("existing-" + mode + ".zip")
+                    destination.write_bytes(b"pre-existing destination must survive\x00" +
+                                            secrets.token_bytes(32))
+                    perform_case(case_name + "-" + mode, encrypted, destination,
+                                 identity=identity if mode == "identity" else None,
+                                 secret=passphrase if mode == "passphrase" else None,
+                                 expect_success=False)
+        require(original_before == witness(original), "original fixture changed across matrix")
+        report.update(status="passed", original_preserved=True)
+except Failure as error:
+    report.update(status="failed", reason=str(error))
+    exit_code = 1
+except Exception as error:
+    # Arbitrary exception text/captured output may expose secrets.
+    report.update(status="failed", reason="runner exception: " + type(error).__name__)
+    exit_code = 1
+finally:
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+print("crypto " + report["status"] + ": " + str(report_path))
+if report.get("reason"):
+    print(report["reason"])
+sys.exit(exit_code)
+PY
+}
+
 e2e_init_artifacts
 e2e_banner "Share / Export Bundle E2E Test Suite"
+
+# This entrypoint deliberately precedes SQLite/server setup and all build
+# helpers. Qualification must pass the exact prepared candidate executable.
+if [ "${1:-}" = "--crypto-only" ]; then
+    if [ "$#" -ne 3 ] || [ ! -x "$3" ]; then
+        e2e_fail "usage: --crypto-only CASE /absolute/path/to/built/am"
+        e2e_summary || true
+        exit 1
+    fi
+    CRYPTO_WORK="$(e2e_mktemp "e2e_share_crypto")"
+    e2e_case_banner "real age CLI crypto: $2"
+    if share_crypto_matrix "$3" "$2" "${CRYPTO_WORK}"; then
+        e2e_pass "real age CLI crypto: $2"
+        e2e_summary
+    else
+        CRYPTO_STATUS=$?
+        if [ "${CRYPTO_STATUS}" -eq 77 ]; then
+            e2e_skip "optional real-age dependency absent (see crypto.json when Python is available)"
+        else
+            e2e_fail "required real-age crypto case failed (see crypto.json)"
+        fi
+        e2e_summary || true
+        exit "${CRYPTO_STATUS}"
+    fi
+    exit 0
+fi
 
 e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
 
@@ -54,10 +756,18 @@ e2e_fatal() {
 # ---------------------------------------------------------------------------
 
 AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
-MCP_BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
 
 e2e_log "am binary: ${AM_BIN}"
-e2e_log "mcp-agent-mail binary: ${MCP_BIN}"
+
+# Full share qualification always requires the real dependencies, regardless
+# of the optional-local setting used by individual Cargo tests.
+e2e_case_banner "real age passphrase and identity interoperability"
+CRYPTO_WORK="$(e2e_mktemp "e2e_share_crypto")"
+if AM_SHARE_REQUIRE_AGE=1 share_crypto_matrix "${AM_BIN}" all "${CRYPTO_WORK}"; then
+    e2e_pass "real age CLI crypto matrix"
+else
+    e2e_fatal "real age CLI crypto matrix failed (see crypto.json)"
+fi
 
 # ---------------------------------------------------------------------------
 # Workspace
@@ -78,6 +788,9 @@ am_env() {
     STORAGE_ROOT="${STORAGE_ROOT}" \
     "$@"
 }
+
+MCP_BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+e2e_log "mcp-agent-mail binary: ${MCP_BIN}"
 
 extract_local_asset_paths() {
     local html_file="$1"
@@ -286,6 +999,32 @@ print(json.dumps({
     fi
 done
 
+# Bodies for the browser render case (Case 17): Markdown the viewer must
+# render, and hostile HTML whose payloads set a DOM marker if they ever run.
+for kind in markdown hostile; do
+    rpc_call "send_msg_${kind}" "send_message" "$(python3 -c "
+import json,sys
+bodies = {
+    'markdown': '## Plan\n\n- **bold item**\n- \`inline code\`\n\n[docs](https://example.invalid/docs)',
+    'hostile': 'before <img src=x onerror=\"document.documentElement.dataset.pwned=1\"> '
+               '<script>document.documentElement.dataset.pwned=2</script> '
+               '<svg><animate onbegin=\"document.documentElement.dataset.pwned=3\" attributeName=x dur=1s></svg> '
+               '[link](javascript:document.documentElement.dataset.pwned=4) after',
+}
+print(json.dumps({
+    'project_key': sys.argv[1],
+    'sender_name': 'RedFox',
+    'to': ['BlueBear'],
+    'subject': 'Viewer ' + sys.argv[2],
+    'body_md': bodies[sys.argv[2]],
+    'thread_id': 'share-viewer-thread'
+}))
+" "${PROJECT_DIR}" "${kind}")"
+    if rpc_has_error "${E2E_ARTIFACT_DIR}/send_msg_${kind}_body.json"; then
+        e2e_fatal "send_message ${kind} failed"
+    fi
+done
+
 # Reply
 rpc_call "reply_msg" "reply_message" "$(python3 -c "
 import json,sys
@@ -307,7 +1046,7 @@ print(json.dumps({
 }))
 " "${PROJECT_DIR}")"
 
-e2e_pass "seeded mailbox (3 messages + 1 reply + 1 ack)"
+e2e_pass "seeded mailbox (5 messages + 1 reply + 1 ack)"
 
 # Stop server (we only need the seeded DB from here)
 e2e_stop_server || true
@@ -449,10 +1188,25 @@ def strip_volatile(obj):
 
 m1 = strip_volatile(json.load(open(sys.argv[1], "r")))
 m2 = strip_volatile(json.load(open(sys.argv[2], "r")))
+# viewer/data/meta.json records when the export ran (generated_at), so its
+# file hash differs per export; its content is compared on its own below.
+for m in (m1, m2):
+    (m.get("files") or {}).pop("viewer/data/meta.json", None)
 print("match" if m1 == m2 else "mismatch")
 PY
 )"
 e2e_assert_eq "manifest structures match (ignoring timestamps)" "match" "${MANIFEST_MATCH}"
+
+META_MATCH="$(python3 - <<'PY' "${BUNDLE1}/viewer/data/meta.json" "${BUNDLE2}/viewer/data/meta.json"
+import json, sys
+
+metas = [json.load(open(path, "r")) for path in sys.argv[1:3]]
+for meta in metas:
+    meta.pop("generated_at", None)
+print("match" if metas[0] == metas[1] else "mismatch")
+PY
+)"
+e2e_assert_eq "viewer meta.json matches apart from generated_at" "match" "${META_MATCH}"
 
 MANIFEST_DIFF="$(python3 - <<'PY' "${BUNDLE1}/manifest.json" "${BUNDLE2}/manifest.json"
 import difflib
@@ -854,9 +1608,7 @@ if e2e_wait_port 127.0.0.1 "${CF_PORT}" 5; then
         http_get_capture "case_16_cf_asset_${CF_ASSET_IDX}" "http://127.0.0.1:${CF_PORT}/${rel}"
         local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${CF_ASSET_PROBE}"
-        if [ "${rel##*/}" = "viewer.js" ] && [ "${local_status}" != "200" ]; then
-            e2e_pass "CF optional asset absent: ${rel} (status=${local_status})"
-        elif [ "${local_status}" = "200" ]; then
+        if [ "${local_status}" = "200" ]; then
             e2e_pass "CF asset reachable: ${rel}"
         else
             e2e_fail "CF asset missing: ${rel} (status=${local_status})"
@@ -896,9 +1648,7 @@ if e2e_wait_port 127.0.0.1 "${GH_PORT}" 5; then
         http_get_capture "case_16_gh_asset_${GH_ASSET_IDX}" "http://127.0.0.1:${GH_PORT}/repo/${rel}"
         local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${GH_ASSET_PROBE}"
-        if [ "${rel}" = "viewer/viewer.js" ] && [ "${local_status}" != "200" ]; then
-            e2e_pass "GH optional asset absent: /repo/${rel} (status=${local_status})"
-        elif [ "${local_status}" = "200" ]; then
+        if [ "${local_status}" = "200" ]; then
             e2e_pass "GH asset reachable: /repo/${rel}"
         else
             e2e_fail "GH asset missing: /repo/${rel} (status=${local_status})"
@@ -918,6 +1668,87 @@ GitHub-Pages-like smoke (repo subpath):
 python3 -m http.server ${GH_PORT} --bind 127.0.0.1 --directory ${GH_ROOT}
 EOF
 )"
+
+# ---------------------------------------------------------------------------
+# Case 17: the exported viewer renders mail in a real browser (br-kp1in.42)
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "viewer renders mail in headless Chromium and sanitizes hostile bodies"
+
+CHROMIUM_BIN=""
+for candidate in chromium-browser chromium google-chrome; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+        CHROMIUM_BIN="$(command -v "${candidate}")"
+        break
+    fi
+done
+NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
+if [ -z "${CHROMIUM_BIN}" ] || [ "${NODE_MAJOR}" -lt 22 ]; then
+    e2e_skip "viewer browser render needs Chromium and Node >= 22 (chromium='${CHROMIUM_BIN}' node=${NODE_MAJOR})"
+else
+    # Snap-packaged Chromium can only write a profile inside its own snap dir.
+    if [ -d "${HOME}/snap/chromium" ]; then
+        VIEWER_PROFILE="${HOME}/snap/chromium/common/am-e2e-share-viewer-profile"
+        mkdir -p "${VIEWER_PROFILE}"
+    else
+        VIEWER_PROFILE="$(e2e_mktemp "e2e_share_viewer_profile")"
+    fi
+    VIEWER_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+    python3 -m http.server "${VIEWER_PORT}" --bind 127.0.0.1 --directory "${BUNDLE1}" \
+        >"${E2E_ARTIFACT_DIR}/case_17_server.log" 2>&1 &
+    VIEWER_PID=$!
+    if e2e_wait_port 127.0.0.1 "${VIEWER_PORT}" 5; then
+        VIEWER_REPORT="${E2E_ARTIFACT_DIR}/case_17_viewer_report.json"
+        timeout 240 node "${SCRIPT_DIR}/../tests/e2e/lib/share_viewer_cdp.mjs" \
+            "http://127.0.0.1:${VIEWER_PORT}/viewer/" "${VIEWER_PROFILE}" "${CHROMIUM_BIN}" \
+            >"${VIEWER_REPORT}" 2>"${E2E_ARTIFACT_DIR}/case_17_driver_stderr.txt" </dev/null || true
+        # One "PASS <label>" or "FAIL <label>" line per check.
+        while IFS= read -r line; do
+            case "${line}" in
+                "PASS "*) e2e_pass "${line#PASS }" ;;
+                *) e2e_fail "${line#FAIL }" ;;
+            esac
+        done < <(python3 - "${VIEWER_REPORT}" <<'PY'
+import json
+import sys
+
+try:
+    report = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:  # an empty or truncated report is a failure
+    print(f"FAIL viewer report unreadable: {exc}")
+    sys.exit(0)
+
+
+def check(ok, label):
+    print(("PASS " if ok else "FAIL ") + label)
+
+
+state = report.get("state") or {}
+rendered = {m.get("subject"): m.get("body_html", "") for m in report.get("rendered") or []}
+markdown = rendered.get("Viewer markdown", "")
+hostile = rendered.get("Viewer hostile", "")
+check(not report.get("error"), f"browser driver ran (error={report.get('error')})")
+check(state.get("loading") is False and state.get("messages", 0) >= 6,
+      f"viewer controller loaded the snapshot ({state})")
+check(report.get("alpine_errors") == 0,
+      f"zero Alpine expression errors ({report.get('alpine_errors')})")
+check(not report.get("dialogs"), f"no failure dialogs ({report.get('dialogs')})")
+check("<strong>bold item</strong>" in markdown and "<code>inline code</code>" in markdown,
+      "Markdown body renders as HTML")
+check("before" in hostile and "after" in hostile, "hostile body still shows its text")
+check(not any(token in hostile.lower() for token in ("onerror", "onbegin", "<script", "javascript:")),
+      "hostile body keeps no handler, script or javascript: URL")
+check(report.get("pwned") == [], f"no hostile payload executed ({report.get('pwned')})")
+check(report.get("live_handlers") == [],
+      f"no live handler in any rendered body ({report.get('live_handlers')})")
+PY
+)
+    else
+        e2e_fail "viewer smoke server failed to start"
+    fi
+    kill "${VIEWER_PID}" 2>/dev/null || true
+    wait "${VIEWER_PID}" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # Finalize: save hashes and summary

@@ -1,0 +1,617 @@
+"""Tests of the release smoke's swarm-phase judgement logic (br-kp1in.34).
+
+These exercise helper policy and independent SQLite/archive fixtures, NOT
+Agent Mail; the phase itself runs against real binaries through
+tests/e2e/test_release_smoke.sh. The count-only false green also has a retained
+real HTTP/mailbox control in br-kp1in.35.
+"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location(
+    'release_smoke',
+    Path(__file__).resolve().parents[2] / 'tests' / 'e2e' / 'lib' / 'release_smoke.py',
+)
+assert spec is not None and spec.loader is not None
+smoke = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(smoke)
+
+TIMEOUT_ERROR = {'code': -32603, 'message': 'Request timed out after 30s (method=tools/call:file_reservation_paths)'}
+
+
+class ClassifyCallTests(unittest.TestCase):
+    def test_success_is_ok(self):
+        self.assertEqual(smoke.classify_call(False, {'granted': []}), 'ok')
+
+    def test_dispatch_deadline_is_a_timeout(self):
+        self.assertEqual(smoke.classify_call(True, TIMEOUT_ERROR), 'timeout')
+
+    def test_other_errors_are_tool_errors(self):
+        busy = {'error': {'type': 'RESOURCE_BUSY', 'message': 'database is busy'}}
+        self.assertEqual(smoke.classify_call(True, busy), 'tool_error')
+        self.assertEqual(smoke.error_code(busy), 'RESOURCE_BUSY')
+
+
+class KillWindowTests(unittest.TestCase):
+    def test_call_in_flight_at_the_kill_is_excused(self):
+        self.assertTrue(smoke.in_kill_window(start=95.0, end=100.5, kill_t=100.0, restarted_t=102.0))
+
+    def test_call_started_just_after_restart_is_excused(self):
+        self.assertTrue(smoke.in_kill_window(start=104.0, end=104.1, kill_t=100.0, restarted_t=102.0))
+
+    def test_call_long_after_restart_is_not_excused(self):
+        self.assertFalse(smoke.in_kill_window(start=110.0, end=110.2, kill_t=100.0, restarted_t=102.0))
+
+    def test_call_finished_before_the_kill_is_not_excused(self):
+        self.assertFalse(smoke.in_kill_window(start=90.0, end=99.0, kill_t=100.0, restarted_t=102.0))
+
+    def test_no_kill_excuses_nothing(self):
+        self.assertFalse(smoke.in_kill_window(start=1.0, end=2.0, kill_t=None, restarted_t=None))
+
+
+class ToolStatsTests(unittest.TestCase):
+    def records(self):
+        recs = [('file_reservation_paths', float(i), float(i) + 0.1, 'ok', '') for i in range(98)]
+        # Two calls hit the 30 s dispatch deadline.
+        recs += [('file_reservation_paths', 200.0, 230.0, 'timeout', 'x'),
+                 ('file_reservation_paths', 201.0, 231.0, 'timeout', 'x')]
+        recs += [('send_message', 99.0, 100.2, 'conn_error', 'RemoteDisconnected'),   # cut by the kill
+                 ('send_message', 300.0, 300.1, 'conn_error', 'URLError'),            # not excused
+                 ('send_message', 301.0, 301.2, 'tool_error', 'RESOURCE_BUSY'),
+                 ('send_message', 302.0, 302.1, 'ok', '')]
+        return recs
+
+    def test_timed_out_calls_count_at_full_duration(self):
+        # Planted negative: dropping timed-out calls from latency would report a
+        # 0.1 s p99 and hide the stall the phase exists to catch.
+        s = smoke.swarm_tool_stats(self.records(), kill_t=100.0, restarted_t=102.0)
+        fr = s['file_reservation_paths']
+        self.assertEqual(fr['n'], 100)
+        self.assertEqual(fr['timeouts'], 2)
+        self.assertGreaterEqual(fr['p99_s'], 30.0)
+        self.assertGreater(fr['p99_s'], smoke.SWARM_TOOL_P99_BUDGET_S)
+
+    def test_connection_errors_outside_the_kill_window_are_failures(self):
+        s = smoke.swarm_tool_stats(self.records(), kill_t=100.0, restarted_t=102.0)
+        sm = s['send_message']
+        self.assertEqual(sm['kill_window'], 1)
+        self.assertEqual(sm['conn_errors'], 1)
+        self.assertEqual(sm['tool_errors'], {'RESOURCE_BUSY': 1})
+        self.assertEqual(sm['n'], 2)
+
+    def test_without_a_kill_every_connection_error_counts(self):
+        s = smoke.swarm_tool_stats(self.records(), kill_t=None, restarted_t=None)
+        self.assertEqual(s['send_message']['conn_errors'], 2)
+        self.assertEqual(s['send_message']['kill_window'], 0)
+
+
+class DrainWindowTests(unittest.TestCase):
+    def test_progress_with_queued_work_passes(self):
+        self.assertEqual(smoke.drain_stalled_windows([(0, 10, 5), (10, 20, 7), (20, 30, 0)]), [])
+
+    def test_queued_work_without_progress_is_a_stall(self):
+        bad = smoke.drain_stalled_windows([(0, 10, 5), (10, 10, 9)])
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]['depth_at_open'], 5)
+
+    def test_an_empty_queue_without_progress_is_idle_not_stalled(self):
+        self.assertEqual(smoke.drain_stalled_windows([(0, 10, 0), (10, 10, 0)]), [])
+
+
+class KnobTests(unittest.TestCase):
+    def test_release_strength_can_pass(self):
+        self.assertIsNone(smoke.swarm_knob_shortfall(smoke.RELEASE_MIN_SWARM_AGENTS,
+                                                     smoke.RELEASE_MIN_SWARM_SECS))
+
+    def test_fewer_agents_or_a_shorter_run_cannot_pass(self):
+        self.assertIsNotNone(smoke.swarm_knob_shortfall(smoke.RELEASE_MIN_SWARM_AGENTS - 1,
+                                                        smoke.RELEASE_MIN_SWARM_SECS))
+        self.assertIsNotNone(smoke.swarm_knob_shortfall(smoke.RELEASE_MIN_SWARM_AGENTS,
+                                                        smoke.RELEASE_MIN_SWARM_SECS - 1))
+
+    def test_skipped_phase_records_no_checks_so_it_is_no_verdict(self):
+        saved = smoke.SWARM_AGENTS
+        smoke.SWARM_AGENTS = 0
+        try:
+            checks: list = []
+            extra = smoke.phase_swarm(None, {}, checks)
+        finally:
+            smoke.SWARM_AGENTS = saved
+        self.assertEqual(checks, [])
+        self.assertEqual(smoke.verdict(checks), 'NO_VERDICT')
+        self.assertIn('cannot_pass', extra)
+
+
+class ContentionWorkloadTests(unittest.TestCase):
+    def test_original_shared_thread_schedule_is_unchanged(self):
+        for sampled in range(1, 51):
+            self.assertEqual(smoke.swarm_thread_id(17, 23, sampled, False), f'swarm-{sampled}')
+
+    def test_sparse_conflicts_mix_repeated_and_unique_paths_in_every_project(self):
+        projects = [set() for _ in range(smoke.SWARM_PROJECTS)]
+        shared = [0] * smoke.SWARM_PROJECTS
+        unique = set()
+        for agent in range(smoke.RELEASE_MIN_SWARM_AGENTS):
+            for sequence in range(32):
+                thread = smoke.swarm_thread_id(agent, sequence, 1, True)
+                project = agent % smoke.SWARM_PROJECTS
+                projects[project].add(thread)
+                if thread == 'swarm-contention-shared':
+                    shared[project] += 1
+                else:
+                    self.assertNotIn(thread, unique)
+                    unique.add(thread)
+        self.assertTrue(all(count >= 2 for count in shared))
+        self.assertTrue(all(len(threads) > 1 for threads in projects))
+        self.assertEqual(len(unique) + sum(shared), smoke.RELEASE_MIN_SWARM_AGENTS * 32)
+
+    def test_skipped_contention_phase_cannot_pass(self):
+        with patch.object(smoke, 'SWARM_AGENTS', 0):
+            checks = []
+            extra = smoke.phase_archive_contention(None, {}, checks)
+        self.assertEqual(smoke.verdict(checks), 'NO_VERDICT')
+        self.assertEqual(extra['thread_workload'], 'sparse_conflicts')
+        self.assertIn('cannot_pass', extra)
+
+    def test_control_first_never_uses_control_verdict_as_candidate_verdict(self):
+        # This qualifies harness judgement only; no fake server verdict is
+        # evidence for Agent Mail. Keep a real receipt so the order is auditable.
+        for candidate_verdict, control_verdict, expected_rc in [('FAIL', 'PASS', 1),
+                                                                ('PASS', 'FAIL', 0)]:
+            root = Path(tempfile.mkdtemp(prefix='am-release-arm-order-'))
+            calls = []
+
+            def run_arm(name, binary, out, *, archive_contention=False):
+                calls.append((name, archive_contention))
+                return {'arm': name, 'phases': {},
+                        'verdict': candidate_verdict if name == 'candidate' else control_verdict}
+
+            argv = ['release_smoke.py', '--bin', sys.executable, '--control-bin', sys.executable,
+                    '--control-first', '--archive-contention', '--out', str(root)]
+            with patch.object(sys, 'argv', argv), patch.object(smoke, 'run_arm', run_arm), \
+                    patch.object(smoke, 'log'):
+                self.assertEqual(smoke.main(), expected_rc)
+            receipt = json.loads((root / 'release_smoke_receipt.json').read_text())
+            self.assertEqual(calls, [('control', True), ('candidate', True)])
+            self.assertEqual(receipt['arm_order'], ['control', 'candidate'])
+            self.assertEqual(receipt['candidate_verdict'], candidate_verdict)
+
+
+class ArchiveParityTests(unittest.TestCase):
+    def setUp(self):
+        # Retain evidence; never delete even private fixture files (AGENTS.md).
+        self.root = Path(tempfile.mkdtemp(prefix='am-release-archive-witness-'))
+        self.arm = smoke.Arm('witness-fixture', Path(sys.executable), self.root)
+        self.body = '\nsynthetic body with significant spaces \t\n\n'
+        self.envelope = {
+            'id': 1, 'from': 'BlueSpring', 'to': ['RedLake'], 'cc': ['GreenStone'],
+            'bcc': ['WhiteOak'], 'subject': 'witness', 'created': '2023-11-14T22:13:20.123456Z',
+            'thread_id': 'thread-one', 'topic': None, 'project': self.arm.proj1,
+            'project_slug': 'proof', 'importance': 'normal', 'ack_required': True,
+            'attachments': [], 'reply_to': 7,
+        }
+        conn = sqlite3.connect(self.arm.db_path)
+        try:
+            conn.executescript('''
+                CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT);
+                CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT);
+                CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER,
+                    subject TEXT, body_md TEXT, thread_id TEXT, topic TEXT, importance TEXT,
+                    ack_required INTEGER, created_ts INTEGER, attachments TEXT,
+                    recipients_json TEXT, archive_metadata_json TEXT);
+                CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT);
+                CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY,
+                    project_id INTEGER, kind TEXT);
+            ''')
+            conn.execute('INSERT INTO projects VALUES(1, ?, ?)', ('proof', self.arm.proj1))
+            conn.executemany('INSERT INTO agents(id, name, project_id) VALUES(?, ?, 1)',
+                             [(1, 'BlueSpring'), (2, 'RedLake'), (3, 'GreenStone'), (4, 'WhiteOak')])
+            roles = {key: self.envelope[key] for key in ('to', 'cc', 'bcc')}
+            conn.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                         (1, 1, 1, 'witness', self.body, 'thread-one', None, 'normal', 1,
+                          1700000000123456, '[]', json.dumps(roles), '{"reply_to":7}'))
+            conn.executemany('INSERT INTO message_recipients VALUES(1,?,?)',
+                             [(2, 'to'), (3, 'cc'), (4, 'bcc')])
+            conn.commit()
+        finally:
+            conn.close()
+        self.path = self.root / 'storage/projects/proof/messages/2023/11/witness__1.md'
+        self.path.parent.mkdir(parents=True)
+        self.git('init', '--initial-branch=main')
+        self.write_message(self.envelope, self.body)
+        (self.root / 'original-message-retained.md').write_bytes(self.path.read_bytes())
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ['git', '-c', 'user.name=Archive Witness', '-c', 'user.email=witness@example.invalid',
+             '-c', 'commit.gpgsign=false', '-C', str(self.root / 'storage'), *arguments],
+            check=True, capture_output=True, timeout=10,
+        ).stdout
+
+    def commit_archive(self):
+        self.git('add', '--', 'projects')
+        self.git('commit', '--allow-empty', '-m', 'Synthetic archive witness')
+
+    def mailbox_copy(self, name, folder='inbox'):
+        return self.root / 'storage/projects/proof/agents' / name / folder / '2023/11' / self.path.name
+
+    def write_message(self, envelope, body, commit=True):
+        full = ('---json\n' + json.dumps(envelope) + '\n---\n\n' + body).encode()
+        inbox = ('---json\n' + json.dumps({**envelope, 'bcc': []}) + '\n---\n\n' + body).encode()
+        self.path.write_bytes(full)
+        outbox = self.mailbox_copy(envelope['from'], 'outbox')
+        outbox.parent.mkdir(parents=True, exist_ok=True)
+        outbox.write_bytes(full)
+        for name in set(envelope['to']) | set(envelope['cc']) | set(envelope['bcc']):
+            if name.startswith('project:'):
+                continue
+            path = self.mailbox_copy(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(inbox)
+        if commit:
+            self.commit_archive()
+
+    def parity(self):
+        return smoke.archive_db_parity(self.root / 'storage', self.arm.db_path)
+
+    def update_db(self, sql, parameters=()):
+        conn = sqlite3.connect(self.arm.db_path)
+        try:
+            conn.execute(sql, parameters)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_real_snapshot_and_lossless_body_pass_without_server_requests(self):
+        def forbidden_health():
+            self.fail('quiet convergence must not poll the server')
+        self.arm.health = forbidden_health
+        self.assertTrue(self.parity()[0])
+        ok, detail = self.arm.wait_converged(2, 1)
+        self.assertTrue(ok, detail)
+        trace = json.loads((self.root / 'out/archive_convergence.jsonl').read_text().splitlines()[0])
+        self.assertTrue(trace['no_mcp_requests'])
+        self.assertTrue(trace['within_bound'])
+        self.assertEqual(trace['committed_copies'], 5)
+        self.assertEqual(trace['git_objects_verified'], 2)
+
+    def test_missing_inbox_cannot_pass_complete_canonical_counts(self):
+        inbox = self.mailbox_copy('RedLake')
+        retained = self.root / 'missing-inbox-retained.md'
+        inbox.rename(retained)
+        before = self.git('rev-parse', 'HEAD')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['missing_ids'], [])
+        self.assertEqual(detail['missing_copies'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+        self.assertFalse(inbox.exists(), 'observing must not repair the missing inbox')
+        retained.rename(inbox)
+        self.assertTrue(self.parity()[0])
+
+    def test_missing_sender_outbox_is_not_archive_convergence(self):
+        self.mailbox_copy('BlueSpring', 'outbox').rename(self.root / 'missing-outbox-retained.md')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['missing_copies'], [{'id': 1, 'copy': 'outbox'}])
+
+    def test_complete_working_bundle_must_also_be_committed(self):
+        body = 'changed live and working bytes, not yet in Git'
+        self.update_db('UPDATE messages SET body_md=?', (body,))
+        self.write_message(self.envelope, body, commit=False)
+        before = self.git('rev-parse', 'HEAD')
+        index_before = (self.root / 'storage/.git/index').read_bytes()
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['mismatches'], [])
+        self.assertEqual(len(detail['uncommitted_copies']), 5)
+        self.assertEqual(detail['committed_copies'], 0)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), before)
+        self.assertEqual((self.root / 'storage/.git/index').read_bytes(), index_before)
+        self.commit_archive()
+        self.assertTrue(self.parity()[0])
+
+    def test_semantically_correct_uncommitted_inbox_is_not_durable(self):
+        inbox = self.mailbox_copy('RedLake')
+        raw = ('---json\n' + json.dumps({**self.envelope, 'bcc': []}, indent=2)
+               + '\n---\n\n' + self.body).encode()
+        inbox.write_bytes(raw)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [])
+        self.assertEqual(detail['uncommitted_copies'], [{'id': 1, 'copy': 'inbox'}])
+        self.commit_archive()
+        self.assertTrue(self.parity()[0])
+
+    def test_committed_bcc_leak_in_recipient_copy_is_rejected(self):
+        self.mailbox_copy('RedLake').write_bytes(self.path.read_bytes())
+        self.commit_archive()
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertNotIn('WhiteOak', json.dumps(detail))
+
+    def test_missing_real_git_blob_cannot_be_supplied_by_working_copies(self):
+        relative = self.path.relative_to(self.root / 'storage').as_posix()
+        oid = self.git('rev-parse', 'HEAD:' + relative).strip().decode('ascii')
+        object_path = self.root / 'storage/.git/objects' / oid[:2] / oid[2:]
+        retained = self.root / 'missing-object-retained'
+        object_path.rename(retained)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertTrue(detail['bundle_mismatches'])
+        retained.rename(object_path)
+        self.assertTrue(self.parity()[0])
+
+    def test_one_pinned_tree_does_not_mix_copies_from_later_commits(self):
+        snapshot = smoke.ArchiveCommitSnapshot(self.root / 'storage', time.monotonic() + 5)
+        original = self.path.read_bytes()
+        try:
+            self.assertTrue(snapshot.verify(self.path, original))
+            self.write_message(self.envelope, 'later tree contents')
+            self.assertTrue(snapshot.verify(self.path, original))
+            self.assertFalse(snapshot.verify(self.path, self.path.read_bytes()))
+            self.assertNotEqual(self.git('rev-parse', 'HEAD').strip().decode(), snapshot.head)
+        finally:
+            snapshot.close()
+        self.assertIsNotNone(snapshot.reader.poll(), 'owned Git reader must be reaped')
+
+    def test_multiple_messages_share_one_reader_without_reusing_their_verdicts(self):
+        self.update_db('''INSERT INTO messages
+            SELECT 2,project_id,sender_id,subject,body_md,thread_id,topic,importance,
+                   ack_required,created_ts,attachments,recipients_json,archive_metadata_json
+            FROM messages WHERE id=1''')
+        self.update_db('INSERT INTO message_recipients SELECT 2,agent_id,kind '
+                       'FROM message_recipients WHERE message_id=1')
+        self.path = self.path.with_name('second__2.md')
+        self.write_message({**self.envelope, 'id': 2}, self.body)
+        with patch.object(smoke.subprocess, 'Popen', wraps=subprocess.Popen) as spawned:
+            ok, detail = self.parity()
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail['committed_copies'], 10)
+        self.assertEqual(detail['git_objects_verified'], 4)
+        readers = [call for call in spawned.call_args_list
+                   if call.args[0][-2:] == ['cat-file', '--batch']]
+        self.assertEqual(len(readers), 1, 'one Git reader must serve every message and copy')
+        self.mailbox_copy('RedLake').write_bytes((self.root / 'original-message-retained.md').read_bytes())
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 2, 'copy': 'inbox'}])
+
+    def test_mailbox_symlink_is_refused_without_reading_its_target(self):
+        inbox = self.mailbox_copy('RedLake')
+        retained = self.root / 'symlink-inbox-retained.md'
+        inbox.rename(retained)
+        inbox.symlink_to(retained)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['bundle_mismatches'], [{'id': 1, 'copy': 'inbox'}])
+        self.assertTrue(inbox.is_symlink())
+
+    def test_bcc_only_inbox_has_empty_visible_routing_without_losing_delivery(self):
+        envelope = {**self.envelope, 'to': [], 'cc': [], 'bcc': ['WhiteOak']}
+        self.update_db('ALTER TABLE message_recipients RENAME TO retained_message_recipients')
+        self.update_db('CREATE TABLE message_recipients AS SELECT * FROM retained_message_recipients '
+                       'WHERE agent_id=4')
+        self.update_db('UPDATE messages SET recipients_json=?',
+                       (json.dumps({role: envelope[role] for role in ('to', 'cc', 'bcc')}),))
+        self.write_message(envelope, self.body)
+        ok, detail = self.parity()
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail['committed_copies'], 3)
+
+    def test_same_count_modified_body_is_rejected_without_echoing_content(self):
+        self.write_message(self.envelope, 'different synthetic body')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertIn('body_md', detail['mismatches'][0]['fields'])
+        self.assertNotIn('different synthetic body', json.dumps(detail))
+
+    def test_same_count_unrelated_id_cannot_replace_the_expected_message(self):
+        self.path.rename(self.root / 'displaced-original-retained.md')
+        self.path = self.path.with_name('unrelated__99.md')
+        self.write_message({**self.envelope, 'id': 99}, self.body)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['missing_ids'], [1])
+        self.assertEqual(detail['extra_ids'], [99])
+
+    def test_same_count_wrong_recipient_role_is_rejected(self):
+        self.write_message({**self.envelope, 'to': ['BlueSpring']}, self.body)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['db_messages'], detail['archive_messages'])
+        self.assertEqual(detail['mismatches'][0]['fields'], ['to'])
+
+    def test_cached_routing_cannot_hide_changed_delivery_roles(self):
+        self.update_db("UPDATE message_recipients SET kind='cc' WHERE agent_id=2")
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertIn('db_error', detail)
+
+    def test_cached_routing_cannot_hide_a_missing_delivery(self):
+        # Preserve every original row in another table, then expose a genuinely
+        # incomplete active delivery set without deleting fixture evidence.
+        self.update_db('ALTER TABLE message_recipients RENAME TO retained_message_recipients')
+        self.update_db('CREATE TABLE message_recipients AS SELECT * FROM retained_message_recipients '
+                       'WHERE agent_id<>2')
+        self.assertFalse(self.parity()[0])
+
+    def test_orphaned_or_foreign_recipient_identity_is_rejected(self):
+        self.update_db('UPDATE message_recipients SET agent_id=999 WHERE agent_id=2')
+        self.assertFalse(self.parity()[0])
+        self.update_db('UPDATE message_recipients SET agent_id=2 WHERE agent_id=999')
+        self.update_db("INSERT INTO projects VALUES(2, 'other', '/other')")
+        self.update_db('UPDATE agents SET project_id=2 WHERE id=2')
+        self.assertFalse(self.parity()[0])
+
+    def test_explicit_project_mailbox_delivery_preserves_routing_and_scope(self):
+        envelope = {**self.envelope, 'to': ['RedLake', 'project:proof']}
+        roles = {role: envelope[role] for role in ('to', 'cc', 'bcc')}
+        self.update_db('INSERT INTO project_mailbox_deliveries VALUES(1,1,?)', ('to',))
+        self.update_db('UPDATE messages SET recipients_json=?', (json.dumps(roles),))
+        self.write_message(envelope, self.body)
+        self.assertTrue(self.parity()[0])
+        self.update_db("INSERT INTO projects VALUES(2, 'other', '/other')")
+        self.update_db('UPDATE project_mailbox_deliveries SET project_id=2')
+        self.assertFalse(self.parity()[0])
+
+    def test_legacy_empty_cache_uses_complete_delivery_rows(self):
+        self.update_db("UPDATE messages SET recipients_json='{}'")
+        self.assertTrue(self.parity()[0])
+
+    def test_recipient_objects_cannot_masquerade_as_name_arrays(self):
+        malformed = {**self.envelope, 'to': {'RedLake': 123}}
+        self.write_message(malformed, self.body)
+        self.assertFalse(self.parity()[0])
+        self.write_message(self.envelope, self.body)
+        roles = {role: malformed[role] for role in ('to', 'cc', 'bcc')}
+        self.update_db('UPDATE messages SET recipients_json=?', (json.dumps(roles),))
+        self.assertFalse(self.parity()[0])
+
+    def test_json_metadata_types_cannot_alias_boolean_and_numeric_values(self):
+        self.write_message({**self.envelope, 'ack_required': 1}, self.body)
+        self.assertFalse(self.parity()[0])
+        self.update_db('UPDATE messages SET attachments=?', ('[{"inline":true}]',))
+        self.write_message({**self.envelope, 'attachments': [{'inline': True}]}, self.body)
+        self.assertTrue(self.parity()[0])
+        self.write_message({**self.envelope, 'attachments': [{'inline': 1}]}, self.body)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertIn('attachments', detail['mismatches'][0]['fields'])
+
+    def test_known_reply_absence_refuses_an_added_archive_parent(self):
+        self.update_db("UPDATE messages SET archive_metadata_json='{}'")
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['mismatches'][0]['fields'], ['reply_to'])
+        envelope = {key: value for key, value in self.envelope.items() if key != 'reply_to'}
+        self.write_message(envelope, self.body)
+        self.assertTrue(self.parity()[0])
+
+    def test_legacy_null_reply_authority_is_explicitly_unverifiable(self):
+        self.update_db('UPDATE messages SET archive_metadata_json=NULL')
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['unverifiable_reply_ids'], [1])
+        self.assertEqual(detail['mismatches'], [])
+
+    def test_invalid_reply_parent_types_or_missing_thread_are_rejected(self):
+        for parent in (0, 1, True, '7', None):
+            with self.subTest(parent=parent):
+                self.write_message({**self.envelope, 'reply_to': parent}, self.body)
+                self.assertFalse(self.parity()[0])
+        self.write_message({**self.envelope, 'thread_id': None}, self.body)
+        self.assertFalse(self.parity()[0])
+        self.write_message({**self.envelope, 'reply_to': True}, self.body)
+        self.update_db('UPDATE messages SET archive_metadata_json=?', ('{"reply_to":true}',))
+        self.assertFalse(self.parity()[0])
+
+    def test_project_root_symlink_is_refused_without_following_it(self):
+        projects = self.root / 'storage/projects'
+        retained = self.root / 'retained-projects'
+        projects.rename(retained)
+        projects.symlink_to(retained, target_is_directory=True)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['archive_error'], 'ValueError')
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires Unix FIFO support')
+    def test_nonregular_canonical_entry_is_refused(self):
+        self.path.rename(self.root / 'retained-before-fifo.md')
+        os.mkfifo(self.path)
+        ok, detail = self.parity()
+        self.assertFalse(ok)
+        self.assertEqual(detail['invalid_files'], 1)
+
+    def test_expired_observation_deadline_cannot_pass_matching_content(self):
+        ok, detail = smoke.archive_db_parity(self.root / 'storage', self.arm.db_path,
+                                            deadline=time.monotonic() - 1)
+        self.assertFalse(ok)
+        self.assertTrue(detail['deadline_exceeded'])
+        ok, detail = self.arm.wait_converged(0, 1)
+        self.assertFalse(ok)
+        self.assertTrue(json.loads(detail)['deadline_exceeded'])
+
+    def test_expensive_sqlite_observation_cannot_pass_after_its_deadline(self):
+        self.update_db('ALTER TABLE messages RENAME TO retained_messages')
+        self.update_db('''CREATE VIEW messages AS
+            WITH RECURSIVE work(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM work WHERE n<100000000)
+            SELECT m.* FROM retained_messages m CROSS JOIN work WHERE work.n=100000000''')
+        ok, detail = smoke.archive_db_parity(self.root / 'storage', self.arm.db_path,
+                                            deadline=time.monotonic() + 0.2)
+        self.assertFalse(ok)
+        self.assertTrue(detail['deadline_exceeded'])
+        self.assertIn(detail['db_error'], ('OperationalError', 'TimeoutError'))
+
+    def test_live_client_prevents_quiet_claim_then_stopped_client_allows_it(self):
+        ready, finish = threading.Event(), threading.Event()
+
+        def client():
+            ready.set()
+            finish.wait()
+
+        thread = threading.Thread(target=client)
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(2), 'real client thread did not start')
+            ok, detail = self.arm.wait_converged(2, 1, client_threads=[thread])
+            self.assertFalse(ok)
+            detail = json.loads(detail)
+            self.assertEqual(detail['active_client_threads'], 1)
+            self.assertFalse(detail['no_mcp_requests'])
+            self.assertTrue(detail['convergence_unobserved'])
+        finally:
+            finish.set()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(self.arm.wait_converged(2, 1, client_threads=[thread])[0])
+
+
+def elf_image(machine: int, program_header_types: list) -> bytes:
+    """A little-endian ELF64 header followed by its program headers."""
+    header = bytearray(64)
+    header[:6] = b'\x7fELF\x02\x01'
+    header[18:20] = machine.to_bytes(2, 'little')
+    header[32:40] = (64).to_bytes(8, 'little')
+    header[54:56] = (56).to_bytes(2, 'little')
+    header[56:58] = len(program_header_types).to_bytes(2, 'little')
+    return bytes(header) + b''.join(
+        p_type.to_bytes(4, 'little') + bytes(52) for p_type in program_header_types)
+
+
+class ElfTargetTests(unittest.TestCase):
+    def test_no_interpreter_is_static(self):
+        self.assertEqual(smoke.elf_target(elf_image(0x3E, [1, 1])), 'x86_64-static')
+
+    def test_interpreter_header_is_dynamic(self):
+        self.assertEqual(smoke.elf_target(elf_image(0xB7, [6, 3, 1])), 'aarch64-dynamic')
+
+    def test_the_running_python_is_recognised(self):
+        with open(sys.executable, 'rb') as f:
+            target = smoke.elf_target(f.read(1 << 16))
+        self.assertIsNotNone(target)
+        self.assertNotIn('unknown', target)
+
+    def test_non_elf_and_truncated_headers_are_unknown(self):
+        self.assertIsNone(smoke.elf_target(b'#!/bin/sh\n' + bytes(64)))
+        self.assertIsNone(smoke.elf_target(elf_image(0x3E, [1, 1])[:100]))
+
+
+if __name__ == '__main__':
+    unittest.main()

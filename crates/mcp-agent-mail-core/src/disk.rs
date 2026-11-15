@@ -15,6 +15,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Bytes per MiB.
 const MIB: u64 = 1024 * 1024;
 
+/// Read the Windows volume serial number and 64-bit file index from an open file.
+///
+/// These identify the retained file on NTFS even when its name is replaced by
+/// another file with the same creation time. NTFS can preserve creation times
+/// through file tunneling, so timestamps alone are not ownership evidence.
+/// This uses the same stable capability metadata API as the link-count probe;
+/// it does not reopen a pathname or substitute timestamps on failure. The
+/// underlying API exposes 64-bit indexes, not ReFS's full 128-bit file IDs.
+#[cfg(windows)]
+pub fn windows_file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    let retained = cap_std::fs::File::from_std(file.try_clone()?);
+    let metadata = retained.metadata()?;
+    Ok((
+        cap_fs_ext::MetadataExt::dev(&metadata),
+        cap_fs_ext::MetadataExt::ino(&metadata),
+    ))
+}
+
 /// Read the Windows hard-link count from an already-open file authority.
 ///
 /// The capability metadata wrapper supplies stable handle information. Cloning
@@ -752,6 +770,40 @@ fn normalize_probe_path(path: &Path) -> PathBuf {
     PathBuf::from(".")
 }
 
+/// Whether an I/O failure was caused by the host's storage, not the data.
+///
+/// That covers a full filesystem, an exhausted quota, or a read-only mount
+/// (ENOSPC/EDQUOT/EROFS and their Windows equivalents). Such a failure while
+/// staging a private probe copy says nothing about the mailbox, so it must
+/// never be read as database damage (br-txx8u).
+#[must_use]
+pub fn is_host_storage_exhaustion(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull
+            | io::ErrorKind::QuotaExceeded
+            | io::ErrorKind::ReadOnlyFilesystem
+    ) || is_host_storage_exhaustion_message(&error.to_string())
+}
+
+/// [`is_host_storage_exhaustion`] for an error that has already been
+/// flattened to text (`SqlError`, `CliError` and recovery reasons carry only
+/// the rendered `io::Error`).
+#[must_use]
+pub fn is_host_storage_exhaustion_message(text: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "no space left on device",
+        "quota exceeded",
+        "read-only file system",
+        "not enough space on the disk",
+        "(os error 28)",
+        "(os error 30)",
+        "(os error 122)",
+    ];
+    let lower = text.to_ascii_lowercase();
+    SIGNATURES.iter().any(|signature| lower.contains(signature))
+}
+
 /// Return available bytes for the filesystem containing `path`.
 ///
 /// Uses `fs2::available_space` (cross-platform) and never requires unsafe code.
@@ -1226,6 +1278,85 @@ pub fn is_platform_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn host_storage_exhaustion_recognizes_full_quota_and_read_only_storage() {
+        for error in [
+            io::Error::from(io::ErrorKind::StorageFull),
+            io::Error::from(io::ErrorKind::QuotaExceeded),
+            io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+            io::Error::other("write to disk: Quota exceeded (os error 122)"),
+        ] {
+            assert!(is_host_storage_exhaustion(&error), "{error}");
+        }
+        for text in [
+            "failed to stage source-byte-neutral SQLite health probe for /m/storage.sqlite3: No space left on device (os error 28)",
+            "canonical snapshot tempdir failed: Disk quota exceeded (os error 122)",
+            "macOS: Disc quota exceeded (os error 69)",
+            "Read-only file system (os error 30)",
+        ] {
+            assert!(is_host_storage_exhaustion_message(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn host_storage_exhaustion_ignores_database_and_permission_failures() {
+        for error in [
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::other("database disk image is malformed"),
+        ] {
+            assert!(!is_host_storage_exhaustion(&error), "{error}");
+        }
+        for text in [
+            "PRAGMA integrity_check failed: database disk image is malformed",
+            "file is not a database",
+            "os error 2",
+            "(os error 280)",
+        ] {
+            assert!(!is_host_storage_exhaustion_message(text), "{text}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_survives_writes_and_distinguishes_equal_creation_time_replacement() {
+        use std::os::windows::fs::FileTimesExt as _;
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let alias = dir.path().join("alias");
+        let moved = dir.path().join("moved");
+        std::fs::write(&source, b"original").unwrap();
+        let authority = open_regular_file_no_follow(&source).unwrap();
+        let identity = windows_file_identity(&authority).unwrap();
+        std::fs::write(&source, b"ordinary writes change length and mtime").unwrap();
+        assert_eq!(windows_file_identity(&authority).unwrap(), identity);
+        let reopened = open_regular_file_no_follow(&source).unwrap();
+        assert_eq!(windows_file_identity(&reopened).unwrap(), identity);
+
+        std::fs::hard_link(&source, &alias).unwrap();
+        let linked = open_regular_file_no_follow(&alias).unwrap();
+        assert_eq!(windows_file_identity(&linked).unwrap(), identity);
+        std::fs::rename(&source, &moved).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        let replacement = open_regular_file_read_write_no_follow(&source).unwrap();
+        // Make the collision deterministic, without depending on the volume's
+        // optional tunneling cache or on timestamp resolution.
+        let created = authority.metadata().unwrap().created().unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_created(created))
+            .unwrap();
+        assert_eq!(replacement.metadata().unwrap().created().unwrap(), created);
+        assert_eq!(windows_file_identity(&authority).unwrap(), identity);
+        assert_eq!(windows_file_identity(&linked).unwrap(), identity);
+        assert_ne!(windows_file_identity(&replacement).unwrap(), identity);
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            b"ordinary writes change length and mtime"
+        );
+    }
 
     #[cfg(windows)]
     #[test]

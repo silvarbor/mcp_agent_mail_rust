@@ -16,7 +16,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="flex flex-col page-transition" x-data="unifiedInboxManager()">
+<div class="flex flex-col page-transition" x-data="unifiedInboxManager()" x-init="init()">
 
   <!-- Fullscreen Backdrop -->
   <div x-show="isFullscreen"
@@ -44,7 +44,7 @@
         @input="filterMessages()"
         @keydown.escape="searchQuery = ''; filterMessages()"
         type="search"
-        placeholder="Search all messages across all projects and agents..."
+        placeholder="Filter the newest messages across projects and agents..."
         class="w-full pl-12 pr-4 py-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 focus:ring-2 focus:ring-primary-500/20"
         autocomplete="off"
         id="unified-search"
@@ -56,8 +56,8 @@
             <i data-lucide="x" class="w-4 h-4 text-slate-500"></i>
           </button>
         </template>
-        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 text-xs font-mono rounded border border-slate-300 dark:border-slate-600">
-          <span class="shortcut-key">⌘</span><span>K</span>
+        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 text-xs font-mono rounded border border-slate-300 dark:border-slate-600" title="Press / to search (⌘K opens the command palette)">
+          <span>/</span>
         </kbd>
       </div>
     </div>
@@ -111,9 +111,11 @@
               class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-2 transition-all duration-200 hover:border-primary-300 dark:hover:border-primary-700 hover:text-primary-700 dark:hover:text-primary-400"
               :aria-busy="isRefreshing"
               aria-label="Refresh inbox">
-        <i data-lucide="refresh-cw"
-           class="w-4 h-4"
-           :class="isRefreshing ? 'animate-spin text-primary-500' : 'text-slate-500 dark:text-slate-400'"></i>
+        <!-- Animate a stable wrapper: Lucide swaps the <i> for a new <svg>. -->
+        <span class="inline-flex w-4 h-4"
+              :class="isRefreshing ? 'animate-spin text-primary-500' : 'text-slate-500 dark:text-slate-400'">
+          <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+        </span>
         <span class="hidden xl:inline">Refresh</span>
       </button>
       <div class="flex flex-col min-w-0 break-words">
@@ -308,7 +310,7 @@
       <div class="flex-1 overflow-y-auto">
         <template x-if="filteredMessages.length > 0">
           <div>
-            <template x-for="(msg, index) in pagedMessages" :key="msg.id">
+            <template x-for="(msg, index) in filteredMessages" :key="msg.id">
               <!-- Gmail-style Message Item -->
               <div @click="handleMessageClick(msg)"
                    @keydown.enter="handleMessageClick(msg)"
@@ -412,11 +414,6 @@
           </div>
         </template>
       </div>
-      <div x-show="filteredMessages.length > 0" class="flex items-center justify-between gap-2 px-4 py-3 border-t border-slate-200 dark:border-slate-700 text-sm">
-        <button @click="messagePage--" :disabled="messagePage === 0" class="px-3 py-2 rounded-lg border disabled:opacity-40">Previous</button>
-        <span x-text="`${messagePage * pageSize + 1}–${Math.min((messagePage + 1) * pageSize, filteredMessages.length)} of ${filteredMessages.length}`"></span>
-        <button @click="messagePage++" :disabled="(messagePage + 1) * pageSize >= filteredMessages.length" class="px-3 py-2 rounded-lg border disabled:opacity-40">Next</button>
-      </div>
     </aside>
 
     <!-- Right Pane: Message Detail (Split View Only) -->
@@ -519,8 +516,8 @@
                   <i data-lucide="external-link" class="w-4 h-4"></i>
                   Open in Project
                 </a>
-                <template x-if="selectedMessage.thread_id">
-                  <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
+                <template x-if="selectedMessage.thread_url">
+                  <a :href="window.agentMailAppendAuth(selectedMessage.thread_url)"
                      class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                     <i data-lucide="git-branch" class="w-4 h-4"></i>
                     View Thread
@@ -585,7 +582,7 @@
     <div class="flex items-center justify-between mb-6">
       <div>
         <h2 class="text-2xl font-semibold text-slate-900 dark:text-white mb-2">Your Projects</h2>
-        <p class="text-slate-600 dark:text-slate-400">{{ projects|length }} project{{ 's' if projects|length != 1 else '' }} in total</p>
+        <p class="text-slate-600 dark:text-slate-400">{{ projects|length }} project{{ 's' if projects|length != 1 else '' }} with agents · <a href="/mail/projects" class="underline hover:text-primary-600 dark:hover:text-primary-400">all projects and related-project links</a></p>
       </div>
 
       {% if projects|length > 0 %}
@@ -673,8 +670,6 @@ function unifiedInboxManager() {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
     filteredMessages: [],
-    messagePage: 0,
-    pageSize: 50,
     selectedMessage: null,
     selectedMessages: [],
     searchQuery: '',
@@ -688,9 +683,6 @@ function unifiedInboxManager() {
     isRefreshing: false,
     lastRefreshTime: null,
     refreshError: null,
-    refreshFailures: 0,
-    refreshController: null,
-    destroyed: false,
 
     // Filters
     filters: {
@@ -702,10 +694,6 @@ function unifiedInboxManager() {
     },
 
     // Computed
-    get pagedMessages() {
-      return this.filteredMessages.slice(this.messagePage * this.pageSize, (this.messagePage + 1) * this.pageSize);
-    },
-
     get uniqueProjects() {
       return [...new Set(
         this.allMessages
@@ -788,6 +776,7 @@ function unifiedInboxManager() {
     },
 
     init() {
+      this.filteredMessages = [...this.allMessages];
       this.filterMessages();
       if (!staticExport) {
         this.lastRefreshTime = new Date();
@@ -850,15 +839,23 @@ function unifiedInboxManager() {
         }
       }
 
-      this.scheduleAutoRefresh();
-    },
+      // Auto-select first message if in split view
+      if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
+        this.selectMessage(this.filteredMessages[0]);
+      }
 
-    destroy() {
-      this.destroyed = true;
-      document.removeEventListener('keydown', this._keydownHandler);
-      clearTimeout(this.autoRefreshHandle);
-      this.autoRefreshHandle = null;
-      this.refreshController?.abort();
+      this.scheduleAutoRefresh();
+
+      // Return cleanup function for Alpine.js v3
+      return () => {
+        if (this._keydownHandler) {
+          document.removeEventListener('keydown', this._keydownHandler);
+        }
+        if (this.autoRefreshHandle) {
+          clearInterval(this.autoRefreshHandle);
+          this.autoRefreshHandle = null;
+        }
+      };
     },
 
     // Filtering
@@ -907,13 +904,13 @@ function unifiedInboxManager() {
           const subject = (msg.subject ?? '').toString().toLowerCase();
           const sender = (msg.sender_label || msg.sender || '').toString().toLowerCase();
           const recipients = (msg.recipients_label || msg.recipients || '').toString().toLowerCase();
-          const excerpt = (msg.excerpt ?? '').toString().toLowerCase();
+          const body = (msg.body_md ?? msg.excerpt ?? '').toString().toLowerCase();
           const projectName = (msg.project_name ?? '').toString().toLowerCase();
           return (
             subject.includes(query) ||
             sender.includes(query) ||
             recipients.includes(query) ||
-            excerpt.includes(query) ||
+            body.includes(query) ||
             projectName.includes(query)
           );
         });
@@ -1002,8 +999,6 @@ function unifiedInboxManager() {
       }
 
       this.filteredMessages = filtered;
-      const selectionIndex = filtered.findIndex(msg => msg.id === this.selectedMessage?.id);
-      this.messagePage = selectionIndex >= 0 ? Math.floor(selectionIndex / this.pageSize) : 0;
 
       const visibleIds = new Set(filtered.map((msg) => msg.id));
       if (this.selectedMessages.length > 0) {
@@ -1021,7 +1016,12 @@ function unifiedInboxManager() {
         this.selectMessage(filtered[0]);
       }
 
-      // The shared placeholder observer initializes icons added by Alpine.
+      // Re-render icons
+      this.$nextTick(() => {
+        if (typeof lucide !== 'undefined') {
+          lucide.createIcons();
+        }
+      });
     },
 
     // Refresh helpers
@@ -1031,17 +1031,15 @@ function unifiedInboxManager() {
         return;
       }
       if (this.autoRefreshHandle) {
-        clearTimeout(this.autoRefreshHandle);
+        clearInterval(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
-      if (!this.autoRefreshEnabled || this.destroyed) {
+      if (!this.autoRefreshEnabled) {
         return;
       }
-      const delay = Math.min(this.autoRefreshSeconds * 1000 * (2 ** this.refreshFailures), 300000);
-      this.autoRefreshHandle = setTimeout(() => {
-        this.autoRefreshHandle = null;
+      this.autoRefreshHandle = setInterval(() => {
         this.fetchLatestMessages({ silent: true });
-      }, delay);
+      }, this.autoRefreshSeconds * 1000);
     },
 
     handleAutoRefreshToggle() {
@@ -1052,7 +1050,7 @@ function unifiedInboxManager() {
       if (this.autoRefreshEnabled) {
         this.scheduleAutoRefresh();
       } else if (this.autoRefreshHandle) {
-        clearTimeout(this.autoRefreshHandle);
+        clearInterval(this.autoRefreshHandle);
         this.autoRefreshHandle = null;
       }
     },
@@ -1073,16 +1071,11 @@ function unifiedInboxManager() {
         }
         return;
       }
-      if (this.isRefreshing || this.destroyed) {
+      if (this.isRefreshing) {
         return;
       }
       this.isRefreshing = true;
       this.refreshError = null;
-      clearTimeout(this.autoRefreshHandle);
-      this.autoRefreshHandle = null;
-      const controller = new AbortController();
-      this.refreshController = controller;
-      const requestTimeout = setTimeout(() => controller.abort(), 30000);
 
       const previouslySelectedId = this.selectedMessage?.id ?? null;
       const previouslySelectedSet = new Set(this.selectedMessages || []);
@@ -1097,41 +1090,21 @@ function unifiedInboxManager() {
         }
         const response = await fetch(window.agentMailAppendAuth(`/mail/api/unified-inbox?${params.toString()}`), {
           headers: { Accept: 'application/json' },
-          cache: 'no-store',
-          signal: controller.signal
+          cache: 'no-store'
         });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const payload = await response.json();
-        if (this.destroyed) return;
         const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
-        const previousById = new Map(this.allMessages.map(message => [message.id, message]));
-        const stableContent = message => JSON.stringify(Object.fromEntries(
-          Object.keys(message).filter(key => key !== 'created_relative' && key !== 'body_length')
-            .sort().map(key => [key, message[key]])
-        ));
-        const nextMessages = incomingMessages.map(message => {
-          const previous = previousById.get(message.id);
-          if (previous && stableContent(previous) === stableContent(message)) {
-            if (previous.created_relative !== message.created_relative) {
-              previous.created_relative = message.created_relative;
-            }
-            return previous;
-          }
-          return message;
-        });
-        const changed = nextMessages.length !== this.allMessages.length ||
-          nextMessages.some((message, index) => message !== this.allMessages[index]);
-        if (changed) {
-          this.allMessages = nextMessages;
-          this.filterMessages();
-        }
+
+        this.allMessages = incomingMessages;
+        this.filterMessages();
 
         if (previouslySelectedId) {
           const nextSelection = this.filteredMessages.find((m) => m.id === previouslySelectedId);
           if (nextSelection) {
-            if (this.selectedMessage !== nextSelection) this.selectMessage(nextSelection);
+            this.selectMessage(nextSelection);
           } else if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
             this.selectMessage(this.filteredMessages[0]);
           } else {
@@ -1141,33 +1114,30 @@ function unifiedInboxManager() {
           this.selectMessage(this.filteredMessages[0]);
         }
 
-        if (changed && previouslySelectedSet.size > 0) {
+        if (previouslySelectedSet.size > 0) {
           this.selectedMessages = this.filteredMessages
             .filter((m) => previouslySelectedSet.has(m.id))
             .map((m) => m.id);
-        } else if (changed && this.selectedMessages.length > 0) {
+        } else if (this.selectedMessages.length > 0) {
           this.selectedMessages = [];
         }
 
         this.lastRefreshTime = new Date();
-        this.refreshFailures = 0;
 
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Inbox refreshed', 'success');
         }
       } catch (error) {
-        if (this.destroyed) return;
-        this.refreshFailures++;
         console.error('Unified inbox refresh failed:', error);
         this.refreshError = 'Refresh failed. Retrying soon.';
         if (!silent && typeof window.showToast === 'function') {
           window.showToast('Failed to refresh inbox', 'error');
         }
       } finally {
-        clearTimeout(requestTimeout);
-        this.refreshController = null;
         this.isRefreshing = false;
-        this.scheduleAutoRefresh();
+        if (!silent) {
+          this.scheduleAutoRefresh();
+        }
       }
     },
 
@@ -1217,8 +1187,6 @@ function unifiedInboxManager() {
       }
 
       this.selectedMessage = msg;
-      const index = this.filteredMessages.findIndex(message => message.id === msg.id);
-      if (index >= 0) this.messagePage = Math.floor(index / this.pageSize);
 
       // Scroll message into view in left pane (for keyboard navigation)
       this.$nextTick(() => {
@@ -1269,6 +1237,9 @@ function unifiedInboxManager() {
                 }
                 setTimeout(() => {
                   button.innerHTML = '<i data-lucide="copy" class="w-4 h-4"></i>';
+                  if (typeof lucide !== 'undefined') {
+                    lucide.createIcons();
+                  }
                 }, 2000);
               } else {
                 // Fallback for browsers without clipboard API
@@ -1287,6 +1258,9 @@ function unifiedInboxManager() {
           wrapper.appendChild(button);
         });
 
+        if (typeof lucide !== 'undefined') {
+          lucide.createIcons();
+        }
       });
     },
 

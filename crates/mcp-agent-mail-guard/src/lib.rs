@@ -396,12 +396,15 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "    return items".to_string(),
         String::new(),
         "def _run_child(path: Path, * , stdin_bytes=None):".to_string(),
+        "    # Children get git's own arguments (pre-push: remote name and URL);".to_string(),
+        "    # `git lfs pre-push \"$@\"` exits 1 without them, blocking every push.".to_string(),
+        "    args = sys.argv[1:]".to_string(),
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.".to_string(),
         "    try:".to_string(),
         "        if os.name != 'posix' and path.suffix.lower() == '.py':".to_string(),
-        "            return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode"
+        "            return subprocess.run([sys.executable, str(path), *args], input=stdin_bytes, check=False).returncode"
             .to_string(),
-        "        return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode"
+        "        return subprocess.run([str(path), *args], input=stdin_bytes, check=False).returncode"
             .to_string(),
         "    except OSError as exc:".to_string(),
         "        print(f'mcp-agent-mail chain-runner: could not execute {path.name}: {exc}', file=sys.stderr)"
@@ -415,6 +418,11 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             .to_string(),
         "    return first_failure or rc".to_string(),
         String::new(),
+        "def _orig_runnable() -> bool:".to_string(),
+        "    # Git skips a hook that is not executable; the user's original hook".to_string(),
+        "    # keeps that behaviour rather than failing every commit with 126.".to_string(),
+        "    return ORIG.exists() and (os.name != 'posix' or _is_exec(ORIG))".to_string(),
+        String::new(),
     ];
 
     if hook_name == "pre-push" {
@@ -426,7 +434,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "    rc = _run_child(exe, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             String::new(),
-            "if ORIG.exists():".to_string(),
+            "if _orig_runnable():".to_string(),
             "    rc = _run_child(ORIG, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
             "sys.exit(first_failure)".to_string(),
@@ -438,7 +446,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "    rc = _run_child(exe)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             String::new(),
-            "if ORIG.exists():".to_string(),
+            "if _orig_runnable():".to_string(),
             "    rc = _run_child(ORIG)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
             "sys.exit(first_failure)".to_string(),
@@ -451,9 +459,13 @@ fn render_chain_runner_script(hook_name: &str) -> String {
 // One template per hook is more readable than a dozen concatenated fragments.
 #[allow(clippy::too_many_lines)]
 fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
+    use sha2::{Digest, Sha256};
     // Real guard plugin: checks active file reservations against staged changes (pre-commit)
     // or pushed commits (pre-push).
     let project_json = serde_json::to_string(project).unwrap_or_else(|_| "\"\"".to_string());
+    let project_slug_json =
+        serde_json::to_string(&mcp_agent_mail_core::resolve_project_identity(project).slug)
+            .unwrap_or_else(|_| "\"\"".to_string());
     let hook_name_json = serde_json::to_string(hook_name).unwrap_or_else(|_| "\"\"".to_string());
     let template = r##"#!/usr/bin/env python3
 # mcp-agent-mail guard plugin (__HOOK_NAME_TEXT__)
@@ -462,16 +474,26 @@ fn render_guard_plugin_script(project: &str, hook_name: &str) -> String {
 
 import datetime
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
 
 PROJECT = __PROJECT_JSON__
+INSTALLED_PROJECT_SLUG = __PROJECT_SLUG_JSON__
 HOOK_NAME = __HOOK_NAME_JSON__
+# STORAGE_ROOT configured when the guard was installed (environment or the
+# user config.env); a commit shell's own STORAGE_ROOT still takes precedence.
+INSTALLED_STORAGE_ROOT = __STORAGE_ROOT_JSON__
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
-GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
+# Trimmed and case-insensitive, as `am guard check`/status read it: `Warn`
+# must not report warn mode while the hook blocks.
+GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block").strip().lower()
 
 def fail_closed(message):
     """Fail-closed exit for guard infrastructure failures (GH#224).
@@ -514,6 +536,15 @@ def _is_segfault_rc(rc):
     shell wrapper, 0xC0000005 on Windows."""
     return rc in (-11, -7, 139, 135, 0xC0000005)
 
+def _guard_git_env(env=None):
+    # A receipt is evidence about the stored commit, never a replacement or
+    # grafted graph supplied by the caller. --no-replace-objects alone does
+    # NOT disable info/grafts.
+    env = dict(os.environ if env is None else env)
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_GRAFT_FILE"] = os.devnull
+    return env
+
 def _run_git_with_retry(args, **kwargs):
     """subprocess.run wrapper that retries on SIGSEGV (git 2.51.0).
 
@@ -528,6 +559,7 @@ def _run_git_with_retry(args, **kwargs):
     and bypass the retry entirely.
     """
     args = _git_argv(args)
+    kwargs["env"] = _guard_git_env(kwargs.get("env"))
 
     check_requested = kwargs.pop("check", False)
 
@@ -690,9 +722,10 @@ class _NameStatusStream:
     time no matter how many commits feed the stream.
     """
 
-    def __init__(self, files, max_records):
+    def __init__(self, files, max_records, strict=False):
         self.files = files
         self.max_records = max_records
+        self.strict = strict
         self.records = 0
         self.capped = False
         self._tail = b""
@@ -706,7 +739,7 @@ class _NameStatusStream:
         self._tail = parts.pop()
         for token in parts:
             if self._paths_left == 0:
-                status = token.decode("utf-8", "ignore").strip()
+                status = token.decode("utf-8", "strict" if self.strict else "ignore").strip()
                 if not status:
                     continue
                 if self.max_records is not None and self.records >= self.max_records:
@@ -715,7 +748,7 @@ class _NameStatusStream:
                 self.records += 1
                 self._paths_left = 2 if status.startswith(("R", "C")) else 1
                 continue
-            path = token.decode("utf-8", "ignore")
+            path = token.decode("utf-8", "strict" if self.strict else "ignore")
             if path:
                 self.files.add(path)
             self._paths_left -= 1
@@ -727,7 +760,7 @@ def _kill_quietly(proc):
     except OSError:
         pass
 
-def _scan_push_commits(rev_list_args, files, max_paths, deadline):
+def _scan_push_commits(rev_list_args, files, max_paths, deadline, admissions=None, strict=False):
     """Stream `git rev-list ... | git diff-tree --stdin` into `files`.
 
     Returns (records, capped, timed_out). Both git processes are killed the
@@ -745,29 +778,62 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
     # identical to the concatenation of the per-commit outputs.
     diff_tree_args = _git_argv(
         ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
-         "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", "--stdin"]
+         "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z",
+         "-m" if strict else "--cc", "--stdin"]
     )
     rev_list_args = _git_argv(rev_list_args)
+    scan_env = _guard_git_env()
+    if strict:
+        # Read the immutable object's real parents even if a concurrent fetch
+        # changes the repository's shallow boundary. Missing parent objects
+        # must fail inspection rather than masquerade as a root commit.
+        scan_env["GIT_SHALLOW_FILE"] = os.devnull
     delays = (0.1, 0.4, 1.6)
     for attempt in range(len(delays) + 1):
         left = _seconds_left(deadline)
         if left is not None and left <= 0:
             return 0, False, True
         scratch = set()
-        parser = _NameStatusStream(scratch, max_paths)
+        parser = _NameStatusStream(scratch, max_paths, strict)
         rev_list = subprocess.Popen(
-            rev_list_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            rev_list_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=scan_env,
         )
         try:
             diff_tree = subprocess.Popen(
-                diff_tree_args, stdin=rev_list.stdout,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                diff_tree_args, stdin=subprocess.PIPE if admissions else rev_list.stdout,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=scan_env,
             )
         except Exception:
             _kill_quietly(rev_list)
             rev_list.wait()
             raise
-        rev_list.stdout.close()  # diff-tree owns the read end now
+        filter_errors = []
+        filter_thread = None
+        if admissions:
+            def _forward_unadmitted():
+                try:
+                    for line in rev_list.stdout:
+                        oid = line.strip().decode("ascii")
+                        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+                            raise ValueError("invalid commit object ID")
+                        if not admissions.admitted(oid):
+                            diff_tree.stdin.write(line)
+                    diff_tree.stdin.close()
+                except BaseException as exc:
+                    filter_errors.append(str(exc))
+                    _kill_quietly(diff_tree)
+                    _kill_quietly(rev_list)
+                finally:
+                    rev_list.stdout.close()
+                    try:
+                        diff_tree.stdin.close()
+                    except OSError:
+                        pass
+            filter_thread = _threading.Thread(target=_forward_unadmitted, daemon=True)
+            filter_thread.start()
+        else:
+            rev_list.stdout.close()  # diff-tree owns the read end now
         expired = _threading.Event()
 
         def _expire():
@@ -789,6 +855,12 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
                     _kill_quietly(diff_tree)
                     _kill_quietly(rev_list)
                     break
+        except BaseException:
+            _kill_quietly(diff_tree)
+            _kill_quietly(rev_list)
+            diff_tree.wait()
+            rev_list.wait()
+            raise
         finally:
             if timer is not None:
                 timer.cancel()
@@ -797,11 +869,19 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
         rev_list_err = rev_list.stderr.read().decode("utf-8", "ignore").strip()
         diff_tree_rc = diff_tree.wait()
         rev_list_rc = rev_list.wait()
+        if filter_thread is not None:
+            filter_thread.join(timeout=1)
+            if filter_thread.is_alive():
+                fail_closed("mcp-agent-mail: commit admission inspection did not finish")
 
         if parser.capped:
             files.update(scratch)
             return parser.records, True, False
         if diff_tree_rc == 0 and rev_list_rc == 0:
+            if filter_errors:
+                fail_closed("mcp-agent-mail: commit admission filtering failed")
+            if strict and (parser._tail or parser._paths_left):
+                raise ValueError("incomplete committed-path record")
             files.update(scratch)
             return parser.records, False, False
         if expired.is_set():
@@ -826,7 +906,7 @@ def _scan_push_commits(rev_list_args, files, max_paths, deadline):
         )
     return 0, False, False  # unreachable: the loop returns or exits
 
-def get_push_files():
+def get_push_files(admissions=None):
     """Get (paths, unchecked) for the push (for pre-push).
 
     `unchecked` describes, for the operator, every part of the push the
@@ -896,7 +976,8 @@ def get_push_files():
             # Bounds 2 and 3: one streamed pipeline, capped on records read and
             # on the shared deadline.
             records, capped, timed_out = _scan_push_commits(
-                ["git", "rev-list", "-n", str(inspect)] + rev_args, files, max_paths, deadline
+                ["git", "rev-list", "-n", str(inspect)] + rev_args, files, max_paths, deadline,
+                admissions=admissions,
             )
             if capped:
                 unchecked.append(
@@ -919,6 +1000,303 @@ def get_push_files():
     except Exception as exc:
         fail_closed("mcp-agent-mail: guard failed to inspect push files: " + str(exc))
     return sorted(files), unchecked
+
+# Commit admission is optional evidence, never authority to skip an ancestor.
+# Its private key and signed records live outside the worktree. Platforms
+# without directory-relative no-follow I/O retain the ordinary push check.
+ADMISSION_DIRECTORY = "agent-mail-guard-admissions-v1"
+ADMISSION_MAX_BYTES = 8192
+ADMISSION_POLICY = "__ADMISSION_POLICY_SHA256__"
+
+def _json_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def _file_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino)
+
+def _read_regular(path, limit, directory=None, private=False):
+    # A substituted FIFO must refuse, not block before fstat can inspect it.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags, dir_fd=directory)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("admission evidence is not one regular file")
+        if private and (metadata.st_uid != os.getuid() or metadata.st_mode & 0o077):
+            raise ValueError("admission evidence is not private to this user")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("admission evidence exceeds its byte limit")
+        if _file_identity(os.stat(path, dir_fd=directory, follow_symlinks=False)) != _file_identity(metadata):
+            raise ValueError("admission evidence changed while being read")
+        return data
+    finally:
+        os.close(fd)
+
+def _open_directory_chain(path):
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd or os.link not in os.supports_dir_fd):
+        raise ValueError("no-follow directory-relative admission I/O is unavailable")
+    path = os.path.abspath(path)
+    fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in path.split(os.path.sep):
+            if component:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+def _admission_binding(common, archive_root):
+    repo = os.path.realpath(get_repo_root())
+    project = os.path.realpath(project_root_for(archive_root, repo))
+    # An error-free absence can later become this repo's local archive. It
+    # cannot admit a later external matching archive: that changes this path.
+    archive = os.path.realpath(archive_root) if archive_root else repo
+    return {
+        "version": 1, "policy": ADMISSION_POLICY,
+        "repository": repo, "git_common_dir": common,
+        "repository_identity": list(_file_identity(os.stat(repo))),
+        "git_identity": list(_file_identity(os.stat(common))),
+        "project": project, "project_argument": PROJECT,
+        "project_identity": list(_file_identity(os.stat(project))),
+        "archive": archive,
+        "archive_identity": list(_file_identity(os.stat(archive))),
+        "storage_root": os.path.realpath(default_storage_root()),
+        "ignorecase": CASE_INSENSITIVE_REPO,
+    }
+
+class _AdmissionStore:
+    def __init__(self, create=False, archive_root=None, checked_binding=None):
+        self.common_fd = self.fd = None
+        self.authority_fds = {}
+        graph = _run_git_with_retry(
+            ["git", "rev-parse", "--is-shallow-repository"], capture_output=True,
+            text=True, check=True, timeout=10,
+        )
+        if graph.stdout.strip() != "false":
+            # A shallow boundary can turn a deletion into an apparent root
+            # commit, hiding the removed name from diff-tree. Such a graph
+            # cannot create or reuse complete-commit evidence.
+            raise ValueError("shallow history cannot establish complete commit admission")
+        result = _run_git_with_retry(
+            ["git", "rev-parse", "--git-common-dir"], capture_output=True,
+            text=True, check=True, timeout=10,
+        )
+        self.common = os.path.realpath(result.stdout.strip())
+        try:
+            self.common_fd = _open_directory_chain(self.common)
+            if create:
+                try:
+                    os.mkdir(ADMISSION_DIRECTORY, 0o700, dir_fd=self.common_fd)
+                except FileExistsError:
+                    pass
+            self.fd = os.open(ADMISSION_DIRECTORY,
+                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=self.common_fd)
+            metadata = os.fstat(self.fd)
+            if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise ValueError("commit admission directory is not private to this user")
+            self.binding = _admission_binding(self.common, archive_root)
+            if checked_binding is not None and self.binding != checked_binding:
+                raise ValueError("project/archive authority changed after commit inspection")
+            # Retained handles prevent inode reuse from disguising replacement.
+            # Repeated receipt checks walk only these few directories, never
+            # the archive's reservation population once per pushed commit.
+            for path_key, identity_key in (
+                    ("repository", "repository_identity"),
+                    ("project", "project_identity"),
+                    ("archive", "archive_identity")):
+                path = self.binding[path_key]
+                if path not in self.authority_fds:
+                    self.authority_fds[path] = _open_directory_chain(path)
+                if list(_file_identity(os.fstat(self.authority_fds[path]))) != self.binding[identity_key]:
+                    raise ValueError("commit admission authority changed while opening it")
+            self.prefix = hashlib.sha256(_json_bytes(self.binding)).hexdigest()
+            self._check_namespace()
+            if create:
+                # Atomic no-replace publication: a losing creator MUST read
+                # the winner's key, never sign with its discarded proposal.
+                self._write_once("key", secrets.token_bytes(32))
+            self.key = _read_regular("key", 32, self.fd, private=True)
+            if len(self.key) != 32:
+                raise ValueError("invalid commit admission key")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for fd in self.authority_fds.values():
+            os.close(fd)
+        self.authority_fds.clear()
+        for name in ("fd", "common_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def _check_namespace(self):
+        # Walk without following a substituted ancestor or leaf symlink.
+        # A retired archive/project cannot authorize its replacement.
+        for path, retained in [(self.common, self.common_fd), *self.authority_fds.items()]:
+            current = _open_directory_chain(path)
+            try:
+                if _file_identity(os.fstat(current)) != _file_identity(os.fstat(retained)):
+                    raise ValueError("commit admission project/archive authority changed")
+            finally:
+                os.close(current)
+        namespace = os.stat(ADMISSION_DIRECTORY, dir_fd=self.common_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(namespace.st_mode)
+                or _file_identity(namespace) != _file_identity(os.fstat(self.fd))):
+            raise ValueError("commit admission directory authority changed")
+
+    def _write_once(self, name, data):
+        self._check_namespace()
+        temporary = ".staged-" + secrets.token_hex(16)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(fd)
+            self._check_namespace()
+            try:
+                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+                        follow_symlinks=False)
+            except FileExistsError:
+                pass
+            os.unlink(temporary, dir_fd=self.fd)
+            os.fsync(self.fd)
+            self._check_namespace()
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+
+    def _name(self, oid):
+        return self.prefix + "-" + oid + ".json"
+
+    def admitted(self, oid):
+        try:
+            self._check_namespace()
+            raw = _read_regular(self._name(oid), ADMISSION_MAX_BYTES, self.fd, private=True)
+            record = json.loads(raw)
+            payload = record["payload"]
+            valid = (payload["commit"] == oid and payload["binding"] == self.binding
+                     and payload["complete"] is True and payload["mode"] == "block"
+                     and hmac.compare_digest(record["mac"], hmac.new(
+                         self.key, _json_bytes(payload), hashlib.sha256).hexdigest()))
+            self._check_namespace()
+            return valid
+        except Exception:
+            # Unavailable or substituted evidence never exempts the commit.
+            return False
+
+    def record(self, oid, agent_name, archive_root):
+        payload = {"binding": self.binding, "commit": oid, "complete": True,
+                   "mode": "block", "agent": agent_name,
+                   "archive_observation": "present" if archive_root else "absent"}
+        record = {"payload": payload, "mac": hmac.new(
+            self.key, _json_bytes(payload), hashlib.sha256).hexdigest()}
+        data = _json_bytes(record)
+        if len(data) > ADMISSION_MAX_BYTES:
+            raise ValueError("commit admission exceeds its byte limit")
+        self._write_once(self._name(oid), data)
+
+class _PushAdmissions:
+    def __init__(self):
+        self.initialized = False
+        self.store = None
+        self.excluded = False
+
+    def admitted(self, oid):
+        if not self.initialized:
+            self.initialized = True
+            try:
+                # Ambiguous current archive authority cannot reuse evidence.
+                _, archive = get_active_reservations(strict=True)
+                self.store = _AdmissionStore(archive_root=archive)
+            except (Exception, SystemExit):
+                self.store = None
+        admitted = self.store is not None and self.store.admitted(oid)
+        self.excluded = self.excluded or admitted
+        return admitted
+
+    def verify_exclusions(self):
+        if not self.excluded:
+            return
+        try:
+            # Resolve again once after the bounded scan. Intact directories
+            # do not rule out a newly matching external archive. Later leases
+            # within the same authority deliberately preserve prior admission.
+            _, archive = get_active_reservations(strict=True)
+            self.store._check_namespace()
+            if _admission_binding(self.store.common, archive) != self.store.binding:
+                raise ValueError("the resolved project/archive authority changed")
+            self.store._check_namespace()
+        except (Exception, SystemExit) as exc:
+            # Excluded objects lack an ordinary path check in this invocation.
+            fail_closed("mcp-agent-mail: commit admission authority changed during the push; "
+                        "the excluded commits require a fresh reservation check: " + str(exc))
+
+    def close(self):
+        if self.store is not None:
+            self.store.close()
+
+def admit_committed_head():
+    """Post-commit is an independent strict inspection, never a commit veto."""
+    store = None
+    try:
+        result = _run_git_with_retry(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        oid = result.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            raise ValueError("HEAD is not an immutable commit object ID")
+        timeout = push_scan_bound(PUSH_TIMEOUT_ENV, PUSH_TIMEOUT_SECS_DEFAULT)
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        files = set()
+        _, capped, expired = _scan_push_commits(
+            ["git", "rev-list", "--no-walk", oid], files,
+            push_scan_bound(PUSH_MAX_PATHS_ENV, PUSH_MAX_PATHS_DEFAULT), deadline,
+            strict=True,
+        )
+        if capped or expired:
+            raise ValueError("the complete commit inspection exceeded its scan bound")
+        reservations, archive = get_active_reservations(strict=True)
+        repo = get_repo_root()
+        common = _run_git_with_retry(
+            ["git", "rev-parse", "--git-common-dir"], capture_output=True,
+            text=True, check=True, timeout=10,
+        ).stdout.strip()
+        checked_binding = _admission_binding(os.path.realpath(common), archive)
+        paths = project_relative_paths(sorted(files), checked_binding["project"],
+                                       repo, CASE_INSENSITIVE_REPO)
+        agent = AGENT_NAME or resolve_identity_agent_name() or ""
+        if reservations and paths and not agent:
+            raise ValueError("no agent identity is available for committed-path inspection")
+        if check_conflicts(paths, reservations, agent):
+            raise ValueError("the committed snapshot conflicts with an active reservation")
+        current_reservations, current_archive = get_active_reservations(strict=True)
+        if reservations != current_reservations or archive != current_archive:
+            raise ValueError("reservation authority changed during commit inspection")
+        store = _AdmissionStore(create=True, archive_root=archive,
+                                checked_binding=checked_binding)
+        store.record(oid, agent, archive)
+    except (Exception, SystemExit) as exc:
+        print("WARNING: mcp-agent-mail: commit remains unadmitted; pre-push will check it normally: "
+              + str(exc), file=sys.stderr)
+    finally:
+        if store is not None:
+            store.close()
 
 def is_real_directory(path):
     try:
@@ -951,7 +1329,12 @@ def default_storage_root():
         value = os.environ.get(key, "").strip()
         if value:
             return os.path.expanduser(value)
-    
+    # The installer writes STORAGE_ROOT to config.env, which a commit shell
+    # does not export: without the installed value the hook looked in the
+    # default location, found no archive and allowed every commit.
+    if INSTALLED_STORAGE_ROOT.strip():
+        return os.path.expanduser(INSTALLED_STORAGE_ROOT.strip())
+
     # Match Rust core's default_storage_root_path logic.
     # Only honor the legacy path if it actually *contains* an archive —
     # an empty-directory stub at ~/.mcp_agent_mail_git_mailbox_repo (left
@@ -1100,7 +1483,7 @@ def project_metadata_matches(
     canonical_human_key = canonical_text(human_key)
     return bool(canonical_human_key and canonical_human_key in {canonical_project, canonical_repo})
 
-def probe_real_directory(path):
+def probe_real_directory(path, strict=False):
     """(is_dir, error) -- inspection errors are distinct from a missing path.
 
     `os.path.isdir` coerces permission errors into False, which upstream made
@@ -1111,25 +1494,26 @@ def probe_real_directory(path):
     """
     try:
         if os.path.islink(path):
-            return False, None
+            return False, ("linked archive directory: " + path) if strict else None
         os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
         return False, None
     except OSError as exc:
         return False, "%s: %s" % (path, exc)
     try:
-        return os.path.isdir(path), None
+        is_directory = os.path.isdir(path)
+        return is_directory, ("archive path is not a directory: " + path) if strict and not is_directory else None
     except OSError as exc:
         return False, "%s: %s" % (path, exc)
 
-def resolve_archive_root():
+def resolve_archive_root(strict=False):
     """Locate this project's archive root.
 
     Returns (archive_root, suspicious_entry, errors):
     - (path, None, [...]) when a matching archive is found;
     - (None, name, [...]) when an archive whose directory name collides with
       this project's slug exists but provably belongs to a different project
-      (slug collision -- the guard must stay fail-closed, GH#224 note);
+      (slug collision -- warn that protection is unavailable for this repo);
     - (None, None, []) when nothing in the storage root relates to this repo
       at all (nothing to guard -- callers may fail open);
     - (None, *, [error, ...]) when resolution hit inspection errors
@@ -1140,7 +1524,7 @@ def resolve_archive_root():
     repo_root = get_repo_root()
     if repo_root:
         local_reservations, err = probe_real_directory(
-            os.path.join(repo_root, "file_reservations")
+            os.path.join(repo_root, "file_reservations"), strict
         )
         if local_reservations:
             return repo_root, None, errors
@@ -1149,7 +1533,7 @@ def resolve_archive_root():
 
     storage_root = default_storage_root()
     projects_dir = os.path.join(storage_root, "projects")
-    projects_dir_ok, err = probe_real_directory(projects_dir)
+    projects_dir_ok, err = probe_real_directory(projects_dir, strict)
     if err:
         errors.append(err)
         return None, None, errors
@@ -1180,7 +1564,7 @@ def resolve_archive_root():
     for name in explicit_names:
         candidate = os.path.join(projects_dir, name)
         reservations_ok, err = probe_real_directory(
-            os.path.join(candidate, "file_reservations")
+            os.path.join(candidate, "file_reservations"), strict
         )
         if reservations_ok:
             return candidate, None, errors
@@ -1196,6 +1580,8 @@ def resolve_archive_root():
         return None, None, errors
 
     slug_candidates = set(explicit_names)
+    if INSTALLED_PROJECT_SLUG:
+        slug_candidates.add(INSTALLED_PROJECT_SLUG)
     if project_slug:
         slug_candidates.add(project_slug)
     if repo_slug:
@@ -1204,6 +1590,9 @@ def resolve_archive_root():
     suspicious = None
     for entry in entries:
         try:
+            if strict and entry.is_symlink():
+                errors.append("linked project archive: " + entry.path)
+                continue
             if not entry.is_dir(follow_symlinks=False):
                 continue
         except OSError as exc:
@@ -1212,7 +1601,7 @@ def resolve_archive_root():
 
         candidate = entry.path
         reservations_ok, err = probe_real_directory(
-            os.path.join(candidate, "file_reservations")
+            os.path.join(candidate, "file_reservations"), strict
         )
         if err:
             errors.append(err)
@@ -1224,20 +1613,33 @@ def resolve_archive_root():
 
         metadata_path = os.path.join(candidate, "project.json")
         if not is_real_file(metadata_path):
-            if suspicious is None and entry.name in slug_candidates:
-                suspicious = entry.name
+            if strict and os.path.lexists(metadata_path):
+                errors.append("project metadata is not a regular file: " + metadata_path)
+                continue
+            # This project's slug with no metadata saying otherwise: only a
+            # parsed project.json naming another project proves a collision,
+            # so enforce these reservations rather than allow (fail closed).
+            if entry.name in slug_candidates:
+                return candidate, None, errors
             continue
         try:
-            with open(metadata_path, "r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
+            if strict:
+                metadata = _strict_archive_json(metadata_path)
+            else:
+                with open(metadata_path, "r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
         except OSError as exc:
             # Cannot rule this candidate out as ours: unreadable metadata is
             # an errored outcome, not proof of no-match (GH#228).
             errors.append("%s: %s" % (metadata_path, exc))
             continue
         except Exception:
-            if suspicious is None and entry.name in slug_candidates:
-                suspicious = entry.name
+            if strict:
+                errors.append("project metadata is malformed: " + metadata_path)
+                continue
+            # Truncated or corrupt metadata proves nothing either (see above).
+            if entry.name in slug_candidates:
+                return candidate, None, errors
             continue
         if project_metadata_matches(
             metadata,
@@ -1295,9 +1697,46 @@ def is_expired(value, now):
             return False
     return False
 
-def get_active_reservations():
-    """Read active file reservations directly from the archive."""
-    archive_root, suspicious, errors = resolve_archive_root()
+def _strict_archive_json(path):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate archive metadata key")
+            result[key] = value
+        return result
+    record = json.loads(_read_regular(path, 1024 * 1024), object_pairs_hook=unique_object)
+    if not isinstance(record, dict):
+        raise ValueError("archive metadata is not an object")
+    return record
+
+def _validate_lease_timestamp(value, released=False):
+    if released and (value is None or value in ("", "0", "null", "none")):
+        return
+    if isinstance(value, bool):
+        raise ValueError("invalid reservation timestamp")
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError("invalid reservation timestamp")
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing reservation timestamp")
+    text = value.strip()
+    if all(ch.isdigit() or ch in ".+-" for ch in text):
+        if not math.isfinite(float(text)):
+            raise ValueError("invalid reservation timestamp")
+        return
+    datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+def get_active_reservations(strict=False):
+    """Read active file reservations directly from the archive.
+
+    Returns (reservations, archive_root); archive_root is None when no
+    archive was found.
+    """
+    archive_root, suspicious, errors = resolve_archive_root(strict)
+    if strict and (errors or suspicious):
+        raise ValueError("archive authority is ambiguous; no commit admission recorded")
     if not archive_root:
         if errors:
             # Resolution ERRORED -- "no matching project" is unprovable
@@ -1322,7 +1761,7 @@ def get_active_reservations():
                 "different project -- slug collision); allowing",
                 file=sys.stderr,
             )
-            return []
+            return [], None
         # This repo matches no agent-mail project archive, so there are no
         # reservations that can be evaluated. A guard must not turn missing
         # mailbox state into a universal commit gate.
@@ -1331,11 +1770,15 @@ def get_active_reservations():
             "nothing to guard, allowing",
             file=sys.stderr,
         )
-        return []
+        return [], None
 
     reservations_dir = os.path.join(archive_root, "file_reservations")
+    if strict:
+        metadata_path = os.path.join(archive_root, "project.json")
+        if os.path.lexists(metadata_path):
+            _strict_archive_json(metadata_path)
     if not is_real_directory(reservations_dir):
-        return []
+        return [], archive_root
 
     now = datetime.datetime.now(datetime.timezone.utc)
     active = []
@@ -1346,29 +1789,56 @@ def get_active_reservations():
         # but through the GH#224 path that honors warn mode + names bypass.
         fail_closed("mcp-agent-mail: guard failed to read reservations: " + str(exc))
 
+    # Reservation identity is (database generation, id). Rebuilds reuse ids,
+    # and delayed old-generation releases can overwrite the shared path alias.
+    # A release in another file cannot retire an active stable artifact:
+    # filesystem mtimes do not identify the live database generation. Unlike
+    # the former GH#299 shortcut, ambiguous historical active files keep
+    # blocking until expiry or authoritative archive-normalize quarantine.
     for entry in entries:
         try:
             if not entry.is_file(follow_symlinks=False):
+                if strict and entry.name.endswith(".json"):
+                    raise ValueError("reservation artifact is not a regular file")
                 continue
         except OSError:
+            if strict:
+                raise
             continue
         if not entry.name.endswith(".json"):
             continue
         if entry.is_symlink():
             continue
         try:
-            with open(entry.path, "r", encoding="utf-8") as handle:
-                record = json.load(handle)
+            if strict:
+                record = _strict_archive_json(entry.path)
+            else:
+                with open(entry.path, "r", encoding="utf-8") as handle:
+                    record = json.load(handle)
         except Exception:
+            if strict:
+                raise
             continue
-
+        if not isinstance(record, dict):
+            continue
+        if strict:
+            _validate_lease_timestamp(record.get("released_ts"), released=True)
         if released_ts_marks_released(record.get("released_ts")):
             continue
+        if strict:
+            _validate_lease_timestamp(record.get("expires_ts"))
         if is_expired(record.get("expires_ts"), now):
             continue
 
+        if strict and not isinstance(record.get("exclusive"), bool):
+            raise ValueError("reservation exclusivity is ambiguous")
         pattern = str(record.get("path_pattern") or record.get("path") or "").strip()
         holder = str(record.get("agent_name") or record.get("agent") or "").strip()
+        if strict and record.get("exclusive") is True and (
+                not pattern or not holder
+                or not isinstance(record.get("path_pattern") or record.get("path"), str)
+                or not isinstance(record.get("agent_name") or record.get("agent"), str)):
+            raise ValueError("exclusive reservation identity is ambiguous")
         if not pattern or not holder or record.get("exclusive") is not True:
             continue
 
@@ -1380,7 +1850,53 @@ def get_active_reservations():
             }
         )
 
-    return active
+    return active, archive_root
+
+def project_root_for(archive_root, repo_root):
+    """The directory reservation paths are relative to: the project's human_key."""
+    values = []
+    metadata_path = os.path.join(archive_root, "project.json") if archive_root else ""
+    if metadata_path and is_real_file(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            if isinstance(metadata, dict):
+                values.append(str(metadata.get("human_key", "")).strip())
+        except Exception:
+            pass
+    values.append(PROJECT.strip())
+    for value in values:
+        if value and os.path.isabs(value):
+            return value
+    return repo_root
+
+def project_relative_paths(paths, project_root, repo_root, ignorecase):
+    """Re-anchor git's repo-relative paths to the project root reservations use.
+
+    They differ when the project is a folder inside the repository (a
+    monorepo; paths outside that folder are not this project's to guard) or
+    the repository a folder inside the project. Unrelated roots (a worktree
+    beside the project's checkout) leave the paths unchanged.
+    """
+    if not project_root or not repo_root:
+        return paths
+    project = canonical_text(project_root)
+    repo = canonical_text(repo_root)
+    try:
+        inner = os.path.relpath(project, repo).replace(os.sep, "/")
+        outer = os.path.relpath(repo, project).replace(os.sep, "/")
+    except ValueError:
+        return paths
+    if inner == ".":
+        return paths
+    if inner != ".." and not inner.startswith("../"):
+        prefix = inner + "/"
+        if ignorecase:
+            return [p[len(prefix):] for p in paths if p.lower().startswith(prefix.lower())]
+        return [p[len(prefix):] for p in paths if p.startswith(prefix)]
+    if outer != ".." and not outer.startswith("../"):
+        return [outer + "/" + p for p in paths]
+    return paths
 
 def core_ignorecase_enabled():
     """Detect git core.ignorecase for path comparison parity with Rust guard."""
@@ -1514,8 +2030,10 @@ def glob_to_regex(pattern):
     if regex.startswith("\0/"):
         regex = "(?:.+/|)" + regex[2:]
     regex = regex.replace("\0", ".*")
-    # Handle {a,b} bash-style brace expansion.
-    regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
+    # Handle {a,b} bash-style brace expansion. The alternatives are already
+    # escaped regex (commas are emitted bare), so keep their escapes: stripping
+    # backslashes here turned `{c++,cpp}` into a pattern that never matched.
+    regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace(",", "|") + ")", regex)
     return regex
 
 def compile_reservations(reservations, self_agent):
@@ -1570,6 +2088,14 @@ def check_conflicts(paths, reservations, self_agent):
             continue
 
         for pattern, holder, normalized_pattern, matcher, has_glob in compiled:
+            # 0. Literal match: a reserved path conflicts with that exact path
+            #    (and anything under it) even when it contains glob characters,
+            #    as the server treats it: Next.js `app/[slug]/page.tsx` is a
+            #    file name, and as a glob its `[slug]` class never matches it.
+            if normalized_f == normalized_pattern or normalized_f.startswith(normalized_pattern + "/"):
+                conflicts.append((f, pattern, holder))
+                break
+
             # 1. Glob matching: check if concrete path matches reserved glob
             #    (an uncompilable pattern matches everything, see above).
             if matcher is None or matcher.fullmatch(normalized_f) is not None:
@@ -1611,21 +2137,44 @@ def main():
     if is_truthy(os.environ.get("AGENT_MAIL_BYPASS")):
         sys.exit(0)
 
+    # Only an explicit false value disables enforcement, as the server reads it.
     enforcement_enabled = os.environ.get("FILE_RESERVATIONS_ENFORCEMENT_ENABLED")
-    if enforcement_enabled is not None and not is_truthy(enforcement_enabled):
+    if enforcement_enabled is not None and enforcement_enabled.strip().lower() in ("0", "false", "f", "no", "n"):
         sys.exit(0)
+
+    if HOOK_NAME == "post-commit":
+        if GUARD_MODE == "block":
+            admit_committed_head()
+        return
 
     unchecked = []
     if HOOK_NAME == "pre-push":
-        files_to_check, unchecked = get_push_files()
+        admissions = _PushAdmissions()
+        try:
+            files_to_check, unchecked = get_push_files(admissions)
+            admissions.verify_exclusions()
+        finally:
+            admissions.close()
     else:
         files_to_check = get_staged_files()
 
     if not files_to_check and not unchecked:
         sys.exit(0)
 
-    reservations = get_active_reservations()
+    reservations, archive_root = get_active_reservations()
     if not reservations:
+        sys.exit(0)
+
+    # Reservation patterns are relative to the project root; git's paths are
+    # relative to the repository top level.
+    repo_root = get_repo_root()
+    files_to_check = project_relative_paths(
+        files_to_check,
+        project_root_for(archive_root, repo_root),
+        repo_root,
+        core_ignorecase_enabled(),
+    )
+    if not files_to_check and not unchecked:
         sys.exit(0)
 
     # Prefer the explicit environment override, then recover the caller's
@@ -1672,11 +2221,69 @@ if __name__ == "__main__":
     main()
 "##;
 
+    // An explicitly configured STORAGE_ROOT (process environment or the user
+    // config.env the installer writes) is baked in; with none, the hook keeps
+    // computing the default root at commit time. Read as Config reads it: a
+    // project's own .env must not redirect the archive the guard checks.
+    let installed_storage_root = mcp_agent_mail_core::config::infra_env_value("STORAGE_ROOT")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let storage_root_json =
+        serde_json::to_string(&installed_storage_root).unwrap_or_else(|_| "\"\"".to_string());
+    // The loaded Python program carries its own policy identity. Re-reading
+    // its path during a concurrent hook reinstall could certify old checks
+    // under the replacement program's digest.
+    let admission_policy = Sha256::digest(template.as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        },
+    );
+
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
         .replace("__PROJECT_TEXT__", &project.replace(['\n', '\r'], " "))
         .replace("__PROJECT_JSON__", &project_json)
+        .replace("__PROJECT_SLUG_JSON__", &project_slug_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
+        .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
+        .replace("__ADMISSION_POLICY_SHA256__", &admission_policy)
+}
+
+fn render_cmd_shim(hook_name: &str) -> String {
+    format!(
+        "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{hook_name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+    )
+}
+
+fn render_ps1_shim(hook_name: &str) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{hook_name}'\npython $hook @args\nexit $LASTEXITCODE\n"
+    )
+}
+
+/// Remove `path` only when it holds exactly the shim install wrote: install
+/// leaves a user's own `.cmd`/`.ps1` alone, so uninstall must too.
+fn remove_own_shim(path: &Path, shim: &str) {
+    if std::fs::read_to_string(path).is_ok_and(|content| content == shim) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `base`, or `base-2`, `base-3`, ... : the first that does not exist yet.
+fn unused_path(base: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(base).is_err() {
+        return base.to_path_buf();
+    }
+    let name = base
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    (2..=u32::MAX)
+        .map(|n| base.with_file_name(format!("{name}-{n}")))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+        .unwrap_or_else(|| base.to_path_buf())
 }
 
 pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> GuardResult<()> {
@@ -1698,13 +2305,32 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         std::fs::create_dir_all(&run_dir)?;
 
         let chain_path = hooks_dir.join(name);
+        let orig = hooks_dir.join(format!("{name}.orig"));
+        // An earlier install chained a pre-chain-runner agent-mail guard as
+        // `.orig`, so it kept enforcing its own older rules (a hard AGENT_NAME
+        // requirement among them) behind the current guard. Park it where the
+        // chain runner does not run it; it is kept, not deleted.
+        if std::fs::read_to_string(&orig).is_ok_and(|c| is_legacy_single_file_guard(&c)) {
+            let parked = unused_path(&hooks_dir.join(format!("{name}.orig.legacy-agent-mail")));
+            std::fs::rename(&orig, &parked)?;
+        }
         if chain_path.exists() {
             let content = std::fs::read_to_string(&chain_path).unwrap_or_default();
             let content = content.trim();
-            // Idempotent: backup if not ours
-            if !content.contains(&format!("mcp-agent-mail chain-runner ({name})")) {
-                let orig = hooks_dir.join(format!("{name}.orig"));
-                if !orig.exists() {
+            // Idempotent: backup if not ours. A legacy single-file agent-mail
+            // guard is ours too, so the chain runner replaces it instead of
+            // chaining the old guard behind the new one.
+            if !content.contains(&format!("mcp-agent-mail chain-runner ({name})"))
+                && !is_legacy_single_file_guard(content)
+            {
+                if orig.exists() {
+                    // The first install already chained `.orig`; this is a
+                    // newer hook written since (husky, the pre-commit
+                    // framework). Chain it too instead of overwriting it, so
+                    // its checks keep running.
+                    let preserved = unused_path(&run_dir.join(format!("50-preserved-{name}")));
+                    std::fs::rename(&chain_path, &preserved)?;
+                } else {
                     std::fs::rename(&chain_path, &orig)?;
                 }
             }
@@ -1717,17 +2343,11 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         // Windows shims
         let cmd_path = hooks_dir.join(format!("{name}.cmd"));
         if !cmd_path.exists() {
-            let body = format!(
-                "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
-            );
-            write_guard_file_atomic(&cmd_path, &body, false)?;
+            write_guard_file_atomic(&cmd_path, &render_cmd_shim(name), false)?;
         }
         let ps1_path = hooks_dir.join(format!("{name}.ps1"));
         if !ps1_path.exists() {
-            let body = format!(
-                "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{name}'\npython $hook @args\nexit $LASTEXITCODE\n"
-            );
-            write_guard_file_atomic(&ps1_path, &body, false)?;
+            write_guard_file_atomic(&ps1_path, &render_ps1_shim(name), false)?;
         }
 
         // Write guard plugin
@@ -1744,6 +2364,10 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
     install_hook("pre-commit")?;
 
     if install_prepush {
+        // Post-commit independently checks the immutable object before it
+        // records admission. It does not infer success from pre-commit, and
+        // Git ignores its exit status, so failure retains the push backstop.
+        install_hook("post-commit")?;
         install_hook("pre-push")?;
     }
 
@@ -1774,7 +2398,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
     }
 
     // Remove our hooks.d plugins if present.
-    for sub in ["pre-commit", "pre-push"] {
+    for sub in ["pre-commit", "post-commit", "pre-push"] {
         let plugin = hooks_dir.join("hooks.d").join(sub).join(PLUGIN_FILE_NAME);
         if plugin.exists() {
             let _ = std::fs::remove_file(plugin);
@@ -1783,7 +2407,7 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
 
     // Legacy top-level single-file uninstall (pre-chain-runner installs)
     // Only remove chain-runner if no other plugins depend on it.
-    for hook_name in ["pre-commit", "pre-push"] {
+    for hook_name in ["pre-commit", "post-commit", "pre-push"] {
         let hook_path = hooks_dir.join(hook_name);
         if !hook_path.exists() {
             continue;
@@ -1807,12 +2431,24 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
             if orig_path.exists() {
                 std::fs::rename(&orig_path, &hook_path)?;
             }
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.cmd")),
+                &render_cmd_shim(hook_name),
+            );
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.ps1")),
+                &render_ps1_shim(hook_name),
+            );
         } else if is_legacy_hook {
             let _ = std::fs::remove_file(&hook_path);
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.cmd")),
+                &render_cmd_shim(hook_name),
+            );
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.ps1")),
+                &render_ps1_shim(hook_name),
+            );
         }
     }
 
@@ -1820,6 +2456,34 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
 }
 
 /// Check the guard installation status for a repository.
+/// Whether `hook_name` would run the guard. Our chain runner enforces nothing
+/// itself: it runs `hooks.d/<hook>/*`, skipping (on POSIX) files without an
+/// exec bit, so the guard is present only while its plugin is there and runnable.
+fn guard_hook_present(hooks_dir: &Path, hook_name: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(hooks_dir.join(hook_name)) else {
+        return false;
+    };
+    if !contents.contains(&format!("mcp-agent-mail chain-runner ({hook_name})")) {
+        return contents.contains("mcp-agent-mail");
+    }
+    let plugin = hooks_dir
+        .join("hooks.d")
+        .join(hook_name)
+        .join(PLUGIN_FILE_NAME);
+    let Ok(metadata) = std::fs::metadata(&plugin) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
 pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -1830,14 +2494,8 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     let hooks_dir = resolve_hooks_dir(repo)?;
     let mode = GuardMode::from_env();
 
-    let pre_commit_path = hooks_dir.join("pre-commit");
-    let pre_push_path = hooks_dir.join("pre-push");
-
-    let pre_commit_present = pre_commit_path.exists()
-        && std::fs::read_to_string(&pre_commit_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
-
-    let pre_push_present = pre_push_path.exists()
-        && std::fs::read_to_string(&pre_push_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
+    let pre_commit_present = guard_hook_present(&hooks_dir, "pre-commit");
+    let pre_push_present = guard_hook_present(&hooks_dir, "pre-push");
 
     // Check if worktrees are enabled (core.hooksPath set)
     let worktrees_enabled = {
@@ -1872,8 +2530,14 @@ fn is_guard_gated_from_values(
     _worktrees_enabled: Option<&str>,
     _git_identity_enabled: Option<&str>,
 ) -> bool {
+    // Only an explicit false value disables the guard, as the server reads the
+    // same variable (`parse_bool` with default true): `on`, a typo or an empty
+    // value must not silently switch commit enforcement off.
     if let Some(val) = enforcement_enabled {
-        return is_truthy_value(Some(val));
+        return !matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "f" | "no" | "n"
+        );
     }
     // Default to true: the file reservation guard is active unless explicitly
     // disabled via FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false.
@@ -1961,12 +2625,12 @@ pub fn guard_check_full(
         });
     }
 
-    let agent_name = resolve_guard_agent_name(repo_root).ok_or(GuardError::MissingAgentName)?;
-
     // Read reservations from the archive
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
-
-    let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase)?;
+    let paths = project_relative_paths(archive_root, repo_root, paths, ignorecase);
+    let agent_name = resolve_guard_agent_name(repo_root);
+    let conflicts =
+        conflicts_for_identity(&paths, &reservations, agent_name.as_deref(), ignorecase)?;
 
     Ok(GuardCheckResult {
         conflicts,
@@ -1974,6 +2638,28 @@ pub fn guard_check_full(
         bypassed: false,
         gated: false,
     })
+}
+
+/// Conflicts for `agent`. An identity is needed only when some path is covered
+/// by an exclusive reservation (it may be the caller's own). With none covered
+/// there is no conflict whoever the caller is, so a missing `AGENT_NAME` is not
+/// an error. The installed hook stays stricter and fails closed whenever any
+/// reservation is active.
+fn conflicts_for_identity(
+    paths: &[String],
+    reservations: &[FileReservationRecord],
+    agent: Option<&str>,
+    ignorecase: bool,
+) -> GuardResult<Vec<GuardConflict>> {
+    if let Some(agent) = agent {
+        return check_path_conflicts(paths, reservations, agent, ignorecase);
+    }
+    // No holder is named "", so this lists every covered path.
+    if check_path_conflicts(paths, reservations, "", ignorecase)?.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err(GuardError::MissingAgentName)
+    }
 }
 
 /// Check if given paths conflict with active file reservations.
@@ -1987,12 +2673,67 @@ pub fn guard_check(
     _advisory: bool,
 ) -> GuardResult<Vec<GuardConflict>> {
     let ignorecase = detect_core_ignorecase(repo_root);
-    let agent_name = resolve_guard_agent_name(repo_root).ok_or(GuardError::MissingAgentName)?;
 
     // Read reservations from archive JSON files
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
+    let paths = project_relative_paths(archive_root, repo_root, paths, ignorecase);
+    let agent_name = resolve_guard_agent_name(repo_root);
 
-    check_path_conflicts(paths, &reservations, &agent_name, ignorecase)
+    conflicts_for_identity(&paths, &reservations, agent_name.as_deref(), ignorecase)
+}
+
+/// Re-anchor git's repo-relative `paths` to the project root reservation
+/// patterns are relative to: the archive's `project.json` `human_key`.
+///
+/// They differ when the project is a folder inside the repository (a monorepo;
+/// paths outside that folder are not this project's to guard) or the
+/// repository a folder inside the project. Without readable metadata, or with
+/// unrelated roots (a worktree beside the project's checkout), `paths` are
+/// returned unchanged.
+fn project_relative_paths(
+    archive_root: &Path,
+    repo_root: &Path,
+    paths: &[String],
+    ignorecase: bool,
+) -> Vec<String> {
+    let Some(project_root) = archive_project_root(archive_root) else {
+        return paths.to_vec();
+    };
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let (project, repo) = (canonical(&project_root), canonical(repo_root));
+    let as_slashes = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    if let Ok(inner) = project.strip_prefix(&repo) {
+        let inner = as_slashes(inner);
+        if inner.is_empty() {
+            return paths.to_vec();
+        }
+        let prefix = format!("{inner}/");
+        return paths
+            .iter()
+            .filter_map(|path| {
+                let head = path.get(..prefix.len())?;
+                let inside = if ignorecase {
+                    head.eq_ignore_ascii_case(&prefix)
+                } else {
+                    head == prefix
+                };
+                inside.then(|| path[prefix.len()..].to_string())
+            })
+            .collect();
+    }
+    if let Ok(outer) = repo.strip_prefix(&project) {
+        let outer = as_slashes(outer);
+        return paths.iter().map(|path| format!("{outer}/{path}")).collect();
+    }
+    paths.to_vec()
+}
+
+/// The absolute `human_key` recorded in the archive's `project.json`.
+fn archive_project_root(archive_root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(archive_root.join("project.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let root = PathBuf::from(metadata.get("human_key")?.as_str()?.trim());
+    root.is_absolute().then_some(root)
 }
 
 /// Core conflict detection: check paths against reservations using globset.
@@ -2093,28 +2834,29 @@ fn check_path_conflicts(
                 break;
             }
 
-            // Also check the reverse: pattern's literal base is a prefix of the path.
-            // This is needed for literal directory reservations (e.g. reserving "src/subdir"
-            // blocks edits to "src/subdir/file.rs").
-            // We do NOT do this if the pattern has a glob, because globs like "src/*"
-            // should not recursively lock subdirectories (that's what "src/**" is for).
-            if !res.has_glob {
-                let literal_base = res_pattern;
-                if normalized.starts_with(literal_base)
+            // Also check the reverse: the pattern, read literally, is the path or
+            // a parent of it. Literal directory reservations need this (reserving
+            // "src/subdir" blocks "src/subdir/file.rs"), and so do file names that
+            // contain glob characters: Next.js `app/[slug]/page.tsx` never matches
+            // itself as a glob, yet the server counts the same string as a
+            // conflict. For a real glob this compares only its literal text, so
+            // "src/*" still does not lock subdirectories ("src/**" does that).
+            let literal_base = res_pattern;
+            if normalized == *literal_base
+                || (normalized.starts_with(literal_base.as_str())
                     && (literal_base.is_empty()
                         || normalized
                             .as_bytes()
                             .get(literal_base.len())
-                            .is_some_and(|&c| c == b'/'))
-                {
-                    conflicts.push(GuardConflict {
-                        path: path.clone(),
-                        pattern: res.path_pattern.clone(),
-                        holder: res.agent_name.clone(),
-                        expires_ts: res.expires_ts.clone(),
-                    });
-                    break;
-                }
+                            .is_some_and(|&c| c == b'/')))
+            {
+                conflicts.push(GuardConflict {
+                    path: path.clone(),
+                    pattern: res.path_pattern.clone(),
+                    holder: res.agent_name.clone(),
+                    expires_ts: res.expires_ts.clone(),
+                });
+                break;
             }
         }
     }
@@ -2180,24 +2922,17 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
-/// Unreleased reservation artifacts plus, per reservation id, the newest
-/// released artifact seen (GH#299).
-type ReservationArtifactScan = (
-    Vec<(std::path::PathBuf, serde_json::Value)>,
-    std::collections::HashMap<u64, ReservationArtifactStamp>,
-);
-
-fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<ReservationArtifactScan> {
-    // GH#299: after a mailbox rebuild the archive can hold two generation
-    // stamped artifacts for one reservation id: `id-<id>-g<old>.json` with
-    // `released_ts: null` from the previous database generation and
-    // `id-<id>-g<current>.json` released under the current one. The old
-    // artifact is history, not an active reservation. Track, per id, the
-    // newest released artifact so a superseded foreign-generation active
-    // twin is skipped below.
-    let mut candidates: Vec<(std::path::PathBuf, serde_json::Value)> = Vec::new();
-    let mut released_by_id: std::collections::HashMap<u64, ReservationArtifactStamp> =
-        std::collections::HashMap::new();
+/// Scan unreleased artifacts independently. Reservation identity is the pair
+/// `(database generation, id)`; a rebuilt database can reuse the numeric id for
+/// another lease. A delayed old-generation release can also overwrite the
+/// shared path alias, leaving the active stable artifact as its only protection.
+///
+/// The archive-only guard cannot identify the live generation from filesystem
+/// mtimes. Unlike the former GH#299 shortcut, a foreign-generation release never
+/// suppresses an active artifact. Historical active artifacts left by recovery
+/// therefore block until expiry or authoritative archive-normalize quarantine.
+fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<Vec<serde_json::Value>> {
+    let mut candidates = Vec::new();
 
     let entries = std::fs::read_dir(reservations_dir)?;
     for entry in entries {
@@ -2232,25 +2967,14 @@ fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<Reservatio
             continue;
         };
 
-        // Skip released reservations, remembering them per reservation id.
         // Older archive artifacts sometimes persisted zero-like sentinels for
         // still-active reservations, and the DB layer still treats those as active.
         if released_ts_marks_record_released(&val["released_ts"]) {
-            if let Some(stamp) = reservation_artifact_stamp(&path, &val, metadata.as_ref()) {
-                released_by_id
-                    .entry(stamp.id)
-                    .and_modify(|existing| {
-                        if stamp.modified > existing.modified {
-                            *existing = stamp.clone();
-                        }
-                    })
-                    .or_insert(stamp);
-            }
             continue;
         }
-        candidates.push((path, val));
+        candidates.push(val);
     }
-    Ok((candidates, released_by_id))
+    Ok(candidates)
 }
 
 /// Read active file reservations from the archive's `file_reservations/` directory.
@@ -2270,21 +2994,7 @@ fn read_active_reservations_from_archive(
 
     let now = chrono::Utc::now();
     let mut records = Vec::new();
-    let (candidates, released_by_id) = scan_reservation_artifacts(&reservations_dir)?;
-
-    for (path, val) in candidates {
-        // GH#299: an unreleased artifact from another database generation is
-        // superseded by a released twin of the same id that is at least as
-        // recent (the current generation's release), and never blocks delivery.
-        if let Some(stamp) =
-            reservation_artifact_stamp(&path, &val, std::fs::metadata(&path).ok().as_ref())
-            && let Some(released) = released_by_id.get(&stamp.id)
-            && released.generation != stamp.generation
-            && released.modified >= stamp.modified
-        {
-            continue;
-        }
-
+    for val in scan_reservation_artifacts(&reservations_dir)? {
         // Parse expires_ts and check expiry
         let expires_str = match val["expires_ts"].as_str() {
             Some(s) => s.to_string(),
@@ -2354,45 +3064,6 @@ fn read_active_reservations_from_archive(
     }
 
     Ok(records)
-}
-
-/// Identity of one reservation artifact: numeric reservation id, the
-/// database generation it was written under (from the `id-<id>-g<gen>.json`
-/// name, else the record's `db_generation`, else none), and its mtime.
-#[derive(Clone, Debug)]
-struct ReservationArtifactStamp {
-    id: u64,
-    generation: Option<String>,
-    modified: std::time::SystemTime,
-}
-
-fn reservation_artifact_stamp(
-    path: &Path,
-    record: &serde_json::Value,
-    metadata: Option<&std::fs::Metadata>,
-) -> Option<ReservationArtifactStamp> {
-    let stem = path.file_stem()?.to_str()?;
-    let rest = stem.strip_prefix("id-")?;
-    let (id_text, name_generation) = match rest.split_once("-g") {
-        Some((id, generation)) if !generation.is_empty() => (id, Some(generation.to_string())),
-        _ => (rest, None),
-    };
-    let id = id_text.parse::<u64>().ok()?;
-    let generation = name_generation.or_else(|| {
-        record["db_generation"]
-            .as_str()
-            .map(str::trim)
-            .filter(|generation| !generation.is_empty())
-            .map(str::to_string)
-    });
-    let modified = metadata
-        .and_then(|meta| meta.modified().ok())
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    Some(ReservationArtifactStamp {
-        id,
-        generation,
-        modified,
-    })
 }
 
 fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
@@ -3370,6 +4041,13 @@ mod tests {
             Some("0")
         ));
         assert!(!is_guard_gated_from_values(Some("0"), Some("1"), Some("1")));
+        assert!(!is_guard_gated_from_values(Some(" False "), None, None));
+        assert!(!is_guard_gated_from_values(Some("no"), None, None));
+        // As the server reads it: anything but an explicit false keeps the
+        // guard on, so a typo or an empty value cannot switch it off.
+        assert!(is_guard_gated_from_values(Some("on"), None, None));
+        assert!(is_guard_gated_from_values(Some(""), None, None));
+        assert!(is_guard_gated_from_values(Some("enabled"), None, None));
     }
 
     #[test]
@@ -3472,8 +4150,15 @@ mod tests {
         let pre_commit = hooks_dir.join("pre-commit");
         let orig_body = "#!/bin/sh\necho original\n";
         std::fs::write(&pre_commit, orig_body).expect("write pre-commit");
+        // The user's own Windows wrapper: install leaves it, uninstall must too.
+        let user_cmd = "@echo off\r\nrem my own wrapper\r\n";
+        std::fs::write(hooks_dir.join("pre-commit.cmd"), user_cmd).expect("write user cmd");
 
         install_guard("/abs/path/backend", &repo_dir, false).expect("install_guard");
+        assert!(
+            hooks_dir.join("pre-commit.ps1").exists(),
+            "install writes its own .ps1 shim"
+        );
 
         let chain_body = std::fs::read_to_string(&pre_commit).expect("read chain");
         assert!(
@@ -3496,6 +4181,94 @@ mod tests {
         assert!(!plugin_path.exists(), "expected plugin file to be removed");
         let restored = std::fs::read_to_string(&pre_commit).expect("read restored pre-commit");
         assert_eq!(restored, orig_body);
+        assert!(
+            !hooks_dir.join("pre-commit.ps1").exists(),
+            "uninstall removes the shim it wrote"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.cmd")).expect("user cmd kept"),
+            user_cmd,
+            "uninstall must not delete the user's own .cmd"
+        );
+    }
+
+    /// A pre-chain-runner agent-mail guard is ours: install replaces it rather
+    /// than chaining it behind the new guard, and one an earlier install
+    /// chained as `.orig` is parked where the chain runner no longer runs it.
+    #[test]
+    fn install_replaces_a_legacy_single_file_guard_instead_of_chaining_it() {
+        let legacy = "#!/usr/bin/env python3\n# mcp-agent-mail guard hook\nimport sys\n\
+                      print('AGENT_NAME environment variable is required.')\nsys.exit(2)\n";
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+        let pre_commit = hooks_dir.join("pre-commit");
+        let orig = hooks_dir.join("pre-commit.orig");
+
+        std::fs::write(&pre_commit, legacy).expect("write legacy guard");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("install");
+        let hook = std::fs::read_to_string(&pre_commit).expect("hook");
+        assert!(hook.contains("mcp-agent-mail chain-runner (pre-commit)"));
+        assert!(!orig.exists(), "the legacy guard must not be chained");
+
+        std::fs::write(&orig, legacy).expect("legacy guard chained by an older install");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("reinstall");
+        assert!(!orig.exists(), "the chain runner must no longer run it");
+        let parked = hooks_dir.join("pre-commit.orig.legacy-agent-mail");
+        assert_eq!(std::fs::read_to_string(parked).expect("kept"), legacy);
+
+        // A user's own hook is still chained as before.
+        let user_hook = "#!/bin/sh\necho mine\n";
+        std::fs::write(&pre_commit, user_hook).expect("write user hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("install over user hook");
+        assert_eq!(std::fs::read_to_string(&orig).expect("orig"), user_hook);
+    }
+
+    #[test]
+    fn reinstalling_over_a_newer_user_hook_chains_it_instead_of_overwriting_it() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git").join("hooks");
+        let pre_commit = hooks_dir.join("pre-commit");
+
+        std::fs::write(&pre_commit, "#!/bin/sh\necho first\n").expect("write first hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("first install");
+        // A tool (husky, pre-commit) rewrites the hook after the first install.
+        let newer = "#!/bin/sh\necho newer\n";
+        std::fs::write(&pre_commit, newer).expect("write newer hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("reinstall");
+
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.orig")).expect("orig"),
+            "#!/bin/sh\necho first\n",
+            "the first original stays where uninstall restores it"
+        );
+        let chained = hooks_dir
+            .join("hooks.d")
+            .join("pre-commit")
+            .join("50-preserved-pre-commit");
+        assert_eq!(
+            std::fs::read_to_string(&chained).expect("newer hook is chained, not lost"),
+            newer
+        );
+
+        // A third rewrite and reinstall keeps both newer hooks.
+        std::fs::write(&pre_commit, "#!/bin/sh\necho third\n").expect("write third hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("third install");
+        assert_eq!(
+            std::fs::read_to_string(chained.with_file_name("50-preserved-pre-commit-2"))
+                .expect("third hook chained"),
+            "#!/bin/sh\necho third\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&chained).expect("still there"),
+            newer
+        );
     }
 
     #[test]
@@ -3712,57 +4485,111 @@ mod tests {
         }
     }
 
-    /// GH#299: after a mailbox rebuild, an unreleased artifact from the previous
-    /// database generation must not block delivery when the same reservation
-    /// id has a released artifact under the current generation.
+    struct ReservationGenerationFixture {
+        active: serde_json::Value,
+        active_path: PathBuf,
+        foreign_path: PathBuf,
+        alias_path: PathBuf,
+    }
+
+    impl ReservationGenerationFixture {
+        fn write(archive: &Path, foreign_owner: &str) -> Self {
+            let dir = archive.join("file_reservations");
+            std::fs::create_dir_all(&dir).expect("mkdir reservations");
+            let active = serde_json::json!({
+                "id": 123,
+                "project": archive.to_string_lossy(),
+                "path_pattern": "main.rs",
+                "agent": "BlueLake",
+                "exclusive": true,
+                "created_ts": "2026-10-01T00:00:00Z",
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": null,
+                "db_generation": "11223344",
+            });
+            let active_path = dir.join("id-123-g11223344.json");
+            let foreign_path = dir.join("id-123-gaabbccdd.json");
+            // SHA1("main.rs"): the same legacy path alias written by storage.
+            let alias_path = dir.join("d28144c4832d52a64a74ddd6d29c1c182d228e1f.json");
+            std::fs::write(&active_path, active.to_string()).expect("write active stable artifact");
+            std::fs::write(&alias_path, active.to_string()).expect("write active path alias");
+
+            // An old cleanup publication arrives after a rebuild reused the
+            // row id and path. It owns a different stable filename but replaces
+            // the shared alias, leaving only the current stable file active.
+            let mut released = active.clone();
+            released["db_generation"] = serde_json::json!("aabbccdd");
+            released["agent"] = serde_json::json!(foreign_owner);
+            released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+            std::fs::write(&foreign_path, released.to_string())
+                .expect("write foreign terminal artifact");
+            std::fs::write(&alias_path, released.to_string()).expect("overwrite shared path alias");
+            Self {
+                active,
+                active_path,
+                foreign_path,
+                alias_path,
+            }
+        }
+
+        fn set_foreign_mtime(&self, foreign_seconds: u64) {
+            let epoch = std::time::SystemTime::UNIX_EPOCH;
+            for (path, seconds) in [
+                (&self.active_path, 1_700_000_200),
+                (&self.foreign_path, foreign_seconds),
+                (&self.alias_path, foreign_seconds),
+            ] {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open artifact for deterministic timestamp")
+                    .set_modified(epoch + Duration::from_secs(seconds))
+                    .expect("set artifact timestamp");
+            }
+        }
+
+        fn release_current(&self) {
+            let mut released = self.active.clone();
+            released["released_ts"] = serde_json::json!("2026-10-03T00:00:00Z");
+            for path in [&self.active_path, &self.alias_path] {
+                std::fs::write(path, released.to_string()).expect("publish current release");
+            }
+        }
+    }
+
+    /// The former GH#299 shortcut confused publication order with database
+    /// authority. Even identical owners cannot establish generation identity;
+    /// historical active files require expiry or authoritative normalization.
     #[test]
-    fn foreign_generation_active_artifact_is_superseded_by_released_current_twin() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let archive = td.path().join("archive");
-        let res_dir = archive.join("file_reservations");
-        std::fs::create_dir_all(&res_dir).expect("mkdir");
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    fn foreign_generation_release_never_suppresses_an_active_artifact() {
+        for foreign_owner in ["BlueLake", "GreenLake"] {
+            for foreign_seconds in [1_700_000_100, 1_700_000_200, 1_700_000_300] {
+                let td = tempfile::TempDir::new().expect("tempdir");
+                let fixture = ReservationGenerationFixture::write(td.path(), foreign_owner);
+                fixture.set_foreign_mtime(foreign_seconds);
 
-        // Old generation: still "active" on disk.
-        let old = serde_json::json!({
-            "path_pattern": "src/lib.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": null,
-            "db_generation": "oldgen00"
-        });
-        std::fs::write(res_dir.join("id-123-goldgen00.json"), old.to_string()).expect("write");
-        // Current generation: released. Written afterwards, so at least as recent.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let current = serde_json::json!({
-            "path_pattern": "src/lib.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": "2026-09-02T00:00:00Z",
-            "db_generation": "curgen11"
-        });
-        std::fs::write(res_dir.join("id-123-gcurgen11.json"), current.to_string()).expect("write");
-        // A different id with only an old-generation active artifact stays active:
-        // nothing in the current generation says it was released.
-        let lone = serde_json::json!({
-            "path_pattern": "src/other.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": null,
-            "db_generation": "oldgen00"
-        });
-        std::fs::write(res_dir.join("id-124-goldgen00.json"), lone.to_string()).expect("write");
+                let active = read_active_reservations_from_archive(td.path(), false).expect("read");
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "the stable artifact is the sole active copy"
+                );
+                let paths = vec!["main.rs".to_string()];
+                let conflicts = check_path_conflicts(&paths, &active, "PinkStone", false)
+                    .expect("check protected path");
+                assert_eq!(conflicts.len(), 1, "{foreign_owner}, {foreign_seconds}");
+                assert_eq!(conflicts[0].holder, "BlueLake");
 
-        let active = read_active_reservations_from_archive(&archive, false).expect("read");
-        let patterns: Vec<&str> = active.iter().map(|r| r.path_pattern.as_str()).collect();
-        assert_eq!(
-            patterns,
-            vec!["src/other.rs"],
-            "the superseded foreign-generation artifact must be skipped: {patterns:?}"
-        );
+                fixture.release_current();
+                let active = read_active_reservations_from_archive(td.path(), false).expect("read");
+                assert!(
+                    check_path_conflicts(&paths, &active, "PinkStone", false)
+                        .expect("check released path")
+                        .is_empty(),
+                    "the current generation's own release must unblock the path"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3957,6 +4784,100 @@ mod tests {
         assert!(conflicts.is_empty());
     }
 
+    /// `am guard check` without an identity: uncovered paths pass, a path under
+    /// any exclusive lease (even the caller's own) needs the identity to decide.
+    #[test]
+    fn missing_identity_is_an_error_only_for_covered_paths() {
+        let reservations = vec![
+            reservation("src/**", "OtherAgent", true),
+            reservation("docs/**", "OtherAgent", false),
+        ];
+        let uncovered = vec!["README.md".to_string(), "docs/guide.md".to_string()];
+        let covered = vec!["README.md".to_string(), "src/lib.rs".to_string()];
+
+        assert!(
+            conflicts_for_identity(&uncovered, &reservations, None, false)
+                .expect("uncovered paths need no identity")
+                .is_empty()
+        );
+        assert!(matches!(
+            conflicts_for_identity(&covered, &reservations, None, false),
+            Err(GuardError::MissingAgentName)
+        ));
+        // With an identity the usual rules apply: the holder passes, others conflict.
+        assert!(
+            conflicts_for_identity(&covered, &reservations, Some("OtherAgent"), false)
+                .expect("holder")
+                .is_empty()
+        );
+        let conflicts = conflicts_for_identity(&covered, &reservations, Some("Me"), false)
+            .expect("other agent");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "src/lib.rs");
+    }
+
+    /// Reservations are relative to the project root (`human_key`); git
+    /// reports repo-relative paths. A project in a monorepo folder sees its own
+    /// paths re-anchored and the rest of the repository dropped.
+    #[test]
+    fn project_relative_paths_reanchor_to_the_project_root() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo = td.path().join("repo");
+        let project = repo.join("services").join("api");
+        let archive = td.path().join("archive");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let set_human_key = |key: &Path| {
+            let metadata = serde_json::json!({ "human_key": key.to_string_lossy() });
+            std::fs::write(archive.join("project.json"), metadata.to_string()).expect("write");
+        };
+        let paths = vec![
+            "services/api/src/lib.rs".to_string(),
+            "web/app.ts".to_string(),
+            "Services/Api/x.rs".to_string(),
+        ];
+        let own = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // No metadata: unchanged.
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+
+        set_human_key(&project);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            own(&["src/lib.rs"])
+        );
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, true),
+            own(&["src/lib.rs", "x.rs"])
+        );
+
+        // The project is the repository: unchanged.
+        set_human_key(&repo);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+
+        // The repository is a folder inside the project: prefixed.
+        set_human_key(td.path());
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths[..1], false),
+            own(&["repo/services/api/src/lib.rs"])
+        );
+
+        // Unrelated roots (a worktree beside the checkout): unchanged.
+        let worktree = td.path().join("repo-worktree");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+        set_human_key(&worktree);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+    }
+
     #[test]
     fn check_path_conflicts_root_reservation_blocks_everything() {
         let reservations = vec![FileReservationRecord {
@@ -4047,6 +4968,28 @@ mod tests {
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].holder, "OtherAgent");
+    }
+
+    #[test]
+    fn check_path_conflicts_blocks_file_names_with_glob_characters() {
+        // Next.js / SvelteKit route files: `[slug]` is part of the name, and as
+        // a glob class it never matches the name itself.
+        let reservations = vec![
+            reservation("app/[slug]/page.tsx", "OtherAgent", true),
+            reservation("pages/[id]", "OtherAgent", true),
+        ];
+        let paths = vec![
+            "app/[slug]/page.tsx".to_string(),
+            "pages/[id]/index.tsx".to_string(),
+            "app/other/page.tsx".to_string(),
+        ];
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
+        let blocked = conflicts
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(blocked, vec!["app/[slug]/page.tsx", "pages/[id]/index.tsx"]);
     }
 
     #[test]
@@ -5108,6 +6051,44 @@ mod tests {
         );
     }
 
+    /// The chain runner alone enforces nothing: once its plugin is gone (or,
+    /// on POSIX, loses its exec bit and is skipped) status must say so.
+    #[test]
+    fn guard_status_requires_the_runnable_plugin_behind_the_chain_runner() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        install_guard("/test/project", &repo_dir, true).expect("install");
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(status.pre_commit_present && status.pre_push_present);
+
+        let hooks_dir = PathBuf::from(&status.hooks_dir);
+        let plugin = hooks_dir
+            .join("hooks.d")
+            .join("pre-commit")
+            .join(PLUGIN_FILE_NAME);
+        let parked = plugin.with_extension("parked");
+        std::fs::rename(&plugin, &parked).expect("park plugin");
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(!status.pre_commit_present, "chain runner without plugin");
+        assert!(status.pre_push_present, "pre-push plugin untouched");
+
+        std::fs::rename(&parked, &plugin).expect("restore plugin");
+        assert!(guard_status(&repo_dir).expect("status").pre_commit_present);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert!(
+                !guard_status(&repo_dir).expect("status").pre_commit_present,
+                "the chain runner skips a plugin without an exec bit"
+            );
+        }
+    }
+
     #[test]
     fn guard_status_invalid_repo_returns_error() {
         let td = tempfile::TempDir::new().expect("tempdir");
@@ -5472,6 +6453,95 @@ mod tests {
         None
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn guard_commit_admission_runs_native_rendered_programs_against_real_git() {
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let templates = tempfile::tempdir().expect("template directory");
+        for hook in ["pre-commit", "post-commit", "pre-push"] {
+            std::fs::write(
+                templates.path().join(hook),
+                render_guard_plugin_script("__ADMISSION_TEST_PROJECT__", hook),
+            )
+            .expect("write actual renderer output");
+        }
+        let output = Command::new(python)
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/commit_admission.py"))
+            .arg("--templates")
+            .arg(templates.path())
+            .output()
+            .expect("execute real Git admission regressions");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_install_reinstall_and_uninstall_preserve_user_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(td.path());
+        let hooks = repo.join(".git/hooks");
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        );
+        let original = "#!/bin/sh\nprintf 'user post-commit\\n' >> user-post-commit.log\n";
+        std::fs::write(hooks.join("post-commit"), original).expect("user hook");
+        std::fs::set_permissions(
+            hooks.join("post-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable user hook");
+        let user_shim = "@echo user-owned post-commit\r\n";
+        std::fs::write(hooks.join("post-commit.cmd"), user_shim).expect("user shim");
+        for _ in 0..2 {
+            install_guard(&repo.to_string_lossy(), &repo, true).expect("install composed hooks");
+        }
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit.orig")).unwrap(),
+            original
+        );
+        let plugin = hooks.join("hooks.d/post-commit").join(PLUGIN_FILE_NAME);
+        assert!(plugin.is_file());
+        assert!(
+            std::fs::read_to_string(&plugin)
+                .unwrap()
+                .contains("admit_committed_head")
+        );
+        let python = python_executable().expect("Python is required to execute installed guards");
+        let output = Command::new(python)
+            .arg(hooks.join("post-commit"))
+            .current_dir(&repo)
+            .env("AGENT_MAIL_BYPASS", "1")
+            .output()
+            .expect("run composed post-commit hook");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("user-post-commit.log")).unwrap(),
+            "user post-commit\n"
+        );
+        uninstall_guard(&repo).expect("uninstall our plugins");
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap(),
+            user_shim
+        );
+        assert!(!plugin.exists());
+    }
+
     #[test]
     fn guard_plugin_script_contains_project() {
         let script = render_guard_plugin_script("/my/project", "pre-commit");
@@ -5498,6 +6568,147 @@ mod tests {
         assert!(script.contains("sys.exit(2)"));
     }
 
+    /// The installed hook must preserve the same generation boundary as the
+    /// Rust reader, including when a foreign release replaces the path alias.
+    #[test]
+    fn guard_plugin_keeps_active_reservations_across_foreign_generation_releases() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}\n").expect("write staged");
+        run_git(&repo_dir, &["add", "main.rs"]);
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+        let run = |mode: &str| {
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .env("AGENT_MAIL_GUARD_MODE", mode)
+                .env("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true")
+                .env_remove("AGENT_MAIL_BYPASS")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        for foreign_owner in ["BlueLake", "GreenLake"] {
+            for foreign_seconds in [1_700_000_100, 1_700_000_200, 1_700_000_300] {
+                let fixture = ReservationGenerationFixture::write(&repo_dir, foreign_owner);
+                fixture.set_foreign_mtime(foreign_seconds);
+                let output = run("block");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "foreign release must not unblock: {foreign_owner}, {foreign_seconds}: {stderr}"
+                );
+                assert!(stderr.contains("held by BlueLake"), "{stderr}");
+
+                // Warn mode remains trimmed and case-insensitive.
+                let warned = run(" Warn ");
+                assert_eq!(warned.status.code(), Some(0));
+                assert!(String::from_utf8_lossy(&warned.stderr).contains("WARNING"));
+
+                fixture.release_current();
+                let output = run("block");
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "the current generation's own release must unblock: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    /// A `STORAGE_ROOT` configured at install time (the installer writes it to
+    /// `config.env`, which commit shells do not export) is where the hook looks,
+    /// and a slug-matching archive whose `project.json` is missing is enforced,
+    /// not waved through as a "collision".
+    #[test]
+    fn guard_plugin_finds_the_installed_storage_root_and_enforces_unlabelled_archives() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("custom-storage");
+        let home_dir = td.path().join("home");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::create_dir_all(&home_dir).expect("mkdir home");
+        run_git(&repo_dir, &["init", "-q"]);
+        let staged = repo_dir.join("src").join("main.rs");
+        std::fs::create_dir_all(staged.parent().expect("src dir")).expect("mkdir src");
+        std::fs::write(&staged, "fn main() {}\n").expect("write staged file");
+        run_git(&repo_dir, &["add", "src/main.rs"]);
+
+        let slug = mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy()).slug;
+        let reservations_dir = storage_root
+            .join("projects")
+            .join(&slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        // Deliberately no project.json beside it.
+        std::fs::write(
+            reservations_dir.join("conflict.json"),
+            serde_json::json!({
+                "path_pattern": "src/main.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let run_hook = |configured_root: &str| {
+            let script = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("STORAGE_ROOT", configured_root)],
+                || render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+            );
+            let script_path = td.path().join("guard.py");
+            std::fs::write(&script_path, script).expect("write guard script");
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env_remove("STORAGE_ROOT")
+                .env_remove("AGENT_MAIL_STORAGE_ROOT")
+                .env_remove("XDG_DATA_HOME")
+                .env("HOME", &home_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        let blocked = run_hook(&storage_root.to_string_lossy());
+        assert_eq!(
+            blocked.status.code(),
+            Some(1),
+            "the installed root's reservation must block: stderr={}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("src/main.rs"));
+
+        // Negative control: with no configured root the hook looks under HOME,
+        // finds nothing and allows, which is what every config.env install got.
+        let allowed = run_hook("");
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
+    }
+
     #[test]
     fn guard_plugin_slug_collision_warns_instead_of_blocking_unrelated_commit() {
         let Some(python) = python_executable() else {
@@ -5519,20 +6730,15 @@ mod tests {
 
         let repo_identity =
             mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
-        let colliding_identity =
-            mcp_agent_mail_core::resolve_project_identity(&colliding_project.to_string_lossy());
-        assert_eq!(
-            repo_identity.slug, colliding_identity.slug,
-            "test setup needs slug collision"
-        );
-
+        // Put foreign metadata under this project's actual slug. Git identity
+        // can hash paths, so punctuation alone need not create a collision.
         let archive_root = storage_root.join("projects").join(&repo_identity.slug);
         let reservations_dir = archive_root.join("file_reservations");
         std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
         std::fs::write(
             archive_root.join("project.json"),
             serde_json::json!({
-                "slug": colliding_identity.slug,
+                "slug": repo_identity.slug,
                 "human_key": colliding_project.to_string_lossy(),
             })
             .to_string(),
@@ -5579,6 +6785,81 @@ mod tests {
             "expected archive lookup warning, got stdout={}, stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A project in a monorepo folder: its reservations are relative to that
+    /// folder, git's staged paths to the repository top level. The hook must
+    /// block the reserved file under the folder and allow the same relative
+    /// path elsewhere in the repository.
+    #[test]
+    fn guard_plugin_reanchors_staged_paths_for_a_project_inside_the_repo() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let project_dir = repo_dir.join("services").join("api");
+        let storage_root = td.path().join("storage");
+        for dir in [project_dir.join("src"), repo_dir.join("src")] {
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write");
+        }
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let project_key = project_dir.to_string_lossy().into_owned();
+        let identity = mcp_agent_mail_core::resolve_project_identity(&project_key);
+        let archive_root = storage_root.join("projects").join(&identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        let metadata = serde_json::json!({ "slug": identity.slug, "human_key": project_key });
+        std::fs::write(archive_root.join("project.json"), metadata.to_string())
+            .expect("write metadata");
+        let reservation = serde_json::json!({
+            "path_pattern": "src/main.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "released_ts": serde_json::Value::Null,
+        });
+        std::fs::write(reservations_dir.join("lease.json"), reservation.to_string())
+            .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&project_key, "pre-commit"),
+        )
+        .expect("write guard script");
+        let commit_check = |staged: &str| {
+            run_git(&repo_dir, &["read-tree", "--empty"]);
+            run_git(&repo_dir, &["add", staged]);
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .env("STORAGE_ROOT", &storage_root)
+                .env_remove("AGENT_MAIL_GUARD_MODE")
+                .env_remove("AGENT_MAIL_BYPASS")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        let inside = commit_check("services/api/src/main.rs");
+        assert_eq!(
+            inside.status.code(),
+            Some(1),
+            "the reserved file under the project folder must block: stderr={}",
+            String::from_utf8_lossy(&inside.stderr),
+        );
+        assert!(String::from_utf8_lossy(&inside.stderr).contains("held by OtherAgent"));
+
+        let outside = commit_check("src/main.rs");
+        assert_eq!(
+            outside.status.code(),
+            Some(0),
+            "the same relative path outside the project is not reserved: stderr={}",
+            String::from_utf8_lossy(&outside.stderr),
         );
     }
 
@@ -5948,6 +7229,66 @@ mod tests {
             assert!(
                 script.contains("treating as a conflict (fail-closed)"),
                 "guard {hook} must fail closed when a reservation pattern cannot be evaluated"
+            );
+        }
+    }
+
+    /// The installed hook's own matcher, imported under every interpreter: a
+    /// file name containing glob characters blocks itself and what is under it,
+    /// and brace alternatives keep their regex escapes (`{c++,cpp}`).
+    #[test]
+    fn guard_plugin_matcher_blocks_bracketed_names_and_escaped_brace_alternatives() {
+        let pythons = python_executables();
+        if pythons.is_empty() {
+            return;
+        }
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let script_path = td.path().join("guard_matcher.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script("/abs/project", "pre-commit"),
+        )
+        .expect("write guard script");
+        // A raw string: a `\` line continuation would strip the loop body's
+        // indentation and make the probe a Python syntax error.
+        let probe = r"import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('guard', sys.argv[1])
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+out = []
+for pattern, path in json.loads(sys.argv[2]):
+    res = [{'path_pattern': pattern, 'agent_name': 'OtherAgent'}]
+    out.append(bool(guard.check_conflicts([path], res, 'MyAgent')))
+print(json.dumps(out))
+";
+        let cases = serde_json::json!([
+            ["app/[slug]/page.tsx", "app/[slug]/page.tsx"],
+            ["app/[slug]", "app/[slug]/page.tsx"],
+            ["src/{c++,cpp}/**", "src/c++/main.cpp"],
+            ["src/{c++,cpp}/**", "src/cpp/main.cpp"],
+            ["docs/{a(1),b}/*.md", "docs/a(1)/x.md"],
+            // Negatives: an unrelated alternative, and `*` stays in one folder.
+            ["src/{c++,cpp}/**", "src/rust/main.rs"],
+            ["src/*", "src/sub/file.rs"],
+        ]);
+        for python in &pythons {
+            let output = Command::new(python)
+                .args(["-c", probe])
+                .arg(&script_path)
+                .arg(cases.to_string())
+                .output()
+                .expect("run matcher probe");
+            assert!(
+                output.status.success(),
+                "probe failed under {python}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let verdicts: Vec<bool> =
+                serde_json::from_slice(&output.stdout).expect("probe prints a JSON list");
+            assert_eq!(
+                verdicts,
+                vec![true, true, true, true, true, false, false],
+                "matcher verdicts under {python}"
             );
         }
     }
@@ -6607,6 +7948,78 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn chain_runner_passes_git_arguments_and_skips_a_non_executable_original() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let hooks_dir = td.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+        let marker = td.path().join("marker.txt");
+
+        // pre-push: the user's original hook (say `git lfs pre-push "$@"`)
+        // needs git's remote name and URL, and the ref lines on stdin.
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-push"),
+            &render_chain_runner_script("pre-push"),
+            true,
+        )
+        .expect("write chain runner");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-push.orig"),
+            "#!/bin/sh\nprintf '%s|' \"$@\" >> \"$CHAIN_MARKER\"\ncat >> \"$CHAIN_MARKER\"\n",
+            true,
+        )
+        .expect("write original pre-push");
+        let mut child = Command::new(&python)
+            .env("CHAIN_MARKER", &marker)
+            .arg(hooks_dir.join("pre-push"))
+            .args(["origin", "https://example.test/repo.git"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("run pre-push chain");
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin
+                .write_all(b"refs/heads/main abc refs/heads/main def\n")
+                .expect("write refs");
+        }
+        let status = child.wait().expect("wait pre-push chain");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "origin|https://example.test/repo.git|refs/heads/main abc refs/heads/main def\n"
+        );
+
+        // pre-commit: git never ran a non-executable hook, so after install the
+        // moved original must not start failing every commit with 126.
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-commit"),
+            &render_chain_runner_script("pre-commit"),
+            true,
+        )
+        .expect("write chain runner");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-commit.orig"),
+            "#!/bin/sh\nexit 1\n",
+            false,
+        )
+        .expect("write non-executable original");
+        let output = Command::new(&python)
+            .arg(hooks_dir.join("pre-commit"))
+            .output()
+            .expect("run pre-commit chain");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn chain_runner_runs_later_pre_commit_hooks_after_guard_failure() {
         let Some(python) = python_executable() else {
             return;
@@ -6853,8 +8266,8 @@ refs/heads/topic dddddddddddddddddddddddddddddddddddddddd\n";
     fn rendered_pre_push_hook_is_batched_and_bounded() {
         let script = render_guard_plugin_script("/abs/project", "pre-push");
         assert!(
-            script.contains("\"-z\", \"--cc\", \"--stdin\"]"),
-            "diff-tree must take its commit list on stdin"
+            script.contains("\"-m\" if strict else \"--cc\", \"--stdin\"]"),
+            "push scans retain combined merge diffs; strict commit admission checks every parent, both on stdin"
         );
         assert!(
             !script.contains("for sha in commits:"),

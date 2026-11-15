@@ -18,6 +18,165 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Repeated agent-profile conflicts (GH#375)
+
+An `agent_archive_reconcile_deferred` warning with `transient=false` can mean
+the archived profile disagrees with the live identity or deregistration ledger.
+For example, an archived permanent deregistration cannot be cleared merely
+because the live ledger lacks it. These conflicts require authoritative
+evidence; the background worker does not choose a winner or rewrite either
+side to silence the warning.
+
+The reconciler retains up to **1,024 conflict fingerprints** separately from
+transient retry debt. A readable identity, lifecycle or project conflict emits
+one warning for its current inputs. On subsequent finite roster visits, the
+worker rereads the live source and the exact working and committed
+`profile.json` / `project.json` payloads. If the same validated conflict
+remains, it skips publication admission and another warning. Changes to those
+inputs invalidate suppression; a legitimate repair still uses fresh source
+validation and the ordinary archive locks. Database heartbeat timestamps and
+unrelated Git commits do not invalidate an otherwise unchanged conflict.
+
+The `agent_archive_reconcile` summary distinguishes `suppressed_conflicts`
+from healthy `unchanged` profiles, reports the retained `conflict_len`, and
+counts capacity evictions as `conflict_evicted`. Suppressed conflicts alone
+do not request rapid catch-up. Source-query, lock and resource failures retain
+their normal transient retry behavior. Unreadable artifacts, invalid JSON,
+oversized or unsafe artifacts and incomplete source authority cannot acquire
+suppression.
+
+Fingerprints survive normal daemon restarts in the existing atomic agent
+reconciliation checkpoint beside the database. The checkpoint contains IDs
+and hashes, not profile contents or registration tokens; its physical/logical
+database and archive binding prevents reuse across a different mailbox
+generation. A missing, incompatible or corrupt checkpoint causes a fresh scan;
+unavailable checkpoint storage leaves suppression in memory and reports that
+restart progress is not durable. Conflicting records themselves remain intact.
+
+After confirming a durable checkpoint publication, the worker can retain that
+checkpoint without another replacement or fsync when a pass leaves the same
+scheduling state and neither the live queue nor the saved checkpoint contains
+transient retry debt. It verifies the actual file against the confirmed
+publication and compares the mailbox binding, roster position, preferred lane
+and ordered conflict fingerprints. A new checkpoint owner, a previous save
+failure, or a changed, missing, corrupt or obsolete file requires the normal
+atomic save path. Pending retries keep their existing timestamp and cooldown
+persistence rules. Readable matching bytes alone never establish that the
+required synchronization succeeded: the existing save path syncs the file
+and, on Unix, its parent directory.
+
+This is a bounded optimization, not a claim that the conflict has been fixed.
+Roster visits still perform source and evidence reads to detect legitimate
+changes. With more than 1,024 simultaneous conflicts, FIFO capacity eviction
+can cause renewed warnings and repeated checks for evicted entries; it never
+blocks later roster work or displaces transient retry debt. Use the initial
+warning's agent ID and reason to investigate both authorities. Read-only
+`am doctor check --json` can provide broader mailbox diagnostics, but this
+change does not add an automatic command to accept one side of a conflicting
+deregistration.
+
+## Metrics-index growth and memory exhaustion (GH#372)
+
+FrankenSQLite 0.4.10 through 0.4.12 can leave very sparse B-tree pages when
+inserting descending index keys. Agent Mail's metrics history uses
+`idx_tool_metrics_snapshots_tool_ts(tool_name, collected_ts DESC)`: each new
+sample sorts before the older samples for that tool. With metrics persistence
+enabled, this can amplify both database size and the memory needed to open it.
+`PRAGMA integrity_check` can still report `ok`, and `freelist_count` can be
+small: these are allocated, sparsely populated index pages, not necessarily
+corruption or free pages. See [issue #372](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/372)
+and [upstream #521](https://github.com/Dicklesworthstone/frankensqlite/issues/521).
+
+**Upgrade first to a build using FrankenSQLite 0.4.13.** The dependency update
+fixes subsequent insertions without changing the mailbox schema or rebuilding
+existing files at startup. Existing oversized index pages need an explicit
+offline rebuild; upgrading alone does not reclaim them. If an upgrade cannot
+be deployed immediately, set `TOOL_METRICS_EMIT_ENABLED=false` in the server's
+environment and restart it gracefully to stop new metrics snapshots. This is
+a temporary growth mitigation, not a repair of the existing index.
+
+### Offline recovery
+
+Run every command with the same `DATABASE_URL` and `STORAGE_ROOT` as the
+affected server. For a container deployment, stop the serving container and
+run the upgraded `am` against the same persistent volume in an isolated
+maintenance container. Do not start a second server on that volume.
+
+1. Gracefully **stop all HTTP and stdio servers using the mailbox** and keep
+   them stopped, including any supervisor that would restart them. For a
+   systemd user service, for example:
+
+   ```bash
+   systemctl --user stop mcp-agent-mail
+   am doctor locks --json
+   am doctor drain --json
+   ```
+
+   `am doctor drain` only reports ownership; it does not stop anything. Require
+   `safe_to_mutate=true`. A restart command is not a substitute for stopping
+   the server throughout maintenance. Never remove activity locks to force
+   admission. VACUUM rejects both `--allow-live-owner` and `--take-ownership`:
+   replacing a wedged process's lock does not prove that the process stopped.
+
+2. Keep an independent pre-incident backup outside the storage root when one
+   is available, and ensure enough free space for a full backup and the
+   temporary VACUUM image. Preview the selected database and page counts:
+
+   ```bash
+   am doctor vacuum --json
+   ```
+
+   Without `--yes`, this is read-only. `--dry-run` remains read-only even
+   when combined with `--yes`. A clean integrity result does not rule out
+   this specific bloat, so it does not eliminate the need for compaction.
+
+3. Apply the offline rebuild:
+
+   ```bash
+   am doctor vacuum --yes --json
+   ```
+
+   The command holds the applicable mailbox activity locks exclusively from
+   admission through verification, including the database lock, preventing a cooperating server from
+   restarting in the middle. It first exports a full-schema, standalone
+   backup that includes committed WAL rows, verifies its integrity and message
+   contents, and flushes the backup to disk. The private
+   `doctor-vacuum-backup-*/mailbox.sqlite3` directory beside the database is
+   retained; the exact path is printed on stderr and returned as `backup_path`.
+   Backup failure aborts before in-place VACUUM. It never reconstructs messages
+   from the archive or drops metrics/history tables.
+
+   Success requires a clean post-compaction integrity check and matching
+   SHA-256 content witnesses for messages, recipient read/ack state, project
+   deliveries/receipts, agents and projects. The witnesses include every
+   stored column and are computed in bounded batches. The schema definitions,
+   `user_version`, `application_id` and AUTOINCREMENT high-water marks must also
+   survive unchanged. JSON reports
+   `message_content_preserved=true`, before/after page counts and file sizes,
+   and `reclaimed_pages`.
+
+4. Confirm the command exited successfully, inspect the before/after sizes,
+   and verify the mailbox before restarting the server:
+
+   ```bash
+   am doctor health
+   am doctor check --json
+   systemctl --user start mcp-agent-mail
+   ```
+
+   Use the applicable supervisor command for your deployment. After restart,
+   confirm existing conversations and acknowledgements are readable and monitor
+   memory/database growth with metrics enabled. The automatic maintenance
+   cadence may still compact the separate ATC telemetry sidecar; main-mailbox
+   compaction is reserved for this explicit offline command.
+
+If compaction or content verification fails, **keep the server stopped** and
+retain the reported backup and the original database family for diagnosis.
+The command does not automatically restore over the mailbox. Do not copy a
+backup over an active database or delete WAL/namespace sidecars by hand; use
+the supported `am doctor restore <backup-path>` recovery surface only after
+reviewing the failure and confirming offline ownership.
+
 ---
 
 ## Reconstruct/Promotion Refusal Loop (GH#208)
@@ -90,10 +249,10 @@ the 2.51.0 bug. (Disassemble `/usr/bin/git` around `0x1db240` if you
 want to see the faulting `testb $0x1,0x52(%r12)` — it's reading
 `cache_entry::ce_flags` after the backing mmap was invalidated.)
 
-Run `am doctor check` for a structured report (once A2 ships this):
+The doctor's known-bad-git detector gives a structured report:
 
 ```bash
-am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_INDEX_RACE")'
+am doctor fix --only fm-environment_toolchain-known-bad-git-no-override --list --json
 ```
 
 ### Remediate (in order)
@@ -126,7 +285,7 @@ am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_IN
 
    ```bash
    # Dry-run (default): see what would be pruned
-   am doctor fix-orphan-refs --all --dry-run --format json
+   am doctor fix-orphan-refs --all --format json
 
    # Review, then apply
    am doctor fix-orphan-refs --all --apply

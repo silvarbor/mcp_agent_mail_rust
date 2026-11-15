@@ -1,20 +1,150 @@
-//! Step 1: SQLite snapshot creation via SQL-level dump and restore.
+//! Step 1: SQLite snapshot creation for public exports and private archives.
 //!
 //! Creates an atomic, clean canonical SQLite copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, finalization with FTS5/VACUUM).
 //!
-//! Instead of a byte-level file copy we read schema + data through the runtime
-//! driver and re-create them in a fresh destination file.
+//! Public exports and scoped/scrubbed archives project the supported mailbox
+//! tables through the runtime driver. Unscoped lossless archives use the source
+//! engine's `VACUUM INTO` to preserve the complete database schema and payload.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 use sqlmodel_core::Value;
 
 use crate::ShareError;
 
+mod shared;
+
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// Lifecycle of an opaque native archive phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullArchiveProgressState {
+    Started,
+    Progress,
+    Finished,
+    Failed,
+}
+
+/// Content-free phase timing for an unscoped, lossless database image.
+///
+/// Native exports emit phase boundaries only: `table` is always `None` and
+/// `rows_copied` is zero. The source engine owns the copy statement, which cannot
+/// be interrupted by this observer. Events contain no source paths or SQL.
+#[derive(Debug, Clone, Copy)]
+pub struct FullArchiveProgress {
+    pub phase: &'static str,
+    pub table: Option<&'static str>,
+    pub rows_copied: u64,
+    pub elapsed: Duration,
+    pub state: FullArchiveProgressState,
+}
+
+/// Returning an error cancels at a phase boundary. A single database statement
+/// is not preempted. The destination remains caller-owned staging until the
+/// entire snapshot operation succeeds and must not be packaged after an error.
+pub type FullArchiveObserver<'a> = dyn FnMut(FullArchiveProgress) -> Result<(), ShareError> + 'a;
+
+fn full_archive_phase<T>(
+    phase: &'static str,
+    progress: &mut FullArchiveObserver<'_>,
+    operation: impl FnOnce() -> Result<T, ShareError>,
+) -> Result<T, ShareError> {
+    let started = Instant::now();
+    progress(FullArchiveProgress {
+        phase,
+        table: None,
+        rows_copied: 0,
+        elapsed: Duration::ZERO,
+        state: FullArchiveProgressState::Started,
+    })?;
+    let result = operation();
+    let event = FullArchiveProgress {
+        phase,
+        table: None,
+        rows_copied: 0,
+        elapsed: started.elapsed(),
+        state: if result.is_ok() {
+            FullArchiveProgressState::Finished
+        } else {
+            FullArchiveProgressState::Failed
+        },
+    };
+    match result {
+        Ok(value) => {
+            progress(event)?;
+            Ok(value)
+        }
+        Err(error) => {
+            // Preserve the operation's original failure even if cancellation
+            // is requested while reporting it.
+            let _ = progress(event);
+            Err(error)
+        }
+    }
+}
+
+/// A measured stage of snapshot preparation, independent of archive packaging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotProgressPhase {
+    Copy,
+    Scope,
+    Scrub,
+    Compact,
+    Viewer,
+}
+
+/// Progress contains schema names and counts only, never mailbox contents.
+///
+/// `rows_copied` is cumulative within `table` for the current phase. A `None`
+/// table marks a phase boundary; a table with zero rows marks its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotProgress {
+    pub phase: SnapshotProgressPhase,
+    pub table: Option<&'static str>,
+    pub rows_copied: u64,
+}
+
+impl SnapshotProgress {
+    pub(crate) const fn phase(phase: SnapshotProgressPhase) -> Self {
+        Self {
+            phase,
+            table: None,
+            rows_copied: 0,
+        }
+    }
+}
+
+/// Returning an error stops at the current checkpoint. Copy checkpoints occur
+/// between bounded pages; a single database statement is not preempted.
+pub type SnapshotObserver<'a> = dyn FnMut(SnapshotProgress) -> Result<(), ShareError> + 'a;
+
+/// A bounded, content-free description of work in the snapshot pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// Create the private database copy through the appropriate source engine.
+    Snapshot,
+    /// Resolve project selectors and remove out-of-scope rows from the copy.
+    Filter,
+    /// Apply the preset and publication-specific credential redaction.
+    Scrub,
+    /// Rebuild storage; published bundles also receive viewer search artifacts.
+    Finalize,
+}
+
+/// Phase boundaries only: no database paths, selectors, SQL, or mailbox data.
+///
+/// A failed phase emits `Started` but not `Finished`; the returned error keeps
+/// its existing type and is handled by the caller. Observers should perform
+/// only bounded diagnostic work and must not mutate snapshot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhaseEvent {
+    Started(SnapshotPhase),
+    Finished(SnapshotPhase),
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum SnapshotDestinationProfile {
@@ -111,6 +241,9 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "created_ts",
             "recipients_json",
             "attachments",
+            // NULL is unknown legacy authority; {} proves a non-reply. Keep
+            // the opaque value intact through private copies and finalization.
+            "archive_metadata_json",
         ],
     },
     KnownTable {
@@ -282,6 +415,27 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
     source_profile: SnapshotSourceProfile,
     destination_profile: SnapshotDestinationProfile,
 ) -> Result<PathBuf, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        destination,
+        checkpoint,
+        source_profile,
+        destination_profile,
+        SnapshotProgressPhase::Copy,
+        &mut |_| Ok(()),
+    )
+}
+
+pub(crate) fn rebuild_sqlite_snapshot_with_progress(
+    source: &Path,
+    destination: &Path,
+    checkpoint: bool,
+    source_profile: SnapshotSourceProfile,
+    destination_profile: SnapshotDestinationProfile,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<PathBuf, ShareError> {
+    observer(SnapshotProgress::phase(phase))?;
     let source = crate::resolve_share_sqlite_path(source);
 
     match std::fs::symlink_metadata(&source) {
@@ -374,7 +528,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
                     source.display()
                 ),
             })?;
-            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            transfer_tables_with_progress(&src, &dst_conn, phase, observer)?;
             // A true read-only observer must use ordinary Drop. Checkpointing
             // close helpers are writer teardown and may mutate a live WAL.
             drop(src);
@@ -391,7 +545,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
                         ),
                     })?;
             }
-            transfer_tables_in_consistent_read(&src, &dst_conn)?;
+            transfer_tables_with_progress(&src, &dst_conn, phase, observer)?;
         }
     }
     // Use the existing canonical staging connection for any destination
@@ -406,6 +560,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             ),
         })?;
     drop(dst_conn);
+    observer(SnapshotProgress::phase(phase))?;
     publish_sqlite_snapshot(stage_dir, &staged_dest, &dest, sync_snapshot_parent)?;
 
     Ok(dest)
@@ -558,7 +713,7 @@ fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
 /// and must use the guarded same-engine API instead. A multiply-linked inode
 /// likewise defeats pathname-based ownership checks because another alias can
 /// still be live or replaced independently.
-fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
+pub(crate) fn validate_private_canonical_snapshot_source(path: &Path) -> Result<(), ShareError> {
     let metadata = std::fs::symlink_metadata(path).map_err(ShareError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(ShareError::Validation {
@@ -743,16 +898,26 @@ impl SnapshotSource for CanonicalDbConn {
 /// snapshot. In WAL mode, separate queries without this transaction can each
 /// observe a different commit and produce a cross-table or cross-page state
 /// that never existed in the source.
+#[cfg(test)]
 fn transfer_tables_in_consistent_read<S: SnapshotSource>(
     src: &S,
     dst: &CanonicalDbConn,
+) -> Result<(), ShareError> {
+    transfer_tables_with_progress(src, dst, SnapshotProgressPhase::Copy, &mut |_| Ok(()))
+}
+
+fn transfer_tables_with_progress<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
 ) -> Result<(), ShareError> {
     src.execute_snapshot("BEGIN")
         .map_err(|e| ShareError::Sqlite {
             message: format!("cannot begin consistent source snapshot read: {e}"),
         })?;
 
-    match transfer_tables(src, dst) {
+    match transfer_tables(src, dst, phase, observer) {
         Ok(()) => match src.execute_snapshot("COMMIT") {
             Ok(()) => Ok(()),
             Err(commit_error) => {
@@ -779,8 +944,19 @@ fn transfer_tables_in_consistent_read<S: SnapshotSource>(
 }
 
 /// Transfer tables from a source snapshot to a fresh destination database.
-fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<(), ShareError> {
+fn transfer_tables<S: SnapshotSource>(
+    src: &S,
+    dst: &CanonicalDbConn,
+    phase: SnapshotProgressPhase,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
+        let mut progress = SnapshotProgress {
+            phase,
+            table: Some(table.name),
+            rows_copied: 0,
+        };
+        observer(progress)?;
         create_dst_table(dst, table)?;
         let source_columns = source_columns(src, table.name)?;
         if source_columns.is_empty() {
@@ -791,28 +967,13 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
             continue;
         }
         let insert_sql = build_insert(table.name, table.columns);
-        let select_columns = quoted_column_list(&available_columns);
-        let page_by_column = table
-            .page_by_column
-            .filter(|column| source_columns.contains(*column));
-        let mut last_page_value: i64 = -1;
+        let page_keys = snapshot_page_keys(src, table, &source_columns)?;
+        // None is the first page, not an invented -1 identity. Imported
+        // databases and previous snapshots can contain any signed SQLite ID.
+        let mut after: Option<Vec<SnapshotKey>> = None;
         loop {
-            let (select_sql, params): (String, Vec<Value>) =
-                if let Some(page_by_column) = page_by_column {
-                    (
-                        format!(
-                            "SELECT {select_columns} FROM \"{}\" WHERE \"{page_by_column}\" > ?1 \
-                         ORDER BY \"{page_by_column}\" ASC LIMIT 1000",
-                            table.name
-                        ),
-                        vec![Value::BigInt(last_page_value)],
-                    )
-                } else {
-                    (
-                        format!("SELECT {select_columns} FROM \"{}\"", table.name),
-                        vec![],
-                    )
-                };
+            let (select_sql, params) =
+                snapshot_page_query(table, &available_columns, &page_keys, after.as_deref());
 
             let rows =
                 src.query_snapshot(&select_sql, &params)
@@ -820,6 +981,11 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                         message: format!("SELECT from {} failed: {e}", table.name),
                     })?;
 
+            if rows.len() > SNAPSHOT_PAGE_ROWS {
+                return Err(ShareError::Validation {
+                    message: format!("snapshot {} page exceeded its row bound", table.name),
+                });
+            }
             if rows.is_empty() {
                 break;
             }
@@ -833,6 +999,12 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                     message: format!("BEGIN for {} page failed: {e}", table.name),
                 })?;
             for row in &rows {
+                let key = snapshot_row_key(row, table.name, &page_keys)?;
+                if after.as_ref().is_some_and(|previous| key <= *previous) {
+                    return Err(ShareError::Validation {
+                        message: format!("snapshot {} cursor did not advance", table.name),
+                    });
+                }
                 let values: Vec<Value> = table
                     .columns
                     .iter()
@@ -846,24 +1018,25 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                         )
                     })
                     .collect();
-                if let Some(page_by_column) = page_by_column {
-                    last_page_value = extract_page_value(row, table.name, page_by_column)?;
-                }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {
                         message: format!("INSERT into {} failed: {e}", table.name),
                     })?;
+                after = Some(key);
             }
             dst.execute_sync("COMMIT", &[])
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("COMMIT for {} page failed: {e}", table.name),
                 })?;
-            if page_by_column.is_none() {
-                break;
-            }
+            progress.rows_copied = progress
+                .rows_copied
+                .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            observer(progress)?;
         }
     }
-    Ok(())
+    // Shared deliveries and lazy receipts are part of the same source read
+    // transaction, including the finalization rebuild of a prepared snapshot.
+    shared::transfer(src, dst, phase, observer)
 }
 
 /// Create a table in the destination database.
@@ -883,14 +1056,14 @@ fn create_dst_table(dst: &CanonicalDbConn, table: &KnownTable) -> Result<(), Sha
         })
 }
 
-/// Build INSERT OR REPLACE SQL for a destination table.
+/// Build an insert that cannot silently overwrite a previously copied row.
 fn build_insert(table: &str, columns: &[&str]) -> String {
     let col_list = quoted_column_list(columns);
     let placeholders = (0..columns.len())
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
+    format!("INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
 }
 
 fn quoted_column_list(columns: &[&str]) -> String {
@@ -914,32 +1087,165 @@ fn source_columns<S: SnapshotSource>(src: &S, table: &str) -> Result<HashSet<Str
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;
-    Ok(extract_column_names(&rows))
+    extract_column_names(&rows)
 }
 
-fn extract_column_names(rows: &[sqlmodel_core::Row]) -> HashSet<String> {
+fn extract_column_names(rows: &[sqlmodel_core::Row]) -> Result<HashSet<String>, ShareError> {
     rows.iter()
-        .filter_map(|row| row.get_named::<String>("name").ok())
+        .map(|row| {
+            row.get_named::<String>("name")
+                .map(|name| name.to_ascii_lowercase())
+                .map_err(|error| ShareError::Sqlite {
+                    message: format!("cannot decode snapshot source column: {error}"),
+                })
+        })
         .collect()
 }
 
-fn extract_page_value(
+const SNAPSHOT_PAGE_ROWS: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SnapshotKey {
+    Integer(i64),
+    Text(String),
+}
+
+/// A keyset page needs an actual uniqueness constraint, not a promising column
+/// name. Otherwise duplicate identities can straddle a page boundary and the
+/// continuation would silently skip the second row. Runtime recipients use a
+/// two-column PK; legacy recipients can add kind. Both fit the three-key walk.
+fn snapshot_page_keys<'a>(
+    src: &impl SnapshotSource,
+    table: &'a KnownTable,
+    columns: &HashSet<String>,
+) -> Result<Vec<&'a str>, ShareError> {
+    let keys = table
+        .page_by_column
+        .map_or_else(|| table.primary_key_columns.to_vec(), |column| vec![column]);
+    if keys.is_empty() || keys.iter().any(|key| !columns.contains(*key)) {
+        return Err(ShareError::Validation {
+            message: format!("snapshot {} lacks its complete pagination key", table.name),
+        });
+    }
+    let rows = src
+        .query_snapshot(&format!("PRAGMA table_info(\"{}\")", table.name), &[])
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("inspect snapshot {} key: {error}", table.name),
+        })?;
+    let mut primary = std::collections::BTreeMap::new();
+    for row in rows {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("decode snapshot {} key name: {error}", table.name),
+            })?
+            .to_ascii_lowercase();
+        let position = row
+            .get_named::<i64>("pk")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("decode snapshot {} key position: {error}", table.name),
+            })?;
+        if position < 0 || (position > 0 && primary.insert(position, name).is_some()) {
+            return Err(ShareError::Validation {
+                message: format!("snapshot {} has an ambiguous primary key", table.name),
+            });
+        }
+    }
+    if primary.is_empty()
+        || primary.iter().enumerate().any(|(index, (position, name))| {
+            *position != i64::try_from(index + 1).unwrap_or(i64::MAX)
+                || !keys.contains(&name.as_str())
+        })
+    {
+        return Err(ShareError::Validation {
+            message: format!(
+                "snapshot {} pagination key is not uniquely constrained",
+                table.name
+            ),
+        });
+    }
+    Ok(keys)
+}
+
+fn snapshot_page_query(
+    table: &KnownTable,
+    columns: &[&str],
+    keys: &[&str],
+    after: Option<&[SnapshotKey]>,
+) -> (String, Vec<Value>) {
+    // Alias the projection so upper-case imported column declarations do not
+    // change the names returned by the driver. Identifiers are known constants.
+    let projection = columns
+        .iter()
+        .map(|column| format!("\"{column}\" AS \"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_keys = keys
+        .iter()
+        .map(|key| {
+            if *key == "kind" {
+                format!("\"{key}\" COLLATE BINARY")
+            } else {
+                format!("\"{key}\"")
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut sql = format!("SELECT {projection} FROM \"{}\"", table.name);
+    let mut params = Vec::new();
+    if let Some(after) = after {
+        debug_assert_eq!(after.len(), keys.len());
+        let continuation = (0..keys.len())
+            .map(|index| {
+                let mut terms = (0..index)
+                    .map(|equal| format!("{} = ?{}", order_keys[equal], equal + 1))
+                    .collect::<Vec<_>>();
+                terms.push(format!("{} > ?{}", order_keys[index], index + 1));
+                format!("({})", terms.join(" AND "))
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        if keys.len() > 1 {
+            // The disjunction alone can make SQLite walk the index from its
+            // beginning on every page. Every matching tuple has its first
+            // key >= the cursor's first key; expose that range explicitly so
+            // the planner can seek past already-copied message populations.
+            sql.push_str(&format!(
+                " WHERE {} >= ?1 AND ({continuation})",
+                order_keys[0]
+            ));
+        } else {
+            sql.push_str(&format!(" WHERE {continuation}"));
+        }
+        params.extend(after.iter().map(|key| match key {
+            SnapshotKey::Integer(value) => Value::BigInt(*value),
+            SnapshotKey::Text(value) => Value::Text(value.clone()),
+        }));
+    }
+    sql.push_str(&format!(
+        " ORDER BY {} LIMIT {SNAPSHOT_PAGE_ROWS}",
+        order_keys.join(", ")
+    ));
+    (sql, params)
+}
+
+fn snapshot_row_key(
     row: &sqlmodel_core::Row,
     table: &str,
-    page_by_column: &str,
-) -> Result<i64, ShareError> {
-    let Some(val) = row.get_by_name(page_by_column) else {
-        return Err(ShareError::Sqlite {
-            message: format!("missing pagination column {page_by_column} while copying {table}"),
-        });
-    };
-    match val {
-        Value::BigInt(v) => Ok(*v),
-        Value::Int(v) => Ok(i64::from(*v)),
-        _ => Err(ShareError::Sqlite {
-            message: format!("unexpected non-integer pagination column {table}.{page_by_column}"),
-        }),
-    }
+    keys: &[&str],
+) -> Result<Vec<SnapshotKey>, ShareError> {
+    keys.iter()
+        .map(|key| match (*key, row.get_by_name(key)) {
+            ("kind", Some(Value::Text(value))) => Ok(SnapshotKey::Text(value.clone())),
+            ("kind", _) => Err(ShareError::Validation {
+                message: format!("unexpected non-text pagination column {table}.{key}"),
+            }),
+            (_, Some(Value::BigInt(value))) => Ok(SnapshotKey::Integer(*value)),
+            (_, Some(Value::Int(value))) => Ok(SnapshotKey::Integer(i64::from(*value))),
+            _ => Err(ShareError::Sqlite {
+                message: format!("unexpected non-integer pagination column {table}.{key}"),
+            }),
+        })
+        .collect()
 }
 
 fn available_columns<'a>(table: &'a KnownTable, source_columns: &HashSet<String>) -> Vec<&'a str> {
@@ -979,7 +1285,7 @@ fn snapshot_column_prefers_text(column: &str) -> bool {
 /// 1. Create snapshot
 /// 2. Apply project scope
 /// 3. Scrub data
-/// 4. Finalize (FTS, materialized views, performance indexes, VACUUM)
+/// 4. Compact storage; published shares also build viewer/search derivatives
 ///
 /// The source assumptions are the same as [`create_sqlite_snapshot`]: a
 /// complete, valid `FrankenSQLite` namespace pair is mandatory and the source
@@ -989,9 +1295,139 @@ pub fn create_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
+    create_snapshot_context_with_observer(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+    )
+}
+
+/// Prepare a live-mailbox snapshot while observing its phase boundaries.
+///
+/// Uses exactly the same guarded source and scrub policy as
+/// [`create_snapshot_context`]. Observation does not enable any extra reads of
+/// the source, release locks, or expose row contents to the observer.
+///
+/// # Errors
+///
+/// Returns the original [`ShareError`] if snapshot creation, project filtering,
+/// scrubbing, or finalization fails. No later phase is started on failure.
+pub fn create_snapshot_context_with_observer(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut dyn FnMut(SnapshotPhaseEvent),
+) -> Result<SnapshotContext, ShareError> {
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot));
     create_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot));
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        None,
+        observer,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Prepare a live snapshot with phase and bounded-copy progress checkpoints.
+///
+/// The observer can cancel by returning an error. It runs synchronously, never
+/// receives mailbox contents, and cannot interrupt an individual DB statement.
+/// As with [`create_snapshot_context`], the destination is caller-owned staging
+/// until the entire function succeeds and must not be published on an error.
+///
+/// # Errors
+///
+/// Returns snapshot preparation errors or the observer's cancellation error.
+pub fn create_snapshot_context_with_progress(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    create_snapshot_context_with_options(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        SnapshotOptions {
+            purpose,
+            namespace_retention_root: None,
+        },
+        observer,
+    )
+}
+
+/// Prepare a live-mailbox snapshot with an explicit private metadata retention
+/// destination. The live source retains the same guarded read-only admission.
+///
+/// # Errors
+///
+/// Returns snapshot/cancellation errors and refuses retention inside the
+/// snapshot directory. The caller must preserve failed snapshot staging.
+pub fn create_snapshot_context_with_options(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    options: SnapshotOptions<'_>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        snapshot_path,
+        true,
+        SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+        SnapshotProgressPhase::Copy,
+        observer,
+    )?;
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        options.purpose,
+        options.namespace_retention_root,
+        &mut |_| {},
+        observer,
+    )
+}
+
+/// What a snapshot is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPurpose {
+    /// A share bundle that will be published: registration tokens and opaque
+    /// message recovery metadata are removed whatever the scrub preset.
+    Publish,
+    /// A private archive (`am archive save`): the preset alone decides, so the
+    /// lossless `archive` preset keeps tokens and a restore can still send.
+    /// Viewer-only search indexes and materialized tables are not built.
+    PrivateArchive,
+}
+
+/// Destination policy for snapshot preparation.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotOptions<'a> {
+    pub purpose: SnapshotPurpose,
+    /// Existing caller-owned directory outside snapshot staging and published
+    /// payloads. Unique metadata-only children are retained with mode 0700 on
+    /// Unix. `None` uses the process temp root only if outside the snapshot
+    /// directory; its lifetime remains controlled by that root's owner.
+    /// Retirement uses same-filesystem rename and propagates cross-device
+    /// errors; it never substitutes copy-and-delete.
+    pub namespace_retention_root: Option<&'a Path>,
 }
 
 /// Full snapshot preparation pipeline for a private canonical SQLite source.
@@ -1009,29 +1445,485 @@ pub fn create_private_canonical_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_snapshot_context_with_observer(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+    )
+}
+
+/// Prepare a private canonical snapshot while observing its phase boundaries.
+///
+/// The source exclusivity requirement of
+/// [`create_private_canonical_snapshot_context`] still applies. Events carry
+/// only the fixed phase name and whether it started or finished.
+///
+/// # Errors
+///
+/// Returns the original [`ShareError`] if snapshot creation, project filtering,
+/// scrubbing, or finalization fails. A failed phase never emits `Finished`.
+pub fn create_private_canonical_snapshot_context_with_observer(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut dyn FnMut(SnapshotPhaseEvent),
+) -> Result<SnapshotContext, ShareError> {
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot));
     create_private_canonical_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot));
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        None,
+        observer,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Prepare a private canonical snapshot with the same progress/cancellation
+/// contract as [`create_snapshot_context_with_progress`]. Live mailbox paths
+/// still require the guarded runtime-source API.
+///
+/// # Errors
+///
+/// Returns snapshot preparation errors or the observer's cancellation error.
+pub fn create_private_canonical_snapshot_context_with_progress(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_snapshot_context_with_options(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        SnapshotOptions {
+            purpose,
+            namespace_retention_root: None,
+        },
+        observer,
+    )
+}
+
+/// Prepare an engine-exclusive private canonical source with an explicit
+/// metadata retention destination. Live mailboxes must use the runtime API.
+///
+/// # Errors
+///
+/// Returns snapshot/cancellation errors and unsafe-retention refusals. The
+/// caller must preserve failed snapshot staging instead of publishing it.
+pub fn create_private_canonical_snapshot_context_with_options(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    options: SnapshotOptions<'_>,
+    observer: &mut SnapshotObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    rebuild_sqlite_snapshot_with_progress(
+        source,
+        snapshot_path,
+        true,
+        SnapshotSourceProfile::CanonicalExport,
+        SnapshotDestinationProfile::Default,
+        SnapshotProgressPhase::Copy,
+        observer,
+    )?;
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        options.purpose,
+        options.namespace_retention_root,
+        &mut |_| {},
+        observer,
+    )
+}
+
+/// Create a full, lossless private archive of a live FrankenSQLite database.
+/// Unlike the share projection, this preserves every table, column, trigger,
+/// index, sequence counter, and durable metadata such as `user_version` and
+/// `application_id`. The private image is settled to DELETE journal mode for
+/// portability. No scoping or scrub is applied.
+///
+/// The source requires valid existing FrankenSQLite namespace authority and is
+/// opened through the engine-enforced read-only seam. Only the private image is
+/// written. Use this API only for a private, unscoped archive.
+///
+/// # Errors
+///
+/// Returns an error on source admission, copy, validation, or publication
+/// failure, including observer cancellation at phase boundaries. A database
+/// statement cannot be preempted. The destination is caller-owned staging until
+/// this function succeeds; a late cancellation may leave that image intact.
+/// An existing destination is never replaced.
+pub fn create_full_archive_snapshot_with_progress(
+    source: &Path,
+    destination: &Path,
+    progress: &mut FullArchiveObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    create_full_archive_snapshot(
+        source,
+        destination,
+        SnapshotSourceProfile::Runtime,
+        progress,
+    )
+}
+
+/// Create a full, lossless archive of a private canonical SQLite database.
+///
+/// The source must be caller-owned and engine-exclusive; live FrankenSQLite
+/// mailboxes must use [`create_full_archive_snapshot_with_progress`].
+/// No share-table allowlist, project scope, or scrubbing is applied.
+///
+/// # Errors
+///
+/// Returns an error on source admission, copy, validation, or publication
+/// failure, including observer cancellation at phase boundaries. A database
+/// statement cannot be preempted. The destination is caller-owned staging until
+/// this function succeeds; a late cancellation may leave that image intact.
+/// An existing destination is never replaced.
+pub fn create_private_canonical_full_archive_snapshot_with_progress(
+    source: &Path,
+    destination: &Path,
+    progress: &mut FullArchiveObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    create_full_archive_snapshot(
+        source,
+        destination,
+        SnapshotSourceProfile::CanonicalExport,
+        progress,
+    )
+}
+
+/// An unscoped lossless backup is a database image, not a viewer projection.
+/// Preserve schema, extra columns, triggers, indexes, sequence counters, and
+/// database-only authority that the share allowlist cannot know about. The
+/// source pager stays read-only; only the private destination is writable.
+fn create_full_archive_snapshot(
+    source: &Path,
+    destination: &Path,
+    source_profile: SnapshotSourceProfile,
+    progress: &mut FullArchiveObserver<'_>,
+) -> Result<SnapshotContext, ShareError> {
+    let source = crate::resolve_share_sqlite_path(source);
+    match std::fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(ShareError::Validation {
+                message: format!("snapshot source is not a real file: {}", source.display()),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ShareError::SnapshotSourceNotFound {
+                path: source.display().to_string(),
+            });
+        }
+        Err(error) => return Err(ShareError::Io(error)),
+    }
+    if matches!(source_profile, SnapshotSourceProfile::CanonicalExport) {
+        validate_private_canonical_snapshot_source(&source)?;
+    }
+    let destination = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(destination)
+    };
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            return Err(ShareError::SnapshotDestinationExists {
+                path: destination.display().to_string(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ShareError::Io(error)),
+    }
+    if sqlite_sidecar_artifacts_exist(&destination)? {
+        return Err(ShareError::SnapshotDestinationExists {
+            path: destination.display().to_string(),
+        });
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        ShareError::Io(std::io::Error::other("snapshot destination has no parent"))
+    })?;
+    ensure_real_directory(parent)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".archive-snapshot-stage.")
+        .tempdir_in(parent)?;
+    let staged = stage.path().join("mailbox.sqlite3");
+    let staged_text = staged.to_str().ok_or_else(|| ShareError::Validation {
+        message: "snapshot destination must be a UTF-8 path".to_string(),
+    })?;
+
+    let conn = full_archive_phase("snapshot_source_open", progress, || {
+        use mcp_agent_mail_db::pool::{
+            GuardedReadOnlyConn, open_guarded_read_only_canonical_sqlite_file,
+            open_guarded_read_only_franken_existing_file,
+        };
+        match source_profile {
+            SnapshotSourceProfile::Runtime => {
+                open_guarded_read_only_franken_existing_file(&source, "full archive snapshot")
+                    .map(GuardedReadOnlyConn::Franken)
+            }
+            SnapshotSourceProfile::CanonicalExport => {
+                open_guarded_read_only_canonical_sqlite_file(&source, "full archive snapshot")
+                    .map(GuardedReadOnlyConn::Canonical)
+            }
+        }
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("cannot open full archive source read-only: {error}"),
+        })
+    })?;
+    full_archive_phase("snapshot_full_copy", progress, || {
+        // This changes the SQL policy only. Both guarded openers retain an
+        // engine-enforced read-only pager. VACUUM INTO takes one consistent
+        // read of primary + committed WAL, writes a fresh private inode, and
+        // neither checkpoints nor rewrites the source family.
+        let copy_error = |error| ShareError::Sqlite {
+            message: format!("full archive database copy failed: {error}"),
+        };
+        conn.execute_raw("PRAGMA query_only = OFF")
+            .map_err(copy_error)?;
+        conn.execute_raw(&format!(
+            "VACUUM INTO '{}'",
+            staged_text.replace('\'', "''")
+        ))
+        .map_err(copy_error)
+    })?;
+    drop(conn);
+    full_archive_phase("snapshot_neutralize", progress, || {
+        // Same private-image handoff used by doctor and recovery. Retire only
+        // destination namespace witnesses and fold its WAL, then allow the
+        // canonical validator to inspect that private inode.
+        mcp_agent_mail_db::neutralize_private_salvage_artifact(&staged, staged_text).map_err(
+            |error| ShareError::Sqlite {
+                message: format!("cannot settle full archive snapshot: {error}"),
+            },
+        )
+    })?;
+    let mut context = full_archive_phase("snapshot_validate", progress, || {
+        full_archive_context(&staged)
+    })?;
+    full_archive_phase("snapshot_publish", progress, || {
+        publish_sqlite_snapshot(stage, &staged, &destination, sync_snapshot_parent)
+    })?;
+    context.snapshot_path = destination;
+    Ok(context)
+}
+
+fn full_archive_context(path: &Path) -> Result<SnapshotContext, ShareError> {
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(
+        path,
+        "full archive validation",
+    )
+    .map_err(|error| ShareError::Sqlite {
+        message: format!("cannot read completed full archive snapshot: {error}"),
+    })?;
+    let sql_error = |error| ShareError::Sqlite {
+        message: format!("cannot validate full archive snapshot: {error}"),
+    };
+    let integrity = conn
+        .query_sync("PRAGMA quick_check", &[])
+        .map_err(sql_error)?;
+    if integrity.len() != 1
+        || integrity[0].get_by_name("quick_check") != Some(&Value::Text("ok".to_string()))
+    {
+        return Err(ShareError::Validation {
+            message: "full archive snapshot failed SQLite quick_check".to_string(),
+        });
+    }
+    let tables: HashSet<String> = conn
+        .query_sync("SELECT name FROM sqlite_master WHERE type = 'table'", &[])
+        .map_err(sql_error)?
+        .iter()
+        .map(|row| {
+            row.get_named::<String>("name")
+                .map(|name| name.to_ascii_lowercase())
+                .map_err(sql_error)
+        })
+        .collect::<Result<_, _>>()?;
+    let count = |table: &str| -> Result<i64, ShareError> {
+        if !tables.contains(table) {
+            return Ok(0);
+        }
+        // Callers below pass only fixed mailbox table identifiers.
+        let rows = conn
+            .query_sync(&format!("SELECT COUNT(*) AS n FROM \"{table}\""), &[])
+            .map_err(sql_error)?;
+        rows.first()
+            .ok_or_else(|| ShareError::Validation {
+                message: format!("full archive snapshot count is missing for {table}"),
+            })?
+            .get_named("n")
+            .map_err(sql_error)
+    };
+    let mut projects = Vec::new();
+    if tables.contains("projects") {
+        for row in conn
+            .query_sync(
+                "SELECT id AS id, slug AS slug, human_key AS human_key FROM projects ORDER BY id",
+                &[],
+            )
+            .map_err(sql_error)?
+        {
+            projects.push(crate::scope::ProjectRecord {
+                id: row.get_named("id").map_err(sql_error)?,
+                slug: row.get_named("slug").map_err(sql_error)?,
+                human_key: row.get_named("human_key").map_err(sql_error)?,
+            });
+        }
+    }
+    let remaining = crate::scope::RemainingCounts {
+        projects: count("projects")?,
+        agents: count("agents")?,
+        messages: count("messages")?,
+        recipients: count("message_recipients")?,
+        file_reservations: count("file_reservations")?,
+        inbox_stats: count("inbox_stats")?,
+        agent_links: count("agent_links")?,
+        project_sibling_suggestions: count("project_sibling_suggestions")?,
+    };
+    let scrub_summary = crate::scrub::ScrubSummary {
+        preset: "archive".to_string(),
+        pseudonym_salt: "archive".to_string(),
+        agents_total: remaining.agents,
+        agents_pseudonymized: 0,
+        ack_flags_cleared: 0,
+        recipients_cleared: 0,
+        file_reservations_removed: 0,
+        agent_links_removed: 0,
+        secrets_replaced: 0,
+        attachments_sanitized: 0,
+        bodies_redacted: 0,
+        attachments_cleared: 0,
+    };
+    Ok(SnapshotContext {
+        snapshot_path: path.to_path_buf(),
+        scope: crate::scope::ProjectScopeResult {
+            identifiers: Vec::new(),
+            projects,
+            removed_count: 0,
+            remaining,
+        },
+        scrub_summary,
+        // No viewer index was built. Any existing runtime FTS schema is still
+        // preserved verbatim as part of the full database image.
+        fts_enabled: false,
+    })
 }
 
 fn finish_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    namespace_retention_root: Option<&Path>,
+    phase_observer: &mut dyn FnMut(SnapshotPhaseEvent),
+    observer: &mut SnapshotObserver<'_>,
 ) -> Result<SnapshotContext, ShareError> {
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Filter));
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Scope))?;
+    // Scoping deletes the other projects first; keep their paths so the scrub
+    // still redacts them where kept rows mention them.
+    let all_project_paths = if project_filters.is_empty() {
+        Vec::new()
+    } else {
+        crate::scope::project_paths_before_scope(snapshot_path)?
+    };
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
-    let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Filter));
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Scrub));
+    observer(SnapshotProgress::phase(SnapshotProgressPhase::Scrub))?;
+    let mut scrub_summary =
+        crate::scrub::scrub_snapshot_redacting(snapshot_path, scrub_preset, &all_project_paths)?;
+    if purpose == SnapshotPurpose::Publish {
+        // Before finalize rebuilds the file, so no page keeps the old values.
+        let removed = crate::scrub::clear_registration_tokens(snapshot_path)?;
+        scrub_summary.secrets_replaced += removed;
+        clear_published_archive_metadata(snapshot_path)?;
+    }
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
         crate::scrub::redact_scope_project_human_keys(&mut scope);
     }
-    let finalize = crate::finalize_export_db(snapshot_path)?;
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub));
+    phase_observer(SnapshotPhaseEvent::Started(SnapshotPhase::Finalize));
+    // A restorable private archive needs the authoritative tables, not the
+    // static viewer's correlated recipient projections, attachment expansion,
+    // FTS index or analysis pass. Still rebuild the scoped/scrubbed image so
+    // deleted rows and redacted payload bytes cannot remain in free pages.
+    let fts_enabled = match purpose {
+        SnapshotPurpose::PrivateArchive => {
+            crate::finalize::finalize_snapshot_with_retention(
+                snapshot_path,
+                namespace_retention_root,
+                observer,
+            )?;
+            false
+        }
+        SnapshotPurpose::Publish => {
+            crate::finalize::finalize_export_with_retention(
+                snapshot_path,
+                namespace_retention_root,
+                observer,
+            )?
+            .fts_enabled
+        }
+    };
+    phase_observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
 
     Ok(SnapshotContext {
         snapshot_path: snapshot_path.to_path_buf(),
         scope,
         scrub_summary,
-        fts_enabled: finalize.fts_enabled,
+        fts_enabled,
     })
+}
+
+/// Recovery metadata is not viewer data and newer writers may put credentials
+/// or private routing in it. Preserve it in private archives, but never publish
+/// it, including with the otherwise lossless archive scrub preset. This runs
+/// before the final canonical rebuild so old payload pages are not shipped.
+fn clear_published_archive_metadata(snapshot_path: &Path) -> Result<(), ShareError> {
+    let path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let conn =
+        DbConn::open_file(path.display().to_string()).map_err(|error| ShareError::Sqlite {
+            message: format!("open snapshot for recovery metadata cleanup: {error}"),
+        })?;
+    let conn = mcp_agent_mail_db::guard_db_conn(conn, "published recovery metadata cleanup");
+    // Every snapshot produced here has this column, even for legacy sources.
+    // Its absence or an unreadable schema must stop publication, not skip it.
+    conn.execute_raw(
+        "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NOT NULL",
+    )
+    .map_err(|error| ShareError::Sqlite {
+        message: format!("clear published recovery metadata: {error}"),
+    })?;
+    let remaining = conn
+        .query_sync(
+            "SELECT 1 FROM messages WHERE archive_metadata_json IS NOT NULL LIMIT 1",
+            &[],
+        )
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("verify published recovery metadata cleanup: {error}"),
+        })?;
+    if !remaining.is_empty() {
+        return Err(ShareError::Validation {
+            message: "message recovery metadata remains in published snapshot".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Context returned by the snapshot preparation pipeline.
@@ -1046,6 +1938,1691 @@ pub struct SnapshotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_archive_preserves_schema_authority_and_unknown_payloads() {
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("full-source.sqlite3");
+            let destination = directory.path().join("full-copy.sqlite3");
+            let seed = |conn: &dyn SnapshotSource| {
+                for sql in [
+                    "PRAGMA user_version=231",
+                    "PRAGMA application_id=4242",
+                    "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+                    "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, registration_token TEXT, operator_note TEXT)",
+                    "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, body_md TEXT, archive_metadata_json TEXT)",
+                    "CREATE TABLE db_identity(generation TEXT NOT NULL)",
+                    "CREATE TABLE future_state(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, payload BLOB NOT NULL, extra TEXT DEFAULT 'kept')",
+                    "CREATE INDEX future_payload ON future_state(payload)",
+                    "CREATE TABLE backup_audit(value INTEGER)",
+                    "CREATE TRIGGER future_after_insert AFTER INSERT ON future_state BEGIN INSERT INTO backup_audit VALUES(NEW.id); END",
+                    "INSERT INTO projects VALUES(1,'backup','/backup',17)",
+                    "INSERT INTO agents VALUES(2,1,'BlueLake','registration-secret','extra authoritative column')",
+                    "INSERT INTO messages VALUES(3,1,'keep exact body','{\"reply_to\":1}')",
+                    "INSERT INTO db_identity VALUES('durable-generation')",
+                    "INSERT INTO future_state(name,payload) VALUES('one',X'00FF')",
+                    "UPDATE sqlite_sequence SET seq=500 WHERE name='future_state'",
+                ] {
+                    conn.execute_snapshot(sql).unwrap();
+                }
+            };
+            if live {
+                let conn = DbConn::open_file(source.display().to_string()).unwrap();
+                seed(&conn);
+            } else {
+                seed(&private_source(&source));
+            }
+            let source_before = std::fs::read(&source).unwrap();
+            let mut events = Vec::new();
+            let context = if live {
+                create_full_archive_snapshot_with_progress(&source, &destination, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |event| {
+                        events.push(event);
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+            assert!(!context.fts_enabled);
+            assert_eq!(context.scope.remaining.messages, 1);
+            assert_eq!(context.scope.remaining.agents, 1);
+            assert_eq!(context.scrub_summary.secrets_replaced, 0);
+            let finished: Vec<_> = events
+                .iter()
+                .filter(|event| event.state == FullArchiveProgressState::Finished)
+                .map(|event| event.phase)
+                .collect();
+            assert_eq!(
+                finished,
+                [
+                    "snapshot_source_open",
+                    "snapshot_full_copy",
+                    "snapshot_neutralize",
+                    "snapshot_validate",
+                    "snapshot_publish"
+                ]
+            );
+            let copied = private_source(&destination);
+            let row = &copied
+                .query_sync("SELECT registration_token, operator_note FROM agents", &[])
+                .unwrap()[0];
+            assert_eq!(
+                row.get_named::<String>("registration_token").unwrap(),
+                "registration-secret"
+            );
+            assert_eq!(
+                row.get_named::<String>("operator_note").unwrap(),
+                "extra authoritative column"
+            );
+            assert_eq!(
+                copied
+                    .query_sync("SELECT generation FROM db_identity", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("generation")
+                    .unwrap(),
+                "durable-generation"
+            );
+            assert_eq!(
+                copied
+                    .query_sync("SELECT hex(payload) AS payload FROM future_state", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("payload")
+                    .unwrap(),
+                "00FF"
+            );
+            assert_eq!(
+                copied.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                    .get_named::<i64>("user_version")
+                    .unwrap(),
+                231
+            );
+            assert_eq!(
+                copied.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                    .get_named::<i64>("application_id")
+                    .unwrap(),
+                4242
+            );
+            assert_eq!(
+                copied
+                    .query_sync("SELECT COUNT(*) AS n FROM backup_audit", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap(),
+                1,
+                "copying must not fire user triggers"
+            );
+            assert_eq!(copied.query_sync("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='future_payload' AND type='index'", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 1);
+            copied
+                .execute_raw("INSERT INTO future_state(name,payload) VALUES('two',X'01')")
+                .unwrap();
+            assert_eq!(
+                copied
+                    .query_sync("SELECT id FROM future_state WHERE name='two'", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("id")
+                    .unwrap(),
+                501
+            );
+            assert_eq!(
+                copied
+                    .query_sync("SELECT COUNT(*) AS n FROM backup_audit", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap(),
+                2,
+                "restored triggers must still work"
+            );
+            copied
+                .execute_raw("INSERT INTO future_state(name,payload) VALUES('two',X'02')")
+                .expect_err("restored unique constraint must still apply");
+        }
+    }
+
+    #[test]
+    fn full_archive_reads_committed_wal_without_mutating_source_family() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("wal-archive.sqlite3");
+        let destination = directory.path().join("wal-copy.sqlite3");
+        let writer = DbConn::open_file(source.display().to_string()).unwrap();
+        writer
+            .execute_raw("CREATE TABLE backup_witness(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        writer.execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; INSERT INTO backup_witness VALUES(1,'committed WAL payload')").unwrap();
+        drop(writer);
+        let family = || {
+            [
+                "",
+                "-wal",
+                "-shm",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-journal",
+            ]
+            .map(|suffix| std::fs::read(format!("{}{suffix}", source.display())).ok())
+        };
+        let before = family();
+        assert!(before[1].as_ref().is_some_and(|wal| wal.len() > 32));
+        create_full_archive_snapshot_with_progress(&source, &destination, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            family(),
+            before,
+            "backup must not checkpoint or rewrite the source family"
+        );
+        let copied = private_source(&destination);
+        assert_eq!(
+            copied
+                .query_sync("SELECT value FROM backup_witness", &[])
+                .unwrap()[0]
+                .get_named::<String>("value")
+                .unwrap(),
+            "committed WAL payload"
+        );
+        assert!(!sqlite_sidecar_artifacts_exist(&destination).unwrap());
+    }
+
+    #[test]
+    fn full_archive_failed_publication_preserves_previous_copy_and_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("publication-source.sqlite3");
+        let destination = directory.path().join("publication-copy.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), false);
+        let source_before = std::fs::read(&source).unwrap();
+        let mut events = Vec::new();
+        let error = create_private_canonical_full_archive_snapshot_with_progress(
+            &source,
+            &destination,
+            &mut |event| {
+                if event.phase == "snapshot_publish"
+                    && event.state == FullArchiveProgressState::Started
+                {
+                    std::fs::write(&destination, b"previous backup evidence").unwrap();
+                }
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ShareError::SnapshotDestinationExists { .. }
+        ));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"previous backup evidence"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        assert_eq!(events.last().unwrap().phase, "snapshot_publish");
+        assert_eq!(
+            events.last().unwrap().state,
+            FullArchiveProgressState::Failed
+        );
+        let retained = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".archive-snapshot-stage.")
+            })
+            .expect("publication collision must retain the completed private image");
+        assert_eq!(
+            reply_metadata(&private_source(&retained.join("mailbox.sqlite3"))),
+            reply_metadata(&private_source(&source))
+        );
+        let retry = directory.path().join("retry-copy.sqlite3");
+        create_private_canonical_full_archive_snapshot_with_progress(&source, &retry, &mut |_| {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            reply_metadata(&private_source(&retry)),
+            reply_metadata(&private_source(&source))
+        );
+    }
+
+    /// Run the incumbent projected archive and the full-image path together on
+    /// identical input. This is opt-in because the incumbent can be expensive;
+    /// the test asserts exact payload equality, never a host-dependent timing.
+    #[test]
+    #[ignore = "manual same-process archive scaling comparison"]
+    fn archive_snapshot_scale_comparison() {
+        let messages = std::env::var("AM_ARCHIVE_BENCH_MESSAGES")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(2000);
+        assert!((7..=1_000_000).contains(&messages));
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("scale-source.sqlite3");
+        let conn = private_source(&source);
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw("INSERT INTO agents(id,project_id,name) VALUES(2,1,'RedFox'),(3,1,'GoldStone'); CREATE TABLE message_recipients(message_id INTEGER,agent_id INTEGER,kind TEXT,read_ts INTEGER,ack_ts INTEGER,PRIMARY KEY(message_id,agent_id,kind))").unwrap();
+        conn.execute_sync(
+            "WITH RECURSIVE ids(id) AS (VALUES(7) UNION ALL SELECT id+1 FROM ids WHERE id<?1) INSERT INTO messages(id,project_id,sender_id,subject,body_md,archive_metadata_json) SELECT id,1,1,printf('subject-%d',id),printf('message-%d: %s',id,?2),'{\"reply_to\":1}' FROM ids",
+            &[Value::BigInt(messages), Value::Text("synthetic backup durability payload ".repeat(24))],
+        ).unwrap();
+        conn.execute_raw("INSERT INTO message_recipients SELECT messages.id,agents.id,CASE agents.id WHEN 1 THEN 'to' WHEN 2 THEN 'cc' ELSE 'bcc' END,100,200 FROM messages CROSS JOIN agents").unwrap();
+        drop(conn);
+        // Admit a closed copy of exactly the same private fixture. Canonical
+        // reads below always use `source`; they never open the runtime inode.
+        let runtime_source = directory.path().join("scale-runtime-source.sqlite3");
+        std::fs::copy(&source, &runtime_source).unwrap();
+        drop(DbConn::open_file(runtime_source.display().to_string()).unwrap());
+        for live in [false, true] {
+            let engine = if live { "runtime" } else { "canonical" };
+            let selected_source = if live { &runtime_source } else { &source };
+            let projected = directory
+                .path()
+                .join(format!("scale-{engine}-projected.sqlite3"));
+            let full = directory
+                .path()
+                .join(format!("scale-{engine}-full.sqlite3"));
+            let started = Instant::now();
+            if live {
+                create_snapshot_context(
+                    selected_source,
+                    &projected,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            } else {
+                create_private_canonical_snapshot_context(
+                    selected_source,
+                    &projected,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            }
+            .unwrap();
+            let projected_ms = started.elapsed().as_millis();
+            let started = Instant::now();
+            let mut phases = Vec::new();
+            let mut progress = |event: FullArchiveProgress| {
+                if event.state == FullArchiveProgressState::Finished {
+                    phases.push((event.phase, event.elapsed.as_millis()));
+                }
+                Ok(())
+            };
+            if live {
+                create_full_archive_snapshot_with_progress(selected_source, &full, &mut progress)
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    selected_source,
+                    &full,
+                    &mut progress,
+                )
+            }
+            .unwrap();
+            let full_ms = started.elapsed().as_millis();
+            for (sql, columns) in [
+                (
+                    "SELECT id,body_md,subject,recipients_json,archive_metadata_json FROM messages ORDER BY id",
+                    [
+                        "id",
+                        "body_md",
+                        "subject",
+                        "recipients_json",
+                        "archive_metadata_json",
+                    ],
+                ),
+                (
+                    "SELECT message_id,agent_id,kind,CAST(read_ts AS TEXT) AS read_ts,CAST(ack_ts AS TEXT) AS ack_ts FROM message_recipients ORDER BY message_id,agent_id,kind",
+                    ["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+                ),
+            ] {
+                let expected = private_source(&source).query_sync(sql, &[]).unwrap();
+                let actual = private_source(&full).query_sync(sql, &[]).unwrap();
+                let incumbent = private_source(&projected).query_sync(sql, &[]).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                assert_eq!(incumbent.len(), expected.len());
+                for ((expected, actual), incumbent) in expected.iter().zip(&actual).zip(&incumbent)
+                {
+                    for column in columns {
+                        assert_eq!(actual.get_by_name(column), expected.get_by_name(column));
+                        assert_eq!(incumbent.get_by_name(column), expected.get_by_name(column));
+                    }
+                }
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "fixture": "same_process_private_archive",
+                    "source_engine": engine,
+                    "ordering": "projected_then_full",
+                    "messages": messages,
+                    "recipients": messages*3,
+                    "projected_ms": projected_ms,
+                    "full_ms": full_ms,
+                    "full_phase_ms": phases,
+                    "projected_bytes": std::fs::metadata(&projected).unwrap().len(),
+                    "full_bytes": std::fs::metadata(&full).unwrap().len(),
+                    "payload_equal": true,
+                    "production_bottleneck_attributed": false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn full_archive_cancellation_stops_before_publication_without_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("cancel-source.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), false);
+        let source_before = std::fs::read(&source).unwrap();
+        for (index, (phase, state)) in [
+            ("snapshot_source_open", FullArchiveProgressState::Started),
+            ("snapshot_full_copy", FullArchiveProgressState::Started),
+            ("snapshot_full_copy", FullArchiveProgressState::Finished),
+            ("snapshot_neutralize", FullArchiveProgressState::Started),
+            ("snapshot_validate", FullArchiveProgressState::Started),
+            ("snapshot_validate", FullArchiveProgressState::Finished),
+            ("snapshot_publish", FullArchiveProgressState::Started),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = directory.path().join(format!("cancel-{index}.sqlite3"));
+            let mut events = Vec::new();
+            let error = create_private_canonical_full_archive_snapshot_with_progress(
+                &source,
+                &destination,
+                &mut |event| {
+                    events.push(event);
+                    if event.phase == phase && event.state == state {
+                        Err(ShareError::Validation {
+                            message: "stop native archive at checkpoint".to_string(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stop native archive at checkpoint")
+            );
+            assert!(
+                !destination.exists(),
+                "cancellation must not publish an image"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+            let last = events.last().unwrap();
+            assert_eq!((last.phase, last.state), (phase, state));
+        }
+    }
+
+    fn private_source(path: &Path) -> CanonicalDbConn {
+        CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap()
+    }
+
+    fn seed_reply_metadata_source(conn: &impl SnapshotSource, legacy: bool) {
+        for sql in [
+            "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT DEFAULT 'test', model TEXT DEFAULT 'test', task_description TEXT DEFAULT '', inception_ts INTEGER DEFAULT 0, last_active_ts INTEGER DEFAULT 0, attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT DEFAULT 'thread', topic TEXT DEFAULT 'handoff', subject TEXT DEFAULT 'subject', body_md TEXT DEFAULT 'body', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts INTEGER DEFAULT 1707000000000000, recipients_json TEXT DEFAULT '{}', attachments TEXT DEFAULT '[]')",
+        ] {
+            conn.execute_snapshot(sql).unwrap();
+        }
+        // Add the optional column before any rows: this fixture is not a v30
+        // short-record migration, which has its own materialization coverage.
+        if !legacy {
+            conn.execute_snapshot("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
+                .unwrap();
+        }
+        for sql in [
+            "INSERT INTO projects VALUES(1,'reply-copy','/reply-copy',1707000000000000)",
+            "INSERT INTO agents(id,project_id,name) VALUES(1,1,'BlueLake')",
+            "INSERT INTO messages(id,project_id,sender_id) VALUES(1,1,1),(2,1,1),(3,1,1),(4,1,1),(5,1,1),(6,1,1)",
+        ] {
+            conn.execute_snapshot(sql).unwrap();
+        }
+        if !legacy {
+            for sql in [
+                "UPDATE messages SET archive_metadata_json='{}' WHERE id=2",
+                "UPDATE messages SET archive_metadata_json='{\"reply_to\":2}' WHERE id=3",
+                "UPDATE messages SET archive_metadata_json=' { \"reply_to\" : 2 } ' WHERE id=4",
+                "UPDATE messages SET archive_metadata_json='{\"future\":\"private recovery payload\",\"reply_to\":2}' WHERE id=5",
+                "UPDATE messages SET archive_metadata_json='not-json' WHERE id=6",
+            ] {
+                conn.execute_snapshot(sql).unwrap();
+            }
+        }
+    }
+
+    fn reply_metadata(conn: &impl SnapshotSource) -> Vec<(i64, Option<String>)> {
+        conn.query_snapshot(
+            "SELECT id, archive_metadata_json FROM messages ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_named("id").unwrap(),
+                row.get_named("archive_metadata_json").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    const SNAPSHOT_SUCCESS_EVENTS: [SnapshotPhaseEvent; 8] = [
+        SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Filter),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Filter),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Scrub),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Finalize),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize),
+    ];
+
+    #[test]
+    fn snapshot_observer_reports_real_pipeline_and_preserves_private_metadata() {
+        for live in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.sqlite3");
+            let snapshot = dir.path().join("snapshot.sqlite3");
+            let original = if live {
+                let conn = DbConn::open_file(source.display().to_string()).unwrap();
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            };
+            let mut events = Vec::new();
+            let context = if live {
+                create_snapshot_context_with_observer(
+                    &source,
+                    &snapshot,
+                    &["reply-copy".to_string()],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            } else {
+                create_private_canonical_snapshot_context_with_observer(
+                    &source,
+                    &snapshot,
+                    &["reply-copy".to_string()],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            }
+            .unwrap();
+            assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS);
+            assert_eq!(context.scope.projects.len(), 1);
+            assert_eq!(context.scope.remaining.messages, 6);
+            assert_eq!(reply_metadata(&private_source(&snapshot)), original);
+            let unchanged = if live {
+                reply_metadata(&DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                reply_metadata(&private_source(&source))
+            };
+            assert_eq!(
+                unchanged, original,
+                "observation must not mutate the source"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_observer_does_not_finish_or_advance_after_snapshot_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sqlite3");
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        for live in [false, true] {
+            let mut events = Vec::new();
+            let result = if live {
+                create_snapshot_context_with_observer(
+                    &missing,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            } else {
+                create_private_canonical_snapshot_context_with_observer(
+                    &missing,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(ShareError::SnapshotSourceNotFound { .. })
+            ));
+            assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS[..1]);
+            assert!(!snapshot.exists());
+            assert!(!missing.exists());
+        }
+    }
+
+    #[test]
+    fn snapshot_observer_attributes_unknown_project_to_filter_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), false);
+        let original = reply_metadata(&private_source(&source));
+        let mut events = Vec::new();
+        let error = create_private_canonical_snapshot_context_with_observer(
+            &source,
+            &snapshot,
+            &["unknown-private-project".to_string()],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| events.push(event),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ShareError::ScopeIdentifierNotFound { .. }));
+        assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS[..3]);
+        assert_eq!(reply_metadata(&private_source(&source)), original);
+    }
+
+    #[test]
+    fn snapshot_observer_stops_at_failing_scrub_or_finalize_phase() {
+        for (phase, expected_events) in [
+            (SnapshotPhase::Scrub, &SNAPSHOT_SUCCESS_EVENTS[..5]),
+            (SnapshotPhase::Finalize, &SNAPSHOT_SUCCESS_EVENTS[..7]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.sqlite3");
+            let snapshot = dir.path().join("snapshot.sqlite3");
+            let preserved = dir.path().join("snapshot-before-failure.sqlite3");
+            seed_reply_metadata_source(&private_source(&source), false);
+            let original = reply_metadata(&private_source(&source));
+            let mut events = Vec::new();
+            let error = create_private_canonical_snapshot_context_with_observer(
+                &source,
+                &snapshot,
+                &[],
+                crate::ScrubPreset::Archive,
+                SnapshotPurpose::PrivateArchive,
+                &mut |event| {
+                    events.push(event);
+                    if event == SnapshotPhaseEvent::Started(phase) {
+                        // Disposable-fixture fault: preserve the copy, then
+                        // make the next real phase encounter a non-file path.
+                        std::fs::rename(&snapshot, &preserved).unwrap();
+                        std::fs::create_dir(&snapshot).unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, ShareError::Validation { .. }));
+            assert_eq!(events, expected_events);
+            assert!(preserved.is_file(), "keep the failure evidence intact");
+            assert_eq!(reply_metadata(&private_source(&source)), original);
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_exact_reply_authority_through_live_and_private_copies() {
+        for live in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("metadata-source.sqlite3");
+            let copy = dir.path().join("metadata-copy.sqlite3");
+            let rebuilt = dir.path().join("metadata-rebuilt.sqlite3");
+            let expected = if live {
+                let conn = DbConn::open_file(source.display().to_string()).unwrap();
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            };
+            assert_eq!(expected[0], (1, None));
+            assert_eq!(expected[1], (2, Some("{}".to_string())));
+            assert_eq!(expected[2], (3, Some("{\"reply_to\":2}".to_string())));
+            if live {
+                create_sqlite_snapshot(&source, &copy, false).unwrap();
+            } else {
+                create_private_canonical_sqlite_snapshot(&source, &copy, false).unwrap();
+            }
+            assert_eq!(reply_metadata(&private_source(&copy)), expected);
+            create_private_canonical_sqlite_snapshot(&copy, &rebuilt, false).unwrap();
+            assert_eq!(reply_metadata(&private_source(&rebuilt)), expected);
+            let unchanged = if live {
+                reply_metadata(&DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                reply_metadata(&private_source(&source))
+            };
+            assert_eq!(unchanged, expected, "source must remain unchanged");
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_metadata_remains_unknown_instead_of_becoming_a_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy-metadata.sqlite3");
+        let copy = dir.path().join("legacy-copy.sqlite3");
+        let rebuilt = dir.path().join("legacy-rebuilt.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), true);
+        create_private_canonical_sqlite_snapshot(&source, &copy, false).unwrap();
+        create_private_canonical_sqlite_snapshot(&copy, &rebuilt, false).unwrap();
+        let expected: Vec<_> = (1..=6).map(|id| (id, None)).collect();
+        assert_eq!(reply_metadata(&private_source(&copy)), expected);
+        assert_eq!(reply_metadata(&private_source(&rebuilt)), expected);
+    }
+
+    #[test]
+    fn snapshot_context_preserves_private_metadata_and_clears_every_publish_preset() {
+        for preset in [
+            crate::ScrubPreset::Standard,
+            crate::ScrubPreset::Strict,
+            crate::ScrubPreset::Archive,
+        ] {
+            for purpose in [SnapshotPurpose::Publish, SnapshotPurpose::PrivateArchive] {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("context-metadata.sqlite3");
+                let snapshot = dir.path().join("context-copy.sqlite3");
+                seed_reply_metadata_source(&private_source(&source), false);
+                let original = reply_metadata(&private_source(&source));
+                let context = create_private_canonical_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    preset,
+                    purpose,
+                )
+                .unwrap();
+                let expected = if purpose == SnapshotPurpose::PrivateArchive
+                    && matches!(preset, crate::ScrubPreset::Archive)
+                {
+                    original.clone()
+                } else {
+                    original.iter().map(|(id, _)| (*id, None)).collect()
+                };
+                assert_eq!(reply_metadata(&private_source(&snapshot)), expected);
+                assert_eq!(reply_metadata(&private_source(&source)), original);
+                let copied = private_source(&snapshot);
+                let derived = copied
+                    .query_sync(
+                        "SELECT name FROM sqlite_master WHERE name IN \
+                         ('fts_messages', 'message_overview_mv', 'attachments_by_message_mv', \
+                          'fts_search_overview_mv') ORDER BY name",
+                        &[],
+                    )
+                    .unwrap();
+                if purpose == SnapshotPurpose::PrivateArchive {
+                    assert!(!context.fts_enabled);
+                    assert!(derived.is_empty(), "backups do not need viewer artifacts");
+                } else {
+                    assert!(context.fts_enabled);
+                    assert_eq!(derived.len(), 4, "published bundles keep their viewer data");
+                    let overview = copied
+                        .query_sync("SELECT id FROM message_overview_mv ORDER BY id", &[])
+                        .unwrap();
+                    assert_eq!(overview.len(), original.len());
+                }
+                let bytes = std::fs::read(&snapshot).unwrap();
+                let private_payload = b"private recovery payload";
+                assert_eq!(
+                    bytes
+                        .windows(private_payload.len())
+                        .any(|part| part == private_payload),
+                    purpose == SnapshotPurpose::PrivateArchive
+                        && matches!(preset, crate::ScrubPreset::Archive),
+                    "compaction must remove scrubbed payload bytes for {purpose:?}/{preset:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_archive_context_keeps_restore_authority_without_viewer_work() {
+        fn seed(conn: &impl SnapshotSource) {
+            for sql in [
+                "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+                "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, reaper_exempt INTEGER, registration_token TEXT, retired_at INTEGER)",
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, body_md TEXT, ack_required INTEGER, recipients_json TEXT, attachments TEXT, archive_metadata_json TEXT)",
+                "CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind))",
+                "CREATE TABLE file_reservations(id INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, path_pattern TEXT, released_ts INTEGER)",
+                "CREATE TABLE file_reservation_releases(reservation_id INTEGER PRIMARY KEY, released_ts INTEGER)",
+                "CREATE TABLE agent_deregistrations(agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
+                "CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY, project_id INTEGER, kind TEXT, delivered_ts INTEGER)",
+                "CREATE TABLE project_mailbox_receipts(message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id))",
+                "INSERT INTO projects VALUES(1,'restore-state','/restore-state',1707000000000000)",
+                "INSERT INTO agents VALUES(-9,1,'RetiredLake',1,'retired-secret',800),(0,1,'BlueLake',1,'blue-secret',NULL),(1,1,'RedLake',0,'red-secret',NULL)",
+                r#"INSERT INTO messages VALUES(-7,1,1,'private body',1,'{"to":["BlueLake"],"cc":["BlueLake"],"bcc":[]}','[{"path":"private.txt"}]',' { "reply_to" : 0 } '),(0,1,1,'zero identity',0,'{}','[]','{}'),(1,1,1,'shared body',1,'{"to":["project:restore-state"],"cc":[],"bcc":[]}','[]',NULL)"#,
+                "INSERT INTO message_recipients VALUES(-7,0,'cc',NULL,222),(-7,0,'to',111,NULL),(0,1,'to',333,444)",
+                "INSERT INTO file_reservations VALUES(-3,1,0,'src/**',900)",
+                "INSERT INTO file_reservation_releases VALUES(-3,900)",
+                "INSERT INTO agent_deregistrations VALUES(-9,800)",
+                "INSERT INTO project_mailbox_deliveries VALUES(1,1,'to',500)",
+                "INSERT INTO project_mailbox_receipts VALUES(1,0,100,110)",
+            ] {
+                conn.execute_snapshot(sql).unwrap();
+            }
+        }
+
+        fn restore_state(conn: &impl SnapshotSource) -> Vec<Vec<Value>> {
+            let mut result = Vec::new();
+            for (sql, columns) in [
+                (
+                    "SELECT id,slug,human_key,CAST(created_at AS TEXT) AS created_at FROM projects ORDER BY id",
+                    &["id", "slug", "human_key", "created_at"][..],
+                ),
+                (
+                    "SELECT id,name,reaper_exempt,registration_token,CAST(retired_at AS TEXT) AS retired_at FROM agents ORDER BY id",
+                    &[
+                        "id",
+                        "name",
+                        "reaper_exempt",
+                        "registration_token",
+                        "retired_at",
+                    ][..],
+                ),
+                (
+                    "SELECT id,body_md,ack_required,recipients_json,attachments,archive_metadata_json FROM messages ORDER BY id",
+                    &[
+                        "id",
+                        "body_md",
+                        "ack_required",
+                        "recipients_json",
+                        "attachments",
+                        "archive_metadata_json",
+                    ][..],
+                ),
+                (
+                    "SELECT message_id,agent_id,kind,CAST(read_ts AS TEXT) AS read_ts,CAST(ack_ts AS TEXT) AS ack_ts FROM message_recipients ORDER BY message_id,agent_id,kind",
+                    &["message_id", "agent_id", "kind", "read_ts", "ack_ts"][..],
+                ),
+                (
+                    "SELECT id,path_pattern,CAST(released_ts AS TEXT) AS released_ts FROM file_reservations ORDER BY id",
+                    &["id", "path_pattern", "released_ts"][..],
+                ),
+                (
+                    "SELECT reservation_id,CAST(released_ts AS TEXT) AS released_ts FROM file_reservation_releases ORDER BY reservation_id",
+                    &["reservation_id", "released_ts"][..],
+                ),
+                (
+                    "SELECT agent_id,CAST(deregistered_at AS TEXT) AS deregistered_at FROM agent_deregistrations ORDER BY agent_id",
+                    &["agent_id", "deregistered_at"][..],
+                ),
+                (
+                    "SELECT message_id,project_id,kind,delivered_ts FROM project_mailbox_deliveries ORDER BY message_id",
+                    &["message_id", "project_id", "kind", "delivered_ts"][..],
+                ),
+                (
+                    "SELECT message_id,agent_id,read_ts,ack_ts FROM project_mailbox_receipts ORDER BY message_id,agent_id",
+                    &["message_id", "agent_id", "read_ts", "ack_ts"][..],
+                ),
+            ] {
+                for row in conn.query_snapshot(sql, &[]).unwrap() {
+                    result.push(
+                        columns
+                            .iter()
+                            .map(|column| match row.get_by_name(column).unwrap() {
+                                Value::Int(value) => Value::BigInt(i64::from(*value)),
+                                value => value.clone(),
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            result
+        }
+
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.sqlite3");
+            let snapshot = directory.path().join("archive.sqlite3");
+            let original = if live {
+                let conn = DbConn::open_file(source.to_str().unwrap()).unwrap();
+                seed(&conn);
+                restore_state(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed(&conn);
+                restore_state(&conn)
+            };
+            let context = if live {
+                create_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            } else {
+                create_private_canonical_snapshot_context(
+                    &source,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                )
+            }
+            .unwrap();
+            assert!(!context.fts_enabled);
+            assert_eq!(context.scope.remaining.messages, 3);
+            assert!(!sqlite_sidecar_artifacts_exist(&snapshot).unwrap());
+            let guarded = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+                &snapshot,
+                "restorable private archive handoff test",
+            )
+            .expect("the unchanged guard must admit the completed private archive");
+            assert!(matches!(
+                &guarded,
+                mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical(_)
+            ));
+            drop(guarded);
+            let copied = private_source(&snapshot);
+            assert_eq!(restore_state(&copied), original);
+            let integrity = copied.query_sync("PRAGMA integrity_check", &[]).unwrap();
+            assert_eq!(integrity.len(), 1);
+            assert_eq!(integrity[0].get_as::<String>(0).unwrap(), "ok");
+            let unchanged = if live {
+                restore_state(&DbConn::open_file(source.to_str().unwrap()).unwrap())
+            } else {
+                restore_state(&private_source(&source))
+            };
+            assert_eq!(unchanged, original, "the source remains authoritative");
+        }
+    }
+
+    fn seed_large_private_archive(path: &Path) -> usize {
+        let conn = private_source(path);
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token='restorable-registration-token'; \
+             CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, \
+                 read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); \
+             BEGIN IMMEDIATE",
+        )
+        .unwrap();
+        let count = 2 * SNAPSHOT_PAGE_ROWS + 7;
+        for id in 1..=i64::try_from(count).unwrap() {
+            if id > 6 {
+                conn.execute_sync(
+                    "INSERT INTO messages(id,project_id,sender_id,body_md,attachments,archive_metadata_json) \
+                     VALUES(?1,1,1,?2,?3,?4)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(format!("message body {id}")),
+                        Value::Text(format!("[{{\"path\":\"attachments/item-{id}.bin\"}}]")),
+                        Value::Text(format!("{{\"reply_to\":{}}}", id - 1)),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_sync(
+                "INSERT INTO message_recipients VALUES(?1,1,'to',?2,?3)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(id * 2),
+                    Value::BigInt(id * 3),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        count
+    }
+
+    #[test]
+    fn private_archive_progress_bounds_copy_pages_without_building_viewer_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("large-source.sqlite3");
+        let snapshot = dir.path().join("large-archive.sqlite3");
+        let count = seed_large_private_archive(&source);
+        let original = std::fs::read(&source).unwrap();
+        let mut events = Vec::new();
+        let context = create_private_canonical_snapshot_context_with_progress(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!context.fts_enabled);
+        let mut phases = events.iter().map(|event| event.phase).collect::<Vec<_>>();
+        phases.dedup();
+        assert_eq!(
+            phases,
+            [
+                SnapshotProgressPhase::Copy,
+                SnapshotProgressPhase::Scope,
+                SnapshotProgressPhase::Scrub,
+                SnapshotProgressPhase::Compact
+            ]
+        );
+        for phase in [SnapshotProgressPhase::Copy, SnapshotProgressPhase::Compact] {
+            for table in ["messages", "message_recipients"] {
+                let counts = events
+                    .iter()
+                    .filter(|event| event.phase == phase && event.table == Some(table))
+                    .map(|event| event.rows_copied)
+                    .collect::<Vec<_>>();
+                assert_eq!(counts, [0, 1000, 2000, 2007]);
+            }
+        }
+        let conn = private_source(&snapshot);
+        let rows = conn
+            .query_sync(
+                "SELECT id,body_md,attachments,archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), count);
+        for (index, row) in rows.iter().enumerate().skip(6) {
+            let id = i64::try_from(index + 1).unwrap();
+            assert_eq!(row.get_named::<i64>("id").unwrap(), id);
+            assert_eq!(
+                row.get_named::<String>("body_md").unwrap(),
+                format!("message body {id}")
+            );
+            assert_eq!(
+                row.get_named::<String>("attachments").unwrap(),
+                format!("[{{\"path\":\"attachments/item-{id}.bin\"}}]"),
+            );
+            assert_eq!(
+                row.get_named::<String>("archive_metadata_json").unwrap(),
+                format!("{{\"reply_to\":{}}}", id - 1),
+            );
+        }
+        let receipts = conn
+            .query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM message_recipients ORDER BY message_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), count);
+        for (index, row) in receipts.iter().enumerate() {
+            let id = i64::try_from(index + 1).unwrap();
+            assert_eq!(row.get_named::<i64>("message_id").unwrap(), id);
+            assert_eq!(
+                row.get_named::<String>("read_ts").unwrap(),
+                (id * 2).to_string()
+            );
+            assert_eq!(
+                row.get_named::<String>("ack_ts").unwrap(),
+                (id * 3).to_string()
+            );
+        }
+        assert_eq!(
+            conn.query_sync("SELECT registration_token FROM agents WHERE id=1", &[])
+                .unwrap()[0]
+                .get_named::<String>("registration_token")
+                .unwrap(),
+            "restorable-registration-token",
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'fts_%' OR name LIKE '%_mv'",
+                &[],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA quick_check", &[]).unwrap()[0]
+                .get_as::<String>(0)
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn snapshot_cancel_after_copy_page_does_not_publish_and_releases_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cancel-source.sqlite3");
+        let snapshot = dir.path().join("cancel-copy.sqlite3");
+        seed_large_private_archive(&source);
+        let original = std::fs::read(&source).unwrap();
+        let mut stopped = false;
+        let error = create_private_canonical_snapshot_context_with_progress(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| {
+                if event.phase == SnapshotProgressPhase::Copy
+                    && event.table == Some("messages")
+                    && event.rows_copied == 1000
+                {
+                    stopped = true;
+                    return Err(ShareError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled by test observer",
+                    )));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(stopped);
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert!(!snapshot.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        private_source(&source)
+            .execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+        // The same destination can be used after cancellation; no partial
+        // image or transaction from the cancelled attempt is reusable authority.
+        create_private_canonical_sqlite_snapshot(&source, &snapshot, false).unwrap();
+        assert_eq!(
+            private_source(&snapshot)
+                .query_sync("SELECT count(*) AS n FROM messages", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2007,
+        );
+    }
+
+    #[test]
+    fn snapshot_cancel_during_compaction_preserves_the_prepared_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("compact-source.sqlite3");
+        let snapshot = dir.path().join("compact-copy.sqlite3");
+        seed_large_private_archive(&source);
+        create_private_canonical_sqlite_snapshot(&source, &snapshot, false).unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        let error = crate::finalize::finalize_snapshot_with_progress(&snapshot, &mut |event| {
+            if event.table == Some("messages") && event.rows_copied == 1000 {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled while compacting",
+                )));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_observer_cancellation_rolls_back_the_source_read_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("held-source.sqlite3"));
+        seed_reply_metadata_source(&source, false);
+        let destination = private_source(&dir.path().join("held-copy.sqlite3"));
+        let error = transfer_tables_with_progress(
+            &source,
+            &destination,
+            SnapshotProgressPhase::Copy,
+            &mut |event| {
+                if event.table == Some("messages") && event.rows_copied > 0 {
+                    return Err(ShareError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled source read",
+                    )));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ShareError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        // Keep the source connection alive: Drop cannot mask a leaked read
+        // transaction. A fresh transaction must work immediately after cancel.
+        source.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(reply_metadata(&source).len(), 6);
+    }
+
+    #[test]
+    #[ignore = "manual same-fixture private archive versus previous viewer-finalization path"]
+    fn private_archive_and_viewer_baseline_performance() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("benchmark-source.sqlite3");
+        let archive = dir.path().join("benchmark-archive.sqlite3");
+        let baseline = dir.path().join("benchmark-viewer-baseline.sqlite3");
+        let messages = seed_large_private_archive(&source);
+
+        // The incumbent archive path in the same invocation: snapshot, scope,
+        // archive scrub and the full static-viewer finalization. This preserves
+        // private fields exactly; using Publish would clear credentials and
+        // would not be an equivalent baseline.
+        let started = std::time::Instant::now();
+        create_private_canonical_sqlite_snapshot(&source, &baseline, true).unwrap();
+        crate::apply_project_scope(&baseline, &[]).unwrap();
+        crate::scrub_snapshot(&baseline, crate::ScrubPreset::Archive).unwrap();
+        let old_finalize = crate::finalize_export_db(&baseline).unwrap();
+        let baseline_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let context = create_private_canonical_snapshot_context(
+            &source,
+            &archive,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+        )
+        .unwrap();
+        let archive_elapsed = started.elapsed();
+        assert!(old_finalize.fts_enabled);
+        assert!(!context.fts_enabled);
+        let previous = private_source(&baseline);
+        let current = private_source(&archive);
+        for table in KNOWN_TABLES {
+            let sql = format!(
+                "SELECT {} FROM \"{}\" ORDER BY {}",
+                quoted_column_list(table.columns),
+                table.name,
+                quoted_column_list(table.primary_key_columns),
+            );
+            let values = |connection: &CanonicalDbConn| {
+                connection
+                    .query_sync(&sql, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                row.get_by_name(column)
+                                    .cloned()
+                                    .expect("known snapshot column")
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values(&current), values(&previous), "{}", table.name);
+        }
+        eprintln!(
+            "archive snapshot comparison: messages={messages} baseline_ms={} archive_ms={} baseline_bytes={} archive_bytes={}",
+            baseline_elapsed.as_millis(),
+            archive_elapsed.as_millis(),
+            std::fs::metadata(&baseline).unwrap().len(),
+            std::fs::metadata(&archive).unwrap().len(),
+        );
+        // No wall-time threshold: record both measurements; correctness and
+        // elimination of unnecessary derivatives are deterministic assertions.
+    }
+
+    #[test]
+    fn snapshot_metadata_pagination_observes_one_wal_generation() {
+        use std::cell::Cell;
+        struct MetadataRace<'a> {
+            reader: &'a CanonicalDbConn,
+            writer: &'a CanonicalDbConn,
+            pages: Cell<usize>,
+        }
+        impl SnapshotSource for MetadataRace<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                if sql.contains("FROM \"messages\"") {
+                    assert!(sql.contains("\"archive_metadata_json\" AS \"archive_metadata_json\""));
+                    assert!(sql.ends_with("LIMIT 1000"));
+                    assert!(rows.len() <= 1000);
+                    self.pages.set(self.pages.get() + 1);
+                    if self.pages.get() == 1 {
+                        self.writer.execute_raw("BEGIN IMMEDIATE; UPDATE messages SET archive_metadata_json='{\"reply_to\":2}', body_md='later body' WHERE id=1001; COMMIT")?;
+                    }
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("wal-metadata.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        for id in 7..=1001 {
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,archive_metadata_json) VALUES(?1,1,1,'{\"reply_to\":1}')",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        let expected = reply_metadata(&conn);
+        let writer = private_source(&source);
+        let target = private_source(&dir.path().join("wal-metadata-copy.sqlite3"));
+        let race = MetadataRace {
+            reader: &conn,
+            writer: &writer,
+            pages: Cell::new(0),
+        };
+        transfer_tables_in_consistent_read(&race, &target).unwrap();
+        assert_eq!(race.pages.get(), 3);
+        assert_eq!(reply_metadata(&target), expected);
+        assert_eq!(
+            reply_metadata(&conn).last().unwrap().1.as_deref(),
+            Some("{\"reply_to\":2}")
+        );
+        let copied_body = target
+            .query_sync("SELECT body_md FROM messages WHERE id=1001", &[])
+            .unwrap();
+        assert_eq!(
+            copied_body[0].get_named::<String>("body_md").unwrap(),
+            "body"
+        );
+    }
+
+    #[test]
+    fn snapshot_pagination_preserves_the_entire_signed_identity_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("signed-source.sqlite3");
+        let copied = dir.path().join("signed-copy.sqlite3");
+        let rebuilt = dir.path().join("signed-rebuilt.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)").unwrap();
+        let ids = [i64::MIN, -1001, -1, 0, 1, i64::MAX];
+        for id in ids {
+            conn.execute_sync(
+                "INSERT INTO projects VALUES(?1, ?2, ?3, 0)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(format!("p-{id}")),
+                    Value::Text(format!("/p-{id}")),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &copied, false).unwrap();
+        create_private_canonical_sqlite_snapshot(&copied, &rebuilt, false).unwrap();
+        for path in [&source, &copied, &rebuilt] {
+            let rows = private_source(path)
+                .query_sync("SELECT id FROM projects ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.get_named::<i64>("id").unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_recipient_pages_preserve_one_messages_large_population() {
+        use std::cell::Cell;
+        struct Recorded<'a> {
+            source: &'a CanonicalDbConn,
+            pages: Cell<usize>,
+        }
+        impl SnapshotSource for Recorded<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.source.execute_raw(sql)
+            }
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.source.query_sync(sql, params)?;
+                if sql.contains("FROM \"message_recipients\"") {
+                    assert!(sql.ends_with("LIMIT 1000"), "{sql}");
+                    assert!(rows.len() <= SNAPSHOT_PAGE_ROWS);
+                    self.pages.set(self.pages.get() + 1);
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("many-recipients.sqlite3"));
+        let target = private_source(&dir.path().join("many-recipients-copy.sqlite3"));
+        source.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id, kind)); BEGIN").unwrap();
+        for agent in -500..650 {
+            for kind in ["to", "cc", "bcc"] {
+                source
+                    .execute_sync(
+                        "INSERT INTO message_recipients VALUES(-1, ?1, ?2, ?3, NULL)",
+                        &[
+                            Value::BigInt(agent),
+                            Value::Text(kind.into()),
+                            Value::BigInt(agent + 1000),
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let recorded = Recorded {
+            source: &source,
+            pages: Cell::new(0),
+        };
+        transfer_tables_in_consistent_read(&recorded, &target).unwrap();
+        assert_eq!(recorded.pages.get(), 5);
+        let rows = target.query_sync("SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id, kind", &[]).unwrap();
+        assert_eq!(rows.len(), 3450);
+        for (row, (agent, kind)) in rows
+            .iter()
+            .zip((-500..650).flat_map(|agent| ["bcc", "cc", "to"].map(|kind| (agent, kind))))
+        {
+            assert_eq!(row.get_named::<i64>("message_id").unwrap(), -1);
+            assert_eq!(row.get_named::<i64>("agent_id").unwrap(), agent);
+            assert_eq!(row.get_named::<String>("kind").unwrap(), kind);
+            assert_eq!(
+                row.get_named::<String>("read_ts").unwrap(),
+                (agent + 1000).to_string()
+            );
+            assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn recipient_continuation_seeks_past_previous_message_populations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("recipient-seek.sqlite3"));
+        source
+            .execute_raw(
+                "CREATE TABLE message_recipients(message_id INTEGER NOT NULL, \
+             agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, \
+             ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); BEGIN IMMEDIATE",
+            )
+            .unwrap();
+        for id in 1..=2007 {
+            source
+                .execute_sync(
+                    "INSERT INTO message_recipients VALUES(?1,1,'to',?2,?3)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(id * 2),
+                        Value::BigInt(id * 3),
+                    ],
+                )
+                .unwrap();
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let table = KNOWN_TABLES
+            .iter()
+            .find(|table| table.name == "message_recipients")
+            .unwrap();
+        let (sql, params) = snapshot_page_query(
+            table,
+            table.columns,
+            table.primary_key_columns,
+            Some(&[
+                SnapshotKey::Integer(1000),
+                SnapshotKey::Integer(1),
+                SnapshotKey::Text("to".into()),
+            ]),
+        );
+        let plan = source
+            .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| {
+                let detail = row.get_named::<String>("detail").unwrap();
+                detail.contains("SEARCH") && detail.contains("message_recipients")
+            }),
+            "continuation must seek into the real primary-key index: {plan:?}"
+        );
+        let rows = source.query_sync(&sql, &params).unwrap();
+        let ids = rows
+            .iter()
+            .map(|row| row.get_named::<i64>("message_id").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (1001..=2000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snapshot_pagination_accepts_uppercase_imported_key_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("uppercase-source.sqlite3");
+        let target = dir.path().join("uppercase-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE PROJECTS(ID INTEGER PRIMARY KEY, SLUG TEXT, HUMAN_KEY TEXT, CREATED_AT INTEGER); INSERT INTO PROJECTS VALUES(-7, 'upper', '/upper', 17)").unwrap();
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
+        let rows = private_source(&target)
+            .query_sync("SELECT id, slug, created_at FROM projects", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), -7);
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "upper");
+        assert_eq!(rows[0].get_named::<String>("created_at").unwrap(), "17");
+    }
+
+    #[test]
+    fn snapshot_refuses_unconstrained_keys_before_boundary_duplicates_are_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("duplicate-source.sqlite3");
+        let target = dir.path().join("duplicate-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE projects(id INTEGER, slug TEXT, human_key TEXT, created_at INTEGER); BEGIN").unwrap();
+        for n in 1..=1001 {
+            let id = n.min(1000);
+            conn.execute_sync(
+                "INSERT INTO projects VALUES(?1, ?2, '/duplicate', 0)",
+                &[Value::BigInt(id), Value::Text(format!("original-{n}"))],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        drop(conn);
+        let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
+        assert!(
+            error.to_string().contains("not uniquely constrained"),
+            "{error}"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            private_source(&source)
+                .query_sync("SELECT count(*) AS n FROM projects", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            1001
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_null_composite_keys_instead_of_skipping_a_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("null-recipient.sqlite3");
+        let target = dir.path().join("null-recipient-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); INSERT INTO message_recipients VALUES(1, 2, NULL, 17, 19)").unwrap();
+        drop(conn);
+        let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("non-text pagination column message_recipients.kind")
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            private_source(&source)
+                .query_sync("SELECT ack_ts FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("ack_ts")
+                .unwrap(),
+            19
+        );
+    }
+
+    #[test]
+    fn snapshot_composite_cursor_uses_binary_order_even_on_nocase_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("nocase-source.sqlite3");
+        let target = dir.path().join("nocase-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT COLLATE NOCASE, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); BEGIN").unwrap();
+        let kinds = (0..1100)
+            .map(|n| format!("{}-{n:04}", if n % 2 == 0 { "B" } else { "a" }))
+            .collect::<Vec<_>>();
+        for kind in &kinds {
+            conn.execute_sync(
+                "INSERT INTO message_recipients VALUES(1, 2, ?1, NULL, 19)",
+                &[Value::Text(kind.clone())],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
+        let rows = private_source(&target)
+            .query_sync(
+                "SELECT kind FROM message_recipients ORDER BY kind COLLATE BINARY",
+                &[],
+            )
+            .unwrap();
+        let mut expected = kinds;
+        expected.sort();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get_named::<String>("kind").unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_nonadvancing_source_pages_and_releases_its_read() {
+        struct Reversed<'a>(&'a CanonicalDbConn);
+        impl SnapshotSource for Reversed<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let mut rows = self.0.query_sync(sql, params)?;
+                if sql.contains("FROM \"projects\"") {
+                    rows.reverse();
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("reversed-source.sqlite3"));
+        let target = private_source(&dir.path().join("reversed-copy.sqlite3"));
+        source.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER); INSERT INTO projects VALUES(1,'one','/one',0),(2,'two','/two',0)").unwrap();
+        let error = transfer_tables_in_consistent_read(&Reversed(&source), &target).unwrap_err();
+        assert!(error.to_string().contains("cursor did not advance"));
+        source.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn snapshot_recipient_paging_keeps_one_wal_snapshot_across_peer_commits() {
+        use std::cell::Cell;
+        struct Interleaved<'a> {
+            source: &'a CanonicalDbConn,
+            writer: &'a CanonicalDbConn,
+            fired: Cell<bool>,
+        }
+        impl SnapshotSource for Interleaved<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.source.execute_raw(sql)
+            }
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.source.query_sync(sql, params)?;
+                if sql.contains("FROM \"message_recipients\"") && !self.fired.replace(true) {
+                    self.writer.execute_raw("BEGIN IMMEDIATE; UPDATE message_recipients SET ack_ts = 999 WHERE agent_id = 2000; INSERT INTO message_recipients VALUES(1,9999,'to',NULL,777); COMMIT")?;
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paged-wal.sqlite3");
+        let source = private_source(&path);
+        source.execute_raw("PRAGMA journal_mode=WAL; CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); BEGIN").unwrap();
+        for agent in 1..=2300 {
+            source
+                .execute_sync(
+                    "INSERT INTO message_recipients VALUES(1,?1,'to',NULL,NULL)",
+                    &[Value::BigInt(agent)],
+                )
+                .unwrap();
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let writer = private_source(&path);
+        let target = private_source(&dir.path().join("paged-wal-copy.sqlite3"));
+        let interleaved = Interleaved {
+            source: &source,
+            writer: &writer,
+            fired: Cell::new(false),
+        };
+        transfer_tables_in_consistent_read(&interleaved, &target).unwrap();
+        assert!(interleaved.fired.get());
+        assert_eq!(
+            target
+                .query_sync("SELECT count(*) AS n FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2300
+        );
+        assert_eq!(
+            target
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE agent_id=2000",
+                    &[]
+                )
+                .unwrap()[0]
+                .get_named::<Option<String>>("ack_ts")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            source
+                .query_sync("SELECT count(*) AS n FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2301
+        );
+        assert_eq!(
+            source
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE agent_id=2000",
+                    &[]
+                )
+                .unwrap()[0]
+                .get_named::<i64>("ack_ts")
+                .unwrap(),
+            999
+        );
+    }
 
     struct InterleavingSnapshotSource {
         inner: DbConn,
@@ -2156,8 +4733,14 @@ mod tests {
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
         let snapshot = dir.path().join("snapshot.sqlite3");
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Standard,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert!(context.snapshot_path.exists());
         assert!(!context.scope.projects.is_empty());
         assert_eq!(
@@ -2225,6 +4808,44 @@ mod tests {
         let verify = verify_bundle(&output, None).unwrap();
         assert!(verify.signature_checked);
         assert!(verify.signature_verified);
+
+        // 15. The signed manifest covers every file the export wrote: a swapped
+        // viewer page fails verification; the hosting config the deploy wizard
+        // rewrites per provider does not.
+        assert!(verify.files_checked && verify.files_verified, "{verify:?}");
+        let listed = manifest["files"].as_object().expect("files map");
+        for path in [
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "mailbox.sqlite3",
+        ] {
+            assert!(listed.contains_key(path), "{path} must be hashed");
+        }
+        for path in [
+            "manifest.json",
+            "manifest.sig.json",
+            "_headers",
+            ".nojekyll",
+        ] {
+            assert!(!listed.contains_key(path), "{path} must not be hashed");
+        }
+        std::fs::write(output.join("_headers"), "/*\n  X-Provider: rewritten\n").unwrap();
+        assert!(verify_bundle(&output, None).unwrap().files_verified);
+        let viewer = output.join("viewer/index.html");
+        std::fs::write(&viewer, b"<script>exfiltrate()</script>").unwrap();
+        let tampered = verify_bundle(&output, None).unwrap();
+        assert!(
+            tampered.signature_verified,
+            "the manifest itself is untouched"
+        );
+        assert!(!tampered.files_verified);
+        assert!(
+            tampered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("viewer/index.html")),
+            "{tampered:?}"
+        );
     }
 
     #[test]
@@ -2277,8 +4898,14 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Standard,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert!(context.snapshot_path.exists());
 
         let copy_conn = SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
@@ -2387,8 +5014,14 @@ mod tests {
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
         let snapshot = dir.path().join("snapshot.sqlite3");
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Archive).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert_eq!(context.scope.projects[0].human_key, "/test/proj");
 
         let output = dir.path().join("bundle");

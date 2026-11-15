@@ -17,11 +17,20 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool,
-    get_coalescer_bypass_read_db_pool, get_db_pool, get_read_db_pool, legacy_tool_error,
-    resolve_existing_project, resolve_project,
+    get_coalescer_bypass_read_db_pool, get_db_pool_for_request, get_read_db_pool,
+    legacy_tool_error, resolve_existing_project, resolve_project,
 };
+
+#[cfg(test)]
+thread_local! {
+    // One-shot failure after the real lookup; writes and session binding use
+    // the production path so the regression checks their absence on failure.
+    static REGISTRATION_LOOKUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
 /// for `register_agent` (#98). Matches the same shape the lib.rs error mapper
@@ -565,12 +574,18 @@ fn coalescer_latency_health_level(
 ///
 /// Read-only: enumerates the same recovery-debris / direct-backup / staging
 /// inventories `am doctor health` reports, through the single shared
-/// implementation in the db crate. Returns `None` (block omitted) when the
-/// mailbox path cannot be resolved (e.g. `:memory:`) or the storage root
-/// cannot be inspected — health never fails on accounting.
-fn health_check_retention_block(config: &Config) -> Option<RetentionHealthResponse> {
-    let resolved =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+/// implementation in the db crate. Only an in-memory mailbox is inapplicable.
+/// A failed inventory is unavailable evidence and must degrade readiness, not
+/// silently disappear from a green response. No accounting result authorizes
+/// recovery or deletion.
+fn health_check_retention_block(
+    config: &Config,
+) -> Result<Option<RetentionHealthResponse>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|error| format!("resolving retention mailbox: {error}"))?;
     let database_path = Path::new(&resolved.canonical_path);
     let live_database_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
     // Same policy shape as the integrity guard's observe-and-alert sweep
@@ -590,12 +605,15 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         database_path,
         Some((policy, now_us)),
     )
-    .ok()?;
-    // The existing operator warn threshold: the integrity guard warns when
-    // the reclaimable debris crosses `doctor_retention_alert_bytes`.
-    let reclaimable_attention = config.doctor_retention_alert_bytes > 0
-        && stats.reclaimable_bytes >= config.doctor_retention_alert_bytes;
-    Some(RetentionHealthResponse {
+    .map_err(|error| format!("inspecting retention footprint: {error}"))?;
+    let staging = mcp_agent_mail_db::recovery_retention::staging::assess_automatic_backup_staging(
+        database_path,
+        stats.proactive_backup_staging,
+    )
+    .map_err(|error| format!("automatic backup staging assessment unavailable: {error}"))?;
+    let reclaimable_attention = stats.reclaimable_attention(config.doctor_retention_alert_bytes);
+    let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
+    Ok(Some(RetentionHealthResponse {
         resident_bytes: stats.resident_bytes,
         resident_bytes_by_category: stats
             .resident_bytes_by_category
@@ -606,7 +624,72 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         reclaimable_bytes: stats.reclaimable_bytes,
         live_database_bytes: stats.live_database_bytes,
         reclaimable_attention,
-    })
+        resident_attention,
+        automatic_backup_staging: Some(BackupStagingHealthResponse::from_assessment(staging)),
+    }))
+}
+
+/// Retention is operational degradation, never a live-corruption verdict.
+/// Keep an explicit contributor even when the byte inventory could not run.
+fn retention_health_verdict(
+    retention: &Result<Option<RetentionHealthResponse>, String>,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel;
+    match retention {
+        Err(error) => HealthVerdict::new(
+            HealthLevel::Yellow,
+            false,
+            format!(
+                "retention inventory unavailable: {error}; inspect mailbox paths and permissions; no clean footprint was established"
+            ),
+        ),
+        Ok(None) => HealthVerdict::new(
+            HealthLevel::Green,
+            false,
+            "in-memory mailbox has no filesystem retention footprint",
+        ),
+        Ok(Some(retention)) => {
+            let staging = retention.automatic_backup_staging.as_ref();
+            let staging_refusal = staging.and_then(|assessment| assessment.refusal.as_deref());
+            let attention = retention.resident_attention
+                || retention.reclaimable_attention
+                || staging_refusal.is_some()
+                || staging.is_none();
+            let live_database = retention
+                .live_database_bytes
+                .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string());
+            let next_step = match staging_refusal {
+                Some(reason) => format!(
+                    "automatic backups refused: {reason}; {}",
+                    mcp_agent_mail_db::recovery_retention::staging::STAGING_REMEDIATION
+                ),
+                None if staging.is_none() => "automatic backup staging assessment unavailable; request a fresh health check before treating backups as available".to_string(),
+                None if attention => "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption".to_string(),
+                None => "staging budget permits an attempt; retention is below the configured alert thresholds, or byte alerts are disabled".to_string(),
+            };
+            HealthVerdict::new(
+                if attention {
+                    HealthLevel::Yellow
+                } else {
+                    HealthLevel::Green
+                },
+                false,
+                format!(
+                    "resident_bytes={} live_database_bytes={} reclaimable_bytes={} resident_attention={} reclaimable_attention={} retained_staging_artifacts={}; {}",
+                    retention.resident_bytes,
+                    live_database,
+                    retention.reclaimable_bytes,
+                    retention.resident_attention,
+                    retention.reclaimable_attention,
+                    staging.map_or_else(
+                        || "unavailable".to_string(),
+                        |assessment| assessment.retained_artifacts.to_string()
+                    ),
+                    next_step,
+                ),
+            )
+        }
+    }
 }
 
 fn percentage_clamped(value: u64, total: u64) -> u64 {
@@ -626,6 +709,11 @@ const HEALTH_CHECK_REQUIRED_TABLES: &[&str] =
 pub struct SemanticReadinessResponse {
     pub status: String,
     pub detail: String,
+    /// Observed excess of SQLite messages over canonical archive messages.
+    /// This is an inventory count, not proof of which message IDs are missing.
+    /// Absent when parity was skipped or the inventory could not be inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_message_gap: Option<u64>,
 }
 
 /// One independent health verdict (br-bvq1x.3.1 / C1).
@@ -809,6 +897,246 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
+const fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot) -> bool {
+    lag.backlog_depth > 0
+        || lag.coalescer_pending > 0
+        || lag.wbq_depth > 0
+        || lag.wbq_inflight_oldest_age_us > 0
+        || lag.wbq_inflight_execution_us > 0
+        || lag.oldest_unmaterialized_us > 0
+}
+
+const MAX_ARCHIVE_GAP_OBSERVATIONS: usize = 64;
+const MAX_ARCHIVE_GAP_GENERATION_BYTES: usize = 256;
+const ARCHIVE_GAP_CRITICAL_AGE: std::time::Duration = std::time::Duration::from_mins(30);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveGapMailbox {
+    database_url: String,
+    storage_root: PathBuf,
+}
+
+impl ArchiveGapMailbox {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveGapGeneration {
+    token: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct ArchiveGapProbe {
+    generation: ArchiveGapGeneration,
+    observed_at: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct ArchiveGapObservation {
+    mailbox: ArchiveGapMailbox,
+    generation: ArchiveGapGeneration,
+    gap: u64,
+    since: std::time::Instant,
+    last_observed: std::time::Instant,
+}
+
+/// Bounded observational state only: eviction forgets an age, never mailbox
+/// data or a recovery authority. A generation token must come from the same
+/// read-only statement that supplied the inventory, and is never seeded here.
+#[derive(Debug, Default)]
+struct ArchiveGapTracker {
+    observations: std::collections::VecDeque<ArchiveGapObservation>,
+}
+
+impl ArchiveGapTracker {
+    fn observe(
+        &mut self,
+        mailbox: ArchiveGapMailbox,
+        generation: Option<&ArchiveGapGeneration>,
+        gap: Option<u64>,
+        archive_pending: bool,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let previous = self
+            .observations
+            .iter()
+            .position(|observation| observation.mailbox == mailbox)
+            .and_then(|index| self.observations.remove(index));
+        let generation = generation.filter(|generation| {
+            !generation.token.trim().is_empty()
+                && generation.token.len() <= MAX_ARCHIVE_GAP_GENERATION_BYTES
+        })?;
+        let gap = gap.filter(|gap| *gap > 0)?;
+        if archive_pending {
+            return None;
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|previous| now < previous.last_observed)
+        {
+            // A slower, older probe must not restart the clock in the past:
+            // that would manufacture a critical age on the next fresh probe.
+            return None;
+        }
+        let since = previous
+            .filter(|previous| previous.generation == *generation && gap >= previous.gap)
+            .map_or(now, |previous| previous.since);
+        let age = now.saturating_duration_since(since);
+        if self.observations.len() >= MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = self.observations.pop_front();
+        }
+        self.observations.push_back(ArchiveGapObservation {
+            mailbox,
+            generation: generation.clone(),
+            gap,
+            since,
+            last_observed: now,
+        });
+        Some(age)
+    }
+}
+
+fn observe_idle_archive_gap(
+    config: &Config,
+    probe: Option<&ArchiveGapProbe>,
+    semantic: &SemanticReadinessResponse,
+    archive_pending: bool,
+) -> Option<std::time::Duration> {
+    static TRACKER: std::sync::OnceLock<std::sync::Mutex<ArchiveGapTracker>> =
+        std::sync::OnceLock::new();
+    let tracker = TRACKER.get_or_init(|| std::sync::Mutex::new(ArchiveGapTracker::default()));
+    let mut observations = tracker.lock().unwrap_or_else(|poisoned| {
+        let mut observations = poisoned.into_inner();
+        // A partially updated observation must never supply a critical age.
+        observations.observations.clear();
+        tracker.clear_poison();
+        observations
+    });
+    observations.observe(
+        ArchiveGapMailbox::from_config(config),
+        probe.map(|probe| &probe.generation),
+        semantic.archive_message_gap,
+        archive_pending,
+        probe.map_or_else(std::time::Instant::now, |probe| probe.observed_at),
+    )
+}
+
+fn apply_idle_archive_gap_health(
+    semantic: &mut SemanticReadinessResponse,
+    verdicts: &mut HealthVerdicts,
+    archive_pending: bool,
+    idle_gap_age: Option<std::time::Duration>,
+) {
+    use mcp_agent_mail_core::HealthLevel::{Red, Yellow};
+
+    if archive_pending || semantic.archive_message_gap.is_none_or(|gap| gap == 0) {
+        return;
+    }
+    let persistent = idle_gap_age.is_some_and(|age| age >= ARCHIVE_GAP_CRITICAL_AGE);
+    let level = if persistent || verdicts.archive_db_parity.level() == Red {
+        Red
+    } else {
+        Yellow
+    };
+    let observation = idle_gap_age.map_or_else(
+        || "idle gap age is unavailable without a verified database generation".to_string(),
+        |age| {
+            format!(
+                "idle inventory gap has not decreased across observations for {} ms{}",
+                age.as_millis(),
+                if persistent {
+                    "; persistent archive convergence failure (30-minute bound)"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
+    let detail = format!("{}; {observation}", verdicts.archive_db_parity.detail);
+    verdicts.archive_db_parity = HealthVerdict::new(level, true, detail.clone());
+    // Apply after decomposition: an archive gap must not be misclassified as
+    // a database connectivity failure merely because readiness is degraded.
+    // Preserve an existing stronger failure and its diagnostic. If the gap
+    // escalates a prior warning, retain that warning's reason as well.
+    if verdicts.semantic_readiness.level() < level {
+        let detail = if semantic.status == "ok" {
+            detail
+        } else {
+            format!("{}; {detail}", semantic.detail)
+        };
+        verdicts.semantic_readiness = HealthVerdict::new(level, false, detail.clone());
+        semantic.status = if level == Red { "fail" } else { "warn" }.to_string();
+        semantic.detail = detail;
+    }
+}
+
+fn archive_parity_health_verdict(
+    semantic: &SemanticReadinessResponse,
+    kind: SemanticVerdictKind,
+    archive_drain_stall: Option<&str>,
+    archive_pending: bool,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
+
+    if kind == SemanticVerdictKind::ArchiveParity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if let Some(stall) = archive_drain_stall {
+        // br-kp1in.23: write-behind lag is tolerable only while it converges.
+        // A drain that completes nothing leaves every queued write without an
+        // archive copy indefinitely, so parity is broken, not lagging.
+        HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "archive write-behind drain stalled ({stall}); queued archive writes will not \
+                 land until the drain recovers ({})",
+                semantic.detail
+            ),
+        )
+    } else if let Some(gap) = semantic.archive_message_gap.filter(|gap| *gap > 0)
+        && !archive_pending
+    {
+        // Inventory and queue observations are not atomic: a writer can finish
+        // between the probes. Report unverified convergence, not corruption.
+        // A later aligned inventory clears the observation. The generation-
+        // scoped tracker separately escalates a persistent nonshrinking gap.
+        HealthVerdict::new(
+            Yellow,
+            true,
+            format!(
+                "sqlite inventory exceeds the canonical archive by {gap} message(s) with no \
+                 pending archive writes observed; convergence is unverified; inspect message \
+                 reconciliation before archive-only recovery ({})",
+                semantic.detail
+            ),
+        )
+    } else {
+        // Never assert bare alignment: the git archive legitimately trails the
+        // live SQLite index under write-behind flush, so a green parity verdict
+        // must DISCLOSE the actual inventory (carried in the semantic readiness
+        // detail) instead of claiming "aligned" over counts an operator can see
+        // disagree (bead hfdt-p311n). Green stays correct for within-tolerance
+        // write-behind drift; it just no longer hides it behind a false claim.
+        HealthVerdict::new(
+            Green,
+            true,
+            format!(
+                "git archive/sqlite index within write-behind tolerance ({})",
+                semantic.detail
+            ),
+        )
+    }
+}
+
 fn archive_drain_stall_detail(
     lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
     critical_us: u64,
@@ -846,6 +1174,7 @@ fn compute_health_verdicts(
     semantic: &SemanticReadinessResponse,
     integrity: &mcp_agent_mail_db::IntegrityMetrics,
     archive_drain_stall: Option<&str>,
+    archive_pending: bool,
 ) -> HealthVerdicts {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
@@ -880,37 +1209,8 @@ fn compute_health_verdicts(
         HealthVerdict::new(Green, true, "write path schema present and writable")
     };
 
-    let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
-        HealthVerdict::new(Red, true, semantic.detail.clone())
-    } else if let Some(stall) = archive_drain_stall {
-        // br-kp1in.23: write-behind lag is tolerable only while it converges.
-        // A drain that completes nothing leaves every queued write without an
-        // archive copy indefinitely, so parity is broken, not lagging.
-        HealthVerdict::new(
-            Red,
-            true,
-            format!(
-                "archive write-behind drain stalled ({stall}); queued archive writes will not \
-                 land until the drain recovers ({})",
-                semantic.detail
-            ),
-        )
-    } else {
-        // Never assert bare alignment: the git archive legitimately trails the
-        // live SQLite index under write-behind flush, so a green parity verdict
-        // must DISCLOSE the actual inventory (carried in the semantic readiness
-        // detail) instead of claiming "aligned" over counts an operator can see
-        // disagree (bead hfdt-p311n). Green stays correct for within-tolerance
-        // write-behind drift; it just no longer hides it behind a false claim.
-        HealthVerdict::new(
-            Green,
-            true,
-            format!(
-                "git archive/sqlite index within write-behind tolerance ({})",
-                semantic.detail
-            ),
-        )
-    };
+    let archive_db_parity =
+        archive_parity_health_verdict(semantic, kind, archive_drain_stall, archive_pending);
 
     let transport_health = match probe_transport_decode() {
         Ok(()) => HealthVerdict::new(Green, true, "JSON-RPC decode path functional"),
@@ -922,7 +1222,14 @@ fn compute_health_verdicts(
         Err(detail) => HealthVerdict::new(Yellow, false, detail),
     };
 
-    let integrity_check = integrity_health_verdict(integrity);
+    let integrity_check = integrity_health_verdict(
+        config,
+        integrity,
+        mcp_agent_mail_core::global_metrics()
+            .db
+            .integrity_guard_first_check_due_us
+            .load(),
+    );
 
     HealthVerdicts {
         transport_health,
@@ -941,7 +1248,11 @@ fn compute_health_verdicts(
 /// outcome remains red until another complete `PRAGMA integrity_check` passes.
 /// Conversely, before a full check has completed, health is deliberately
 /// yellow rather than falsely green about evidence it does not have.
-fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> HealthVerdict {
+fn integrity_health_verdict(
+    config: &Config,
+    metrics: &mcp_agent_mail_db::IntegrityMetrics,
+    first_check_due_us: u64,
+) -> HealthVerdict {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     use mcp_agent_mail_db::IntegrityCheckOutcome::{Failed, Passed, Unknown};
 
@@ -954,26 +1265,68 @@ fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> He
                 metrics.last_full_check_ts
             ),
         ),
-        Unknown => HealthVerdict::new(
-            Yellow,
-            true,
-            "no full PRAGMA integrity_check has completed in this process",
-        ),
-        Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
+        Unknown | Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
             Red,
             true,
             format!(
-                "latest {} failed at {} after the last successful full integrity_check",
+                "latest {} failed at {}; full integrity_check evidence is required",
                 metrics
                     .last_check_kind
                     .map_or_else(|| "integrity probe".to_string(), |kind| kind.to_string()),
                 metrics.last_check_ts
             ),
         ),
+        Unknown | Passed if !config.integrity_guard_enabled => HealthVerdict::new(
+            Yellow,
+            true,
+            "periodic integrity checks, automatic backups and database maintenance disabled by configuration (INTEGRITY_GUARD_ENABLED=false)",
+        ),
+        Unknown => {
+            let detail = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+                &config.database_url,
+            ) {
+                "no full PRAGMA integrity_check has completed; the periodic guard does not run for an in-memory DATABASE_URL".to_string()
+            } else if config.integrity_check_interval_hours == 0 {
+                "no full PRAGMA integrity_check has completed; periodic full checking disabled by configuration (INTEGRITY_CHECK_INTERVAL_HOURS=0); quick checks remain enabled".to_string()
+            } else {
+                let startup = if config.integrity_check_on_startup {
+                    "no full PRAGMA integrity_check has completed in this process"
+                } else {
+                    "startup integrity check skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)"
+                };
+                if first_check_due_us == 0 {
+                    format!(
+                        "{startup}; first periodic check has not been scheduled by a running integrity guard"
+                    )
+                } else {
+                    let due = i64::try_from(first_check_due_us).unwrap_or(i64::MAX);
+                    let when = mcp_agent_mail_db::micros_to_iso(due);
+                    let pending = if due <= mcp_agent_mail_db::now_micros() {
+                        "; awaiting the first successful full result"
+                    } else {
+                        ""
+                    };
+                    format!("{startup}; first periodic check due at {when}{pending}")
+                }
+            };
+            HealthVerdict::new(Yellow, true, detail)
+        }
         Passed if metrics.last_check_outcome == Unknown => HealthVerdict::new(
             Yellow,
             true,
             "full integrity_check evidence changed while the current probe outcome was unavailable",
+        ),
+        // GH#291: the full check is accepted, but the mailbox carries pages
+        // nothing references and nothing ever wrote. Advisory, not critical.
+        Passed if metrics.never_written_orphan_pages > 0 => HealthVerdict::new(
+            Yellow,
+            false,
+            format!(
+                "full integrity_check passed at {}; {} never-written orphan page(s) are leaked \
+                 space, not data damage (each is proven zero-filled and unreferenced); a \
+                 VACUUM-class rewrite reclaims them",
+                metrics.last_full_check_ts, metrics.never_written_orphan_pages
+            ),
         ),
         Passed => HealthVerdict::new(
             Green,
@@ -1047,10 +1400,15 @@ fn semantic_readiness_response(
     SemanticReadinessResponse {
         status: status.to_string(),
         detail: detail.into(),
+        archive_message_gap: None,
     }
 }
 
-fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse {
+fn health_check_semantic_readiness(
+    config: &Config,
+    observed_generation: &mut Option<ArchiveGapProbe>,
+) -> SemanticReadinessResponse {
+    *observed_generation = None;
     let sqlite_path = match resolve_health_check_sqlite_path(&config.database_url) {
         Ok(path) => path,
         Err(error) => return semantic_readiness_response("fail", error),
@@ -1087,6 +1445,8 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
+    #[cfg(unix)]
+    let source_identity_before = std::fs::metadata(&sqlite_path).ok();
     let conn = match open_health_check_sync_db_connection(&sqlite_path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -1142,25 +1502,33 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(&config.storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
-        return semantic_readiness_response(
-            "ok",
-            format!(
-                "No canonical archive content found under {}",
-                config.storage_root.join("projects").display()
-            ),
-        );
-    }
-
-    let rows = match conn.query_sync(
-        "SELECT \
+    let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
+    let inventory_sql = "SELECT \
             (SELECT COUNT(*) FROM projects) AS project_count, \
             (SELECT COUNT(*) FROM agents) AS agent_count, \
             (SELECT COUNT(*) FROM messages) AS message_count, \
-            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id",
-        &[],
-    ) {
+            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id";
+    // Counts and generation must share one statement snapshot: a later
+    // autocommit identity read could attach an older gap to a recovered DB.
+    // Legacy/unreadable identity remains unknown and never seeds a token.
+    let observed_at = std::time::Instant::now();
+    let inventory = if cfg!(unix) && present.contains("db_identity") {
+        let with_generation = conn.query_sync(
+            &format!(
+                "{inventory_sql}, \
+                 (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id"
+            ),
+            &[],
+        );
+        if with_generation.is_ok() {
+            with_generation
+        } else {
+            conn.query_sync(inventory_sql, &[])
+        }
+    } else {
+        conn.query_sync(inventory_sql, &[])
+    };
+    let rows = match inventory {
         Ok(rows) => rows,
         Err(error) => {
             return semantic_readiness_response(
@@ -1259,7 +1627,7 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
              writes that never landed; compare queues.archive_lag)"
         )
     };
-    semantic_readiness_response(
+    let mut readiness = semantic_readiness_response(
         "ok",
         format!(
             "{alignment}: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
@@ -1270,7 +1638,32 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
             db_agent_count,
             db_message_count
         ),
-    )
+    );
+    readiness.archive_message_gap = Some(db_ahead_by);
+    // Metadata-only checks discard ages across a restored inode even when a
+    // backup retains the same logical token. No additional live DB is opened.
+    #[cfg(unix)]
+    if let Ok(token) = row.get_named::<String>("generation_id") {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Some(before), Ok(after)) = (source_identity_before, std::fs::metadata(&sqlite_path))
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+        {
+            *observed_generation = Some(ArchiveGapProbe {
+                generation: ArchiveGapGeneration {
+                    token,
+                    device: after.dev(),
+                    inode: after.ino(),
+                },
+                observed_at,
+            });
+        }
+    }
+    // Other platforms keep the immediate warning without inventing a
+    // persistence age until a source-bound physical identity is available.
+    #[cfg(not(unix))]
+    let _ = observed_at;
+    readiness
 }
 
 /// Try to write an agent profile to the git archive. Failures are logged
@@ -1295,9 +1688,12 @@ pub(crate) fn try_write_agent_profile(
 }
 
 /// Serialize the durable, non-secret portion of an agent profile for the Git
-/// archive. Keeping lifecycle fields in the profile makes reconstruction
-/// preserve routing state without ever archiving the registration token.
-pub(crate) fn agent_archive_profile_json(
+/// archive.
+///
+/// Keeping lifecycle fields in the profile makes reconstruction preserve
+/// routing state without ever archiving the registration token.
+#[must_use]
+pub fn agent_archive_profile_json(
     agent: &mcp_agent_mail_db::AgentRow,
     deregistered_at: Option<i64>,
 ) -> serde_json::Value {
@@ -1383,6 +1779,10 @@ pub struct HealthCheckResponse {
     /// `not_observed` before the first pooled write connection opened.
     #[serde(default)]
     pub sqlite_autocommit_write_mode: String,
+    /// MVCC and write-contention conflict/retry telemetry, including per-minute
+    /// rolling rates (br-kp1in.16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mvcc_retries: Option<mcp_agent_mail_db::MvccRetryMetrics>,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -1394,12 +1794,19 @@ pub struct HealthCheckResponse {
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskHealthResponse>,
-    /// Retention/reclaim resident footprint (GH#210). Omitted only when the
-    /// mailbox path cannot be resolved or inspected.
+    /// Retention/reclaim resident footprint (GH#210). An inapplicable or
+    /// unavailable block is explained by the retention health contributor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityHealthResponse>,
+    /// Read-only lexical index evidence from this daemon's admitted mailbox.
+    /// Diagnostic clients must not open another pool to reconstruct this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_backfill: Option<mcp_agent_mail_db::search_service::LexicalBackfillHealth>,
+    /// Circuit state belongs to the serving process, not its diagnostic client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breakers: Option<mcp_agent_mail_db::DbHealthStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_indexing: Option<mcp_agent_mail_db::search_service::SemanticIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1412,7 +1819,7 @@ pub struct HealthCheckResponse {
     pub verdicts: HealthVerdicts,
     /// Names of the verdicts that are not green, worst-first, so consumers can
     /// point directly at the failing subsystem.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failing_verdicts: Vec<String>,
     /// Every input that can raise `health_level` beyond the verdict roll-up
     /// (GH#300): the roll-up itself, live pressure, archive materialization
@@ -1527,7 +1934,7 @@ pub struct DiskHealthResponse {
     pub warning_threshold_mb: u64,
     pub critical_threshold_mb: u64,
     pub fatal_threshold_mb: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }
 
@@ -1540,13 +1947,15 @@ pub struct DiskHealthResponse {
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionHealthResponse {
-    /// Total resident bytes: recovery debris + de-duplicated direct backups
-    /// + move-only reclaim staging.
+    /// Total resident logical bytes: recovery debris + de-duplicated direct
+    /// backups + move-only reclaim staging + parent-wide proactive stages.
     pub resident_bytes: u64,
     /// Resident bytes per category label (only nonzero categories present):
     /// `forensic_bundle`, `corrupt_quarantine`, `archive_reconcile_backup`,
     /// `sidecar_snapshot`, `stale_artifact`, `direct_backup`,
-    /// `reclaimable_staging`.
+    /// `reclaimable_staging`, `proactive_backup_staging`. Proactive stages may
+    /// belong to another mailbox sharing the database parent; this is a disk
+    /// footprint, not proof of ownership or permission to reclaim them.
     pub resident_bytes_by_category: std::collections::BTreeMap<String, u64>,
     /// Bytes already consolidated into `doctor/reclaimable/` awaiting an
     /// explicit operator removal.
@@ -1559,6 +1968,44 @@ pub struct RetentionHealthResponse {
     /// (`doctor_retention_alert_bytes`) — the same threshold the integrity
     /// guard's observe-and-alert sweep warns on. Next step: `am doctor reclaim`.
     pub reclaimable_attention: bool,
+    /// Resident evidence exceeds both the absolute floor and 20x live DB
+    /// size (absolute floor only when live size is unknown). This includes
+    /// protected backups and stage copies; it is not reclamation authority.
+    #[serde(default)]
+    pub resident_attention: bool,
+    /// The same count and projected-byte policy the automatic exporter uses.
+    /// An observed refusal degrades health even when byte alerts are disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_backup_staging: Option<BackupStagingHealthResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupStagingHealthResponse {
+    pub retained_artifacts: usize,
+    pub retained_bytes: u64,
+    pub projected_bytes: u64,
+    pub artifact_limit: usize,
+    pub byte_limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+impl BackupStagingHealthResponse {
+    fn from_assessment(
+        assessment: mcp_agent_mail_db::recovery_retention::staging::AutomaticBackupStagingAssessment,
+    ) -> Self {
+        Self {
+            retained_artifacts: assessment.inventory.artifacts(),
+            retained_bytes: assessment.inventory.bytes,
+            projected_bytes: assessment.projected_bytes,
+            artifact_limit: mcp_agent_mail_db::recovery_retention::staging::MAX_RETAINED_STAGES,
+            byte_limit: assessment.byte_limit,
+            refusal: assessment
+                .check_budget()
+                .err()
+                .map(|error| error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1976,6 +2423,10 @@ pub struct WhoisResponse {
     #[serde(flatten)]
     pub agent: AgentResponse,
     pub recent_commits: Vec<CommitInfo>,
+    /// Present when history enrichment exhausted its budget; older matching
+    /// commits may exist even if the returned list is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_commits_truncated: Option<bool>,
 }
 
 /// Git commit information
@@ -1996,7 +2447,8 @@ pub struct CommitInfo {
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
-    let mut semantic_readiness = health_check_semantic_readiness(config);
+    let mut observed_generation = None;
+    let mut semantic_readiness = health_check_semantic_readiness(config, &mut observed_generation);
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
@@ -2018,6 +2470,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // queue capacity/soft-cap values even before the first write/commit.
     mcp_agent_mail_storage::wbq_start();
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
+    let disk_sample = if config.disk_space_monitor_enabled {
+        Some(mcp_agent_mail_core::disk::sample_and_record(config))
+    } else {
+        None
+    };
+    // Include the disk sample in the same observation used for pressure
+    // classification, reported queue gauges, and the pressure explanation.
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let timeout_diagnostics = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(
         mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS.saturating_mul(1_000),
@@ -2026,12 +2485,6 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         metrics.storage.commit_queue_latency_us.p99,
         config.health_commit_coalescer_p99_degraded_ms,
     );
-    let disk_sample = if config.disk_space_monitor_enabled {
-        Some(mcp_agent_mail_core::disk::sample_and_record(config))
-    } else {
-        None
-    };
-
     let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
     let over_80_for_s = if metrics.db.pool_over_80_since_us == 0 {
         0
@@ -2055,20 +2508,37 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let archive_drain_stall = archive_drain_stall_detail(&archive_lag, archive_lag_critical_us);
     let archive_drain_stalled = archive_drain_stall.is_some();
 
-    // Refresh the cached health level (pressure-derived) from live metrics.
-    let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+    // br-kp1in.44: an idle pool must not hide memory-driven red. Classify,
+    // cache and explain one observation rather than taking another snapshot.
+    let pressure_signals = mcp_agent_mail_core::HealthSignals::from_snapshot(&metrics, now_us);
+    let (pressure_level, _changed) =
+        mcp_agent_mail_core::backpressure::refresh_health_level_from_snapshot(&metrics, now_us);
 
     // C1 (br-bvq1x.3.1): decompose health into independent verdicts and roll up
     // strictly, so a green top-level can never coexist with a broken critical
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    let verdicts = compute_health_verdicts(
+    let archive_pending = archive_writes_pending(&archive_lag);
+    let idle_gap_age = observe_idle_archive_gap(
+        config,
+        observed_generation.as_ref(),
+        &semantic_readiness,
+        archive_pending,
+    );
+    let mut verdicts = compute_health_verdicts(
         config,
         pool.is_some(),
         &semantic_readiness,
         &integrity_metrics,
         archive_drain_stall.as_deref(),
+        archive_pending,
+    );
+    apply_idle_archive_gap_health(
+        &mut semantic_readiness,
+        &mut verdicts,
+        archive_pending,
+        idle_gap_age,
     );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
@@ -2101,6 +2571,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let descriptor_level =
         descriptor_health_level(descriptors.utilization_pct, descriptor_growth.is_some());
     effective_level = effective_level.max(descriptor_level);
+    // Observe retention once: the payload and roll-up must use the same
+    // inventory. Missing evidence or excessive retained bytes is yellow,
+    // never a reason to clear a stronger verdict or trip the DB breaker.
+    let retention = health_check_retention_block(config);
+    let retention_verdict = retention_health_verdict(&retention);
+    effective_level = effective_level.max(retention_verdict.level());
     let failing_verdicts = verdicts.failing_names();
     // GH#300: name every input behind the effective level so a red or yellow
     // top level that no decomposed verdict explains (live pressure, archive
@@ -2126,7 +2602,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         HealthLevelContributor {
             name: "pressure".to_string(),
             level: pressure_level.to_string(),
-            detail: "live pool/queue pressure level".to_string(),
+            detail: pressure_signals.pressure_detail(&metrics.system, config),
         },
         HealthLevelContributor {
             name: "archive_lag".to_string(),
@@ -2162,6 +2638,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             level: descriptor_level.to_string(),
             detail: descriptor_health_detail(&descriptors, descriptor_growth.as_ref()),
         },
+        HealthLevelContributor {
+            name: "retention".to_string(),
+            level: retention_verdict.status,
+            detail: retention_verdict.detail,
+        },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
         health_level_contributors.push(HealthLevelContributor {
@@ -2190,6 +2671,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 None => "not_observed",
             }
             .to_string(),
+        mvcc_retries: Some(mcp_agent_mail_db::mvcc_retry_metrics()),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -2313,7 +2795,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             fatal_threshold_mb: config.disk_space_fatal_mb,
             errors: s.errors.clone(),
         }),
-        retention: health_check_retention_block(config),
+        retention: retention.ok().flatten(),
         integrity: Some(IntegrityHealthResponse {
             last_ok_ts: integrity_metrics.last_ok_ts,
             last_check_ts: integrity_metrics.last_check_ts,
@@ -2324,6 +2806,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             checks_total: integrity_metrics.checks_total,
             failures_total: integrity_metrics.failures_total,
         }),
+        lexical_backfill: pool
+            .as_ref()
+            .map(mcp_agent_mail_db::search_service::lexical_backfill_health),
+        circuit_breakers: Some(mcp_agent_mail_db::db_health_status()),
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
         recovery,
@@ -2374,7 +2860,7 @@ Check that all parameters have valid values."
     let base_config = Config::get();
     let config = maybe_reroute_ephemeral_storage(&base_config, &human_key).unwrap_or(base_config);
     let config = &config;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
     if let Some(mode) = identity_mode {
@@ -2450,7 +2936,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create or update an agent identity within a project and persist its profile to Git. Call at session start or to update profile metadata.\n\nUse the same project_key (project slug or absolute working-directory path) across cooperating agents. Supply nonempty program and model, and optionally task_description and attachments_policy (auto, inline, file, or none).\n\nThe unique routing name must be an adjective+noun combination, such as BlueLake or RedStone. Omit name to generate a fresh address. Reusing a name updates that identity's profile and last_active_ts. Names are case-insensitive unique within a project. Messages, permissions, contacts, and reservations always use this address.\n\nOptional display_name is a human-readable Unicode label, such as Officer Alpha. Duplicate labels are allowed and never resolve recipients. Surrounding whitespace is trimmed; blank input clears the label; omission preserves an existing label. Labels have a limit of 128 Unicode characters and reject control characters. Interfaces show Officer Alpha <BlueLake>, or BlueLake when unlabeled.\n\nReturns the agent profile including id, name, program, model, task_description, inception_ts, last_active_ts, project_id, and display_name when present. The archive profile remains under agents/<Name>/profile.json.\n\nExample arguments: {\"project_key\":\"/data/projects/backend\",\"program\":\"test-client\",\"model\":\"test-model\",\"name\":\"BlueLake\",\"display_name\":\"Officer Alpha\"}.\n\nRegistration rotates the registration_token using the existing registration behavior. By default registration is self-asserted. When [registration.proof_gate] is enabled, registration_proof must be a JSON string containing a signed proof bundle binding identity, project_key, program, model, capability scope, issued_at, expires_at, and a nonce to a configured trust-anchor Ed25519 key. Missing, malformed, untrusted, expired, replayed, or mismatched proofs fail closed."
+    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nAgent Naming Rules\n------------------\n- Omit `name` for a random adjective+noun name such as \"GreenLake\" or \"BlueDog\".\n- Explicit names may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; use the canonical name returned by registration.\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    An adjective+noun name (e.g., \"BlueLake\") or a safe task identifier (e.g., \"app-x-refactor\").\n    If omitted, a random adjective+noun name is auto-generated.\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit task name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"app-x-refactor\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Unsafe or reserved names are rejected before an identity is created.\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
 )]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -2470,7 +2956,58 @@ pub async fn register_agent(
     // it explicitly. Ignored when `pane_id` is absent.
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
+    // Optional Unicode profile label. Trimmed, limited to 128 characters, and
+    // free of control characters. Blank clears it; omission preserves it.
+    // Duplicate labels are allowed. Routing continues to use the stable name.
     display_name: Option<String>,
+) -> McpResult<String> {
+    register_agent_with_token_policy(
+        ctx,
+        project_key,
+        program,
+        model,
+        name,
+        task_description,
+        attachments_policy,
+        reaper_exempt,
+        pane_id,
+        tmux_socket_path,
+        registration_proof,
+        display_name,
+        TokenPolicy::Rotate,
+    )
+    .await
+}
+
+/// What a registration does to an existing agent's registration token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenPolicy {
+    /// Issue a fresh token, as `register_agent` always does: the most recent
+    /// registrant is the one that can prove it owns the name.
+    Rotate,
+    /// Leave an existing agent's token alone and do not return it; an agent
+    /// registered for the first time still gets one. For tools that register
+    /// only as a convenience (`macro_prepare_thread`), where rotating would
+    /// silently invalidate the running agent's `sender_token`.
+    KeepExisting,
+}
+
+/// `register_agent` with an explicit [`TokenPolicy`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn register_agent_with_token_policy(
+    ctx: &McpContext,
+    project_key: String,
+    program: String,
+    model: String,
+    name: Option<String>,
+    task_description: Option<String>,
+    attachments_policy: Option<String>,
+    reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
+    registration_proof: Option<String>,
+    display_name: Option<String>,
+    token_policy: TokenPolicy,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -2513,7 +3050,7 @@ pub async fn register_agent(
                 json!({ "field": "display_name" }),
             )
         })?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -2540,7 +3077,7 @@ pub async fn register_agent(
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name format: '{n}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
+                            "Invalid agent name format: '{n}'. Use an adjective+noun name (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', 'worker_42'). Task identifiers must start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters). Reserved identities, template placeholders, '..', trailing dots and device names are not allowed. Omit the 'name' parameter to auto-generate a valid name."
                         ),
                     )
                 });
@@ -2611,23 +3148,121 @@ Check that all parameters have valid values."
         .await?;
     }
 
+    // GH#279 (opt-in): naming an existing agent never binds it to this
+    // session, and a session that holds another identity in this project may
+    // not rewrite this agent's profile or rotate its token.
+    let existing_before = if crate::session_identity::enabled()
+        && let Some(agent_name) = explicit_name.as_deref()
+    {
+        let lookup =
+            mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await;
+        #[cfg(test)]
+        let lookup = if REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.replace(false)) {
+            Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(
+                "injected registration lookup contention".into(),
+            ))
+        } else {
+            lookup
+        };
+        match lookup {
+            asupersync::Outcome::Ok(existing) => Some(existing),
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            other => Some(db_outcome_to_mcp_result(other)?),
+        }
+    } else {
+        None
+    };
+    if let Some(existing) = &existing_before {
+        crate::session_identity::authorize_actor(ctx, existing, false, "re-register")?;
+    }
+
     let mut row = if let Some(agent_name) = explicit_name {
-        // Explicit name: documented upsert/idempotent-re-registration
-        // semantics (refresh program/model/task, bump last_active_ts).
-        db_outcome_to_mcp_result(
-            register_agent_db_with_retry(
-                ctx,
+        // Under session-bound identity, "absent" from the preflight cannot
+        // authorize a later upsert: another session may create the same name
+        // between the SELECT and UPDATE. Claim a genuinely fresh row first.
+        // If the unique constraint says another writer won, resolve that row
+        // and authorize it before any profile/token mutation.
+        if crate::session_identity::enabled() && existing_before.is_none() {
+            match mcp_agent_mail_db::queries::create_agent(
+                ctx.cx(),
                 &pool,
                 project_id,
                 &agent_name,
                 &program,
                 &model,
                 task_description.as_deref(),
-                &policy,
-                reaper_exempt,
+                Some(&policy),
             )
-            .await,
-        )?
+            .await
+            {
+                Outcome::Ok(created) if reaper_exempt != Some(true) => created,
+                Outcome::Ok(_) => db_outcome_to_mcp_result(
+                    register_agent_db_with_retry(
+                        ctx,
+                        &pool,
+                        project_id,
+                        &agent_name,
+                        &program,
+                        &model,
+                        task_description.as_deref(),
+                        &policy,
+                        reaper_exempt,
+                    )
+                    .await,
+                )?,
+                Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                    let raced = db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::get_agent(
+                            ctx.cx(),
+                            &pool,
+                            project_id,
+                            &agent_name,
+                        )
+                        .await,
+                    )?;
+                    crate::session_identity::authorize_actor(ctx, &raced, false, "re-register")?;
+                    db_outcome_to_mcp_result(
+                        register_agent_db_with_retry(
+                            ctx,
+                            &pool,
+                            project_id,
+                            &agent_name,
+                            &program,
+                            &model,
+                            task_description.as_deref(),
+                            &policy,
+                            reaper_exempt,
+                        )
+                        .await,
+                    )?
+                }
+                Outcome::Err(error) => return Err(db_error_to_mcp_error(error)),
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(panic) => {
+                    return Err(McpError::internal_error(format!(
+                        "Internal panic: {}",
+                        panic.message()
+                    )));
+                }
+            }
+        } else {
+            // Explicit name: documented upsert/idempotent-re-registration
+            // semantics (refresh program/model/task, bump last_active_ts).
+            db_outcome_to_mcp_result(
+                register_agent_db_with_retry(
+                    ctx,
+                    &pool,
+                    project_id,
+                    &agent_name,
+                    &program,
+                    &model,
+                    task_description.as_deref(),
+                    &policy,
+                    reaper_exempt,
+                )
+                .await,
+            )?
+        }
     } else {
         // No name given: draw a FRESH name. A random draw that collides with
         // an already-registered agent must redraw, never merge onto that
@@ -2683,16 +3318,27 @@ Check that all parameters have valid values."
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
-    // Every registration (new or update) rotates the token so that only the
-    // most recent registrant can prove ownership.
-    let mut registration_token = match mcp_agent_mail_core::setup::generate_registration_token() {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(
-                "failed to generate registration_token for agent {}: {error}",
-                row.name
-            );
-            String::new()
+    // Under TokenPolicy::Rotate every registration (new or update) rotates the
+    // token so that only the most recent registrant can prove ownership; under
+    // KeepExisting an agent that already has one keeps it (and it is not
+    // returned).
+    let keep_existing_token = token_policy == TokenPolicy::KeepExisting
+        && row
+            .registration_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+    let mut registration_token = if keep_existing_token {
+        String::new()
+    } else {
+        match mcp_agent_mail_core::setup::generate_registration_token() {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to generate registration_token for agent {}: {error}",
+                    row.name
+                );
+                String::new()
+            }
         }
     };
     if !registration_token.is_empty()
@@ -2722,6 +3368,14 @@ Check that all parameters have valid values."
     // to unverified.  Only set when persistence succeeded.
     if !registration_token.is_empty() {
         row.registration_token = Some(registration_token.clone());
+    }
+
+    // GH#279 (opt-in): this session established the agent when it created
+    // it, or already held it.
+    if let Some(agent_id) = row.id
+        && (existing_before.is_none() || crate::session_identity::holds(ctx, row.id))
+    {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
     }
 
     // Invalidate + repopulate read cache after mutation. Scope to the live
@@ -2798,7 +3452,7 @@ Check that all parameters have valid values."
 /// - `project_key`: Project human key or slug
 /// - `program`: Agent program
 /// - `model`: Model identifier
-/// - `name_hint`: Optional name hint (must be valid adjective+noun if provided)
+/// - `name_hint`: Optional adjective+noun name or safe explicit task identifier
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
@@ -2822,7 +3476,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nNote: unlike the Python server, this server has no per-session identity binding, so a\ncaller that opts out of the token echo sends messages with `verified_sender: false`\nunless it obtains the token through an operator/admin path. Under the fail-closed send\nprofile a sender token is mandatory; only opt out of the echo if you have another way\nto obtain the token.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, must be a valid adjective+noun name or safe task identifier and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nAgent Naming Rules\n------------------\n- Omit `name_hint` for a random adjective+noun name such as \"GreenCastle\" or \"BlueLake\".\n- Explicit hints may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; a differently cased duplicate is still rejected.\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith explicit task name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"worker_42\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -2869,13 +3523,13 @@ pub async fn create_agent_identity(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Generate or validate agent name
-    let agent_name = match name_hint {
+    // Validate the hint; without one, a name is drawn at insert time below.
+    let explicit_name = match name_hint {
         Some(hint) => {
             let hint = hint.trim();
             if hint.is_empty() {
@@ -2888,13 +3542,13 @@ pub async fn create_agent_identity(
                 ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(hint)
             {
-                normalized
+                Some(normalized)
             } else {
                 let (err_type, msg) = detect_agent_name_mistake(hint).unwrap_or_else(|| {
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name format: '{hint}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
+                            "Invalid agent name format: '{hint}'. Use an adjective+noun name (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', 'worker_42'). Task identifiers must start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters). Reserved identities, template placeholders, '..', trailing dots and device names are not allowed. Omit the 'name_hint' parameter to auto-generate a valid name."
                         ),
                     )
                 });
@@ -2906,7 +3560,7 @@ pub async fn create_agent_identity(
                 ));
             }
         }
-        None => generate_agent_name(),
+        None => None,
     };
 
     // Validate and normalize attachments_policy (case-insensitive, trimmed)
@@ -2928,62 +3582,84 @@ Check that all parameters have valid values."
         ));
     }
 
-    // Optional cryptographic proof gate (off by default). Mirrors the gate on
-    // `register_agent` so this alternate registration entry point cannot be
-    // used to bypass it. No-op when disabled; fail-closed when enabled.
-    crate::proof_gate::enforce(
-        ctx.cx(),
-        &pool,
-        &crate::proof_gate::RegistrationRequest {
-            agent_name: &agent_name,
-            project_key: &project_key,
-            program: &program,
-            model: &model,
-            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-            proof: registration_proof.as_deref(),
-        },
-    )
-    .await?;
+    let mut row = if let Some(agent_name) = explicit_name {
+        // Optional cryptographic proof gate (off by default). Mirrors the gate
+        // on `register_agent` so this alternate registration entry point
+        // cannot be used to bypass it. No-op when disabled; fail-closed when
+        // enabled.
+        crate::proof_gate::enforce(
+            ctx.cx(),
+            &pool,
+            &crate::proof_gate::RegistrationRequest {
+                agent_name: &agent_name,
+                project_key: &project_key,
+                program: &program,
+                model: &model,
+                granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+                proof: registration_proof.as_deref(),
+            },
+        )
+        .await?;
 
-    // Atomic insert-if-absent: eliminates TOCTOU race between a separate
-    // get_agent check and register_agent upsert. Returns Duplicate if the
-    // name was taken between validation and insert.
-    let agent_out = mcp_agent_mail_db::queries::create_agent(
-        ctx.cx(),
-        &pool,
-        project_id,
-        &agent_name,
-        &program,
-        &model,
-        task_description.as_deref(),
-        Some(&policy),
-    )
-    .await;
+        // Atomic insert-if-absent: eliminates TOCTOU race between a separate
+        // get_agent check and register_agent upsert. Returns Duplicate if the
+        // name was taken between validation and insert.
+        let agent_out = mcp_agent_mail_db::queries::create_agent(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &agent_name,
+            &program,
+            &model,
+            task_description.as_deref(),
+            Some(&policy),
+        )
+        .await;
 
-    let mut row = match agent_out {
-        Outcome::Ok(row) => row,
-        Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                format!(
-                    "Invalid argument value: Agent name '{agent_name}' already exists in this project. \
+        match agent_out {
+            Outcome::Ok(row) => row,
+            Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid argument value: Agent name '{agent_name}' already exists in this project. \
 Choose a different name (or omit the name to auto-generate one)."
-                ),
-                true,
-                json!({
-                    "field": "name_hint",
-                    "error_detail": agent_name,
-                }),
-            ));
+                    ),
+                    true,
+                    json!({
+                        "field": "name_hint",
+                        "error_detail": agent_name,
+                    }),
+                ));
+            }
+            Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(p) => {
+                return Err(McpError::internal_error(format!(
+                    "Internal panic: {}",
+                    p.message()
+                )));
+            }
         }
-        Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
+    } else {
+        // No hint: draw a fresh name and redraw on collision, as
+        // `register_agent` does (GH#213); the proof gate runs per candidate
+        // inside. A random draw that hits an existing agent is not the
+        // caller's mistake and must not fail the call.
+        claim_fresh_auto_named_agent(
+            ctx,
+            &pool,
+            &project_key,
+            project_id,
+            &program,
+            &model,
+            task_description.as_deref(),
+            &policy,
+            registration_proof.as_deref(),
+            generate_agent_name(),
+            generate_agent_name,
+        )
+        .await?
     };
     enqueue_agent_semantic_index(&row);
 
@@ -3065,6 +3741,12 @@ Choose a different name (or omit the name to auto-generate one)."
         }
     }
 
+    // GH#279 (opt-in): a freshly created identity belongs to this session, so
+    // it can act as that agent without the token in its transcript.
+    if let Some(agent_id) = row.id {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
+    }
+
     // Transcript safety (GH#255, Python-parity with issue #154): when the
     // caller opts out of the token echo, omit the token from the tool result
     // entirely and mark the omission explicitly. The token was still
@@ -3134,7 +3816,7 @@ pub async fn retire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3172,6 +3854,8 @@ pub async fn retire_agent(
         )
         .await,
     )?;
+    // GH#279: a retired identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     let agent_json = agent_archive_profile_json(&updated, None);
     try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
 
@@ -3206,7 +3890,7 @@ pub async fn unretire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3267,7 +3951,7 @@ pub async fn deregister_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3300,6 +3984,8 @@ pub async fn deregister_agent(
         )
         .await,
     )?;
+    // GH#279: a deregistered identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     // Read back the ledger timestamp so concurrent/idempotent retries archive
     // the authoritative first deregistration time, never a later candidate.
     let deregistered_at = db_outcome_to_mcp_result(
@@ -3331,7 +4017,7 @@ pub fn is_valid_attachments_policy(policy: &str) -> bool {
 /// # Parameters
 /// - `project_key`: Project human key or slug
 /// - `agent_name`: Agent name to look up
-/// - `include_recent_commits`: Include recent Git commits (default: true)
+/// - `include_recent_commits`: Include bounded recent Git history (default: true)
 /// - `commit_limit`: Max commits to include (default: 5)
 ///
 /// # Returns
@@ -3340,7 +4026,7 @@ pub fn is_valid_attachments_policy(policy: &str) -> bool {
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Return enriched profile details for an agent, optionally including recent archive commits.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent name to look up (use resource://agents/{project_key} to discover names).\ninclude_recent_commits : bool\n    If true, include latest commits touching the project archive authored by the configured git author.\ncommit_limit : int\n    Maximum number of recent commits to include.\n\nReturns\n-------\ndict\n    Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested."
+    description = "Return enriched profile details for an agent, optionally including recent archive commits.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent name to look up (use resource://agents/{project_key} to discover names).\ninclude_recent_commits : bool\n    If true (the default), include recent commits touching this agent's archive directory. History enrichment has a bounded scan so large archives cannot delay the profile indefinitely.\ncommit_limit : int\n    Maximum number of recent commits to include.\n\nReturns\n-------\ndict\n    Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested. If a scan budget is reached, recent_commits_truncated is true and older matching commits may exist. Commit traversal starts at HEAD; imported merges or skewed commit clocks do not guarantee global timestamp ordering."
 )]
 pub async fn whois(
     ctx: &McpContext,
@@ -3380,27 +4066,34 @@ pub async fn whois(
         other => db_outcome_to_mcp_result(other)?,
     };
 
-    // Fetch recent commits from the git archive if requested
+    // Fetch recent commits from the git archive if requested. Budget exhaustion
+    // is explicit so an empty partial scan cannot imply the agent has no history.
+    let mut recent_commits_truncated = None;
     let recent_commits = if include_commits && limit > 0 {
+        ctx.checkpoint()?;
         let config = &Config::get();
         match mcp_agent_mail_storage::open_archive(config, &project.slug) {
             Ok(Some(archive)) => {
                 // Project-relative: get_recent_commits applies the
                 // projects/<slug>/ repo prefix itself.
                 let path_filter = format!("agents/{}", agent_row.name);
-                match mcp_agent_mail_storage::get_recent_commits(
+                match mcp_agent_mail_storage::get_recent_commit_history(
                     &archive,
                     limit,
                     Some(&path_filter),
                 ) {
-                    Ok(commits) => commits
-                        .into_iter()
-                        .map(|c| CommitInfo {
-                            hexsha: c.sha,
-                            summary: c.summary,
-                            authored_ts: c.date,
-                        })
-                        .collect(),
+                    Ok(history) => {
+                        recent_commits_truncated = history.truncated.then_some(true);
+                        history
+                            .commits
+                            .into_iter()
+                            .map(|c| CommitInfo {
+                                hexsha: c.sha,
+                                summary: c.summary,
+                                authored_ts: c.date,
+                            })
+                            .collect()
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to get recent commits: {e}");
                         Vec::new()
@@ -3448,6 +4141,7 @@ pub async fn whois(
             deregistered_at: deregistered_at.map(micros_to_iso),
         },
         recent_commits,
+        recent_commits_truncated,
     };
 
     serde_json::to_string(&response)
@@ -3601,14 +4295,26 @@ pub async fn resolve_pane_identity(
 #[tool(
     description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
 )]
-pub fn cleanup_pane_identities(
-    _ctx: &McpContext,
+pub async fn cleanup_pane_identities(
+    ctx: &McpContext,
     project_key: Option<String>,
 ) -> McpResult<String> {
-    let removed = project_key
-        .map_or_else(mcp_agent_mail_core::cleanup_all_stale_identities, |key| {
+    let removed = match project_key {
+        None => mcp_agent_mail_core::cleanup_all_stale_identities(),
+        Some(key) => {
+            // Identity files are keyed by the project's path: resolve a slug to
+            // it, as resolve_pane_identity does, or a slug cleans nothing.
+            let key = if !Path::new(&key).is_absolute()
+                && let Ok(pool) = get_read_db_pool(ctx.cx()).await
+                && let Ok(project) = resolve_existing_project(ctx, &pool, &key).await
+            {
+                project.human_key
+            } else {
+                key
+            };
             mcp_agent_mail_core::cleanup_stale_identities(&key)
-        });
+        }
+    };
 
     let paths: Vec<String> = removed
         .iter()
@@ -3714,6 +4420,108 @@ mod tests {
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
 
+    #[test]
+    fn registration_lookup_failure_preserves_profile_token_and_binding() {
+        static REGISTRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::test_support::with_isolated_mailbox(
+            &REGISTRATION_TEST_LOCK,
+            "registration lookup failure",
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            |mailbox| {
+                let root = mailbox
+                    .database_path
+                    .parent()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap();
+                Config::reset_cached();
+                RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        let cx = Cx::current().expect("runtime context");
+                        let owner = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        let response = register_agent(
+                            &owner,
+                            root.display().to_string(),
+                            "owner-program".into(),
+                            "owner-model".into(),
+                            Some("BlueLake".into()),
+                            Some("owner task".into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("Owner label".into()),
+                        )
+                        .await
+                        .expect("owner registration");
+                        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                        let before = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                            &cx,
+                            &get_db_pool_for_request(&owner).unwrap(),
+                            response["id"].as_i64().unwrap(),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap();
+                        REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.set(true));
+                        let outsider = McpContext::with_state(
+                            cx.clone(),
+                            2,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        let error = register_agent(
+                            &outsider,
+                            root.display().to_string(),
+                            "changed-program".into(),
+                            "changed-model".into(),
+                            Some("BlueLake".into()),
+                            Some("changed task".into()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("Changed label".into()),
+                        )
+                        .await
+                        .expect_err("lookup failure must precede registration writes");
+                        assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+                        assert!(!REGISTRATION_LOOKUP_FAILURE.with(std::cell::Cell::get));
+                        let after = mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+                            &cx,
+                            &get_db_pool_for_request(&owner).unwrap(),
+                            before.id.unwrap(),
+                        )
+                        .await
+                        .into_result()
+                        .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(after).unwrap(),
+                            serde_json::to_value(&before).unwrap()
+                        );
+                        assert!(crate::session_identity::holds(&owner, before.id));
+                        assert_eq!(
+                            crate::session_identity::session_bindings(&outsider),
+                            Vec::<crate::session_identity::SessionBinding>::new()
+                        );
+                    });
+                REGISTRATION_LOOKUP_FAILURE.with(|failure| failure.set(false));
+                Config::reset_cached();
+            },
+        );
+    }
+
     /// All-green decomposed verdicts, for response-serialization tests that
     /// don't exercise the rollup logic.
     fn green_test_verdicts() -> HealthVerdicts {
@@ -3742,6 +4550,7 @@ mod tests {
             checks_total: 1,
             failures_total: 0,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         }
     }
 
@@ -3881,6 +4690,7 @@ mod tests {
         SemanticReadinessResponse {
             status: status.into(),
             detail: detail.into(),
+            archive_message_gap: None,
         }
     }
 
@@ -3943,7 +4753,7 @@ mod tests {
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
         metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "red");
         assert!(verdict.critical);
         assert!(verdict.detail.contains("later quick check cannot clear it"));
@@ -3952,8 +4762,28 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
         metrics.last_check_ts = 300;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Full);
-        let repaired = integrity_health_verdict(&metrics);
+        let repaired = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(repaired.status, "green");
+    }
+
+    /// GH#291: an accepted full check that carries proven never-written
+    /// orphan pages is an advisory, never a critical verdict.
+    #[test]
+    fn never_written_orphan_pages_are_a_non_critical_yellow_advisory() {
+        let mut metrics = healthy_integrity_metrics();
+        metrics.never_written_orphan_pages = 425;
+
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(verdict.status, "yellow");
+        assert!(!verdict.critical, "leaked space must not gate the roll-up");
+        assert!(verdict.detail.contains("425 never-written orphan page(s)"));
+        assert!(verdict.detail.contains("not data damage"));
+
+        // A failed full check outranks the advisory.
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        let failed = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(failed.status, "red");
+        assert!(failed.critical);
     }
 
     #[test]
@@ -3963,9 +4793,62 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "yellow");
         assert!(verdict.critical);
+    }
+
+    #[test]
+    fn skipped_startup_health_reports_schedule_then_full_success_then_failure() {
+        let mut config = Config {
+            integrity_check_on_startup: false,
+            ..Config::default()
+        };
+        let mut metrics = healthy_integrity_metrics();
+        metrics.last_full_check_ts = 0;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        let due = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap() + 300_000_000;
+        let waiting = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(waiting.status, "yellow");
+        assert!(waiting.critical);
+        assert!(
+            waiting
+                .detail
+                .contains("skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)")
+        );
+        assert!(waiting.detail.contains(&format!(
+            "first periodic check due at {}",
+            mcp_agent_mail_db::micros_to_iso(i64::try_from(due).unwrap())
+        )));
+        let unavailable = integrity_health_verdict(&config, &metrics, 0);
+        assert!(unavailable.detail.contains("has not been scheduled"));
+
+        metrics = healthy_integrity_metrics();
+        assert_eq!(
+            integrity_health_verdict(&config, &metrics, due).status,
+            "green"
+        );
+        config.integrity_guard_enabled = false;
+        let disabled = integrity_health_verdict(&config, &metrics, 0);
+        assert_eq!(disabled.status, "yellow");
+        assert!(disabled.detail.contains("INTEGRITY_GUARD_ENABLED=false"));
+
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        config.integrity_guard_enabled = true;
+        config.integrity_check_interval_hours = 0;
+        let no_full_checks = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(no_full_checks.status, "yellow");
+        assert!(
+            no_full_checks
+                .detail
+                .contains("INTEGRITY_CHECK_INTERVAL_HOURS=0")
+        );
     }
 
     #[test]
@@ -3980,6 +4863,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
@@ -4006,6 +4890,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4026,6 +4911,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert_eq!(
@@ -4043,6 +4929,7 @@ mod tests {
             &semantic("fail", "database pool bootstrap failed"),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4060,6 +4947,7 @@ mod tests {
             &semantic("ok", "aligned"),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "green");
         assert_eq!(verdicts.write_health.status, "green");
@@ -4076,6 +4964,582 @@ mod tests {
     }
 
     #[test]
+    fn archive_parity_tracks_drain_and_inventory_convergence() {
+        let mut observation = semantic("ok", "archive messages=1, db messages=3");
+        observation.archive_message_gap = Some(2);
+        let pending = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            wbq_inflight_execution_us: 1,
+            ..Default::default()
+        };
+        let live = archive_parity_health_verdict(
+            &observation,
+            SemanticVerdictKind::Ok,
+            None,
+            archive_writes_pending(&pending),
+        );
+        assert_eq!(live.status, "green");
+        assert!(live.detail.contains(&observation.detail));
+
+        let idle =
+            archive_parity_health_verdict(&observation, SemanticVerdictKind::Ok, None, false);
+        assert_eq!(idle.status, "yellow");
+        assert!(idle.critical);
+        assert!(idle.detail.contains("by 2 message(s)"));
+        assert!(idle.detail.contains("convergence is unverified"));
+
+        let stalled = archive_parity_health_verdict(
+            &observation,
+            SemanticVerdictKind::Ok,
+            Some("no completed op for 900000 ms"),
+            true,
+        );
+        assert_eq!(stalled.status, "red");
+        assert!(stalled.critical);
+        assert!(stalled.detail.contains("drain stalled"));
+
+        observation.archive_message_gap = Some(0);
+        observation.detail = "Archive and sqlite inventory are aligned".into();
+        let converged =
+            archive_parity_health_verdict(&observation, SemanticVerdictKind::Ok, None, false);
+        assert_eq!(converged.status, "green");
+
+        let ahead = semantic("fail", "archive inventory is ahead of the sqlite index");
+        let unsafe_index = archive_parity_health_verdict(
+            &ahead,
+            classify_semantic_failure(&ahead.status, &ahead.detail),
+            Some("drain stalled"),
+            true,
+        );
+        assert_eq!(unsafe_index.status, "red");
+        assert_eq!(unsafe_index.detail, ahead.detail);
+    }
+
+    fn gap_mailbox(database: &str, archive: &str) -> ArchiveGapMailbox {
+        ArchiveGapMailbox {
+            database_url: database.to_string(),
+            storage_root: PathBuf::from(archive),
+        }
+    }
+
+    fn gap_generation(token: &str) -> ArchiveGapGeneration {
+        ArchiveGapGeneration {
+            token: token.to_string(),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 1,
+        }
+    }
+
+    #[test]
+    fn archive_gap_age_resets_on_progress_and_convergence() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (elapsed, gap, age) in [(0, 20, 0), (300, 21, 300), (600, 19, 0), (900, 19, 300)] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(gap),
+                    false,
+                    start + std::time::Duration::from_secs(elapsed),
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(0),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(19),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_is_scoped_to_database_archive_and_generation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (database, archive, elapsed) in [
+            ("database-a", "archive-a", 0),
+            ("database-b", "archive-a", 600),
+            ("database-a", "archive-b", 1200),
+        ] {
+            let _ = tracker.observe(
+                gap_mailbox(database, archive),
+                Some(&generation),
+                Some(3),
+                false,
+                start + std::time::Duration::from_secs(elapsed),
+            );
+        }
+        for (database, archive, age) in [
+            ("database-a", "archive-a", 1800),
+            ("database-b", "archive-a", 1200),
+            ("database-a", "archive-b", 600),
+        ] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox(database, archive),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                Some(&gap_generation("generation-b")),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                None,
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-b", "archive-a"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::from_mins(20)),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_pending_unavailable_and_invalid_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let blank = gap_generation(" \t");
+        let oversized = gap_generation(&"x".repeat(MAX_ARCHIVE_GAP_GENERATION_BYTES + 1));
+        for (identity, gap, pending) in [
+            (Some(&generation), Some(3), true),
+            (None, Some(3), false),
+            (Some(&generation), None, false),
+            (Some(&blank), Some(3), false),
+            (Some(&oversized), Some(3), false),
+        ] {
+            let mut tracker = ArchiveGapTracker::default();
+            let _ = tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    identity,
+                    gap,
+                    pending,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                None,
+            );
+            assert!(tracker.observations.is_empty());
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::ZERO),
+            );
+        }
+    }
+
+    #[test]
+    fn archive_gap_tracking_is_bounded_and_retains_recent_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for index in 0..MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = tracker.observe(
+                gap_mailbox(&format!("database-{index}"), "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+        }
+        let _ = tracker.observe(
+            gap_mailbox("database-0", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(1),
+        );
+        let _ = tracker.observe(
+            gap_mailbox("database-extra", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-1", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+            "eviction must forget an age instead of manufacturing persistence",
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-0", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_out_of_order_observation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + ARCHIVE_GAP_CRITICAL_AGE,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_secs(1),
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_gap_age_restarts_when_restored_inode_keeps_generation_token() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("preserved-generation");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start,
+        );
+        let restored = ArchiveGapGeneration {
+            inode: 2,
+            ..generation
+        };
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&restored),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn idle_archive_gap_health_escalates_at_the_exact_persistence_boundary() {
+        let config = Config::default();
+        for (age, readiness, color) in [
+            (None, "warn", "yellow"),
+            (Some(std::time::Duration::ZERO), "warn", "yellow"),
+            (
+                ARCHIVE_GAP_CRITICAL_AGE.checked_sub(std::time::Duration::from_millis(1)),
+                "warn",
+                "yellow",
+            ),
+            (Some(ARCHIVE_GAP_CRITICAL_AGE), "fail", "red"),
+            (
+                Some(ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_millis(1)),
+                "fail",
+                "red",
+            ),
+        ] {
+            let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+            observation.archive_message_gap = Some(2);
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, readiness);
+            assert_eq!(verdicts.semantic_readiness.status, color);
+            assert_eq!(verdicts.archive_db_parity.status, color);
+            assert!(verdicts.archive_db_parity.critical);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "green");
+            assert_eq!(verdicts.rollup_level(), verdicts.archive_db_parity.level());
+            if age.is_none() {
+                assert!(observation.detail.contains("age is unavailable"));
+            } else if color == "red" {
+                assert!(observation.detail.contains("30-minute bound"));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_ignores_active_converged_and_skipped_inventory() {
+        let config = Config::default();
+        for (gap, pending) in [(Some(2), true), (Some(0), false), (None, false)] {
+            let mut observation = semantic("ok", "inventory observation");
+            observation.archive_message_gap = gap;
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                pending,
+            );
+            apply_idle_archive_gap_health(
+                &mut observation,
+                &mut verdicts,
+                pending,
+                Some(ARCHIVE_GAP_CRITICAL_AGE),
+            );
+            assert_eq!(observation.status, "ok");
+            assert_eq!(observation.detail, "inventory observation");
+            assert_eq!(verdicts.semantic_readiness.status, "green");
+            assert_eq!(verdicts.archive_db_parity.status, "green");
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_preserves_existing_failures() {
+        let config = Config::default();
+        for age in [None, Some(ARCHIVE_GAP_CRITICAL_AGE)] {
+            let mut observation = semantic(
+                "fail",
+                "sqlite schema missing required health_check tables: messages",
+            );
+            observation.archive_message_gap = Some(2);
+            let prior_detail = observation.detail.clone();
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, "fail");
+            assert_eq!(observation.detail, prior_detail);
+            assert_eq!(verdicts.semantic_readiness.status, "red");
+            assert_eq!(verdicts.semantic_readiness.detail, prior_detail);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "red");
+        }
+
+        let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+        observation.archive_message_gap = Some(2);
+        let mut verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            Some("no completed op for 900000 ms"),
+            false,
+        );
+        apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, None);
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert_eq!(verdicts.semantic_readiness.status, "red");
+        assert_eq!(observation.status, "fail");
+        assert!(observation.detail.contains("drain stalled"));
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+    }
+
+    #[test]
+    fn semantic_archive_gap_wire_format_preserves_skipped_and_legacy_responses() {
+        let legacy = json!({"status": "ok", "detail": "parity skipped"});
+        let mut response: SemanticReadinessResponse =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(response.archive_message_gap, None);
+        assert_eq!(serde_json::to_value(&response).unwrap(), legacy);
+
+        response.archive_message_gap = Some(0);
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["archive_message_gap"],
+            0
+        );
+        response.archive_message_gap = Some(2);
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["archive_message_gap"], 2);
+        let decoded: SemanticReadinessResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.archive_message_gap, Some(2));
+    }
+
+    #[test]
+    fn idle_archive_gap_is_critical_yellow_until_inventory_converges() {
+        let config = Config::default();
+        let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+        observation.archive_message_gap = Some(2);
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+        assert!(verdicts.archive_db_parity.critical);
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("no pending archive writes")
+        );
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("convergence is unverified")
+        );
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Yellow
+        );
+        assert!(
+            verdicts
+                .failing_names()
+                .iter()
+                .any(|name| name == "archive_db_parity")
+        );
+
+        observation.archive_message_gap = Some(0);
+        observation.detail = "Archive and sqlite inventory are aligned".into();
+        let converged = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(converged.archive_db_parity.status, "green");
+        assert_eq!(
+            converged.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn pending_archive_work_includes_dequeued_and_coalescing_writes() {
+        use mcp_agent_mail_storage::ArchiveLagSnapshot;
+        for lag in [
+            ArchiveLagSnapshot {
+                backlog_depth: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                coalescer_pending: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_depth: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_inflight_oldest_age_us: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_inflight_execution_us: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                oldest_unmaterialized_us: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                archive_writes_pending(&lag),
+                "live archive work must tolerate the inventory gap"
+            );
+        }
+        assert!(!archive_writes_pending(&ArchiveLagSnapshot::default()));
+        assert!(
+            !archive_writes_pending(&ArchiveLagSnapshot {
+                enqueued_total: 10,
+                drained_total: 8,
+                dropped_total: 2,
+                ..Default::default()
+            }),
+            "historical failures cannot excuse an idle archive gap indefinitely"
+        );
+    }
+
+    #[test]
     fn green_archive_parity_discloses_inventory_not_bare_aligned() {
         // bead hfdt-p311n: a green archive_db_parity verdict must never hide
         // visibly unequal archive/db counts behind a bare "aligned" claim. The
@@ -4084,12 +5548,15 @@ mod tests {
         let config = Config::from_env();
         let drift_detail = "archive projects=13, agents=332, messages=1496, \
              db projects=13, agents=338, messages=1498";
+        let mut observation = semantic("ok", drift_detail);
+        observation.archive_message_gap = Some(2);
         let verdicts = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             None,
+            true,
         );
         assert_eq!(verdicts.archive_db_parity.status, "green");
         assert!(
@@ -4111,12 +5578,15 @@ mod tests {
         // with zero drain progress while every critical verdict stayed green.
         let config = Config::from_env();
         let drift_detail = "sqlite is ahead of the archive by 3235 message(s)";
+        let mut observation = semantic("ok", drift_detail);
+        observation.archive_message_gap = Some(3235);
         let stalled = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             Some("wbq depth 3453, no completed op for 900000 ms"),
+            true,
         );
         assert_eq!(stalled.archive_db_parity.status, "red");
         assert!(stalled.archive_db_parity.critical);
@@ -4141,9 +5611,10 @@ mod tests {
         let draining = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             None,
+            true,
         );
         assert_eq!(draining.archive_db_parity.status, "green");
         assert_eq!(
@@ -4168,6 +5639,7 @@ mod tests {
             &semantic("ok", "archive files and sqlite messages are aligned"),
             &healthy_integrity_metrics(),
             Some(&detail),
+            archive_writes_pending(&lag),
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert!(verdicts.archive_db_parity.critical);
@@ -4199,6 +5671,435 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn retention_inventory_failure_is_yellow_and_not_database_corruption() {
+        use mcp_agent_mail_core::HealthLevel;
+        let verdict = retention_health_verdict(&Err("injected inventory failure".to_string()));
+        assert_eq!(verdict.level(), HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert!(verdict.detail.contains("injected inventory failure"));
+        assert_eq!(HealthLevel::Red.max(verdict.level()), HealthLevel::Red);
+    }
+
+    #[test]
+    fn memory_retention_is_inapplicable_without_inspecting_storage() {
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: PathBuf::from("/not-inspected-by-retention"),
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(matches!(&result, Ok(None)));
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn retention_probe_reports_resident_debt_from_actual_staging_files() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-probe");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(4_096)
+            .unwrap();
+        let mut config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert!(response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(response.resident_bytes, 4_096);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["resident_attention"], true);
+
+        config.doctor_retention_alert_bytes = 0;
+        let disabled = health_check_retention_block(&config);
+        assert_eq!(
+            retention_health_verdict(&disabled).level(),
+            HealthLevel::Green
+        );
+        let disabled = disabled.unwrap().unwrap();
+        assert_eq!(disabled.resident_bytes, 4_096);
+        assert!(!disabled.resident_attention);
+        assert!(!disabled.reclaimable_attention);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retained_stage_count_degrades_health_even_with_byte_alerts_disabled() {
+        use mcp_agent_mail_core::HealthLevel;
+        for legacy in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let primary = root.join("retention.db");
+            std::fs::write(&primary, [0_u8; 128]).unwrap();
+            let config = Config {
+                database_url: format!("sqlite:///{}", primary.display()),
+                storage_root: root.clone(),
+                doctor_retention_alert_bytes: 0,
+                ..Config::default()
+            };
+            for ordinal in 0..3 {
+                if legacy {
+                    std::fs::write(
+                        root.join(format!(".snapshot-inspect-{ordinal}.sqlite3")),
+                        b"evidence",
+                    )
+                    .unwrap();
+                } else {
+                    let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal}"));
+                    std::fs::create_dir(&stage).unwrap();
+                    std::fs::write(stage.join("snapshot.sqlite3"), b"evidence").unwrap();
+                }
+                let result = health_check_retention_block(&config);
+                let response = result.as_ref().unwrap().as_ref().unwrap();
+                let staging = response.automatic_backup_staging.as_ref().unwrap();
+                assert_eq!(staging.retained_artifacts, ordinal + 1);
+                assert_eq!(
+                    staging.retained_bytes,
+                    8 * u64::try_from(ordinal + 1).unwrap()
+                );
+                assert!(!response.resident_attention);
+                assert!(!response.reclaimable_attention);
+                let verdict = retention_health_verdict(&result);
+                if ordinal < 2 {
+                    assert_eq!(verdict.level(), HealthLevel::Green, "{}", verdict.detail);
+                    assert!(staging.refusal.is_none());
+                } else {
+                    assert_eq!(verdict.level(), HealthLevel::Yellow, "{}", verdict.detail);
+                    assert!(!verdict.critical);
+                    assert!(
+                        verdict
+                            .detail
+                            .contains("automatic backups refused: 3 retained staging artifacts")
+                    );
+                    assert!(
+                        verdict
+                            .detail
+                            .contains("am doctor reclaim does not move these stages")
+                    );
+                    let value = serde_json::to_value(response).unwrap();
+                    assert_eq!(value["automatic_backup_staging"]["retained_artifacts"], 3);
+                    assert!(value["automatic_backup_staging"]["refusal"].is_string());
+                }
+            }
+            assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 4);
+        }
+    }
+
+    #[test]
+    fn retained_legacy_bytes_refuse_health_before_the_count_limit() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let legacy = root.join(".snapshot-inspect-large.sqlite3");
+        let limit = mcp_agent_mail_db::recovery_retention::staging::STAGING_BYTES_FLOOR;
+        std::fs::File::create(&legacy)
+            .unwrap()
+            .set_len(limit)
+            .unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        let staging = response.automatic_backup_staging.as_ref().unwrap();
+        assert_eq!(staging.retained_artifacts, 1);
+        assert_eq!(staging.projected_bytes, 256);
+        assert!(staging.refusal.as_ref().unwrap().contains("exceed"));
+        assert_eq!(
+            response.resident_bytes_by_category["proactive_backup_staging"],
+            limit
+        );
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(std::fs::metadata(&legacy).unwrap().len(), limit);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn unknown_wal_size_is_unavailable_backup_evidence_not_an_empty_generation() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        std::fs::create_dir(root.join("retention.db-wal")).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .contains("assessment unavailable")
+        );
+        let verdict = retention_health_verdict(&result);
+        assert_eq!(verdict.level(), HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert!(!verdict.detail.contains("automatic backups refused"));
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_probe_does_not_hide_a_staging_symlink_as_an_absent_block() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let linked = root.join(".mcp-agent-mail-proactive-backup-linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            // Disabling byte alarms must not turn an inventory error green.
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(
+            result.is_err(),
+            "unavailable inventory must not become Ok(None)"
+        );
+        let verdict = retention_health_verdict(&result);
+        assert_eq!(verdict.level(), mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert_eq!(std::fs::read_link(&linked).unwrap(), root);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_resident_attention_after_move_only_consolidation() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-move");
+        std::fs::create_dir(&stage).unwrap();
+        let evidence = [7_u8; 4_096];
+        std::fs::write(stage.join("snapshot.sqlite3"), evidence).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let before = health_check_retention_block(&config).unwrap().unwrap();
+        assert!(before.resident_attention);
+        assert!(!before.reclaimable_attention);
+        assert_eq!(before.resident_bytes, 4_096);
+        assert_eq!(
+            before.resident_bytes_by_category["proactive_backup_staging"],
+            4_096
+        );
+
+        // An operator's explicit move changes the category, not the disk debt.
+        // No health code is authorized to perform this move itself.
+        let destination = root.join("doctor/reclaimable/health-move");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        let result = health_check_retention_block(&config);
+        let after = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 4_096);
+        assert_eq!(
+            after.resident_bytes_by_category["reclaimable_staging"],
+            4_096
+        );
+        assert!(after.resident_attention);
+        assert!(!after.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(
+            std::fs::read(destination.join("snapshot.sqlite3")).unwrap(),
+            evidence
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_preserves_the_independent_reclaimable_alarm() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let debris = root.join("retention.db.corrupt7");
+        std::fs::write(&debris, [7_u8; 1_024]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            // The effective category budget is 5 * 128 = 640 bytes, so
+            // this quarantine is selected even though resident < 20 * 128.
+            doctor_retention_max_bytes_per_category: 1,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 1_024);
+        assert_eq!(response.reclaimable_bytes, 1_024);
+        assert!(!response.resident_attention);
+        assert!(response.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(std::fs::read(&debris).unwrap(), [7_u8; 1_024]);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_large_mailbox_backups_below_the_ratio_green() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 1_024]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-ratio");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("snapshot.sqlite3"), [7_u8; 4_096]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 4_096);
+        assert!(!response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Green
+        );
+        assert_eq!(
+            std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+            [7_u8; 4_096]
+        );
+    }
+
+    #[test]
+    fn retention_response_accepts_legacy_payloads_without_the_resident_flag() {
+        let legacy = json!({
+            "resident_bytes": 1_024,
+            "resident_bytes_by_category": {"direct_backup": 1_024},
+            "reclaimable_staging_bytes": 0,
+            "reclaimable_bytes": 0,
+            "live_database_bytes": 128,
+            "reclaimable_attention": false,
+        });
+        let response: RetentionHealthResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!response.resident_attention);
+        assert_eq!(response.resident_bytes, 1_024);
+        assert!(response.automatic_backup_staging.is_none());
+        assert_eq!(
+            retention_health_verdict(&Ok(Some(response))).level(),
+            mcp_agent_mail_core::HealthLevel::Yellow,
+            "an older payload without staging evidence cannot prove admission"
+        );
+    }
+
+    #[test]
+    fn health_check_retention_contributor_reports_the_live_inventory() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        drop(conn);
+        let bytes = std::fs::metadata(&primary)
+            .unwrap()
+            .len()
+            .checked_mul(21)
+            .unwrap()
+            .max(1_024);
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-response");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", primary.display())),
+                ("STORAGE_ROOT", &root.display().to_string()),
+                ("DOCTOR_RETENTION_ALERT_BYTES", "512"),
+            ],
+            || {
+                Config::reset_cached();
+                assert_eq!(Config::get().doctor_retention_alert_bytes, 512);
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health response");
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(value["retention"]["resident_attention"], true, "{value}");
+                assert_eq!(
+                    value["retention"]["reclaimable_attention"], false,
+                    "{value}"
+                );
+                assert_eq!(
+                    value["retention"]["resident_bytes_by_category"]["proactive_backup_staging"],
+                    bytes,
+                    "{value}"
+                );
+                let contributor = value["health_level_contributors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["name"] == "retention")
+                    .unwrap_or_else(|| panic!("retention contributor missing: {value}"));
+                assert_eq!(contributor["level"], "yellow", "{value}");
+                assert!(
+                    contributor["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("this is not database corruption"),
+                    "{value}"
+                );
+                // Independent live signals may be red. Retention must never
+                // erase them, and a retention alarm must never leave green.
+                assert!(
+                    matches!(value["health_level"].as_str(), Some("yellow" | "red")),
+                    "{value}"
+                );
+            },
+        );
+        assert_eq!(
+            std::fs::metadata(stage.join("snapshot.sqlite3"))
+                .unwrap()
+                .len(),
+            bytes
+        );
+    }
 
     // ── redact_database_url ──
 
@@ -4322,9 +6223,11 @@ mod tests {
             database_url: "sqlite:///data/test.db".into(),
             storage_root: "/data".into(),
             sqlite_autocommit_write_mode: "mvcc_concurrent".into(),
+            mvcc_retries: None,
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
+                archive_message_gap: Some(0),
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
@@ -4332,6 +6235,8 @@ mod tests {
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -4454,6 +6359,7 @@ mod tests {
                 summary: "test commit".into(),
                 authored_ts: "2026-02-06T00:00:00Z".into(),
             }],
+            recent_commits_truncated: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -4462,6 +6368,7 @@ mod tests {
         assert_eq!(json["program"], "codex-cli");
         // Commits are nested
         assert_eq!(json["recent_commits"][0]["hexsha"], "abc123");
+        assert!(json.get("recent_commits_truncated").is_none());
     }
 
     #[test]
@@ -4488,6 +6395,7 @@ mod tests {
                 deregistered_at: None,
             },
             recent_commits: vec![],
+            recent_commits_truncated: Some(true),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -4495,6 +6403,7 @@ mod tests {
             json["recent_commits"].as_array().unwrap().as_slice(),
             [] as [serde_json::Value; 0]
         );
+        assert_eq!(json["recent_commits_truncated"], true);
     }
 
     // ── Path validation (ensure_project logic) ──
@@ -4522,13 +6431,16 @@ mod tests {
         assert!(is_valid_agent_name("BlueLake"));
         assert!(is_valid_agent_name("RedFox"));
         assert!(is_valid_agent_name("GoldHawk"));
+        assert!(is_valid_agent_name("blue_lake"));
+        assert!(is_valid_agent_name("app-x-refactor"));
+        assert!(is_valid_agent_name("API.review_2"));
     }
 
     #[test]
     fn invalid_agent_names_rejected() {
         use mcp_agent_mail_core::models::is_valid_agent_name;
         assert!(!is_valid_agent_name(""));
-        assert!(!is_valid_agent_name("blue_lake")); // underscore not allowed
+        assert!(!is_valid_agent_name("blue..lake")); // notification path guard
         assert!(!is_valid_agent_name("123"));
         assert!(!is_valid_agent_name("Blue Lake")); // space not allowed
         assert!(!is_valid_agent_name("EaglePeak")); // eagle is a noun, not adjective
@@ -4831,6 +6743,7 @@ mod tests {
                 archive_wbq_p99_us: 0,
                 archive_commit_queue_p99_us: 16_778_000,
                 git_commit_p99_us: 450_000,
+                archive_fence_wait_us: 0,
                 blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                     inflight: 1,
                     zombies: 0,
@@ -4874,9 +6787,11 @@ mod tests {
             database_url: "sqlite:///:memory:".into(),
             storage_root: "/tmp/agent-mail-test".into(),
             sqlite_autocommit_write_mode: "not_observed".into(),
+            mvcc_retries: None,
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),
+                archive_message_gap: None,
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
@@ -4884,6 +6799,8 @@ mod tests {
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -4903,6 +6820,8 @@ mod tests {
             "disk",
             "retention",
             "integrity",
+            "lexical_backfill",
+            "circuit_breakers",
             "semantic_indexing",
             "two_tier_indexing",
             "recovery",
@@ -4968,12 +6887,22 @@ mod tests {
             reclaimable_bytes: 540,
             live_database_bytes: None,
             reclaimable_attention: true,
+            resident_attention: true,
+            automatic_backup_staging: Some(BackupStagingHealthResponse {
+                retained_artifacts: 0,
+                retained_bytes: 0,
+                projected_bytes: 128,
+                artifact_limit: 3,
+                byte_limit: 512 * 1024 * 1024,
+                refusal: None,
+            }),
         };
         let value = serde_json::to_value(&r).unwrap();
         let object = value.as_object().expect("retention object");
         assert!(!object.contains_key("live_database_bytes"));
         assert_eq!(value["resident_bytes"], 630);
         assert_eq!(value["reclaimable_attention"], true);
+        assert_eq!(value["resident_attention"], true);
         assert_eq!(value["resident_bytes_by_category"]["stale_artifact"], 40);
         assert!(
             value["resident_bytes_by_category"]
@@ -4985,6 +6914,89 @@ mod tests {
             !value.to_string().contains("null"),
             "retention block must be null-free: {value}"
         );
+    }
+
+    #[test]
+    fn health_check_detects_unarchived_messages_even_with_an_empty_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("mailbox");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = storage_root.join("storage.sqlite3");
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'gap-project', '/gap-project', 1);\n\
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1);\n\
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, attachments, recipients_json) VALUES (1, 1, 1, 'Persisted', 'body', 1, '[]', '{\"to\":[],\"cc\":[],\"bcc\":[]}');"
+        ).expect("persist a message before its archive copy");
+        drop(conn);
+
+        let mut observed_generation = None;
+        let before = health_check_semantic_readiness(&config, &mut observed_generation);
+        assert_eq!(before.status, "ok", "{}", before.detail);
+        assert_eq!(before.archive_message_gap, Some(1));
+        assert!(
+            observed_generation.is_none(),
+            "health probes must not seed an empty database identity"
+        );
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &before,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+
+        let project = storage_root.join("projects/gap-project");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).expect("create canonical directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"gap-project","human_key":"/gap-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            messages.join("2026-10-01T00-00-00Z__persisted__1.md"),
+            "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Persisted\",\"importance\":\"normal\",\"created_ts\":\"2026-10-01T00:00:00Z\"}\n---\n\nbody\n",
+        ).expect("materialize canonical message");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        conn.execute_raw(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'health-gap-generation')",
+        )
+        .expect("seed the existing database identity independently of health");
+        drop(conn);
+        let after = health_check_semantic_readiness(&config, &mut observed_generation);
+        assert_eq!(after.archive_message_gap, Some(0), "{}", after.detail);
+        #[cfg(unix)]
+        assert_eq!(
+            observed_generation
+                .as_ref()
+                .map(|probe| probe.generation.token.as_str()),
+            Some("health-gap-generation"),
+            "inventory counts and the existing generation must be read together"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            observed_generation.is_none(),
+            "unknown physical file identity must not supply a persistence age"
+        );
+        let repaired = compute_health_verdicts(
+            &config,
+            true,
+            &after,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(repaired.archive_db_parity.status, "green");
     }
 
     #[test]
@@ -5165,7 +7177,25 @@ body
                 let response = health_check(&ctx).expect("health_check should serialize");
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("parse health_check json");
-                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert_eq!(value["semantic_readiness"]["status"], "warn");
+                let lexical: mcp_agent_mail_db::search_service::LexicalBackfillHealth =
+                    serde_json::from_value(value["lexical_backfill"].clone())
+                        .expect("health exposes the admitted daemon's lexical index evidence");
+                assert_eq!(
+                    lexical,
+                    mcp_agent_mail_db::search_service::lexical_backfill_health(
+                        &get_authoritative_live_db_pool().expect("existing health pool")
+                    )
+                );
+                let circuits: mcp_agent_mail_db::DbHealthStatus =
+                    serde_json::from_value(value["circuit_breakers"].clone())
+                        .expect("health exposes the serving process's circuit state");
+                assert!(
+                    circuits
+                        .circuits
+                        .iter()
+                        .any(|circuit| circuit.subsystem == "db")
+                );
                 assert!(
                     value["semantic_readiness"]["detail"]
                         .as_str()
@@ -5551,6 +7581,139 @@ body
             type_name.contains("FrankenConnection"),
             "health_check must use the FrankenSQLite connection type on the normal path: {type_name}"
         );
+    }
+
+    #[test]
+    fn health_check_archive_inventory_is_amortized_o1_via_epoch_cache() {
+        let _guard = crate::tool_util::READ_POOL_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tool_util::reset_read_archive_inventory_cache();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("health-cache.sqlite3");
+        let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+
+        let project_dir = storage_root.join("projects").join("cache-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("07");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"cache-project","human_key":"/cache-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-07-01T12:00:00Z","last_active_ts":"2026-07-01T12:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-07-01T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .expect("write first message");
+
+        {
+            let mut index = repo.index().expect("open git index");
+            index
+                .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+                .expect("stage archive tree");
+            index.write().expect("write git index");
+            let tree_id = index.write_tree().expect("write git tree");
+            let tree = repo.find_tree(tree_id).expect("load git tree");
+            let sig = git2::Signature::now("test", "test@example.com").expect("git signature");
+            repo.commit(Some("HEAD"), &sig, &sig, "seed archive", &tree, &[])
+                .expect("commit archive tree");
+        }
+        std::fs::write(
+            storage_root
+                .join(".git")
+                .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+            format!("1{}", "aa".repeat(16)),
+        )
+        .expect("write epoch token");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'cache-project', '/cache-project', 0)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (1, 1, 'Alice', 'coder', 'test', '', 0, 0, 'auto', 'auto')",
+            &[],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (1, 1, 1, 'First', 'body', 'normal', 0, 0, '[]')",
+            &[],
+        )
+        .expect("insert message");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                crate::tool_util::reset_read_archive_inventory_cache();
+                let cx = Cx::for_testing();
+                let ctx = McpContext::new(cx, 1);
+                for call_idx in 0..5 {
+                    let raw = health_check(&ctx).expect("health_check ok");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&raw).expect("parse health_check json");
+                    assert_eq!(value["status"], "ok", "call {call_idx}: {value}");
+                    assert_eq!(
+                        value["semantic_readiness"]["status"], "ok",
+                        "call {call_idx}: {value}"
+                    );
+                }
+                assert_eq!(
+                    crate::tool_util::read_archive_inventory_scan_count(),
+                    1,
+                    "repeated health_check calls on an unchanged epoch-stamped archive must scan only once (O(1) amortized)"
+                );
+
+                // Simulate a new archive message landing with an epoch token advance while SQLite lags.
+                std::fs::write(
+                    message_dir.join("2026-07-01T12-01-00Z__second__2.md"),
+                    "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[],\"subject\":\"Second\"}\n---\nbody\n",
+                )
+                .expect("write second message");
+                std::fs::write(
+                    storage_root
+                        .join(".git")
+                        .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+                    format!("1{}", "bb".repeat(16)),
+                )
+                .expect("advance epoch token");
+
+                let raw = health_check(&ctx).expect("health_check after drift");
+                let value: serde_json::Value =
+                    serde_json::from_str(&raw).expect("parse health_check json");
+                assert_eq!(
+                    crate::tool_util::read_archive_inventory_scan_count(),
+                    2,
+                    "epoch token advance must invalidate cached archive inventory on next health_check"
+                );
+                assert_eq!(
+                    value["status"], "error",
+                    "health_check must report error when archive advances ahead of SQLite: {value}"
+                );
+            },
+        );
+        crate::tool_util::reset_read_archive_inventory_cache();
     }
 
     #[test]

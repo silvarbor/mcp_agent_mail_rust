@@ -32,6 +32,14 @@ pub enum SetupError {
     #[error("unknown agent platform: {0}")]
     UnknownPlatform(String),
 
+    #[error(
+        "config {0} changed identity, content, permissions, or link topology during its transform"
+    )]
+    ConfigSourceChanged(PathBuf),
+
+    #[error("config mutation lock is held for {0}")]
+    ConfigLockHeld(PathBuf),
+
     /// Namespace publication occurred, but its file flush was not confirmed.
     /// This never promises power-loss durability of directory entries.
     #[cfg(windows)]
@@ -43,7 +51,7 @@ pub enum SetupError {
         path: PathBuf,
         retained: Option<PathBuf>,
         #[source]
-        source: Box<SetupError>,
+        source: Box<Self>,
     },
 
     #[error("{0}")]
@@ -1465,15 +1473,35 @@ fn toml_merge_refusal(
     existing: Option<&str>,
     error: &toml::de::Error,
 ) -> String {
+    // TOML's Display includes the source line, which can contain a bearer.
+    // Even its message may include user-provided keys; report only a known
+    // category and numeric location, never config text.
+    let safe_error = |error: &toml::de::Error| {
+        let category = if error.message().starts_with("duplicate key") {
+            "duplicate key"
+        } else {
+            "syntax error"
+        };
+        error.span().map_or_else(
+            || category.to_string(),
+            |span| format!("{category} at bytes {}..{}", span.start, span.end),
+        )
+    };
     existing
         .and_then(|text| toml::from_str::<toml::Value>(text).err())
         .map_or_else(
-            || format!("refusing to write {section_header}: merged TOML does not parse: {error}"),
+            || {
+                format!(
+                    "refusing to write {section_header}: merged TOML does not parse: {}",
+                    safe_error(error)
+                )
+            },
             |existing_error| {
                 format!(
                     "refusing to write {section_header}: the existing config is not valid TOML \
                      outside the section setup manages, so setup cannot repair it \
-                     ({existing_error}); fix the file by hand and rerun setup"
+                     ({}); fix the file by hand and rerun setup",
+                    safe_error(&existing_error)
                 )
             },
         )
@@ -1930,6 +1958,7 @@ enum OmpMcpAuthorityFormat {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OmpMcpAuthorityProvider {
     Native,
+    Extension,
     ClaudeProject,
     ClaudeUser,
     Codex,
@@ -1946,6 +1975,9 @@ struct OmpMcpAuthoritySource {
     format: OmpMcpAuthorityFormat,
     provider: OmpMcpAuthorityProvider,
     project_level: bool,
+    // Linked npm packages are read through a verified canonical directory,
+    // while OMP expands their runtime paths using the installation spelling.
+    extension_root: Option<PathBuf>,
 }
 
 fn push_omp_mcp_authority_source(
@@ -1968,6 +2000,7 @@ fn push_omp_mcp_authority_source(
         format,
         provider,
         project_level,
+        extension_root: None,
     });
 }
 
@@ -1998,7 +2031,10 @@ fn claude_user_base(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf), PathB
 }
 
 #[allow(clippy::too_many_lines)]
-fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource> {
+fn omp_mcp_authority_sources(
+    params: &SetupParams,
+    extension_sources: Vec<OmpMcpAuthoritySource>,
+) -> Vec<OmpMcpAuthoritySource> {
     use OmpMcpAuthorityFormat::{
         CodexToml, Native, OpenCodeJsonc, Standalone, StandardJson, Unsupported, VsCodeJson,
     };
@@ -2032,9 +2068,12 @@ fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource>
         push_omp_mcp_authority_source(&mut sources, path, Native, NativeProvider, false);
     }
 
-    // Stable imported tool providers, in descending provider priority. OMP
-    // plugin/extension MCP providers are intentionally not guessed here: their
-    // roots and manifests are dynamic and remain an explicit status gap.
+    // Configured extension packages have priority 90, below every native
+    // source and above imported tool providers. Their settings provenance
+    // decides whether the project-config switch suppresses their MCP entries.
+    sources.extend(extension_sources);
+
+    // Stable imported tool providers, in descending provider priority.
     let provider_home = omp_provider_home(params);
 
     // Claude, priority 80: first non-empty project alternative, then first
@@ -2227,17 +2266,27 @@ fn omp_mcp_authority_sources(params: &SetupParams) -> Vec<OmpMcpAuthoritySource>
     sources
 }
 
-/// Return OMP's stable MCP discovery inputs in exact first-wins load order.
+/// Return OMP's persistent MCP discovery inputs, retaining provider load order.
 ///
 /// Setup writes only the canonical native `mcp.json` files. Native `.mcp.json`
-/// siblings, stable imported-tool files, and project-root fallbacks remain
-/// read-only runtime authorities.
+/// siblings, configured extension packages, imported-tool files, and project-root
+/// fallbacks remain read-only runtime authorities. Settings and manifests that
+/// select extension packages are also included, even when a deciding file is
+/// absent, so cache validation follows the same authority as status.
 #[must_use]
 pub fn omp_mcp_authority_paths(params: &SetupParams) -> Vec<PathBuf> {
+    let settings = inspect_omp_settings_authority(params);
+    let extensions = inspect_omp_configured_extensions(params, &settings);
     let mut paths = Vec::new();
-    for source in omp_mcp_authority_sources(params) {
+    for source in omp_mcp_authority_sources(params, extensions.sources) {
         if source.format != OmpMcpAuthorityFormat::Unsupported && !paths.contains(&source.path) {
             paths.push(source.path);
+        }
+    }
+    for observation in settings.observations.iter().chain(&extensions.observations) {
+        let path = PathBuf::from(&observation.path);
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
     paths
@@ -2679,6 +2728,8 @@ impl AgentPlatform {
 // file cannot force setup/status to allocate without limit.
 const SETUP_CONFIG_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+type SetupArtifactCheck<'a> = &'a dyn Fn(&Path) -> Result<(), SetupError>;
+
 fn setup_metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
@@ -2961,7 +3012,13 @@ fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectory
 struct SetupFileSnapshot {
     content: String,
     permissions: u32,
+    recorded_mode: u32,
     link_count: u64,
+    // Keep the observed Unix inode alive until its transaction finishes.
+    // Windows publication instead reacquires exclusive validated flush handles;
+    // retaining these read handles would prevent that exclusive acquisition.
+    #[cfg(unix)]
+    _file: std::fs::File,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -3034,7 +3091,24 @@ fn snapshot_open_setup_file(
     Ok(SetupFileSnapshot {
         content,
         permissions,
+        recorded_mode: {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.permissions().mode()
+            }
+            #[cfg(not(unix))]
+            {
+                if metadata.permissions().readonly() {
+                    0o444
+                } else {
+                    0o644
+                }
+            }
+        },
         link_count,
+        #[cfg(unix)]
+        _file: file,
         #[cfg(unix)]
         device: {
             use std::os::unix::fs::MetadataExt as _;
@@ -3161,7 +3235,7 @@ fn create_unique_setup_file_at(
         match openat(
             &authority.fd,
             candidate.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_raw_mode(raw_mode),
         ) {
             Ok(fd) => {
@@ -3226,6 +3300,7 @@ fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnaps
     let same_identity = false;
     expected.content == observed.content
         && expected.permissions == observed.permissions
+        && expected.recorded_mode == observed.recorded_mode
         && expected.link_count == observed.link_count
         && same_identity
 }
@@ -3285,9 +3360,11 @@ fn revalidate_setup_directory_authority(
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
 fn retain_exchanged_setup_file(
     authority: &SetupDirectoryAuthority,
+    parent: &Path,
     temp_name: &str,
     file_name: &str,
     suffix: &str,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(), SetupError> {
     use rustix::fs::{RenameFlags, renameat_with};
 
@@ -3295,6 +3372,7 @@ fn retain_exchanged_setup_file(
     let now = crate::timestamps::now_micros();
     for attempt in 0..1024 {
         let retained = format!(".{file_name}.{pid}.{now}.{attempt}.{suffix}");
+        verify_artifact(&parent.join(&retained))?;
         match renameat_with(
             &authority.fd,
             temp_name,
@@ -3315,14 +3393,17 @@ fn retain_exchanged_setup_file(
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
 fn write_setup_backup_at(
     authority: &SetupDirectoryAuthority,
+    parent: &Path,
     file_name: &str,
     content: &[u8],
     permissions: u32,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(), SetupError> {
     use rustix::fs::fsync;
 
-    let (_backup_name, mut output) =
+    let (backup_name, mut output) =
         create_unique_setup_file_at(authority, file_name, "bak", permissions)?;
+    verify_artifact(&parent.join(backup_name))?;
     output.write_all(content)?;
     output.sync_all()?;
     drop(output);
@@ -3398,6 +3479,7 @@ fn replace_windows_setup_file_retaining_displaced(
     replaced_path: &str,
     replacement_path: &str,
     suffix: &str,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(String, String), SetupError> {
     replace_windows_setup_file_retaining_displaced_with(
         authority,
@@ -3418,6 +3500,7 @@ fn replace_windows_setup_file_retaining_displaced(
         |existing, new| {
             winsafe::MoveFileEx(existing, Some(new), winsafe::co::MOVEFILE::WRITE_THROUGH)
         },
+        verify_artifact,
     )
 }
 
@@ -3431,11 +3514,13 @@ fn replace_windows_setup_file_retaining_displaced_with(
     suffix: &str,
     mut replace_file: impl FnMut(&str, &str, &str) -> Result<(), winsafe::co::ERROR>,
     mut move_file_no_replace: impl FnMut(&str, &str) -> Result<(), winsafe::co::ERROR>,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(String, String), SetupError> {
     let mut recovered_partial_moves = 0_u8;
     for _ in 0..1024 {
         let (retained_name, retained_path) =
             unique_windows_setup_sibling(authority, file_name, suffix)?;
+        verify_artifact(Path::new(&retained_path))?;
         match replace_file(replaced_path, replacement_path, &retained_path) {
             Ok(()) => return Ok((retained_name, retained_path)),
             Err(error)
@@ -3547,7 +3632,9 @@ fn write_setup_file_atomic_bound(
         || Ok(()),
         || Ok(()),
         || {},
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(test, windows))]
@@ -3571,7 +3658,9 @@ fn write_setup_file_atomic_bound_with_hook(
         before_publish,
         || Ok(()),
         || {},
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(windows)]
@@ -3587,7 +3676,8 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
     before_publish: impl FnOnce() -> Result<(), SetupError>,
     before_replace: impl FnOnce() -> Result<(), SetupError>,
     after_replace: impl FnOnce(),
-) -> Result<(), SetupError> {
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
     let _ = permissions;
     ensure_setup_parent_dir(path, label)?;
     validate_setup_file_target(path, label)?;
@@ -3615,7 +3705,10 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         )
     })?;
 
+    verify_artifact(path)?;
     let (mut temp_file, temp_path) = create_persistent_windows_setup_temp(authority, file_name)?;
+    verify_artifact(&temp_path)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
     std::io::Seek::rewind(&mut temp_file)?;
@@ -3624,6 +3717,13 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         &temp_path,
         "Windows setup staged file",
     )?;
+    if published_snapshot.content.as_bytes() != content || published_snapshot.link_count != 1 {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "staged file changed before publication",
+        ));
+    }
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3653,6 +3753,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
             &target_path,
             &temp_path,
             suffix,
+            verify_artifact,
         )?;
         // The production wrapper supplies a no-op. Tests use this seam to
         // observe transient namespace effects before CAS validation can roll
@@ -3673,6 +3774,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
                 &target_path,
                 &retained_path,
                 "replaced",
+                verify_artifact,
             );
             let (rejected_name, rejected_path) =
                 rollback.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
@@ -3733,7 +3835,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         )?;
     }
 
-    Ok(())
+    Ok(published_snapshot)
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3755,7 +3857,9 @@ fn write_setup_file_atomic_bound(
         backup_existing,
         authority,
         || Ok(()),
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(test, unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3777,7 +3881,9 @@ fn write_setup_file_atomic_bound_with_hook(
         backup_existing,
         None,
         before_publish,
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3791,7 +3897,8 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
     backup_existing: bool,
     authority: Option<&SetupDirectoryAuthority>,
     before_publish: impl FnOnce() -> Result<(), SetupError>,
-) -> Result<(), SetupError> {
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
     use rustix::fs::{RenameFlags, fsync, renameat_with};
 
     ensure_setup_parent_dir(path, label)?;
@@ -3812,10 +3919,29 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
         &owned_authority
     };
     revalidate_setup_directory_authority(parent, authority)?;
+    verify_artifact(path)?;
     let (temp_name, mut temp_file) =
         create_unique_setup_file_at(authority, &display_name, "tmp", permissions)?;
+    verify_artifact(&parent.join(&temp_name))?;
+    revalidate_setup_directory_authority(parent, authority)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
+    std::io::Seek::rewind(&mut temp_file)?;
+    let published_snapshot = snapshot_open_setup_file(
+        temp_file.try_clone()?,
+        &parent.join(&temp_name),
+        "setup staged file",
+    )?;
+    if published_snapshot.content.as_bytes() != content
+        || published_snapshot.recorded_mode & 0o7777 != permissions & 0o7777
+        || published_snapshot.link_count != 1
+    {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "staged file changed before publication",
+        ));
+    }
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3853,9 +3979,11 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
         if backup_existing
             && let Err(error) = write_setup_backup_at(
                 authority,
+                parent,
                 &display_name,
                 observed.content.as_bytes(),
                 permissions,
+                verify_artifact,
             )
         {
             renameat_with(
@@ -3869,9 +3997,14 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
             fsync(&authority.fd).map_err(std::io::Error::from)?;
             return Err(error);
         }
-        if let Err(error) =
-            retain_exchanged_setup_file(authority, &temp_name, &display_name, "replaced")
-        {
+        if let Err(error) = retain_exchanged_setup_file(
+            authority,
+            parent,
+            &temp_name,
+            &display_name,
+            "replaced",
+            verify_artifact,
+        ) {
             renameat_with(
                 &authority.fd,
                 temp_name.as_str(),
@@ -3895,7 +4028,19 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
     }
 
     fsync(&authority.fd).map_err(std::io::Error::from)?;
-    revalidate_setup_directory_authority(parent, authority)
+    revalidate_setup_directory_authority(parent, authority)?;
+    let observed = snapshot_setup_authority_leaf(authority, file_name, path, label)?;
+    if !observed
+        .as_ref()
+        .is_some_and(|observed| setup_snapshots_match(&published_snapshot, observed))
+    {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "published file identity or contents could not be confirmed",
+        ));
+    }
+    Ok(published_snapshot)
 }
 
 fn write_setup_file_atomic(
@@ -3915,6 +4060,62 @@ fn write_setup_file_atomic(
         backup_existing,
         None,
     )
+}
+
+/// Return the exact staged inode witness (and retain its handle on Unix).
+/// Reopening the published pathname would lose the original staging witness.
+fn write_audited_setup_file(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    expected: Option<&SetupFileSnapshot>,
+    authority: &SetupDirectoryAuthority,
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    {
+        write_setup_file_atomic_bound_with_authority_and_hook(
+            path,
+            content,
+            permissions,
+            "audited config",
+            expected,
+            false,
+            Some(authority),
+            || Ok(()),
+            verify_artifact,
+        )
+    }
+    #[cfg(windows)]
+    {
+        write_setup_file_atomic_bound_with_windows_hooks(
+            path,
+            content,
+            permissions,
+            "audited config",
+            expected,
+            false,
+            Some(authority),
+            || Ok(()),
+            || Ok(()),
+            || {},
+            verify_artifact,
+        )
+    }
+    #[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+    {
+        let _ = (
+            path,
+            content,
+            permissions,
+            expected,
+            authority,
+            verify_artifact,
+        );
+        Err(SetupError::Other(
+            "retained config mutation authority is unavailable on this platform".into(),
+        ))
+    }
 }
 
 fn write_setup_file_atomic_with_authority(
@@ -4055,6 +4256,15 @@ fn resolve_secret_git_context(
     path: &Path,
     secure_gitignore: bool,
 ) -> Result<Option<(PathBuf, PathBuf)>, SetupError> {
+    resolve_secret_git_context_inner(path, secure_gitignore, false, false)
+}
+
+fn resolve_secret_git_context_inner(
+    path: &Path,
+    secure_gitignore: bool,
+    locks_held: bool,
+    allow_missing_parents: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, SetupError> {
     const REPOSITORY_SHAPING_GIT_ENV: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -4072,23 +4282,44 @@ fn resolve_secret_git_context(
             path.display()
         )));
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| invalid_setup_path("secret config", path, "must name a file"))?;
-    validate_setup_real_directory(parent, "secret config parent")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_no_parent_traversal(path, "secret config")?;
+    if path.file_name().is_none() {
+        return Err(invalid_setup_path(
+            "secret config",
+            path,
+            "must name a file",
+        ));
+    }
+    let mut ancestor = parent;
+    if allow_missing_parents {
+        while !check_setup_real_directory(ancestor, "secret config parent", false)? {
+            ancestor = ancestor
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+        }
+    } else {
+        validate_setup_real_directory(parent, "secret config parent")?;
+    }
     validate_setup_file_target(path, "secret config")?;
     let _ = read_setup_file(path, "secret config")?;
-    let parent = std::fs::canonicalize(parent).map_err(|error| {
+    let canonical_ancestor = std::fs::canonicalize(ancestor).map_err(|error| {
         SetupError::Other(format!(
             "cannot resolve secret config parent {}: {error}",
-            parent.display()
+            ancestor.display()
         ))
     })?;
-    let repo_probe = crate::git_cmd::GitCmd::new(&parent)
+    let target = canonical_ancestor.join(path.strip_prefix(ancestor).unwrap_or(path));
+    let repo_probe = crate::git_cmd::GitCmd::new(&canonical_ancestor)
         .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"]);
-    let repo_probe = if secure_gitignore {
+    let repo_probe = if locks_held {
+        repo_probe.skip_flock().skip_mutex()
+    } else if secure_gitignore {
         repo_probe
     } else {
         repo_probe.skip_flock()
@@ -4123,7 +4354,6 @@ fn resolve_secret_git_context(
             path.display()
         ))
     })?;
-    let target = parent.join(file_name);
     let relative = target.strip_prefix(&repo_root).map_err(|_| {
         SetupError::Other(format!(
             "secret config {} is outside the resolved Git worktree {}",
@@ -4136,7 +4366,7 @@ fn resolve_secret_git_context(
 
 fn verify_secret_gitignore_protection(
     repo_root: &Path,
-    representative_paths: [String; 5],
+    representative_paths: impl IntoIterator<Item = String>,
 ) -> Result<(), SetupError> {
     for representative in representative_paths {
         // `git check-ignore` does not accept the global `--literal-pathspecs`
@@ -4396,6 +4626,530 @@ pub fn transform_config_atomic(
     )
 }
 
+/// Publication policy and doctor-owned backup destination for an existing config.
+///
+/// The backup is created exclusively, from the transform's exact
+/// source bytes, with mode 0600 on Unix. Windows retains the setup writer's
+/// inherited parent ACL and verified file-flush contract.
+#[derive(Clone, Copy)]
+pub struct ExistingConfigTransformOptions<'a> {
+    pub permissions: u32,
+    pub contains_literal_secret: bool,
+    pub dry_run: bool,
+    pub backup_path: &'a Path,
+}
+
+/// The same snapshot witnesses semantic validation, the verbatim backup, and
+/// the pending/completed action records. No credential bytes belong in logs.
+pub struct ConfigTransformSnapshot<'a> {
+    pub before: &'a [u8],
+    pub after: &'a [u8],
+    pub before_mode: u32,
+    pub after_mode: u32,
+}
+
+fn config_contains_literal_secret(content: &[u8]) -> bool {
+    fn has_credential(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => fields.iter().any(|(key, value)| {
+                ((key.eq_ignore_ascii_case("authorization")
+                    || matches!(key.as_str(), "bearer" | "token" | "HTTP_BEARER_TOKEN"))
+                    && value.as_str().is_some_and(|value| !value.is_empty()))
+                    || has_credential(value)
+            }),
+            Value::Array(values) => values.iter().any(has_credential),
+            _ => false,
+        }
+    }
+    content
+        .windows(7)
+        .any(|bytes| bytes.eq_ignore_ascii_case(b"Bearer "))
+        || serde_json::from_slice::<Value>(content).is_ok_and(|value| has_credential(&value))
+}
+
+#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn open_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<std::fs::File, SetupError> {
+    let basename = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path("config", path, "must name a file"))?;
+    let mut name = OsString::from(".");
+    name.push(basename);
+    name.push(".doctor-lock");
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    let file = {
+        use rustix::fs::{Mode, OFlags, openat};
+        use std::os::unix::fs::MetadataExt as _;
+        let fd = openat(
+            &authority.fd,
+            &name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?;
+        let file = std::fs::File::from(fd);
+        if file.metadata()?.nlink() != 1 {
+            return Err(invalid_setup_path(
+                "config lock",
+                path,
+                "must not have hardlink aliases",
+            ));
+        }
+        file
+    };
+    #[cfg(windows)]
+    let file = {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        let file = authority.dir.open_with(&name, &options)?.into_std();
+        if cap_fs_ext::MetadataExt::nlink(&file.metadata()?) != 1 {
+            return Err(invalid_setup_path(
+                "config lock",
+                path,
+                "must not have hardlink aliases",
+            ));
+        }
+        file
+    };
+    if !file.metadata()?.is_file() {
+        return Err(invalid_setup_path(
+            "config lock",
+            path,
+            "must be a regular file",
+        ));
+    }
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| SetupError::ConfigLockHeld(path.to_path_buf()))?;
+    Ok(file)
+}
+
+#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn revalidate_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+    lock: &std::fs::File,
+) -> Result<(), SetupError> {
+    let mut name = OsString::from(".");
+    name.push(
+        path.file_name()
+            .ok_or_else(|| invalid_setup_path("config", path, "must name a file"))?,
+    );
+    name.push(".doctor-lock");
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    let unchanged = {
+        use rustix::fs::{AtFlags, fstat, statat};
+        let expected = fstat(lock).map_err(std::io::Error::from)?;
+        let observed = statat(&authority.fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
+        expected.st_dev == observed.st_dev
+            && expected.st_ino == observed.st_ino
+            && expected.st_mode == observed.st_mode
+            && expected.st_nlink == 1
+            && observed.st_nlink == 1
+    };
+    #[cfg(windows)]
+    let unchanged = {
+        use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let observed = authority.dir.open_with(&name, &options)?.into_std();
+        let expected = lock.metadata()?;
+        let observed = observed.metadata()?;
+        observed.is_file()
+            && expected.dev() == observed.dev()
+            && expected.ino() == observed.ino()
+            && expected.nlink() == 1
+            && observed.nlink() == 1
+    };
+    if !unchanged {
+        return Err(invalid_setup_path(
+            "config lock",
+            path,
+            "changed identity or hardlink topology during its transform",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+fn open_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<std::fs::File, SetupError> {
+    let _ = (path, authority);
+    Err(SetupError::Other(
+        "retained config mutation authority is unavailable on this platform".into(),
+    ))
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+fn revalidate_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+    lock: &std::fs::File,
+) -> Result<(), SetupError> {
+    let _ = (path, authority, lock);
+    Err(SetupError::Other(
+        "retained config mutation authority is unavailable on this platform".into(),
+    ))
+}
+
+fn verify_existing_secret_git_protection(
+    path: &Path,
+    context: Option<&(PathBuf, PathBuf)>,
+    adjacent_artifacts: bool,
+) -> Result<(), SetupError> {
+    let Some((repo, relative)) = context else {
+        return Ok(());
+    };
+    // This is deliberately verify-only: doctor must never write an unlogged
+    // .gitignore as a side effect of repairing an unrelated config field.
+    check_secret_config_git_exposure_locked(path, repo, relative, false)?;
+    let relative = gitignore_relative_path(relative)?;
+    if !adjacent_artifacts {
+        return verify_secret_gitignore_protection(repo, [relative]);
+    }
+    let (directory, basename) = relative.rsplit_once('/').unwrap_or(("", &relative));
+    verify_secret_gitignore_protection(
+        repo,
+        [
+            relative.clone(),
+            format!("{directory}/.{basename}.probe.tmp")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{directory}/.{basename}.probe.bak")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{directory}/.{basename}.probe.replaced")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{relative}.bak"),
+        ],
+    )
+}
+
+/// Transform an existing config while retaining its no-follow parent and
+/// serializing both its live path and the doctor's backup worktree.
+///
+/// The callback executes once, under the per-path and subsystem locks and all
+/// repository locks (acquired in sorted order). Source identity, bytes, mode,
+/// and hardlink topology must still match before backup and atomic exchange.
+/// Secret writes require existing ignore coverage; this API never edits
+/// `.gitignore`. The exchange detaches hardlink aliases of the original file.
+///
+/// `prepare` records pending intent after the exact-source backup is durable.
+/// `finish` runs only after publication and authority checks succeed, with all
+/// guards still held. On an error after `prepare`, the caller must leave the
+/// pending record unconfirmed: it must not roll back through a fresh pathname
+/// or claim completion. Dry runs skip all writes and call only `finish` for
+/// the preview. Missing files and unchanged transforms invoke neither observer.
+///
+/// # Errors
+///
+/// Refuses unsafe filesystem authority, concurrent source changes, unavailable
+/// serialization, exposed secret artifacts, and failed backup/publication or
+/// observers. Callback errors retain the caller's error type.
+#[allow(clippy::too_many_lines)]
+pub fn transform_existing_config_atomic<E, G, T>(
+    path: &Path,
+    options: ExistingConfigTransformOptions<'_>,
+    acquire_subsystem_locks: impl FnOnce() -> Result<G, E>,
+    transform: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, E>,
+    prepare: impl FnOnce(&ConfigTransformSnapshot<'_>) -> Result<(), E>,
+    finish: impl FnOnce(&ConfigTransformSnapshot<'_>) -> Result<T, E>,
+) -> Result<Option<T>, E>
+where
+    E: From<SetupError>,
+{
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !check_setup_real_directory(parent, "config parent", false)? {
+        return Ok(None);
+    }
+    let authority = open_setup_directory_authority(parent).map_err(SetupError::from)?;
+    if read_setup_file_with_authority(path, "config", Some(&authority))?.is_none() {
+        return Ok(None);
+    }
+    let path_lock = if options.dry_run {
+        None
+    } else {
+        Some(open_config_transform_lock(path, &authority)?)
+    };
+    // Per-action subdirectories do not exist yet. Retain the nearest existing
+    // backup ancestor now, so replacing the run directory cannot redirect the
+    // later secret copy into a different real directory or symlink tree.
+    let mut backup_anchor = options
+        .backup_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    while !check_setup_real_directory(backup_anchor, "config backup parent", false)? {
+        backup_anchor = backup_anchor
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+    }
+    let backup_authority =
+        open_setup_directory_authority(backup_anchor).map_err(SetupError::from)?;
+    // Repository guards precede optional subsystem locks so an extra lock on
+    // the repository sentinel refuses nonblockingly rather than self-waiting.
+    let contexts = [
+        resolve_secret_git_context_inner(path, false, false, false)?,
+        resolve_secret_git_context_inner(options.backup_path, false, false, true)?,
+    ];
+    let mut repos: Vec<_> = contexts
+        .iter()
+        .flatten()
+        .map(|(repo, _)| repo.clone())
+        .collect();
+    repos.sort();
+    repos.dedup();
+    let mutexes: Vec<_> = if options.dry_run {
+        Vec::new()
+    } else {
+        repos
+            .iter()
+            .map(|repo| {
+                crate::GitRepoLocks::global()
+                    .lock_for_with_timeout(repo, std::time::Duration::from_secs(1))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(SetupError::from)?
+    };
+    let _mutex_guards: Vec<_> = mutexes
+        .iter()
+        .map(|mutex| crate::git_lock::lock_mutex_with_timeout(mutex, std::time::Duration::ZERO))
+        .collect::<Result<_, _>>()
+        .map_err(SetupError::from)?;
+    let mut flock_guards = Vec::new();
+    if !options.dry_run {
+        for repo in &repos {
+            let guard = crate::RepoFlock::acquire_with_timeout(repo, std::time::Duration::ZERO)
+                .map_err(SetupError::from)?;
+            if !guard.is_real() {
+                return Err(SetupError::Other(format!(
+                    "cannot serialize config transaction in {}",
+                    repo.display()
+                ))
+                .into());
+            }
+            flock_guards.push(guard);
+        }
+    }
+    let _subsystem_guards = if options.dry_run {
+        None
+    } else {
+        Some(acquire_subsystem_locks()?)
+    };
+    let verify_repositories = || -> Result<(), SetupError> {
+        let observed = [
+            resolve_secret_git_context_inner(path, false, true, false)?,
+            resolve_secret_git_context_inner(options.backup_path, false, true, true)?,
+        ];
+        if contexts != observed {
+            return Err(invalid_setup_path(
+                "config transaction",
+                path,
+                "changed Git repository authority",
+            ));
+        }
+        Ok(())
+    };
+    verify_repositories()?;
+    let Some(source) = read_setup_file_with_authority(path, "config", Some(&authority))? else {
+        return Ok(None);
+    };
+    let output = transform(source.content.as_bytes())?;
+    let verify_source = || -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        let observed = read_setup_file_with_authority(path, "config", Some(&authority))?;
+        if !observed
+            .as_ref()
+            .is_some_and(|observed| setup_snapshots_match(&source, observed))
+        {
+            return Err(SetupError::ConfigSourceChanged(path.to_path_buf()));
+        }
+        Ok(())
+    };
+    verify_source()?;
+    let Some(output) = output.filter(|output| output != source.content.as_bytes()) else {
+        return Ok(None);
+    };
+    if u64::try_from(output.len()).unwrap_or(u64::MAX) > SETUP_CONFIG_FILE_MAX_BYTES
+        || std::str::from_utf8(&output).is_err()
+    {
+        return Err(invalid_setup_path("transformed config", path, "must be bounded UTF-8").into());
+    }
+    let secret = options.contains_literal_secret
+        || config_contains_literal_secret(source.content.as_bytes())
+        || config_contains_literal_secret(&output);
+    let artifact_paths = std::cell::RefCell::new(Vec::<PathBuf>::new());
+    let verify_exact_artifact = |artifact: &Path| -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        verify_repositories()?;
+        let context = resolve_secret_git_context_inner(artifact, false, true, true)?;
+        if context
+            .as_ref()
+            .is_some_and(|(repo, _)| !repos.contains(repo))
+        {
+            return Err(invalid_setup_path(
+                "config artifact",
+                artifact,
+                "changed Git repository authority",
+            ));
+        }
+        verify_existing_secret_git_protection(artifact, context.as_ref(), false)
+    };
+    let protect_artifact = |artifact: &Path| -> Result<(), SetupError> {
+        if secret {
+            // Representative ignore probes cannot detect a negation targeting
+            // a generated name. Verify the actual name before it receives
+            // bytes or a retained secret inode, then remember it for the final
+            // index/ignore check under the same repository guards.
+            verify_exact_artifact(artifact)?;
+            artifact_paths.borrow_mut().push(artifact.to_path_buf());
+        }
+        Ok(())
+    };
+    let verify_exposure = || -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        verify_repositories()?;
+        if secret {
+            verify_existing_secret_git_protection(path, contexts[0].as_ref(), true)?;
+            verify_existing_secret_git_protection(options.backup_path, contexts[1].as_ref(), true)?;
+            for artifact in artifact_paths.borrow().iter() {
+                verify_exact_artifact(artifact)?;
+            }
+        }
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        Ok(())
+    };
+    verify_exposure()?;
+    let view = ConfigTransformSnapshot {
+        before: source.content.as_bytes(),
+        after: &output,
+        before_mode: source.recorded_mode,
+        after_mode: if secret {
+            0o600
+        } else {
+            (options.permissions & 0o777) | 0o600
+        },
+    };
+    if options.dry_run {
+        return finish(&view).map(Some);
+    }
+    // The caller chooses a fresh per-action path. Refuse existing backups;
+    // never overwrite evidence from another mutation or follow a link.
+    ensure_setup_parent_dir(options.backup_path, "config backup")?;
+    let backup_parent = options
+        .backup_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let backup_parent_authority =
+        open_setup_directory_authority(backup_parent).map_err(SetupError::from)?;
+    if read_setup_file_with_authority(
+        options.backup_path,
+        "config backup",
+        Some(&backup_parent_authority),
+    )?
+    .is_some()
+    {
+        return Err(
+            invalid_setup_path("config backup", options.backup_path, "already exists").into(),
+        );
+    }
+    verify_exposure()?;
+    verify_source()?;
+    let backup = write_audited_setup_file(
+        options.backup_path,
+        view.before,
+        0o600,
+        None,
+        &backup_parent_authority,
+        &protect_artifact,
+    )?;
+    if backup.content.as_bytes() != view.before // ubs:ignore -- private backup integrity check, not an authentication oracle.
+        || backup.link_count != 1
+        // ubs:ignore -- compares public permission bits, not secret bytes.
+        || (cfg!(unix) && backup.recorded_mode & 0o7777 != 0o600)
+    {
+        return Err(invalid_setup_path(
+            "config backup",
+            options.backup_path,
+            "failed verbatim verification",
+        )
+        .into());
+    }
+    let verify_backup = || -> Result<(), SetupError> {
+        let observed = read_setup_file_with_authority(
+            options.backup_path,
+            "config backup",
+            Some(&backup_parent_authority),
+        )?;
+        if !observed
+            .as_ref()
+            .is_some_and(|observed| setup_snapshots_match(&backup, observed))
+        {
+            return Err(invalid_setup_path(
+                "config backup",
+                options.backup_path,
+                "changed after verbatim verification",
+            ));
+        }
+        Ok(())
+    };
+    verify_exposure()?;
+    verify_source()?;
+    prepare(&view)?;
+    verify_exposure()?;
+    verify_source()?;
+    verify_backup()?;
+    let published = write_audited_setup_file(
+        path,
+        view.after,
+        view.after_mode,
+        Some(&source),
+        &authority,
+        &protect_artifact,
+    )?;
+    verify_exposure()?;
+    let observed = read_setup_file_with_authority(path, "config", Some(&authority))?;
+    if !observed
+        .as_ref()
+        .is_some_and(|observed| setup_snapshots_match(&published, observed))
+    {
+        return Err(invalid_setup_path("config", path, "publication was not confirmed").into());
+    }
+    verify_backup()?;
+    let result = finish(&view).map(Some);
+    // The collection owns the repository locks through the completion
+    // observer; releasing it earlier would detach the receipt from authority.
+    drop(flock_guards);
+    result
+}
+
 fn write_config_atomic_inner(
     action: &ConfigAction,
     contains_literal_secret: bool,
@@ -4512,7 +5266,7 @@ fn transform_config_atomic_inner(
     #[cfg(unix)]
     let permissions_need_tightening = existing_file
         .as_ref()
-        .is_some_and(|snapshot| snapshot.permissions != effective_permissions);
+        .is_some_and(|snapshot| snapshot.permissions != effective_permissions); // ubs:ignore -- compares public permission bits, not secret bytes.
     #[cfg(not(unix))]
     let permissions_need_tightening = false;
     let topology_needs_detaching = existing_file
@@ -5009,9 +5763,836 @@ fn apply_omp_mcp_authority_drift(
 struct OmpSettingsAuthorityInspection {
     observations: Vec<ConfigStatusFileObservation>,
     merged_mcp_settings: Option<Value>,
+    configured_extensions: Option<OmpSourcedSetting>,
+    disabled_providers: Option<OmpSourcedSetting>,
     project_config_enabled: bool,
     effective_source: Option<PathBuf>,
     unsupported_path: Option<PathBuf>,
+}
+
+struct OmpSourcedSetting {
+    value: Value,
+    source_path: PathBuf,
+    project_level: bool,
+}
+
+#[derive(Default)]
+struct OmpExtensionAuthorityInspection {
+    sources: Vec<OmpMcpAuthoritySource>,
+    observations: Vec<ConfigStatusFileObservation>,
+    unsupported_paths: Vec<PathBuf>,
+}
+
+// Discovery is a synchronous control-plane read. Refuse excessive fan-out
+// instead of letting an extension array turn each status check into a crawl.
+const OMP_CONFIGURED_EXTENSION_MAX_ROOTS: usize = 128;
+const OMP_PLUGIN_MAX_ANCESTORS: usize = 64;
+
+struct OmpInstalledExtension {
+    name: String,
+    root: PathBuf,
+    logical_root: PathBuf,
+    project_level: bool,
+}
+
+fn read_omp_plugin_json(
+    path: &Path,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Option<Map<String, Value>>, ()> {
+    let content = read_setup_file(path, "OMP plugin authority");
+    inspection
+        .observations
+        .push(config_status_file_observation(path, &content));
+    match content {
+        Ok(None) => Ok(None),
+        Ok(Some(snapshot)) => {
+            if let Ok(Value::Object(object)) = serde_json::from_str(&snapshot.content) {
+                Ok(Some(object))
+            } else {
+                inspection.unsupported_paths.push(path.to_path_buf());
+                Err(())
+            }
+        }
+        Err(_) => {
+            inspection.unsupported_paths.push(path.to_path_buf());
+            Err(())
+        }
+    }
+}
+
+// Directory decisions are cache authorities too: creating a node_modules or
+// project anchor can activate a provider without changing any existing file.
+// The CLI's fingerprint reader represents directories by exists=true and no
+// content hash, and re-enumerates selected package paths on every cache check.
+fn observe_omp_plugin_path(
+    path: &Path,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Option<std::fs::Metadata>, ()> {
+    let metadata = std::fs::metadata(path);
+    let observation = if metadata.as_ref().is_ok_and(std::fs::Metadata::is_file) {
+        config_status_file_observation(path, &read_setup_file(path, "OMP plugin anchor"))
+    } else {
+        ConfigStatusFileObservation {
+            path: path.display().to_string(),
+            exists: metadata.is_ok(),
+            content_sha256: None,
+        }
+    };
+    inspection.observations.push(observation);
+    match metadata {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => {
+            inspection.unsupported_paths.push(path.to_path_buf());
+            Err(())
+        }
+    }
+}
+
+fn omp_plugin_paths_equal(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn omp_user_plugins_root(
+    params: &SetupParams,
+    config_dir: &Path,
+    home: &Path,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<PathBuf, ()> {
+    let base = home.join(config_dir);
+    // getPluginsDir(home) deliberately short-circuits profile/XDG resolution
+    // for an isolated SDK home. Production passes the actual home instead.
+    if params.home_dir_override.is_some()
+        && home_dir_for_omp_setup().is_none_or(|actual| !omp_plugin_paths_equal(home, &actual))
+    {
+        return Ok(base.join("plugins"));
+    }
+    let resolve = || -> Result<(PathBuf, bool, Option<String>), SetupError> {
+        let omp_profile = utf8_env_value_for_setup("OMP_PROFILE")?;
+        let pi_profile = utf8_env_value_for_setup("PI_PROFILE")?;
+        let profile = omp_profile.or(pi_profile).and_then(|profile| {
+            let profile = profile.trim();
+            (!profile.is_empty() && profile != "default").then(|| profile.to_string())
+        });
+        if profile
+            .as_deref()
+            .is_some_and(|name| normalize_omp_profile_name(name).is_none())
+        {
+            return Err(SetupError::Other("invalid OMP plugin profile".to_string()));
+        }
+        let root = profile
+            .as_ref()
+            .map_or_else(|| base.clone(), |name| base.join("profiles").join(name));
+        let default_agent = root.join("agent");
+        let active_agent = omp_active_user_config_path(params)?
+            .parent()
+            .ok_or_else(|| SetupError::Other("missing OMP agent directory".to_string()))?
+            .to_path_buf();
+        Ok((
+            root,
+            omp_plugin_paths_equal(&default_agent, &active_agent),
+            profile,
+        ))
+    };
+    let (mut root, default_agent, profile) = resolve().map_err(|_| {
+        inspection.unsupported_paths.push(base.clone());
+    })?;
+    if cfg!(any(target_os = "linux", target_os = "macos")) && default_agent {
+        let xdg = utf8_env_value_for_setup("XDG_DATA_HOME").map_err(|_| {
+            inspection.unsupported_paths.push(base.clone());
+        })?;
+        if let Some(xdg) = xdg.filter(|value| !value.is_empty()) {
+            let xdg = resolve_omp_agent_dir_override(&params.project_dir, &xdg)
+                .map_err(|_| inspection.unsupported_paths.push(base.clone()))?;
+            let app_root = xdg.join("omp");
+            let candidate = profile.as_ref().map_or_else(
+                || app_root.clone(),
+                |name| app_root.join("profiles").join(name),
+            );
+            if let Some(metadata) = observe_omp_plugin_path(&candidate, inspection)? {
+                if !metadata.is_dir() {
+                    inspection.unsupported_paths.push(candidate);
+                    return Err(());
+                }
+                root = candidate;
+            }
+        }
+    }
+    Ok(root.join("plugins"))
+}
+
+fn omp_project_plugins_root(
+    params: &SetupParams,
+    home: &Path,
+    config_dir: &Path,
+    user_root: &Path,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Option<PathBuf>, ()> {
+    let temp = std::env::temp_dir();
+    let mut ancestors = Vec::new();
+    for directory in params.project_dir.ancestors() {
+        if [
+            home,
+            temp.as_path(),
+            Path::new("/tmp"),
+            Path::new("/var/tmp"),
+        ]
+        .iter()
+        .any(|ceiling| omp_plugin_paths_equal(directory, ceiling))
+        {
+            break;
+        }
+        if ancestors.len() == OMP_PLUGIN_MAX_ANCESTORS {
+            inspection
+                .unsupported_paths
+                .push(params.project_dir.clone());
+            return Err(());
+        }
+        ancestors.push(directory);
+    }
+    let is_user = |directory: &Path| {
+        let candidate = directory.join(config_dir);
+        omp_plugin_paths_equal(&candidate, &home.join(config_dir))
+            || user_root
+                .parent()
+                .is_some_and(|root| omp_plugin_paths_equal(&candidate, root))
+    };
+    let mut nearest_git = None;
+    let mut git_anchor = None;
+    for (index, directory) in ancestors.iter().enumerate() {
+        if observe_omp_plugin_path(&directory.join(".git"), inspection)?.is_some() {
+            nearest_git.get_or_insert(index);
+            if !is_user(directory) {
+                git_anchor = Some(*directory);
+                break;
+            }
+        }
+    }
+    let active_agent = omp_active_user_config_path(params)
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    for (index, directory) in ancestors.iter().enumerate() {
+        let candidate = directory.join(config_dir);
+        if !observe_omp_plugin_path(&candidate, inspection)?.is_some_and(|meta| meta.is_dir())
+            || is_user(directory)
+        {
+            continue;
+        }
+        if nearest_git.is_none_or(|git| index > git) {
+            let agent = candidate.join("agent");
+            if observe_omp_plugin_path(&agent, inspection)?.is_some_and(|meta| meta.is_dir())
+                && active_agent
+                    .as_ref()
+                    .is_none_or(|active| !omp_plugin_paths_equal(&agent, active))
+            {
+                continue;
+            }
+        }
+        return Ok(Some(candidate.join("plugins")));
+    }
+    Ok(git_anchor.map(|directory| directory.join(config_dir).join("plugins")))
+}
+
+fn omp_plugin_package_name_is_safe(name: &str) -> bool {
+    let component = |value: &str| {
+        !value.is_empty()
+            && !matches!(value, "." | "..")
+            && !value.ends_with('.')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    name.len() <= 214
+        && name.strip_prefix('@').map_or_else(
+            || component(name),
+            |scoped| {
+                scoped
+                    .split_once('/')
+                    .is_some_and(|(scope, package)| component(scope) && component(package))
+            },
+        )
+}
+
+fn omp_json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+fn omp_plugin_object_keys(object: &Map<String, Value>) -> Vec<String> {
+    let mut names: Vec<_> = object.keys().cloned().collect();
+    // JavaScript Object.keys puts canonical array-index strings first. Rust's
+    // preserve_order map already retains insertion order for all other keys;
+    // stable sorting leaves those in place, including 01 and 4294967295.
+    names.sort_by_key(|name| {
+        name.parse::<u32>()
+            .ok()
+            .filter(|index| *index != u32::MAX && index.to_string() == *name)
+            .map_or((true, 0), |index| (false, index))
+    });
+    names
+}
+
+fn omp_project_disabled_plugins(
+    params: &SetupParams,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<std::collections::HashSet<String>, ()> {
+    // Use config.ts#getConfigDirPaths, not loader.ts's stale .omp/.pi comment.
+    for directory in [".omp", ".claude", ".codex", ".gemini"] {
+        let path = params
+            .project_dir
+            .join(directory)
+            .join("plugin-overrides.json");
+        let Ok(Some(document)) = read_omp_plugin_json(&path, inspection) else {
+            continue;
+        };
+        let Some(disabled) = document.get("disabled").filter(|value| !value.is_null()) else {
+            return Ok(std::collections::HashSet::default());
+        };
+        let Some(disabled) = disabled.as_array().filter(|values| {
+            values.len() <= OMP_CONFIGURED_EXTENSION_MAX_ROOTS
+                && values.iter().all(Value::is_string)
+        }) else {
+            inspection.unsupported_paths.push(path);
+            return Err(());
+        };
+        return Ok(disabled
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect());
+    }
+    Ok(std::collections::HashSet::default())
+}
+
+#[allow(clippy::too_many_lines)]
+fn collect_omp_installed_extensions(
+    root: &Path,
+    project_level: bool,
+    disabled: &std::collections::HashSet<String>,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Vec<OmpInstalledExtension>, ()> {
+    let modules = root.join("node_modules");
+    if observe_omp_plugin_path(&modules, inspection)?.is_none() {
+        return Ok(Vec::new());
+    }
+    if !matches!(
+        check_setup_real_directory(&modules, "OMP installed plugins", false),
+        Ok(true)
+    ) {
+        inspection.unsupported_paths.push(modules);
+        return Err(());
+    }
+    let package_path = root.join("package.json");
+    let package = read_omp_plugin_json(&package_path, inspection)?;
+    let dependencies = match package
+        .as_ref()
+        .and_then(|object| object.get("dependencies"))
+    {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(dependencies)) => dependencies.clone(),
+        Some(_) => {
+            inspection.unsupported_paths.push(package_path);
+            return Err(());
+        }
+    };
+    let lock_path = root.join("omp-plugins.lock.json");
+    let lock = read_omp_plugin_json(&lock_path, inspection)?.unwrap_or_default();
+    let runtime = match lock.get("plugins") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(plugins)) => plugins.clone(),
+        Some(_) => {
+            inspection.unsupported_paths.push(lock_path);
+            return Err(());
+        }
+    };
+    let mut names = omp_plugin_object_keys(&dependencies);
+    for name in omp_plugin_object_keys(&runtime) {
+        if !dependencies.contains_key(&name) {
+            names.push(name);
+        }
+    }
+    if names.len() > OMP_CONFIGURED_EXTENSION_MAX_ROOTS {
+        inspection.unsupported_paths.push(root.to_path_buf());
+        return Err(());
+    }
+    let mut extensions = Vec::new();
+    for name in names {
+        if !omp_plugin_package_name_is_safe(&name) {
+            inspection.unsupported_paths.push(root.to_path_buf());
+            return Err(());
+        }
+        let logical_root = modules.join(&name);
+        let metadata = std::fs::symlink_metadata(&logical_root).ok();
+        if observe_omp_plugin_path(&logical_root, inspection)?.is_none() {
+            continue;
+        }
+        if package.is_some()
+            && !dependencies.contains_key(&name)
+            && !metadata.as_ref().is_some_and(setup_metadata_is_link_like)
+        {
+            continue;
+        }
+        let parent = logical_root.parent().ok_or(())?;
+        if !matches!(
+            check_setup_real_directory(parent, "OMP installed package parent", false),
+            Ok(true)
+        ) {
+            inspection.unsupported_paths.push(logical_root);
+            return Err(());
+        }
+        let canonical = std::fs::canonicalize(&logical_root).map_err(|_| {
+            inspection.unsupported_paths.push(logical_root.clone());
+        })?;
+        if !omp_path_is_absolute_and_traversal_free(&canonical)
+            || !matches!(
+                check_setup_real_directory(&canonical, "OMP installed package", false),
+                Ok(true)
+            )
+        {
+            inspection.unsupported_paths.push(logical_root);
+            return Err(());
+        }
+        let Some(manifest) = read_omp_plugin_json(&canonical.join("package.json"), inspection)?
+        else {
+            continue;
+        };
+        let manifest = manifest
+            .get("omp")
+            .filter(|value| omp_json_truthy(value))
+            .or_else(|| manifest.get("pi"));
+        let Some(manifest) = manifest.filter(|value| omp_json_truthy(value)) else {
+            continue;
+        };
+        if !manifest.is_object() && !manifest.is_array() {
+            inspection
+                .unsupported_paths
+                .push(canonical.join("package.json"));
+            return Err(());
+        }
+        if runtime.get(&name).is_some_and(|state| {
+            omp_json_truthy(state) && !state.get("enabled").is_some_and(omp_json_truthy)
+        }) || disabled.contains(&name)
+        {
+            continue;
+        }
+        extensions.push(OmpInstalledExtension {
+            name,
+            root: canonical,
+            logical_root,
+            project_level,
+        });
+    }
+    Ok(extensions)
+}
+
+fn omp_marketplace_enabled_overrides(
+    params: &SetupParams,
+    claude_dir: &Path,
+    project_root: Option<&Path>,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Map<String, Value>, ()> {
+    let mut paths = vec![claude_dir.join("settings.json")];
+    let anchor = project_root.and_then(|root| root.parent()?.parent());
+    for directory in anchor
+        .into_iter()
+        .chain(std::iter::once(params.project_dir.as_path()))
+    {
+        let directory = std::fs::canonicalize(directory).map_err(|_| {
+            inspection.unsupported_paths.push(directory.to_path_buf());
+        })?;
+        for name in ["settings.json", "settings.local.json"] {
+            let path = directory.join(".claude").join(name);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    let mut overrides = Map::new();
+    for path in paths {
+        if let Some(document) = read_omp_plugin_json(&path, inspection)?
+            && let Some(values) = document.get("enabledPlugins").and_then(Value::as_object)
+        {
+            if values.len() > OMP_CONFIGURED_EXTENSION_MAX_ROOTS {
+                inspection.unsupported_paths.push(path);
+                return Err(());
+            }
+            for (id, enabled) in values {
+                if enabled.is_boolean() {
+                    overrides.insert(id.clone(), enabled.clone());
+                }
+            }
+        }
+    }
+    Ok(overrides)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn read_omp_marketplace_roots(
+    path: &Path,
+    claude: bool,
+    project: bool,
+    active_project: &Path,
+    params: &SetupParams,
+    overrides: &Map<String, Value>,
+    roots: &mut Vec<(String, PathBuf)>,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<(), ()> {
+    let Some(document) = read_omp_plugin_json(path, inspection)? else {
+        return Ok(());
+    };
+    let Some(plugins) = document
+        .get("plugins")
+        .and_then(Value::as_object)
+        .filter(|plugins| {
+            document.get("version").is_some_and(Value::is_number)
+                && plugins.len() <= OMP_CONFIGURED_EXTENSION_MAX_ROOTS
+        })
+    else {
+        inspection.unsupported_paths.push(path.to_path_buf());
+        return Err(());
+    };
+    let mut remaining = OMP_CONFIGURED_EXTENSION_MAX_ROOTS;
+    for (id, entries) in plugins {
+        let Some(entries) = entries.as_array().filter(|entries| !entries.is_empty()) else {
+            continue;
+        };
+        let Some((plugin_name, _)) = id.rsplit_once('@') else {
+            continue;
+        };
+        remaining = remaining.checked_sub(entries.len()).ok_or_else(|| {
+            inspection.unsupported_paths.push(path.to_path_buf());
+        })?;
+        // OMP user installs replace Claude entries even if all are disabled.
+        // Project installs replace user entries only when one remains enabled.
+        if !claude && !project {
+            roots.retain(|(existing, _)| existing != id);
+        }
+        let mut selected = Vec::new();
+        for entry in entries {
+            let Some(install_path) = entry
+                .get("installPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            if entry.get("enabled") == Some(&Value::Bool(false)) {
+                continue;
+            }
+            if claude {
+                let enabled = overrides.get(id).and_then(Value::as_bool);
+                if enabled == Some(false) {
+                    continue;
+                }
+                if matches!(
+                    entry.get("scope").and_then(Value::as_str),
+                    Some("local" | "project")
+                ) && enabled != Some(true)
+                {
+                    let Some(recorded) = entry.get("projectPath").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let recorded = resolve_omp_agent_dir_override(&params.project_dir, recorded)
+                        .map_err(|_| inspection.unsupported_paths.push(path.to_path_buf()))?;
+                    if !omp_plugin_paths_equal(&recorded, active_project) {
+                        continue;
+                    }
+                }
+            }
+            if plugin_name.is_empty() {
+                // claude-plugins only prefixes MCP names for a nonempty
+                // plugin name. An active malformed entry cannot justify an
+                // exclusion; disabled and out-of-scope entries stay inert.
+                inspection.unsupported_paths.push(path.to_path_buf());
+                return Err(());
+            }
+            let install_path = resolve_omp_agent_dir_override(&params.project_dir, install_path)
+                .map_err(|_| inspection.unsupported_paths.push(path.to_path_buf()))?;
+            // Registry precedence is decided before probing the filesystem.
+            // An enabled project install still shadows the same user ID when
+            // its directory is missing; otherwise a stale user registration
+            // could incorrectly hide an independently enabled npm package.
+            let canonical = if observe_omp_plugin_path(&install_path, inspection)?.is_some() {
+                std::fs::canonicalize(&install_path).map_err(|_| {
+                    inspection.unsupported_paths.push(path.to_path_buf());
+                })?
+            } else {
+                install_path
+            };
+            selected.push((id.clone(), canonical));
+        }
+        if project && !selected.is_empty() {
+            roots.retain(|(existing, _)| existing != id);
+        }
+        roots.extend(selected);
+    }
+    Ok(())
+}
+
+fn exclude_omp_marketplace_extensions(
+    params: &SetupParams,
+    home: &Path,
+    user_root: &Path,
+    project_root: Option<&Path>,
+    extensions: &mut Vec<OmpInstalledExtension>,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<(), ()> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+    let (_, claude_dir) = claude_user_base(&params.project_dir, home).map_err(|path| {
+        inspection.unsupported_paths.push(path);
+    })?;
+    let overrides =
+        omp_marketplace_enabled_overrides(params, &claude_dir, project_root, inspection)?;
+    let active_project = project_root
+        .and_then(|root| root.parent()?.parent())
+        .unwrap_or(&params.project_dir);
+    let mut roots = Vec::new();
+    let mut registries = vec![
+        (
+            claude_dir.join("plugins/installed_plugins.json"),
+            true,
+            false,
+        ),
+        (user_root.join("installed_plugins.json"), false, false),
+    ];
+    if let Some(project_root) = project_root {
+        registries.push((project_root.join("installed_plugins.json"), false, true));
+    }
+    for (path, claude, project) in registries {
+        read_omp_marketplace_roots(
+            &path,
+            claude,
+            project,
+            active_project,
+            params,
+            &overrides,
+            &mut roots,
+            inspection,
+        )?;
+    }
+    extensions.retain(|extension| {
+        !roots
+            .iter()
+            .any(|(_, root)| omp_plugin_paths_equal(&extension.root, root))
+    });
+    Ok(())
+}
+
+fn inspect_omp_installed_extensions(
+    params: &SetupParams,
+    inspection: &mut OmpExtensionAuthorityInspection,
+) -> Result<Vec<OmpInstalledExtension>, ()> {
+    let home = omp_provider_home(params).ok_or_else(|| {
+        inspection
+            .unsupported_paths
+            .push(params.project_dir.clone());
+    })?;
+    let config_dir = utf8_env_value_for_setup("PI_CONFIG_DIR").map_err(|_| {
+        inspection.unsupported_paths.push(home.clone());
+    })?;
+    let config_dir = validate_omp_relative_config_dir(
+        config_dir
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(".omp"),
+    )
+    .map_err(|_| inspection.unsupported_paths.push(home.clone()))?;
+    let user_root = omp_user_plugins_root(params, config_dir, &home, inspection)?;
+    let project_root = omp_project_plugins_root(params, &home, config_dir, &user_root, inspection)?
+        .filter(|root| !omp_plugin_paths_equal(root, &user_root));
+    let disabled = omp_project_disabled_plugins(params, inspection)?;
+    let mut extensions =
+        collect_omp_installed_extensions(&user_root, false, &disabled, inspection)?;
+    if let Some(root) = &project_root {
+        for extension in collect_omp_installed_extensions(root, true, &disabled, inspection)? {
+            if let Some(existing) = extensions
+                .iter_mut()
+                .find(|existing| existing.name == extension.name)
+            {
+                *existing = extension;
+            } else {
+                extensions.push(extension);
+            }
+        }
+    }
+    exclude_omp_marketplace_extensions(
+        params,
+        &home,
+        &user_root,
+        project_root.as_deref(),
+        &mut extensions,
+        inspection,
+    )?;
+    Ok(extensions)
+}
+
+fn resolve_omp_configured_extension_root(
+    params: &SetupParams,
+    raw: &str,
+) -> Result<Option<PathBuf>, ()> {
+    if raw.is_empty() {
+        return Err(());
+    }
+    let path = Path::new(raw);
+    let expanded = if let Ok(rest) = path.strip_prefix("~") {
+        omp_provider_home(params).ok_or(())?.join(rest)
+    } else {
+        path.to_path_buf()
+    };
+    let resolved =
+        resolve_omp_agent_dir_override(&params.project_dir, expanded.to_str().ok_or(())?)
+            .map_err(|_| ())?;
+    let root: PathBuf = resolved.components().collect();
+    let parent = root.parent().unwrap_or(&root);
+    if !check_setup_real_directory(parent, "OMP configured extension", false).map_err(|_| ())? {
+        return Ok(Some(root));
+    }
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if setup_metadata_is_link_like(&metadata) => {
+            if crate::disk::is_trusted_system_directory_alias(&root) {
+                Ok(Some(root))
+            } else {
+                Err(())
+            }
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(root)),
+        // A .ts/.js entrypoint has no sibling package discovery surface.
+        Ok(metadata) if metadata.file_type().is_file() => Ok(None),
+        // Keep absent manifest/MCP paths as cache authorities: a package can
+        // be installed after a clean status without changing its settings.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(root)),
+        Ok(_) | Err(_) => Err(()),
+    }
+}
+
+fn inspect_omp_configured_extensions(
+    params: &SetupParams,
+    settings: &OmpSettingsAuthorityInspection,
+) -> OmpExtensionAuthorityInspection {
+    // Contract: can1357/oh-my-pi @ a70f001c43b5f318195410f8cae12c00ab1bff23,
+    // discovery/{omp-extension-roots,omp-plugins,agent-plugin-format}.ts and
+    // config/settings.ts, extensibility/plugins/loader.ts and utils/dirs.ts.
+    // Persisted configured extensions precede installed npm/link packages;
+    // invocation-only CLI/SDK roots are not inferable from setup parameters.
+    let mut inspection = OmpExtensionAuthorityInspection::default();
+    if settings.unsupported_path.is_some() {
+        return inspection;
+    }
+    if let Some(disabled) = &settings.disabled_providers {
+        let Some(providers) = disabled
+            .value
+            .as_array()
+            .filter(|providers| providers.iter().all(Value::is_string))
+        else {
+            // Path-scoped provider rules need OMP's own path matcher; do not
+            // silently interpret an unmodeled effective value as enabled.
+            inspection
+                .unsupported_paths
+                .push(disabled.source_path.clone());
+            return inspection;
+        };
+        if providers
+            .iter()
+            .any(|provider| provider.as_str() == Some("omp-plugins"))
+        {
+            return inspection;
+        }
+    }
+    let mut roots = Vec::new();
+    if let Some(configured) = &settings.configured_extensions {
+        let Some(entries) = configured
+            .value
+            .as_array()
+            .filter(|entries| entries.len() <= OMP_CONFIGURED_EXTENSION_MAX_ROOTS)
+        else {
+            inspection
+                .unsupported_paths
+                .push(configured.source_path.clone());
+            return inspection;
+        };
+        for entry in entries {
+            match entry
+                .as_str()
+                .ok_or(())
+                .and_then(|raw| resolve_omp_configured_extension_root(params, raw))
+            {
+                Ok(Some(root)) => roots.push((root.clone(), root, configured.project_level)),
+                Ok(None) => {}
+                Err(()) => inspection
+                    .unsupported_paths
+                    .push(configured.source_path.clone()),
+            }
+        }
+    }
+    if let Ok(installed) = inspect_omp_installed_extensions(params, &mut inspection) {
+        roots.extend(installed.into_iter().map(|extension| {
+            (
+                extension.root,
+                extension.logical_root,
+                extension.project_level,
+            )
+        }));
+    }
+    let mut seen_roots = std::collections::HashSet::new();
+    for (root, logical_root, project_level) in roots {
+        if !seen_roots.insert(logical_root.clone()) {
+            continue;
+        }
+        let manifest_path = root.join("plugin.json");
+        let manifest = read_setup_file(&manifest_path, "OMP extension manifest authority");
+        inspection
+            .observations
+            .push(config_status_file_observation(&manifest_path, &manifest));
+        match manifest {
+            Ok(Some(snapshot)) => {
+                // Both valid and fatally invalid Agent Plugins manifests
+                // suppress legacy unnamespaced MCP discovery. Standard MCP
+                // names are qualified by the plugin name and cannot collide
+                // with Agent Mail's exact legacy aliases.
+                let standard_manifest = serde_json::from_str::<Value>(&snapshot.content)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("$schema")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|schema| schema.starts_with("https://agent-plugins.org/schemas/"));
+                if standard_manifest {
+                    continue;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                inspection.unsupported_paths.push(manifest_path);
+                continue;
+            }
+        }
+        for name in [".mcp.json", "mcp.json"] {
+            inspection.sources.push(OmpMcpAuthoritySource {
+                path: root.join(name),
+                format: OmpMcpAuthorityFormat::Standalone,
+                provider: OmpMcpAuthorityProvider::Extension,
+                project_level,
+                extension_root: Some(logical_root.clone()),
+            });
+        }
+    }
+    inspection
 }
 
 impl OmpSettingsAuthorityInspection {
@@ -5864,6 +7445,103 @@ fn omp_mcp_source_has_dynamic_inputs(content: &str, format: OmpMcpAuthorityForma
     }
 }
 
+fn substitute_omp_extension_root(
+    value: &mut Value,
+    root: &str,
+    expansion_budget: &mut usize,
+) -> Result<(), ()> {
+    match value {
+        Value::String(value) => {
+            let replacements = value.matches("${OMP_PLUGIN_ROOT}").count()
+                + value.matches("${CLAUDE_PLUGIN_ROOT}").count();
+            let growth_bound = replacements.checked_mul(root.len()).ok_or(())?;
+            *expansion_budget = expansion_budget.checked_sub(growth_bound).ok_or(())?;
+            *value = value
+                .replace("${OMP_PLUGIN_ROOT}", root)
+                .replace("${CLAUDE_PLUGIN_ROOT}", root);
+        }
+        Value::Array(values) => {
+            for value in values {
+                substitute_omp_extension_root(value, root, expansion_budget)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                substitute_omp_extension_root(value, root, expansion_budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_omp_extension_connection_path(root: &Path, value: &str) -> String {
+    let mut normalized = PathBuf::new();
+    for component in root.join(value).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized.display().to_string()
+}
+
+fn prepare_omp_extension_mcp_content(
+    content: String,
+    source: &OmpMcpAuthoritySource,
+) -> Result<String, ()> {
+    let Ok(mut document) = serde_json::from_str::<Value>(&content) else {
+        return Ok(content);
+    };
+    let Some(servers) = document.get_mut("mcpServers") else {
+        return Ok(content);
+    };
+    let root = source
+        .extension_root
+        .as_deref()
+        .or_else(|| source.path.parent())
+        .ok_or(())?;
+    let root_text = root.to_str().ok_or(())?;
+    if root_text.contains("${") {
+        return Err(());
+    }
+    let mut expansion_budget = usize::try_from(SETUP_CONFIG_FILE_MAX_BYTES)
+        .map_err(|_| ())?
+        .checked_sub(content.len())
+        .ok_or(())?;
+    substitute_omp_extension_root(servers, root_text, &mut expansion_budget)?;
+    if let Some(servers) = servers.as_object_mut() {
+        for entry in servers.values_mut().filter_map(Value::as_object_mut) {
+            // Matches discovery/substitute-plugin-root.ts: command paths are
+            // relative to the config directory, independently of an explicit
+            // cwd. Bare executables stay unchanged; no default cwd is added.
+            for field in ["command", "cwd"] {
+                let Some(Value::String(value)) = entry.get_mut(field) else {
+                    continue;
+                };
+                let relative = if field == "cwd" {
+                    !Path::new(value).is_absolute()
+                } else {
+                    ["./", "../", ".\\", "..\\"]
+                        .iter()
+                        .any(|prefix| value.starts_with(*prefix))
+                };
+                if relative {
+                    let resolved = resolve_omp_extension_connection_path(root, value);
+                    expansion_budget = expansion_budget
+                        .checked_sub(resolved.len().saturating_sub(value.len()))
+                        .ok_or(())?;
+                    *value = resolved;
+                }
+            }
+        }
+    }
+    serde_json::to_string(&document).map_err(|_| ())
+}
+
 fn omp_mcp_parse_regular_source(
     content: &str,
     source: &OmpMcpAuthoritySource,
@@ -5898,6 +7576,12 @@ fn omp_mcp_parse_regular_source(
     };
     servers
         .iter()
+        .filter(|(_, entry)| {
+            source.provider != OmpMcpAuthorityProvider::Extension
+                || (entry.is_object()
+                    && (entry.get("command").is_some_and(Value::is_string)
+                        || entry.get("url").is_some_and(Value::is_string)))
+        })
         .map(|(name, entry)| {
             let mut candidate = omp_mcp_candidate_from_entry(name, entry, source);
             if source.format == OmpMcpAuthorityFormat::CodexToml {
@@ -5982,9 +7666,14 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
     };
 
     let settings = inspect_omp_settings_authority(params);
+    let extensions = inspect_omp_configured_extensions(params, &settings);
     inspection
         .observations
         .extend(settings.observations.clone());
+    inspection.observations.extend(extensions.observations);
+    inspection
+        .unsupported_paths
+        .extend(extensions.unsupported_paths);
     if let Some(path) = settings.unsupported_path {
         inspection.unsupported_paths.push(path);
     }
@@ -6015,13 +7704,14 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
                     format: OmpMcpAuthorityFormat::OpenCodeJsonc,
                     provider: OmpMcpAuthorityProvider::OpenCode,
                     project_level,
+                    extension_root: None,
                 };
                 candidates.push(omp_mcp_candidate_from_entry(&name, &entry, &source));
             }
         };
 
     let mut in_open_code = false;
-    for source in omp_mcp_authority_sources(params) {
+    for source in omp_mcp_authority_sources(params, extensions.sources) {
         if in_open_code && source.provider != OmpMcpAuthorityProvider::OpenCode {
             flush_open_code(
                 &mut candidates,
@@ -6048,6 +7738,16 @@ fn inspect_omp_mcp_aliases(params: &SetupParams, action_path: &Path) -> OmpMcpAl
                 inspection.unsupported_paths.push(source.path);
                 continue;
             }
+        };
+        let content = if source.provider == OmpMcpAuthorityProvider::Extension {
+            if let Ok(content) = prepare_omp_extension_mcp_content(content, &source) {
+                content
+            } else {
+                inspection.unsupported_paths.push(source.path);
+                continue;
+            }
+        } else {
+            content
         };
         if omp_mcp_source_has_dynamic_inputs(&content, source.format) {
             inspection.unsupported_paths.push(source.path);
@@ -6385,12 +8085,30 @@ fn merge_omp_settings_document(
     inspection: &mut OmpSettingsAuthorityInspection,
     path: &Path,
     mut root: Map<String, Value>,
-    drop_group_shadows: bool,
+    project_level: bool,
 ) {
+    // Arrays replace the lower layer, including an empty array. The same
+    // provenance used by OMP's Settings.extensionsSourceLevel() determines
+    // project suppression: explicit overlays and active-profile settings are
+    // user-scoped, while every project-settings provider is project-scoped.
+    if let Some(value) = root.remove("extensions") {
+        inspection.configured_extensions = Some(OmpSourcedSetting {
+            value,
+            source_path: path.to_path_buf(),
+            project_level,
+        });
+    }
+    if let Some(value) = root.remove("disabledProviders") {
+        inspection.disabled_providers = Some(OmpSourcedSetting {
+            value,
+            source_path: path.to_path_buf(),
+            project_level,
+        });
+    }
     let Some(incoming_mcp) = root.remove("mcp") else {
         return;
     };
-    if drop_group_shadows && !incoming_mcp.is_object() {
+    if project_level && !incoming_mcp.is_object() {
         return;
     }
     let directly_supplies_leaf = incoming_mcp
@@ -6415,13 +8133,13 @@ fn merge_omp_settings_file(
     required: bool,
     format: OmpSettingsFormat,
     invalid_policy: OmpSettingsInvalidPolicy,
-    drop_group_shadows: bool,
+    project_level: bool,
 ) -> OmpSettingsFileValue {
     let (observation, value) = inspect_omp_settings_file(path, required, format, invalid_policy);
     inspection.observations.push(observation);
     match &value {
         OmpSettingsFileValue::Parsed(root) => {
-            merge_omp_settings_document(inspection, path, root.clone(), drop_group_shadows);
+            merge_omp_settings_document(inspection, path, root.clone(), project_level);
         }
         OmpSettingsFileValue::Unsupported => {
             inspection.unsupported_path = Some(path.to_path_buf());
@@ -6461,6 +8179,8 @@ fn inspect_omp_settings_authority(params: &SetupParams) -> OmpSettingsAuthorityI
     let mut inspection = OmpSettingsAuthorityInspection {
         observations: Vec::new(),
         merged_mcp_settings: None,
+        configured_extensions: None,
+        disabled_providers: None,
         project_config_enabled: true,
         effective_source: None,
         unsupported_path: None,
@@ -6901,9 +8621,12 @@ fn analyze_toml_config_content(
                 .all(|section| section.authorization.is_none())
         },
         |expected| {
-            sections
-                .iter()
-                .any(|section| section.authorization.as_deref() == Some(expected))
+            sections.iter().any(|section| {
+                section
+                    .authorization
+                    .as_deref()
+                    .is_some_and(|actual| constant_time_str_eq(actual, expected))
+            })
         },
     );
     if !auth_matches {
@@ -7659,6 +9382,358 @@ mod tests {
             .expect("setup temp directory")
     }
 
+    #[test]
+    fn audited_config_transform_never_completes_or_rolls_back_a_changed_source() {
+        let td = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(td.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            std::fs::canonicalize(td.path()).unwrap(),
+            resolve_secret_git_context_inner(&td.path().join("config.json"), false, false, true)
+                .unwrap()
+                .expect("isolated Git authority")
+                .0,
+        );
+        let path = td.path().join("config.json");
+        let backup = td.path().join("backups/config.json");
+        std::fs::write(&path, b"original").unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let error = transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: false,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| Ok(Some(b"replacement".to_vec())),
+            |snapshot| {
+                assert_eq!(std::fs::read(&backup)?, snapshot.before);
+                prepared.set(true);
+                std::fs::write(&path, b"concurrent operator edit")?;
+                Ok(())
+            },
+            |_| -> Result<(), SetupError> { panic!("unconfirmed publication must not complete") },
+        )
+        .unwrap_err();
+        assert!(prepared.get());
+        assert!(matches!(error, SetupError::ConfigSourceChanged(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"concurrent operator edit");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_refuses_changed_lock_leaf() {
+        for replace_lock in [false, true] {
+            let td = setup_real_tempdir();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(td.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(
+                std::fs::canonicalize(td.path()).unwrap(),
+                resolve_secret_git_context_inner(
+                    &td.path().join("config.json"),
+                    false,
+                    false,
+                    true
+                )
+                .unwrap()
+                .expect("isolated Git authority")
+                .0,
+            );
+            let path = td.path().join("config.json");
+            let backup = td.path().join("backups/config.json");
+            let lock_path = td.path().join(".config.json.doctor-lock");
+            std::fs::write(&path, b"original").unwrap();
+            let error = transform_existing_config_atomic(
+                &path,
+                ExistingConfigTransformOptions {
+                    permissions: 0o600,
+                    contains_literal_secret: false,
+                    dry_run: false,
+                    backup_path: &backup,
+                },
+                || Ok::<_, SetupError>(()),
+                |_| {
+                    let displaced = td.path().join("retained-lock");
+                    if replace_lock {
+                        std::fs::rename(&lock_path, &displaced)?;
+                        std::fs::write(&lock_path, b"")?;
+                    } else {
+                        std::fs::hard_link(&lock_path, &displaced)?;
+                    }
+                    Ok(Some(b"replacement".to_vec()))
+                },
+                |_| -> Result<(), SetupError> {
+                    panic!("changed lock must precede pending intent")
+                },
+                |_| -> Result<(), SetupError> { panic!("changed lock must not complete") },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("config lock"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            assert!(!backup.exists());
+        }
+    }
+
+    #[test]
+    fn audited_config_transform_checks_git_again_after_pending_intent() {
+        let td = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(td.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = td.path().join("config.json");
+        let backup = td.path().join("backups/config.json");
+        let original = br#"{"token":"old-private-value"}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(
+            td.path().join(".gitignore"),
+            b"/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n",
+        )
+        .unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let error = transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: true,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| Ok(Some(br#"{"token":"new-private-value"}"#.to_vec())),
+            |_| {
+                prepared.set(true);
+                // A non-cooperating git command ignores our advisory guard.
+                // Its index change must be caught before secret publication.
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(td.path())
+                        .args(["add", "-f", "--", "config.json"])
+                        .status()?
+                        .success()
+                );
+                Ok(())
+            },
+            |_| -> Result<(), SetupError> {
+                panic!("tracked secret publication must not complete")
+            },
+        )
+        .unwrap_err();
+        assert!(prepared.get());
+        assert!(error.to_string().contains("Git-tracked"), "{error}");
+        assert!(!error.to_string().contains("private-value"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn audited_config_transform_holds_both_repository_guards_through_completion() {
+        let live = setup_real_tempdir();
+        let audit = setup_real_tempdir();
+        for repo in [live.path(), audit.path()] {
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(
+                repo.join(".gitignore"),
+                b"/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n",
+            )
+            .unwrap();
+        }
+        let path = live.path().join("config.json");
+        let backup = audit.path().join("backups/config.json");
+        std::fs::write(&path, br#"{"token":"old-private-value"}"#).unwrap();
+        let replacement = br#"{"token":"new-private-value"}"#;
+        let check_locks = || {
+            for lock_path in [
+                live.path().join(".config.json.doctor-lock"),
+                live.path().join(".git/am.git-serialize.lock"),
+                audit.path().join(".git/am.git-serialize.lock"),
+            ] {
+                let contender = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .unwrap();
+                assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            }
+        };
+        transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: true,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| {
+                check_locks();
+                Ok(Some(replacement.to_vec()))
+            },
+            |_| {
+                check_locks();
+                Ok(())
+            },
+            |snapshot| {
+                check_locks();
+                assert_eq!(std::fs::read(&path)?, snapshot.after);
+                assert_eq!(std::fs::read(&backup)?, snapshot.before);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_checks_exact_generated_artifact_names_before_secret_writes() {
+        for suffix in ["tmp", "replaced"] {
+            let td = setup_real_tempdir();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(td.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let path = td.path().join("config.json");
+            let backup = td.path().join("backups/config.json");
+            let original = br#"{"token":"old-private-value"}"#;
+            std::fs::write(&path, original).unwrap();
+            // The representative .probe names are ignored, but real generated
+            // names from this process are exposed by the later negation.
+            let ignore = format!(
+                "/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n!/.config.json.{}.*.{suffix}\n",
+                std::process::id()
+            );
+            std::fs::write(td.path().join(".gitignore"), &ignore).unwrap();
+            let error = transform_existing_config_atomic(
+                &path,
+                ExistingConfigTransformOptions {
+                    permissions: 0o600,
+                    contains_literal_secret: true,
+                    dry_run: false,
+                    backup_path: &backup,
+                },
+                || Ok::<_, SetupError>(()),
+                |_| Ok(Some(br#"{"token":"new-private-value"}"#.to_vec())),
+                |_| Ok(()),
+                |_| -> Result<(), SetupError> {
+                    panic!("an exposed generated artifact must not complete")
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("does not protect artifact"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(td.path().join(".gitignore")).unwrap(),
+                ignore
+            );
+            for entry in std::fs::read_dir(td.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.json.")
+                    && entry.metadata().unwrap().len() != 0
+                {
+                    assert!(
+                        Command::new("git")
+                            .arg("-C")
+                            .arg(td.path())
+                            .args(["check-ignore", "--no-index", "--"])
+                            .arg(entry.path())
+                            .status()
+                            .unwrap()
+                            .success(),
+                        "every retained credential artifact must be ignored"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_rejects_a_same_bytes_staged_inode_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let td = setup_real_tempdir();
+        let path = td.path().join("config.json");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = read_setup_file(&path, "test source").unwrap().unwrap();
+        let error = write_setup_file_atomic_bound_with_authority_and_hook(
+            &path,
+            b"replacement",
+            0o600,
+            "test config",
+            Some(&expected),
+            false,
+            None,
+            || {
+                let temp = std::fs::read_dir(td.path())?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .find(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+                    .expect("staged config");
+                std::fs::rename(&temp, td.path().join("retained-staged-file"))?;
+                std::fs::write(&temp, b"replacement")?;
+                std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            },
+            &|_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("published file identity"),
+            "{error}"
+        );
+        // Publication happened, but the returned error must never be mistaken
+        // for a confirmed commit or trigger a fresh-path rollback.
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(td.path().join("retained-staged-file")).unwrap(),
+            b"replacement"
+        );
+        assert!(std::fs::read_dir(td.path()).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            path.extension().is_some_and(|ext| ext == "replaced")
+                && std::fs::read(path).unwrap() == b"original"
+        }));
+    }
+
     #[cfg(unix)]
     fn non_utf8_os_string() -> OsString {
         use std::os::unix::ffi::OsStringExt as _;
@@ -8131,7 +10206,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8765,
             path: "/mcp/".into(),
-            token: "test-token".into(),
+            token: "test-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             skip_user_config: true,
             ..Default::default()
@@ -8164,7 +10239,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 8765,
             path: "/mcp/".into(),
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(AgentPlatform::ALL.to_vec()),
@@ -8222,7 +10297,7 @@ mod tests {
         std::fs::write(&outside, "sentinel\n").unwrap();
         symlink(&outside, tmp.path().join(".gitignore")).unwrap();
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8266,7 +10341,7 @@ mod tests {
                 .success()
         );
         let params = SetupParams {
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8320,7 +10395,7 @@ mod tests {
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         assert!(!flock_sentinel.exists());
         let params = SetupParams {
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8363,7 +10438,7 @@ mod tests {
         );
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         let params = SetupParams {
-            token: "must-not-reach-symlink".into(),
+            token: "must-not-reach-symlink".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8408,7 +10483,7 @@ mod tests {
         );
         let flock_sentinel = tmp.path().join(".git/am.git-serialize.lock");
         let params = SetupParams {
-            token: "must-not-reach-unsafe-gitignore".into(),
+            token: "must-not-reach-unsafe-gitignore".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8444,7 +10519,7 @@ mod tests {
                 .success()
         );
         let mut params = SetupParams {
-            token: "old-secret-token".into(),
+            token: "old-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Omp]),
@@ -8566,7 +10641,7 @@ mod tests {
         let tmp = setup_real_tempdir();
         let override_path = tmp.path().join("custom-agent/mcp.json");
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             omp_user_config_path_override: Some(override_path.clone()),
@@ -8611,7 +10686,7 @@ mod tests {
         // Brackets are Git glob metacharacters and valid filenames on Windows.
         let override_path = tmp.path().join("custom[agent]/mcp[local].json");
         let mut params = SetupParams {
-            token: "first-secret".into(),
+            token: "first-secret".into(), // ubs:ignore -- synthetic test credential.
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             omp_user_config_path_override: Some(override_path.clone()),
@@ -8620,18 +10695,24 @@ mod tests {
             skip_hooks: true,
             ..Default::default()
         };
+        let initial = run_setup(&params);
         assert!(
-            run_setup(&params)[0]
+            initial[0]
                 .actions
                 .iter()
-                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+            "initial literal-metacharacter setup: {:?}",
+            initial[0].actions
         );
         params.token = "second-secret".into();
+        let rotated = run_setup(&params);
         assert!(
-            run_setup(&params)[0]
+            rotated[0]
                 .actions
                 .iter()
-                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_)))
+                .all(|action| !matches!(action.outcome, ActionOutcome::Failed(_))),
+            "rotated literal-metacharacter setup: {:?}",
+            rotated[0].actions
         );
 
         let status = Command::new("git")
@@ -8746,7 +10827,7 @@ mod tests {
     #[test]
     fn nonempty_token_writes_authorization_header() {
         let params = SetupParams {
-            token: "real-token".into(),
+            token: "real-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/p"),
             skip_user_config: true,
             skip_hooks: true,
@@ -8771,7 +10852,7 @@ mod tests {
     fn config_paths_without_expected_bearer_token_lists_the_header_free_user_configs() {
         let home = PathBuf::from("/home/tester");
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             home_dir_override: Some(home.clone()),
             agents: Some(vec![AgentPlatform::Cursor]),
@@ -8797,7 +10878,7 @@ mod tests {
     #[test]
     fn config_paths_without_expected_bearer_token_is_the_complement_of_expected_auth() {
         let params = SetupParams {
-            token: "live-secret-token".into(),
+            token: "live-secret-token".into(), // ubs:ignore -- synthetic test credential.
             project_dir: PathBuf::from("/tmp/project"),
             home_dir_override: Some(PathBuf::from("/home/tester")),
             skip_hooks: true,
@@ -9160,12 +11241,28 @@ mod tests {
         let sentinel = project.join("operator-owned");
         std::fs::write(&sentinel, "sentinel\n").unwrap();
         let missing_process_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
+        // The original leak wrote `./~/.omp/agent/mcp.json` under the process
+        // cwd, not under project_dir, so watch the cwd for relative roots too.
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_roots: Vec<PathBuf> = ["~", "relative-home", "relative-omp"]
+            .iter()
+            .map(|root| cwd.join(root))
+            .filter(|root| !root.exists())
+            .collect();
+        let relative_override = |path: &str| SetupParams {
+            project_dir: project.clone(),
+            omp_user_config_path_override: Some(PathBuf::from(path)),
+            agents: Some(vec![AgentPlatform::Omp]),
+            token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
 
         for mut params in [
             SetupParams {
                 project_dir: project.clone(),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
@@ -9173,7 +11270,7 @@ mod tests {
                 project_dir: project.clone(),
                 home_dir_override: Some(PathBuf::from("relative-home")),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
@@ -9188,10 +11285,12 @@ mod tests {
                     std::path::MAIN_SEPARATOR
                 ))),
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "must-not-be-written".to_string(),
+                token: "must-not-be-written".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             },
+            relative_override("~/.omp/agent/mcp.json"),
+            relative_override("relative-omp/agent/mcp.json"),
         ] {
             params.skip_user_config = true;
             let results = run_setup(&params);
@@ -9203,6 +11302,13 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
             assert!(!project.join(".omp").exists());
             assert!(!project.join(".gitignore").exists());
+            for root in &cwd_roots {
+                assert!(
+                    !root.exists(),
+                    "relative OMP authority wrote under the process cwd: {}",
+                    root.display()
+                );
+            }
         }
 
         drop(missing_process_home);
@@ -9214,7 +11320,7 @@ mod tests {
         let params = SetupParams {
             project_dir: project.clone(),
             agents: Some(vec![AgentPlatform::Omp]),
-            token: "ordinary-direct-setup".to_string(),
+            token: "ordinary-direct-setup".to_string(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..SetupParams::default()
         };
@@ -9482,7 +11588,7 @@ mod tests {
             project_dir: tmp.path().join("project"),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Antigravity]),
-            token: "transport-fixture-token".into(),
+            token: "transport-fixture-token".into(), // ubs:ignore -- synthetic test credential.
             ..Default::default()
         };
         let actions = AgentPlatform::Antigravity.config_actions(&params);
@@ -10095,6 +12201,7 @@ mod tests {
                 Ok(())
             },
             || {},
+            &|_| Ok(()),
         )
         .expect_err("a leaf swap at the ReplaceFile seam must roll back");
 
@@ -10150,6 +12257,7 @@ mod tests {
                 outside_received_secret
                     .set(std::fs::read(&outside).is_ok_and(|content| content == attempted));
             },
+            &|_| Ok(()),
         );
 
         assert!(
@@ -10323,6 +12431,7 @@ mod tests {
                 std::fs::rename(existing, new).unwrap();
                 Ok(())
             },
+            &|_| Ok(()),
         )
         .expect("the documented partial-move state must be restored before retry");
 
@@ -11739,7 +13848,7 @@ http_headers = { Authorization = "Bearer tok" }
             std::fs::create_dir_all(&project).unwrap();
             let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", profile.as_os_str());
             let params = SetupParams {
-                token: "profile-test-token".into(),
+                token: "profile-test-token".into(), // ubs:ignore -- synthetic test credential.
                 project_dir: project.clone(),
                 home_dir_override: Some(home.clone()),
                 agents: Some(vec![AgentPlatform::Claude]),
@@ -11826,7 +13935,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().join("project"),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Claude]),
-            token: "must-not-be-written".into(),
+            token: "must-not-be-written".into(), // ubs:ignore -- synthetic test credential.
             ..Default::default()
         };
         let _profile = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "../other-profile");
@@ -11900,7 +14009,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().to_path_buf(),
             home_dir_override: Some(tmp.path().join("home")),
             agents: Some(vec![AgentPlatform::Claude]),
-            token: "must-not-enter-index".into(),
+            token: "must-not-enter-index".into(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..Default::default()
         };
@@ -12590,6 +14699,1071 @@ http_headers = { Authorization = "Bearer tok" }
     }
 
     #[test]
+    fn omp_installed_plugins_reveal_distinct_aliases_and_observe_runtime_switches() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let root = write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let mcp = root.join(".mcp.json");
+        let original = std::fs::read(&mcp).unwrap();
+        let live = first_setup_status_file(&params);
+        assert_eq!(
+            live.primary_drift_reason,
+            ConfigDriftReason::DuplicateServerEntries
+        );
+        assert!(live.omp_mcp_alias_drift);
+        for path in [
+            plugins.join("package.json"),
+            plugins.join("omp-plugins.lock.json"),
+            root.join("package.json"),
+            root.join("plugin.json"),
+            mcp.clone(),
+        ] {
+            assert!(
+                omp_mcp_authority_paths(&params).contains(&path),
+                "missing authority {path:?}"
+            );
+            assert!(
+                live.status_observations
+                    .iter()
+                    .any(|entry| entry.path == path.display().to_string())
+            );
+        }
+        std::fs::write(
+            plugins.join("omp-plugins.lock.json"),
+            r#"{"plugins":{"mail-plugin":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        assert!(!omp_mcp_authority_paths(&params).contains(&mcp));
+        std::fs::write(
+            plugins.join("omp-plugins.lock.json"),
+            r#"{"plugins":{"mail-plugin":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+        let override_path = params.project_dir.join(".omp/plugin-overrides.json");
+        std::fs::write(&override_path, r#"{"disabled":["mail-plugin"]}"#).unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        assert!(omp_mcp_authority_paths(&params).contains(&override_path));
+        assert_eq!(
+            std::fs::read(mcp).unwrap(),
+            original,
+            "status must never repair imported plugin files"
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_apply_enabled_project_package_shadowing() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let user = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let project = params.project_dir.join(".omp/plugins");
+        let user_package = write_omp_installed_plugin(
+            &user,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let project_package = write_omp_installed_plugin(
+            &project,
+            "mail-plugin",
+            "mcp-agent-mail",
+            "http://other.example/mcp",
+        );
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "project package replaces user package, then native exact-name entry wins"
+        );
+        assert!(!omp_mcp_authority_paths(&params).contains(&user_package.join(".mcp.json")));
+        std::fs::write(
+            project.join("omp-plugins.lock.json"),
+            r#"{"plugins":{"mail-plugin":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "disabled project package must not suppress the enabled user package"
+        );
+        std::fs::write(
+            project.join("omp-plugins.lock.json"),
+            r#"{"plugins":{"mail-plugin":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_package.join(".mcp.json"),
+            r#"{"mcpServers":{"mcp_agent_mail":{"url":"http://other.example/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "mcp:\n  enableProjectConfig: false\n",
+        )
+        .unwrap();
+        assert!(
+            !first_setup_status_file(&params).omp_mcp_alias_drift,
+            "project package keeps project scope after shadowing"
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_follow_configured_roots_and_dependency_insertion_order() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        write_omp_installed_plugin(
+            &plugins,
+            "z-first",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        write_omp_installed_plugin(
+            &plugins,
+            "a-second",
+            "agent-mail",
+            "http://127.0.0.1:8765/mcp/",
+        );
+        std::fs::write(
+            plugins.join("package.json"),
+            r#"{"dependencies":{"z-first":"*","a-second":"*"}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "JSON insertion order, not alphabetical package order, decides first key"
+        );
+        write_omp_installed_plugin(&plugins, "2", "agent-mail", "http://stale.example/mcp");
+        write_omp_installed_plugin(&plugins, "1", "agent-mail", "http://127.0.0.1:8765/mcp/");
+        std::fs::write(
+            plugins.join("package.json"),
+            r#"{"dependencies":{"2":"*","1":"*"}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "JavaScript enumerates canonical numeric package names in index order"
+        );
+        std::fs::write(
+            plugins.join("package.json"),
+            r#"{"dependencies":{"z-first":"*","a-second":"*"}}"#,
+        )
+        .unwrap();
+        let configured = params.project_dir.join("configured");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(configured.join(".mcp.json"), r#"{"mcpServers":{"agent-mail":{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}}}}"#).unwrap();
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./configured]\n",
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "configured packages precede installed packages, equivalent connection dedupes"
+        );
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "disabledProviders: [omp-plugins]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        assert!(!omp_mcp_authority_paths(&params).contains(&plugins.join("package.json")));
+    }
+
+    #[test]
+    fn omp_installed_plugins_byte_changes_invalidate_absent_and_disabled_authority() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let before = first_setup_status_file(&params);
+        assert!(before.status_observations.iter().any(|entry| entry.path
+            == plugins.join("node_modules").display().to_string()
+            && !entry.exists));
+        let root = write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let manifest = root.join("package.json");
+        std::fs::write(&manifest, r#"{"name":"mail-plugin","omp":null}"#).unwrap();
+        let inactive = first_setup_status_file(&params);
+        assert_eq!(inactive.drift_reasons, Vec::<ConfigDriftReason>::new());
+        let inactive_hash = inactive
+            .status_observations
+            .iter()
+            .find(|entry| entry.path == manifest.display().to_string())
+            .unwrap()
+            .content_sha256
+            .clone();
+        std::fs::write(&manifest, r#"{"name":"mail-plugin","omp":{}  }"#).unwrap();
+        let active = first_setup_status_file(&params);
+        assert!(active.omp_mcp_alias_drift);
+        assert_ne!(
+            inactive_hash,
+            active
+                .status_observations
+                .iter()
+                .find(|entry| entry.path == manifest.display().to_string())
+                .unwrap()
+                .content_sha256
+        );
+        let lock = plugins.join("omp-plugins.lock.json");
+        std::fs::write(
+            &lock,
+            r#"{"plugins":{"mail-plugin":{"enabled":false}},"revision":"a"}"#,
+        )
+        .unwrap();
+        let first = first_setup_status_file(&params);
+        std::fs::write(
+            &lock,
+            r#"{"plugins":{"mail-plugin":{"enabled":false}},"revision":"b"}"#,
+        )
+        .unwrap();
+        let second = first_setup_status_file(&params);
+        let observed = |status: &ConfigFileStatus| {
+            status
+                .status_observations
+                .iter()
+                .find(|entry| entry.path == lock.display().to_string())
+                .unwrap()
+                .content_sha256
+                .clone()
+        };
+        assert!(first.drift_reasons.is_empty() && second.drift_reasons.is_empty());
+        assert_ne!(
+            observed(&first),
+            observed(&second),
+            "equal-sized lockfile bytes remain cache authority even while disabled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_installed_plugins_load_lock_only_links_and_track_canonical_retargets() {
+        use std::os::unix::fs::symlink;
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let installed =
+            write_omp_installed_plugin(&plugins, "stale", "agent-mail", "http://stale.example/mcp");
+        std::fs::write(plugins.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        std::fs::write(
+            plugins.join("omp-plugins.lock.json"),
+            r#"{"plugins":{"stale":{"enabled":true},"linked":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "a stale lock-only ordinary npm directory does not load"
+        );
+        let link = plugins.join("node_modules/linked");
+        symlink(&installed, &link).unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "lock-only npm link is a live package"
+        );
+        assert!(omp_mcp_authority_paths(&params).contains(&installed.join(".mcp.json")));
+        let alternate_plugins = tmp.path().join("alternate-plugins");
+        let alternate = write_omp_installed_plugin(
+            &alternate_plugins,
+            "other",
+            "mcp-agent-mail",
+            "http://other.example/mcp",
+        );
+        std::fs::rename(&link, plugins.join("node_modules/previous-link")).unwrap();
+        symlink(&alternate, &link).unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        let paths = omp_mcp_authority_paths(&params);
+        assert!(paths.contains(&alternate.join(".mcp.json")));
+        assert!(!paths.contains(&installed.join(".mcp.json")));
+        let settings = inspect_omp_settings_authority(&params);
+        let sources = inspect_omp_configured_extensions(&params, &settings);
+        let source = sources
+            .sources
+            .iter()
+            .find(|source| source.path == alternate.join(".mcp.json"))
+            .unwrap();
+        let prepared = prepare_omp_extension_mcp_content(
+            r#"{"mcpServers":{"agent-mail":{"command":"./server","cwd":"${OMP_PLUGIN_ROOT}"}}}"#
+                .to_string(),
+            source,
+        )
+        .unwrap();
+        let prepared: Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(
+            prepared["mcpServers"]["agent-mail"]["cwd"],
+            link.display().to_string()
+        );
+        assert_eq!(
+            prepared["mcpServers"]["agent-mail"]["command"],
+            link.join("server").display().to_string()
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_exclude_standard_and_active_marketplace_roots() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let root = write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let manifest = root.join("plugin.json");
+        std::fs::write(
+            &manifest,
+            r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"mail"}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "standard plugin MCP names are qualified"
+        );
+        std::fs::write(&manifest, "{}").unwrap();
+        let registry = plugins.join("installed_plugins.json");
+        let registered = |enabled| json!({"version": 2, "plugins": {"mail@local": [{"installPath":root,"enabled":enabled}]}});
+        std::fs::write(&registry, serde_json::to_string(&registered(true)).unwrap()).unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "active marketplace root is handled by the namespaced provider"
+        );
+        assert!(omp_mcp_authority_paths(&params).contains(&registry));
+        std::fs::write(
+            &registry,
+            serde_json::to_string(&registered(false)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "disabled marketplace registration no longer suppresses the independently enabled npm package"
+        );
+        std::fs::write(
+            &registry,
+            serde_json::to_string(
+                &json!({"version":2,"plugins":{"@local":[{"installPath":root,"enabled":true}]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params)
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig),
+            "an empty marketplace plugin name leaves MCP aliases unqualified and cannot grant an exclusion"
+        );
+        std::fs::write(
+            &registry,
+            serde_json::to_string(
+                &json!({"version":2,"plugins":{"@local":[{"installPath":root,"enabled":false}]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).primary_drift_reason,
+            ConfigDriftReason::DuplicateServerEntries,
+            "disabled malformed entries are inert; the independently enabled npm alias remains visible"
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_preserve_missing_project_marketplace_precedence() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let root = write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let registry = plugins.join("installed_plugins.json");
+        std::fs::write(&registry, serde_json::to_string(&json!({"version":2,"plugins":{"mail@local":[{"installPath":root,"enabled":true}]}})).unwrap()).unwrap();
+        let project_registry = params
+            .project_dir
+            .join(".omp/plugins/installed_plugins.json");
+        std::fs::create_dir_all(project_registry.parent().unwrap()).unwrap();
+        let missing = params.project_dir.join("missing-marketplace-install");
+        let project_registered = |enabled| json!({"version":2,"plugins":{"mail@local":[{"installPath":missing,"enabled":enabled}]}});
+        std::fs::write(
+            &project_registry,
+            serde_json::to_string(&project_registered(true)).unwrap(),
+        )
+        .unwrap();
+        let project_shadow = first_setup_status_file(&params);
+        assert!(
+            project_shadow.omp_mcp_alias_drift,
+            "an enabled missing project install still shadows the user registration, leaving the independent npm alias visible"
+        );
+        assert!(
+            project_shadow
+                .status_observations
+                .iter()
+                .any(
+                    |observation| observation.path == missing.display().to_string()
+                        && !observation.exists
+                )
+        );
+        assert!(omp_mcp_authority_paths(&params).contains(&project_registry));
+        std::fs::write(
+            &project_registry,
+            serde_json::to_string(&project_registered(false)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "disabled project entries do not shadow the active user marketplace install"
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_reject_unsafe_and_malformed_authority_without_disclosing_bytes() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let plugins = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        let package = plugins.join("package.json");
+        std::fs::write(
+            &package,
+            r#"{"dependencies":{"../outside":"secret-registry-token"}}"#,
+        )
+        .unwrap();
+        let status = first_setup_status_file(&params);
+        assert!(
+            status
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("secret-registry-token")
+        );
+        assert!(!omp_mcp_authority_paths(&params).iter().any(|path| {
+            path.components()
+                .any(|component| component == Component::ParentDir)
+        }));
+        std::fs::write(&package, r#"{"dependencies":{"mail-plugin":"*"}}"#).unwrap();
+        std::fs::write(
+            plugins.join("omp-plugins.lock.json"),
+            r#"{"plugins":"secret-registry-token"}"#,
+        )
+        .unwrap();
+        let malformed = first_setup_status_file(&params);
+        assert!(
+            malformed
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+        assert!(
+            !serde_json::to_string(&malformed)
+                .unwrap()
+                .contains("secret-registry-token")
+        );
+    }
+
+    #[test]
+    fn omp_installed_plugins_resolve_parent_project_anchors_and_first_override_file() {
+        let tmp = setup_real_tempdir();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        let project_root = params.project_dir.clone();
+        let plugins = project_root.join(".omp/plugins");
+        let package = write_omp_installed_plugin(
+            &plugins,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        params.project_dir = project_root.join("subdirectory");
+        std::fs::create_dir(&params.project_dir).unwrap();
+        let settings = inspect_omp_settings_authority(&params);
+        let inspection = inspect_omp_configured_extensions(&params, &settings);
+        assert!(
+            inspection
+                .sources
+                .iter()
+                .any(|source| source.path == package.join(".mcp.json") && source.project_level)
+        );
+        let claude = params.project_dir.join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::write(
+            claude.join("plugin-overrides.json"),
+            r#"{"disabled":["mail-plugin"]}"#,
+        )
+        .unwrap();
+        assert!(
+            inspect_omp_configured_extensions(&params, &settings)
+                .sources
+                .is_empty()
+        );
+        let omp = params.project_dir.join(".omp");
+        std::fs::create_dir(&omp).unwrap();
+        std::fs::write(omp.join("plugin-overrides.json"), "{}").unwrap();
+        // Creating a nearer .omp also changes the installed project root;
+        // the old parent package is no longer a live provider.
+        assert!(
+            inspect_omp_configured_extensions(&params, &settings)
+                .sources
+                .is_empty()
+        );
+        let user = params
+            .home_dir_override
+            .as_ref()
+            .unwrap()
+            .join(".omp/plugins");
+        let user_package = write_omp_installed_plugin(
+            &user,
+            "mail-plugin",
+            "agent-mail",
+            "http://stale.example/mcp",
+        );
+        assert!(
+            inspect_omp_configured_extensions(&params, &settings)
+                .sources
+                .iter()
+                .any(|source| source.path == user_package.join(".mcp.json")),
+            "first parsed override file wins over lower-priority disabled list"
+        );
+    }
+
+    fn write_omp_installed_plugin(plugins: &Path, name: &str, alias: &str, url: &str) -> PathBuf {
+        let root = plugins.join("node_modules").join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            plugins.join("package.json"),
+            serde_json::to_string(&json!({"dependencies":{name:"*"}})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::to_string(&json!({"name":name,"omp":{}})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            serde_json::to_string(
+                &json!({"mcpServers":{alias:{"url":url,"headers":{"Authorization":"Bearer tok"}}}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn omp_configured_extensions_participate_in_provider_precedence() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let settings = params.project_dir.join(".omp/config.yml");
+        std::fs::write(&settings, "extensions: [./mail-extension]\n").unwrap();
+        let root = params.project_dir.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        let hidden = root.join(".mcp.json");
+        let primary = root.join("mcp.json");
+        std::fs::write(
+            &hidden,
+            r#"{"mcpServers":{"mcp-agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "native OMP configuration takes priority over extension packages"
+        );
+
+        std::fs::write(
+            &hidden,
+            r#"{"mcpServers":{"mcp_agent_mail":{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &primary,
+            r#"{"mcpServers":{"mcp_agent_mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let claude = params.project_dir.join(".claude/.mcp.json");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(
+            &claude,
+            r#"{"mcpServers":{"mcp_agent_mail":{"url":"http://imported.example/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "extension priority 90 shadows imported Claude priority 80; the hidden extension file wins, then equivalent connections dedupe"
+        );
+
+        let alias_bytes = r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#;
+        std::fs::write(&primary, alias_bytes).unwrap();
+        let duplicate = first_setup_status_file(&params);
+        assert_eq!(
+            duplicate.primary_drift_reason,
+            ConfigDriftReason::DuplicateServerEntries
+        );
+        assert!(duplicate.remediation.contains("mail-extension/mcp.json"));
+        assert_eq!(std::fs::read_to_string(&primary).unwrap(), alias_bytes);
+        for path in [&settings, &hidden, &primary, &root.join("plugin.json")] {
+            assert!(
+                omp_mcp_authority_paths(&params).contains(path),
+                "the cache must fingerprint every extension discovery authority: {path:?}"
+            );
+            assert!(
+                duplicate
+                    .status_observations
+                    .iter()
+                    .any(|observation| { observation.path == path.display().to_string() })
+            );
+        }
+    }
+
+    #[test]
+    fn omp_configured_extensions_follow_profile_project_and_overlay_layers() {
+        let tmp = setup_real_tempdir();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let home = params.home_dir_override.as_ref().unwrap().clone();
+        let user_mcp = home.join(".omp/profiles/work/agent/mcp.json");
+        std::fs::create_dir_all(user_mcp.parent().unwrap()).unwrap();
+        params.omp_user_config_path_override = Some(user_mcp.clone());
+        let root = home.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            user_mcp.parent().unwrap().join("config.yml"),
+            "extensions: [~/mail-extension]\nmcp:\n  enableProjectConfig: false\n",
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "an active-profile user extension remains live when project MCP discovery is disabled"
+        );
+
+        let project_settings = params.project_dir.join(".omp/settings.json");
+        std::fs::write(&project_settings, r#"{"extensions":[]}"#).unwrap();
+        assert!(
+            !first_setup_status_file(&params).omp_mcp_alias_drift,
+            "project arrays replace the user array, including an explicit empty array"
+        );
+        let foreign_settings = params.project_dir.join(".claude/settings.json");
+        std::fs::create_dir_all(foreign_settings.parent().unwrap()).unwrap();
+        std::fs::write(&foreign_settings, r#"{"extensions":["~/mail-extension"]}"#).unwrap();
+        assert!(
+            !first_setup_status_file(&params).omp_mcp_alias_drift,
+            "foreign project providers retain project scope, so their extension MCP is disabled"
+        );
+        let overlay = params.project_dir.join("session.yml");
+        std::fs::write(&overlay, "extensions: [~/mail-extension]\n").unwrap();
+        params.omp_settings_overlay_paths.push(overlay.clone());
+        assert!(
+            first_setup_status_file(&params).omp_mcp_alias_drift,
+            "explicit overlays supply user-scoped extensions, matching OMP settings provenance"
+        );
+        std::fs::write(&overlay, "extensions: []\n").unwrap();
+        assert!(!first_setup_status_file(&params).omp_mcp_alias_drift);
+    }
+
+    #[test]
+    fn omp_configured_extensions_honor_effective_provider_disables_before_shadowing() {
+        let tmp = setup_real_tempdir();
+        let mut params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let user = omp_active_user_config_path(&params).unwrap();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(
+            user.parent().unwrap().join("config.yml"),
+            "disabledProviders: [omp-plugins]\n",
+        )
+        .unwrap();
+        let settings = params.project_dir.join(".omp/config.yml");
+        std::fs::write(&settings, "extensions: [./mail-extension]\n").unwrap();
+        let root = params.project_dir.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        let mcp = root.join(".mcp.json");
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://127.0.0.1:8765/mcp/","headers":{"Authorization":"Bearer tok"}}}}"#,
+        )
+        .unwrap();
+        let claude = params.project_dir.join(".claude/.mcp.json");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(
+            &claude,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://imported.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let disabled = first_setup_status_file(&params);
+        assert!(disabled.omp_mcp_alias_drift);
+        assert!(disabled.remediation.contains(".claude/.mcp.json"));
+        assert!(!omp_mcp_authority_paths(&params).contains(&mcp));
+
+        std::fs::write(
+            &settings,
+            "extensions: [./mail-extension]\ndisabledProviders: []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        assert!(omp_mcp_authority_paths(&params).contains(&mcp));
+        let overlay = params.project_dir.join("providers.yml");
+        std::fs::write(&overlay, "disabledProviders: [omp-plugins]\n").unwrap();
+        params.omp_settings_overlay_paths.push(overlay.clone());
+        assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+        assert!(omp_mcp_authority_paths(&params).contains(&overlay));
+
+        std::fs::write(&overlay, "disabledProviders: {providers: [omp-plugins]}\n").unwrap();
+        assert!(
+            first_setup_status_file(&params)
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig)
+        );
+    }
+
+    #[test]
+    fn omp_configured_extensions_manifest_changes_invalidate_alias_authority() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .unwrap();
+        let root = params.project_dir.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        let manifest = root.join("plugin.json");
+        let mcp = root.join(".mcp.json");
+        std::fs::write(
+            &manifest,
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"mail-extension"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let standard = first_setup_status_file(&params);
+        assert_eq!(standard.drift_reasons, Vec::<ConfigDriftReason>::new());
+        assert!(omp_mcp_authority_paths(&params).contains(&manifest));
+        assert!(
+            !omp_mcp_authority_paths(&params).contains(&mcp),
+            "standard plugin manifests suppress legacy unnamespaced MCP discovery"
+        );
+
+        std::fs::write(&manifest, "{}\n").unwrap();
+        let legacy = first_setup_status_file(&params);
+        assert!(legacy.omp_mcp_alias_drift);
+        let manifest_observation = |status: &ConfigFileStatus| {
+            status
+                .status_observations
+                .iter()
+                .find(|observation| observation.path == manifest.display().to_string())
+                .unwrap()
+                .content_sha256
+                .clone()
+        };
+        assert_ne!(
+            manifest_observation(&standard),
+            manifest_observation(&legacy)
+        );
+    }
+
+    #[test]
+    fn omp_configured_extensions_skip_entries_without_endpoints_before_shadowing() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .unwrap();
+        let root = params.project_dir.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-mail":{"args":["unused"]}}}"#,
+        )
+        .unwrap();
+        let claude = params.project_dir.join(".claude/.mcp.json");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(
+            &claude,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://imported.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let status = first_setup_status_file(&params);
+        assert!(status.omp_mcp_alias_drift);
+        assert!(status.remediation.contains(".claude/.mcp.json"));
+    }
+
+    #[test]
+    fn omp_configured_extensions_ignore_file_entrypoints_and_reject_unsafe_roots() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let settings = params.project_dir.join(".omp/config.yml");
+        let entrypoint = params.project_dir.join("extension.ts");
+        std::fs::write(&entrypoint, "export default function () {}\n").unwrap();
+        std::fs::write(&settings, "extensions: [./extension.ts]\n").unwrap();
+        assert_eq!(
+            first_setup_status_file(&params).drift_reasons,
+            Vec::<ConfigDriftReason>::new()
+        );
+        assert!(!omp_mcp_authority_paths(&params).contains(&entrypoint.join("mcp.json")));
+
+        let unsafe_root = params.project_dir.join("../outside");
+        std::fs::write(&settings, "extensions: [../outside]\n").unwrap();
+        let unsupported = first_setup_status_file(&params);
+        assert_eq!(
+            unsupported.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(unsupported.remediation.contains(".omp/config.yml"));
+        assert!(
+            unsupported
+                .status_observations
+                .iter()
+                .all(|observation| { !Path::new(&observation.path).starts_with(&unsafe_root) }),
+            "rejected raw roots are never read or included in fingerprint authorities"
+        );
+    }
+
+    #[test]
+    fn omp_configured_extensions_resolve_package_paths_and_keep_runtime_controls() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .unwrap();
+        let root = params.project_dir.join("mail-extension");
+        std::fs::create_dir(&root).unwrap();
+        let native = params.project_dir.join(".omp/mcp.json");
+        let mut native_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&native).unwrap()).unwrap();
+        native_config["mcpServers"]["bridge-helper"] = json!({
+            "command": root.join("bin/bridge").display().to_string(),
+            "cwd": root.join("work").display().to_string(),
+            "args": [root.join("data").display().to_string()],
+        });
+        std::fs::write(&native, serde_json::to_string(&native_config).unwrap()).unwrap();
+        let mcp = root.join(".mcp.json");
+        let package_config = r#"{"mcpServers":{"agent-mail":{"command":"./bin/bridge","cwd":"work","args":["${OMP_PLUGIN_ROOT}/data"]}}}"#;
+        std::fs::write(&mcp, package_config).unwrap();
+        assert!(
+            first_setup_status_file(&params).drift_reasons.is_empty(),
+            "root substitution and relative command/cwd resolution must precede connection equivalence"
+        );
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), package_config);
+
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"agent-mail":{"command":"other-bridge","enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(!first_setup_status_file(&params).omp_mcp_alias_drift);
+        let user = omp_active_user_config_path(&params).unwrap();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, r#"{"enabledServers":["agent-mail"]}"#).unwrap();
+        assert!(first_setup_status_file(&params).omp_mcp_alias_drift);
+        std::fs::write(
+            &user,
+            r#"{"enabledServers":["agent-mail"],"disabledServers":["agent-mail"]}"#,
+        )
+        .unwrap();
+        assert!(!first_setup_status_file(&params).omp_mcp_alias_drift);
+
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"agent-mail":{"url":"${MAIL_ENDPOINT}"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            first_setup_status_file(&params)
+                .drift_reasons
+                .contains(&ConfigDriftReason::UnsupportedConfig),
+            "an environment-dependent connection cannot certify a reusable clean status"
+        );
+    }
+
+    #[test]
+    fn omp_configured_extensions_refuse_recursive_placeholder_roots() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        let root = params.project_dir.join("mail-${CLAUDE_PLUGIN_ROOT}");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            serde_json::to_string(&json!({
+                "extensions": [root.display().to_string()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mcp = root.join(".mcp.json");
+        let content = r#"{"mcpServers":{"agent-mail":{"command":"${OMP_PLUGIN_ROOT}/bridge"}}}"#;
+        std::fs::write(&mcp, content).unwrap();
+        let status = first_setup_status_file(&params);
+        assert_eq!(
+            status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(
+            status
+                .remediation
+                .contains("mail-${CLAUDE_PLUGIN_ROOT}/.mcp.json")
+        );
+        assert_eq!(std::fs::read_to_string(mcp).unwrap(), content);
+    }
+
+    #[test]
+    fn omp_configured_extensions_observe_absent_packages_and_sibling_configs() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .unwrap();
+        let root = params.project_dir.join("mail-extension");
+        let mcp = root.join(".mcp.json");
+        let absent = first_setup_status_file(&params);
+        assert_eq!(absent.drift_reasons, Vec::<ConfigDriftReason>::new());
+        for path in [root.join("plugin.json"), mcp.clone(), root.join("mcp.json")] {
+            assert!(omp_mcp_authority_paths(&params).contains(&path));
+            assert!(absent.status_observations.iter().any(|observation| {
+                observation.path == path.display().to_string() && !observation.exists
+            }));
+        }
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let installed = first_setup_status_file(&params);
+        assert!(installed.omp_mcp_alias_drift);
+        assert!(installed.status_observations.iter().any(|observation| {
+            observation.path == mcp.display().to_string()
+                && observation.exists
+                && observation.content_sha256.is_some()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_configured_extensions_do_not_follow_symlinked_packages() {
+        let tmp = setup_real_tempdir();
+        let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
+        write_healthy_omp_project_config(&params);
+        std::fs::write(
+            params.project_dir.join(".omp/config.yml"),
+            "extensions: [./mail-extension]\n",
+        )
+        .unwrap();
+        let external = tmp.path().join("external-package");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join(".mcp.json"),
+            r#"{"mcpServers":{"agent-mail":{"url":"http://stale.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let linked = params.project_dir.join("mail-extension");
+        std::os::unix::fs::symlink(&external, &linked).unwrap();
+        let status = first_setup_status_file(&params);
+        assert_eq!(
+            status.primary_drift_reason,
+            ConfigDriftReason::UnsupportedConfig
+        );
+        assert!(status.status_observations.iter().all(|observation| {
+            !Path::new(&observation.path).starts_with(&linked)
+                && !Path::new(&observation.path).starts_with(&external)
+        }));
+        assert!(
+            omp_mcp_authority_paths(&params)
+                .iter()
+                .all(|path| !path.starts_with(&linked) && !path.starts_with(&external))
+        );
+    }
+
+    #[test]
     fn omp_semantic_equivalence_and_provider_transport_filter_match_runtime() {
         let tmp = setup_real_tempdir();
         let params = setup_status_test_params(tmp.path(), AgentPlatform::Omp);
@@ -12730,7 +15904,7 @@ http_headers = { Authorization = "Bearer tok" }
             project_dir: tmp.path().join("invalid-project"),
             home_dir_override: Some(PathBuf::from("relative-home")),
             agents: Some(vec![AgentPlatform::Omp]),
-            token: "must-not-be-planned".to_string(),
+            token: "must-not-be-planned".to_string(), // ubs:ignore -- synthetic test credential.
             skip_hooks: true,
             ..SetupParams::default()
         };
@@ -12757,7 +15931,7 @@ http_headers = { Authorization = "Bearer tok" }
             let params = SetupParams {
                 project_dir: named_project,
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "named-profile-token".to_string(),
+                token: "named-profile-token".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             };
@@ -12787,7 +15961,7 @@ http_headers = { Authorization = "Bearer tok" }
             let params = SetupParams {
                 project_dir: custom_project,
                 agents: Some(vec![AgentPlatform::Omp]),
-                token: "custom-agent-token".to_string(),
+                token: "custom-agent-token".to_string(), // ubs:ignore -- synthetic test credential.
                 skip_hooks: true,
                 ..SetupParams::default()
             };
@@ -13979,6 +17153,44 @@ url = \"http://127.0.0.1:8766/old/\"
         let message = error.to_string();
         assert!(message.contains("not valid TOML"), "{message}");
         assert!(message.contains("duplicate key"), "{message}");
+    }
+
+    #[test]
+    fn setup_toml_refusal_never_echoes_existing_or_generated_credentials() {
+        let existing_secret = "fixture-existing-bearer-secret";
+        let corrupted = format!(
+            "[other]\n\
+             http_headers = {{ Authorization = \"Bearer {existing_secret}\" }}\n\
+             http_headers = {{ Authorization = \"Bearer {existing_secret}\" }}\n"
+        );
+        let error = merge_toml_section(
+            Some(&corrupted),
+            "[mcp_servers.mcp_agent_mail]",
+            &codex_http_key_values("fixture-replacement-token"),
+        )
+        .expect_err("unmanaged duplicate keys must still refuse publication");
+        for message in [error.to_string(), format!("{error:?}")] {
+            assert!(message.contains("not valid TOML"), "{message}");
+            assert!(message.contains("duplicate key"), "{message}");
+            assert!(message.contains("bytes "), "{message}");
+            assert!(!message.contains(existing_secret), "{message}");
+            assert!(!message.contains("fixture-replacement-token"), "{message}");
+        }
+
+        let generated_secret = "fixture-generated-bearer-secret";
+        let invalid_value =
+            format!("{{ Authorization = \"Bearer {generated_secret}\", invalid = }}");
+        let error = merge_toml_section(
+            Some("[other]\nenabled = true\n"),
+            "[mcp_servers.mcp_agent_mail]",
+            &[("http_headers".to_string(), invalid_value)],
+        )
+        .expect_err("invalid generated TOML must still refuse publication");
+        for message in [error.to_string(), format!("{error:?}")] {
+            assert!(message.contains("merged TOML does not parse"), "{message}");
+            assert!(message.contains("bytes "), "{message}");
+            assert!(!message.contains(generated_secret), "{message}");
+        }
     }
 
     #[test]

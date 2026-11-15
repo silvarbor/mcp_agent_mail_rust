@@ -15,6 +15,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1852,6 +1853,13 @@ fn format_recovery_context() -> Option<String> {
     let db_path = PathBuf::from(&resolved.canonical_path);
     let storage_root = &config.storage_root;
 
+    // No directory, no mailbox: nothing is in recovery. The primary issue
+    // already names the missing path; "corrupt, run doctor repair" would
+    // send the operator the wrong way.
+    if db_path.parent().is_some_and(|parent| !parent.exists()) {
+        return None;
+    }
+
     let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
     let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
 
@@ -2326,7 +2334,7 @@ fn probe_storage_root(config: &Config) -> ProbeResult {
     }
 
     // Check writability via a unique, create_new probe to avoid clobbering files.
-    let probe_nonce = std::time::SystemTime::now()
+    let probe_nonce = std::time::SystemTime::now() // ubs:ignore -- Nonsecret filename; create_new below refuses collisions.
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
@@ -2420,6 +2428,8 @@ fn probe_database(config: &Config) -> ProbeResult {
 /// legacy-import regression can run it from a fresh process against a
 /// freshly imported target (GH#268).
 pub fn probe_integrity(config: &Config) -> ProbeResult {
+    #[cfg(test)]
+    record_startup_work(0);
     if !config.integrity_check_on_startup {
         return ProbeResult::Ok { name: "integrity" };
     }
@@ -2538,20 +2548,22 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
 
     match pool.run_startup_integrity_check() {
         Ok(_) => {
-            let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
-                &config.database_url,
-                &config.storage_root,
-                &mcp_agent_mail_db::VerdictOptions {
-                    skip_integrity_check: true,
-                    ..mcp_agent_mail_db::VerdictOptions::default()
-                },
-            );
-            if verdict.archive_drift.state
-                == mcp_agent_mail_db::MailboxArchiveDriftState::ArchiveAhead
+            #[cfg(test)]
+            record_startup_work(1);
+            // The admitted integrity check above has already proved the
+            // database. Only archive drift is needed here: the full mailbox
+            // verdict repeats size-proportional database sanity probes,
+            // discovers owners and writes an archive writability probe whose
+            // results this recovery decision never consumes.
+            let archive_drift = resolved_db_path.as_deref().map(|db_path| {
+                mcp_agent_mail_db::inspect_mailbox_archive_drift(db_path, &config.storage_root)
+            });
+            if let Some(drift) = archive_drift
+                && drift.state == mcp_agent_mail_db::MailboxArchiveDriftState::ArchiveAhead
             {
                 tracing::warn!(
-                    detail = %verdict.archive_drift.detail,
-                    "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting automatic recovery"
+                    detail = %drift.detail,
+                    "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting archive reconciliation (not confirmed corruption)"
                 );
                 return attempt_probe_recovery(config);
             }
@@ -2563,6 +2575,8 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
             // alternative (refusing to start) would be worse than the
             // worst case we're guarding against (duplicate-id allocation,
             // which already produces a yellow doctor signal).
+            #[cfg(test)]
+            record_startup_work(2);
             match pool.advance_message_id_floor_from_archive() {
                 Ok(Some(new_floor)) => {
                     tracing::warn!(
@@ -2673,7 +2687,11 @@ fn classify_recovery_failure_root_cause(detail: &str) -> String {
     let compact = compact_probe_detail(detail);
     let lower = compact.to_ascii_lowercase();
 
-    if lower.contains("mailbox mutation refused")
+    if lower.contains("archive reconciliation failed on healthy primary") {
+        format!(
+            "archive reconciliation failed while the primary database was healthy; automatic reconstruction was not attempted ({compact})"
+        )
+    } else if lower.contains("mailbox mutation refused")
         || lower.contains("wait for the active owner to finish")
         || lower.contains("supervised restart or operator intervention")
     {
@@ -2873,6 +2891,20 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 #[cfg(test)]
 std::thread_local! {
     static PROBE_RECOVERY_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    // Count real startup operations without replacing their filesystem/DB path.
+    static STARTUP_WORK_COUNTS: std::cell::Cell<[u32; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+#[cfg(test)]
+fn record_startup_work(index: usize) {
+    let mut counts = STARTUP_WORK_COUNTS.get();
+    counts[index] += 1;
+    STARTUP_WORK_COUNTS.set(counts);
+}
+
+#[cfg(test)]
+pub(super) fn take_startup_work_counts() -> [u32; 4] {
+    STARTUP_WORK_COUNTS.replace([0; 4])
 }
 
 #[cfg(test)]
@@ -2949,7 +2981,7 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
         Ok(()) => {
             tracing::warn!(
                 path = %db_path.display(),
-                "database auto-recovered from corruption; startup will continue with recovered data"
+                "database/archive reconciliation completed; startup will continue (this does not establish database corruption)"
             );
             ProbeResult::Ok { name: "integrity" }
         }
@@ -2960,14 +2992,8 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
                 db_path.display(),
                 classify_recovery_failure_root_cause(&e.to_string())
             ),
-            fix: format!(
-                "Try these in order:\n\
-                 1. `am doctor repair --yes` — automatic repair from backups/archive\n\
-                 2. `am doctor reconstruct --yes` — rebuild the database from the Git archive\n\
-                 3. `am clear-and-reset-everything` — archive current state and start completely fresh\n\
-                 The corrupt file has been quarantined at {}.corrupt-*",
-                db_path.display()
-            ),
+            fix: "Preserve the complete database family, archive, and startup logs. Run `am doctor check --json` and inspect the reported schema/replay error before retrying. A reconciliation failure does not prove corruption and must not be worked around by deleting WAL or recovery artifacts. See docs/OPERATOR_COOKBOOK.md for pre-upgrade verification."
+                .into(),
         }),
     }
 }
@@ -3046,7 +3072,21 @@ fn probe_auth(config: &Config) -> ProbeResult {
 /// Samples the last `limit` messages from the DB and verifies that their
 /// canonical archive files exist on disk. Reports count of missing files
 /// but does NOT block startup (warnings only).
-fn probe_consistency(config: &Config) -> ProbeResult {
+fn probe_consistency(
+    config: &Config,
+    cancelled: Option<&AtomicBool>,
+) -> std::io::Result<ProbeResult> {
+    let checkpoint = || {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "startup consistency probe cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    checkpoint()?;
     let pool_config = DbPoolConfig {
         database_url: config.database_url.clone(),
         storage_root: Some(config.storage_root.clone()),
@@ -3057,27 +3097,40 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     let Ok(pool) = mcp_agent_mail_db::DbPool::new(&pool_config) else {
         // If we can't open DB, skip consistency check (integrity probe
         // will catch the root cause).
-        return ProbeResult::Ok {
+        checkpoint()?;
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     };
 
     // Sample last 100 messages for consistency check
+    checkpoint()?;
     let limit = 100i64;
     let Ok(refs) = pool.sample_recent_message_refs(limit) else {
         // DB query failed; skip silently (other probes will catch DB issues).
-        return ProbeResult::Ok {
+        checkpoint()?;
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     };
 
+    checkpoint()?;
     if refs.is_empty() {
-        return ProbeResult::Ok {
+        return Ok(ProbeResult::Ok {
             name: "consistency",
-        };
+        });
     }
 
-    let report = mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs);
+    let report = if let Some(cancelled) = cancelled {
+        mcp_agent_mail_storage::check_archive_consistency_cancellable(
+            &config.storage_root,
+            &refs,
+            cancelled,
+        )?
+    } else {
+        mcp_agent_mail_storage::check_archive_consistency(&config.storage_root, &refs)
+    };
+    checkpoint()?;
 
     if report.missing > 0 {
         tracing::warn!(
@@ -3092,9 +3145,9 @@ fn probe_consistency(config: &Config) -> ProbeResult {
     }
 
     // Consistency is advisory; never block startup
-    ProbeResult::Ok {
+    Ok(ProbeResult::Ok {
         name: "consistency",
-    }
+    })
 }
 
 /// Run the archive consistency probe as an advisory one-shot.
@@ -3102,7 +3155,14 @@ fn probe_consistency(config: &Config) -> ProbeResult {
 /// Intended for background execution so startup critical path stays focused on
 /// hard readiness checks while still preserving consistency diagnostics.
 pub fn run_consistency_probe_advisory(config: &Config) {
-    let _ = probe_consistency(config);
+    let _ = probe_consistency(config, None);
+}
+
+pub(crate) fn run_consistency_probe_advisory_cancellable(
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> std::io::Result<()> {
+    probe_consistency(config, Some(cancelled)).map(drop)
 }
 
 /// Minimum recommended file descriptor limit for production workloads.
@@ -3231,25 +3291,22 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 
 /// Best-effort rotation of old backup detritus in `storage_root`. Errors are
 /// logged at warn level and otherwise ignored — rotation failures must never
-/// prevent the server from starting.
+/// prevent the server from starting. The listener waits for this pass, so a
+/// backlog beyond the budget is left for the background loop.
 fn rotate_backups_best_effort(config: &Config) {
+    #[cfg(test)]
+    record_startup_work(3);
     let Some(database_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return;
     };
     let keep = crate::backup_rotation::resolved_keep_per_kind();
-    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, &database_path, keep)
-    {
-        Ok(report) if report.evicted() > 0 => {
-            tracing::info!(
-                staged = report.staged,
-                deleted = report.deleted,
-                kept = report.kept,
-                bytes_staged = report.bytes_staged,
-                bytes_deleted = report.bytes_deleted,
-                "backup rotation staged old backups in storage_root"
-            );
-        }
-        Ok(_) => {}
+    match crate::backup_rotation::rotate_storage_backups_within(
+        &config.storage_root,
+        &database_path,
+        keep,
+        crate::backup_rotation::COLD_START_ROTATION_BUDGET,
+    ) {
+        Ok(report) => crate::integrity_guard::report_backup_rotation(&report, "startup"),
         Err(err) => {
             tracing::warn!(
                 storage_root = %config.storage_root.display(),
@@ -3686,7 +3743,7 @@ mod tests {
     #[test]
     fn sqlite_url_with_missing_parent_and_query_fails() {
         let mut config = default_config();
-        let nonce = std::time::SystemTime::now()
+        let nonce = std::time::SystemTime::now() // ubs:ignore -- Test-only missing-path fixture name.
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
@@ -3792,7 +3849,7 @@ mod tests {
 
     #[test]
     fn storage_probe_does_not_clobber_existing_probe_file() {
-        let nonce = std::time::SystemTime::now()
+        let nonce = std::time::SystemTime::now() // ubs:ignore -- Test-only directory fixture name.
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
@@ -3915,7 +3972,10 @@ mod tests {
 
     #[test]
     fn run_startup_probes_returns_results() {
-        let config = default_config();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
         let report = run_startup_probes(&config);
         // When an existing Agent Mail server is detected on the default port, the
         // preflight defers db-lock + integrity probes (6 results). Otherwise all 8
@@ -3929,7 +3989,11 @@ mod tests {
 
     #[test]
     fn run_stdio_startup_probes_omits_http_only_checks() {
-        let config = default_config();
+        // These probes open the real mailbox; never touch the shared default paths.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", dir.path().join("storage.sqlite3").display());
+        config.storage_root = dir.path().join("storage");
         let report = run_stdio_startup_probes(&config);
         assert_eq!(report.results.len(), 5);
         assert!(!report.results.iter().any(|result| matches!(
@@ -5096,6 +5160,40 @@ mod tests {
     }
 
     #[test]
+    fn probe_integrity_preserves_archive_writability_probe_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("archive");
+        std::fs::create_dir(&storage_root).expect("archive root");
+        let probe_path = storage_root.join(".write_probe");
+        let original = b"pre-existing archive artifact: do not overwrite or remove";
+        std::fs::write(&probe_path, original).expect("preserve archive sentinel");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open database");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize real mailbox schema");
+        drop(conn);
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        let _ = take_startup_work_counts();
+
+        let result = probe_integrity(&config);
+        assert!(matches!(result, ProbeResult::Ok { .. }), "{result:?}");
+        assert_eq!(
+            take_startup_work_counts(),
+            [1, 1, 1, 0],
+            "integrity, archive drift and ID-floor checks must still run"
+        );
+        assert_eq!(
+            std::fs::read(&probe_path).expect("archive artifact must survive startup"),
+            original,
+            "post-integrity inventory checking must not run unrelated writability probes"
+        );
+    }
+
+    #[test]
     fn stdio_startup_probes_preserve_sqlite_family_when_breaker_is_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
@@ -5603,6 +5701,45 @@ second body
         );
 
         file.unlock().unwrap();
+    }
+
+    // ── Recovery context ─────────────────────────────────────────────────
+
+    #[test]
+    fn recovery_context_is_silent_when_the_database_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("missing");
+        let db_url = format!("sqlite:///{}", storage.join("storage.sqlite3").display());
+        let storage_str = storage.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_str.as_str()),
+            ],
+            || {
+                assert_eq!(super::format_recovery_context(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn recovery_context_still_reports_an_unreadable_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"not a sqlite database, just bytes").unwrap();
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_str = dir.path().to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_str.as_str()),
+            ],
+            || {
+                let context = super::format_recovery_context()
+                    .expect("an unreadable database file still gets recovery context");
+                assert!(context.contains("Mode:"), "{context}");
+            },
+        );
     }
 
     // ── Recovery elapsed formatting tests (br-rqv3i.7) ──────────────────

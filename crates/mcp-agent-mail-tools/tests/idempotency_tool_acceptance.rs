@@ -58,13 +58,17 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let suffix = unique_suffix();
-    let db_path = format!("/tmp/idem-tool-{suffix}.sqlite3");
-    let database_url = format!("sqlite://{db_path}");
-    let storage_root = format!("/tmp/idem-tool-storage-{suffix}");
+    let fixture = tempfile::tempdir().expect("create idempotency fixture");
+    let fixture_root = fixture
+        .path()
+        .canonicalize()
+        .expect("canonical fixture root");
+    let database_url = format!("sqlite://{}", fixture_root.join("mail.sqlite3").display());
+    let storage_root = fixture_root.join("storage").display().to_string();
     let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
     ];
     env.extend_from_slice(extra_env);
     with_process_env_overrides_for_test(&env, || {
@@ -328,6 +332,240 @@ fn assert_exact_replay(fresh: &Value, replay: &str) {
     assert_eq!(&replay, fresh);
 }
 
+fn while_recovery_blocks_writers<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce(McpContext) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    use mcp_agent_mail_db::write_barrier::{
+        active_writer_count, current_thread_holds_promotion_barrier,
+        try_acquire_promotion_barrier_if_idle,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let owner = try_acquire_promotion_barrier_if_idle().expect("hold real recovery promotion");
+    let (done_tx, done_rx) = mpsc::channel();
+    // Promotion ownership is reentrant on its own thread, so retries must run
+    // on another thread to prove they do not request a writer handoff.
+    let reader = std::thread::spawn(move || {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("retry runtime");
+        let result = runtime.block_on(async {
+            let ctx = McpContext::new(Cx::current().expect("retry context"), 2);
+            f(ctx).await
+        });
+        assert!(done_tx.send(result).is_ok(), "return retry result");
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(5));
+    let held = current_thread_holds_promotion_barrier();
+    let writers = active_writer_count();
+    // Release before joining or asserting: the pre-fix implementation parks
+    // behind this barrier and must still finish without leaking a worker.
+    drop(owner);
+    reader.join().expect("retry worker exits");
+    assert!(held, "replays must not release recovery ownership");
+    assert_eq!(writers, 0, "replays must not acquire writer leases");
+    result.expect("committed retries must finish while recovery blocks writers")
+}
+
+#[derive(Default)]
+struct ReplyOptions {
+    to: Option<Vec<String>>,
+    cc: Option<Vec<String>>,
+    subject_prefix: Option<String>,
+    ack_required: Option<bool>,
+}
+
+async fn reply_with_options(
+    ctx: &McpContext,
+    project_key: &str,
+    parent: i64,
+    options: &ReplyOptions,
+    key: Option<&str>,
+) -> Result<String, fastmcp::McpError> {
+    reply_message(
+        ctx,
+        project_key.to_string(),
+        parent,
+        "GreenCastle".to_string(),
+        "Same reply body".to_string(),
+        options.to.clone(),
+        options.cc.clone(),
+        None,
+        options.subject_prefix.clone(),
+        None,
+        options.ack_required,
+        None,
+        None,
+        None,
+        key.map(str::to_string),
+    )
+    .await
+}
+
+async fn delivery_counts(ctx: &McpContext) -> (i64, i64, i64) {
+    let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+    let conn = pool
+        .acquire(ctx.cx())
+        .await
+        .into_result()
+        .expect("DB checkout");
+    let rows = conn
+        .query_sync(
+            "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+             (SELECT COUNT(*) FROM message_recipients) AS recipients, \
+             (SELECT COUNT(*) FROM idempotency_keys) AS keys",
+            &[],
+        )
+        .expect("persisted delivery counts");
+    (
+        rows[0].get_named("messages").expect("message count"),
+        rows[0].get_named("recipients").expect("recipient count"),
+        rows[0].get_named("keys").expect("idempotency key count"),
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn reply_message_idempotency_preserves_omitted_option_semantics() {
+    run_with_storage(|cx, storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project_key = format!("{storage_root}/workspace");
+        std::fs::create_dir_all(&project_key).unwrap();
+        for agent in ["GreenCastle", "BlueLake", "RedFox"] {
+            setup_project_and_agent(&ctx, &project_key, agent).await;
+        }
+        let original = send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "Parent".to_string(),
+            "Original body".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true), // Omitted reply ACK must inherit this value.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("ACK-required parent");
+        let parent = serde_json::from_str::<Value>(&original).unwrap()["deliveries"][0]["payload"]
+            ["id"]
+            .as_i64()
+            .unwrap();
+        let cases = [
+            (
+                "ack",
+                ReplyOptions::default(),
+                ReplyOptions {
+                    ack_required: Some(false),
+                    ..ReplyOptions::default()
+                },
+                "ack_required",
+                serde_json::json!(true),
+                serde_json::json!(false),
+            ),
+            (
+                "subject",
+                ReplyOptions::default(),
+                ReplyOptions {
+                    subject_prefix: Some(String::new()),
+                    ..ReplyOptions::default()
+                },
+                "subject",
+                serde_json::json!("Re: Parent"),
+                serde_json::json!(" Parent"),
+            ),
+            (
+                "recipients",
+                ReplyOptions {
+                    cc: Some(vec!["RedFox".to_string()]),
+                    ..ReplyOptions::default()
+                },
+                ReplyOptions {
+                    to: Some(vec![]),
+                    cc: Some(vec!["RedFox".to_string()]),
+                    ..ReplyOptions::default()
+                },
+                "to",
+                serde_json::json!(["BlueLake"]),
+                serde_json::json!([]),
+            ),
+        ];
+        for (label, omitted, explicit, field, omitted_value, explicit_value) in cases {
+            for (variant, options, changed, expected) in [
+                ("omitted", &omitted, &explicit, &omitted_value),
+                ("explicit", &explicit, &omitted, &explicit_value),
+            ] {
+                let key = format!("{label}-{variant}");
+                let before = delivery_counts(&ctx).await;
+                let fresh = reply_with_options(&ctx, &project_key, parent, options, Some(&key))
+                    .await
+                    .expect("fresh reply");
+                let fresh: Value = serde_json::from_str(&fresh).unwrap();
+                assert_eq!(&fresh["deliveries"][0]["payload"][field], expected, "{key}");
+                assert!(fresh.get("idempotent_replay").is_none());
+                mcp_agent_mail_storage::wbq_flush();
+                let counts = delivery_counts(&ctx).await;
+                assert_eq!(counts.0, before.0 + 1, "one fresh DB message: {key}");
+                let archive_count = count_canonical_messages(&storage_root);
+                assert_eq!(i64::try_from(archive_count).unwrap(), counts.0);
+                let files = snapshot_delivery_files(&storage_root);
+                let inbox = inbox_snapshot(&ctx, &project_key).await;
+
+                let replay = reply_with_options(&ctx, &project_key, parent, options, Some(&key))
+                    .await
+                    .expect("exact retry");
+                assert_exact_replay(&fresh, &replay);
+                let conflict = reply_with_options(&ctx, &project_key, parent, changed, Some(&key))
+                    .await
+                    .expect_err("omitted and explicit reply options must not replay each other");
+                assert_error_type(&conflict, "IDEMPOTENCY_KEY_CONFLICT");
+                mcp_agent_mail_storage::wbq_flush();
+                assert_eq!(delivery_counts(&ctx).await, counts, "no DB writes: {key}");
+                assert_eq!(count_canonical_messages(&storage_root), archive_count);
+                assert_eq!(snapshot_delivery_files(&storage_root), files);
+                assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+            }
+        }
+
+        // An explicitly empty recipient list is invalid without CC/BCC. It
+        // must not become a successful replay of an earlier omitted `to`.
+        let empty = ReplyOptions {
+            to: Some(vec![]),
+            ..ReplyOptions::default()
+        };
+        let counts = delivery_counts(&ctx).await;
+        let archive_count = count_canonical_messages(&storage_root);
+        let files = snapshot_delivery_files(&storage_root);
+        for (key, expected) in [
+            (Some("ack-omitted"), "IDEMPOTENCY_KEY_CONFLICT"),
+            (Some("fresh-empty-recipients"), "INVALID_ARGUMENT"),
+            (None, "INVALID_ARGUMENT"),
+        ] {
+            let error = reply_with_options(&ctx, &project_key, parent, &empty, key)
+                .await
+                .expect_err("empty explicit recipients must not deliver");
+            assert_error_type(&error, expected);
+        }
+        mcp_agent_mail_storage::wbq_flush();
+        assert_eq!(delivery_counts(&ctx).await, counts);
+        assert_eq!(count_canonical_messages(&storage_root), archive_count);
+        assert_eq!(snapshot_delivery_files(&storage_root), files);
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
     let ctx = McpContext::new(cx, 1);
@@ -446,7 +684,8 @@ fn reply_message_attachment_replay_ignores_missing_and_changed_sources() {
 }
 
 #[test]
-fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() {
+#[allow(clippy::too_many_lines)]
+fn attachment_replays_require_current_sender_proof_during_recovery() {
     run_with_storage_env(
         &[("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "1")],
         |cx, storage_root| async move {
@@ -480,49 +719,69 @@ fn attachment_replays_require_current_sender_proof_and_keep_redacted_receipts() 
             mcp_agent_mail_storage::wbq_flush();
             let files = snapshot_delivery_files(&storage_root);
             let inbox = inbox_snapshot(&ctx, &project_key).await;
+            let counts = delivery_counts(&ctx).await;
             std::fs::rename(&source, source.with_extension("retained.bin")).unwrap();
 
-            for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
-                for (proof, expected) in [
-                    (None, "SENDER_TOKEN_REQUIRED"),
-                    (
-                        Some("incorrect-registration-token"),
-                        "SENDER_TOKEN_MISMATCH",
-                    ),
-                ] {
-                    let error =
-                        attachment_request(&ctx, &project_key, &source, parent, body, proof)
-                            .await
-                            .expect_err(
-                                "a prior accepted key must not bypass current sender proof",
-                            );
-                    assert_error_type(&error, expected);
+            let replay_project = project_key.clone();
+            while_recovery_blocks_writers(move |ctx| async move {
+                for (parent, fresh) in [(None, fresh_send), (Some(parent), fresh_reply)] {
+                    for (proof, expected) in [
+                        (None, "SENDER_TOKEN_REQUIRED"),
+                        (
+                            Some("incorrect-registration-token"),
+                            "SENDER_TOKEN_MISMATCH",
+                        ),
+                    ] {
+                        let error =
+                            attachment_request(&ctx, &replay_project, &source, parent, body, proof)
+                                .await
+                                .expect_err("a committed key must not bypass current sender proof");
+                        assert_error_type(&error, expected);
+                    }
+                    let replay = attachment_request(
+                        &ctx,
+                        &replay_project,
+                        &source,
+                        parent,
+                        body,
+                        Some(&token),
+                    )
+                    .await
+                    .expect("verified replay after the source was moved");
+                    assert_exact_replay(&fresh, &replay);
+                    let conflict = attachment_request(
+                        &ctx,
+                        &replay_project,
+                        &source,
+                        parent,
+                        "changed body",
+                        Some(&token),
+                    )
+                    .await
+                    .expect_err("changed retries must conflict during recovery");
+                    assert_error_type(&conflict, "IDEMPOTENCY_KEY_CONFLICT");
+                    assert_eq!(fresh["receipt_mode"], "redacted");
+                    assert_eq!(fresh["verified_sender"], true);
+                    for field in [
+                        "subject",
+                        "body_md",
+                        "attachments",
+                        "deliveries",
+                        "to",
+                        "cc",
+                        "bcc",
+                    ] {
+                        assert!(
+                            fresh.get(field).is_none(),
+                            "redacted receipt exposed {field}"
+                        );
+                    }
                 }
-                let replay =
-                    attachment_request(&ctx, &project_key, &source, parent, body, Some(&token))
-                        .await
-                        .expect("verified replay after the source was moved");
-                assert_exact_replay(&fresh, &replay);
-                assert_eq!(fresh["receipt_mode"], "redacted");
-                assert_eq!(fresh["verified_sender"], true);
-                for field in [
-                    "subject",
-                    "body_md",
-                    "attachments",
-                    "deliveries",
-                    "to",
-                    "cc",
-                    "bcc",
-                ] {
-                    assert!(
-                        fresh.get(field).is_none(),
-                        "redacted receipt exposed {field}"
-                    );
-                }
-            }
+            });
             mcp_agent_mail_storage::wbq_flush();
             assert_eq!(snapshot_delivery_files(&storage_root), files);
             assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
+            assert_eq!(delivery_counts(&ctx).await, counts);
         },
     );
 }

@@ -28,10 +28,12 @@ const HYDRATION_SLICE: Duration = Duration::from_millis(2);
 type AgentKey = (i64, String);
 
 /// Process-local hydration progress, not another durable telemetry stream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AtcPopulationHydrationStats {
     pub snapshot_agents: usize,
     pub pending_agents: usize,
+    /// Completed hydration update calls; engine admission can still refuse a
+    /// row at capacity, so this is not a count of successfully tracked agents.
     pub applied_agents: usize,
     pub unchanged_agents: usize,
     pub last_slice_agents: usize,
@@ -50,6 +52,36 @@ pub struct AtcPopulationHydrationStats {
     pub scope_actions_withheld: u64,
     pub last_scope_effects_withheld: usize,
     pub last_scope_actions_withheld: usize,
+}
+
+/// A nonblocking observation of population hydration work.
+///
+/// `complete` means this queue and its final yield are finished, not that every
+/// row was admitted by the engine or that overall ATC coverage and execution
+/// are healthy. Engine capacity and other safety gates remain independent.
+/// Missing progress is unknown, never a fabricated empty or completed
+/// population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct AtcPopulationHealthSnapshot {
+    pub status: &'static str,
+    pub reason: Option<&'static str>,
+    pub progress: Option<AtcPopulationHydrationStats>,
+    /// Age of the unfinished population, including its final inference yield.
+    pub backlog_age_ms: Option<u64>,
+    /// Whether hydration defers inference; false grants no execution authority.
+    pub inference_deferred_by_hydration: Option<bool>,
+}
+
+impl AtcPopulationHealthSnapshot {
+    const fn unavailable(status: &'static str, reason: Option<&'static str>) -> Self {
+        Self {
+            status,
+            reason,
+            progress: None,
+            backlog_age_ms: None,
+            inference_deferred_by_hydration: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +105,43 @@ struct HydrationState {
 }
 
 impl HydrationState {
+    fn health_snapshot(&self, now_micros: i64) -> AtcPopulationHealthSnapshot {
+        let backlog = !self.pending.is_empty() || self.resume_pending;
+        let inference_deferred =
+            self.active_refresh.is_some() || self.progress.refresh_failed || backlog;
+        let (status, reason) = if self.active_refresh.is_some() {
+            ("degraded", Some("population_refresh_in_progress"))
+        } else if self.progress.refresh_failed {
+            ("degraded", Some("population_refresh_failed"))
+        } else if backlog {
+            ("degraded", Some("population_hydration_incomplete"))
+        } else if self.progress.scope_unresolved_names > 0
+            || self.progress.last_scope_effects_withheld > 0
+            || self.progress.last_scope_actions_withheld > 0
+        {
+            ("degraded", Some("population_scope_restricted"))
+        } else if self.scope.is_none() {
+            ("unknown", Some("population_not_observed"))
+        } else {
+            ("complete", None)
+        };
+        AtcPopulationHealthSnapshot {
+            status,
+            reason,
+            progress: Some(self.progress),
+            backlog_age_ms: backlog.then(|| {
+                u64::try_from(
+                    now_micros
+                        .saturating_sub(self.progress.snapshot_started_at_micros)
+                        .max(0)
+                        / 1_000,
+                )
+                .unwrap_or(u64::MAX)
+            }),
+            inference_deferred_by_hydration: Some(inference_deferred),
+        }
+    }
+
     // Not `const fn`: `VecDeque::is_empty` is not callable in a const context
     // (E0015), and marking this const breaks the build outright.
     fn should_defer_refresh(&self) -> bool {
@@ -107,6 +176,20 @@ impl HydrationState {
                 return Err(error);
             }
         };
+        if rows.len() > mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX
+            || rows.iter().any(|row| !row.metadata_within_limits())
+        {
+            // Validate the entire observation before scope, queue or snapshot
+            // clones. Never filter out an oversized row: it may be newer
+            // activity or a conflicting identity for an otherwise valid row.
+            // Keep the previous bounded state, but suspend inference until a
+            // complete valid refresh replaces it.
+            self.progress.refresh_failures = self.progress.refresh_failures.saturating_add(1);
+            return Err(
+                "ATC population exceeds count or metadata byte limits; coverage is incomplete"
+                    .to_string(),
+            );
+        }
         // Build scope from the actual projection before deduplicating cache
         // keys. Conflicting duplicate identities must not become last-row-wins.
         let next_scope = PopulationScope::from_rows(&rows);
@@ -196,6 +279,11 @@ impl HydrationState {
             return;
         };
         let disposition = scope.retain_authorized(&mut report.effects, &mut report.actions);
+        self.record_scope_disposition(disposition);
+        report.summary.kernel.pending_effects = report.effects.len();
+    }
+
+    fn record_scope_disposition(&mut self, disposition: scope::ScopeDisposition) {
         self.progress.last_scope_effects_withheld = disposition.effects_withheld;
         self.progress.last_scope_actions_withheld = disposition.actions_withheld;
         self.progress.scope_effects_withheld = self
@@ -206,7 +294,6 @@ impl HydrationState {
             .progress
             .scope_actions_withheld
             .saturating_add(u64::try_from(disposition.actions_withheld).unwrap_or(u64::MAX));
-        report.summary.kernel.pending_effects = report.effects.len();
     }
 
     fn annotate(&self, summary: &mut AtcSummarySnapshot, now_micros: i64) {
@@ -256,6 +343,72 @@ static HYDRATION: OnceLock<Mutex<HydrationState>> = OnceLock::new();
 
 fn hydration() -> &'static Mutex<HydrationState> {
     HYDRATION.get_or_init(|| Mutex::new(HydrationState::default()))
+}
+
+pub(super) fn release_capacity_admission() -> Result<(), &'static str> {
+    // Match refresh/reset's HYDRATION -> ENGINE order and keep the observed
+    // population stable through the engine check. A busy or poisoned state is
+    // unavailable evidence, not permission to use an older admitted report.
+    let state = hydration()
+        .try_lock()
+        .map_err(|_| "agent_coverage_unavailable")?;
+    if state.active_refresh.is_some()
+        || state.progress.refresh_failed
+        || !state.pending.is_empty()
+        || state.resume_pending
+    {
+        return Err("agent_coverage_unavailable");
+    }
+    // Preserve standalone engine use before the first DB population. This is
+    // the existing capacity check, not a new target-scope authorization.
+    engine::atc_release_capacity_admission()
+}
+
+/// Keep the current population authority stable through delivery admission.
+/// Acquire before the delivery mutex, matching reset's hydration -> delivery
+/// order. Neither engine callbacks, database I/O nor logging may run under it.
+#[must_use]
+pub(super) struct ReportScopeGuard {
+    state: std::sync::MutexGuard<'static, HydrationState>,
+}
+
+pub(super) fn lock_report_scope() -> ReportScopeGuard {
+    ReportScopeGuard {
+        state: hydration()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
+impl ReportScopeGuard {
+    /// Planning-time validation is not a delivery entitlement. Refresh can
+    /// finish, fail, or revoke a target while the report samples activity.
+    /// The caller first checks epoch/tick ordering under the delivery mutex;
+    /// a rejected old report must not alter population diagnostics either.
+    pub(super) fn revalidate(&mut self, report: &mut AtcTickReport, now_micros: i64) -> bool {
+        let actionable = !report.effects.is_empty() || !report.actions.is_empty();
+        if actionable
+            && (self.state.active_refresh.is_some()
+                || self.state.progress.refresh_failed
+                || !self.state.pending.is_empty()
+                || self.state.resume_pending)
+        {
+            return false;
+        }
+        if actionable && let Some(scope) = self.state.scope.as_ref() {
+            let disposition = scope.retain_authorized(&mut report.effects, &mut report.actions);
+            // Count only newly withheld instances. A second, unchanged check
+            // must not erase the planning check's restriction diagnostics.
+            if disposition.effects_withheld > 0 || disposition.actions_withheld > 0 {
+                self.state.record_scope_disposition(disposition);
+            }
+            report.summary.kernel.pending_effects = report.effects.len();
+        }
+        // Empty progress remains observable during reads and hydration. It
+        // carries no mutation authority and cannot refill an admitted tick.
+        self.state.annotate(&mut report.summary, now_micros);
+        true
+    }
 }
 
 /// A query owns no engine/hydration lock. This lease only permits its result to
@@ -319,6 +472,36 @@ pub fn atc_population_hydration_stats() -> AtcPopulationHydrationStats {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .progress
+}
+
+/// Sample population health without joining a refresh, engine update or reset.
+///
+/// The caller supplies its server's configured enablement; reading health must
+/// not acquire the engine lock or initialize ATC state. Contention and poison
+/// are explicit unknown observations, rather than stale or zero-valued success.
+#[must_use]
+pub fn atc_population_health_snapshot(
+    enabled: bool,
+    now_micros: i64,
+) -> AtcPopulationHealthSnapshot {
+    if !enabled {
+        return AtcPopulationHealthSnapshot::unavailable("disabled", None);
+    }
+    let Some(state) = HYDRATION.get() else {
+        return AtcPopulationHealthSnapshot::unavailable(
+            "unknown",
+            Some("population_not_observed"),
+        );
+    };
+    match state.try_lock() {
+        Ok(state) => state.health_snapshot(now_micros),
+        Err(TryLockError::WouldBlock) => {
+            AtcPopulationHealthSnapshot::unavailable("unknown", Some("population_state_busy"))
+        }
+        Err(TryLockError::Poisoned(_)) => {
+            AtcPopulationHealthSnapshot::unavailable("unknown", Some("population_state_poisoned"))
+        }
+    }
 }
 
 /// Fetch the bounded recent population and apply at most one hydration slice.
@@ -490,6 +673,246 @@ mod tests {
                 last_active_ts: 1_000_000,
             })
             .collect()
+    }
+
+    #[test]
+    fn oversized_population_metadata_never_enters_queues_or_replaces_valid_scope() {
+        use mcp_agent_mail_db::models::{
+            ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+            ATC_POPULATION_MAX_PROJECT_BYTES,
+        };
+        let mut state = HydrationState::default();
+        state.refresh_with(1, || Ok(rows(2))).unwrap();
+        state.drain_with(|_| {}, || true);
+        state.resume_pending = false;
+        let retained = state.previous_snapshot.clone();
+        for index in 0..300 {
+            let mut changed = rows(2);
+            changed[0].last_active_ts = 2_000_000 + index;
+            // If this row were silently skipped, the first row could appear
+            // authoritative despite missing newer/conflicting identity data.
+            changed[1].name = changed[0].name.clone();
+            match index % 3 {
+                0 => changed[1].name = "n".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1),
+                1 => {
+                    changed[1].program =
+                        format!("x\0{}", "p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES));
+                }
+                _ => {
+                    changed[1].project_key =
+                        format!("{}x", "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2));
+                }
+            }
+            assert!(state.refresh_with(2 + index, || Ok(changed)).is_err());
+            assert!(state.pending.is_empty());
+            assert_eq!(state.previous_snapshot, retained);
+            assert_eq!(
+                state.progress.refresh_failures,
+                u64::try_from(index + 1).unwrap()
+            );
+            assert_eq!(
+                state
+                    .health_snapshot(2 + index)
+                    .inference_deferred_by_hydration,
+                Some(true)
+            );
+            assert!(
+                state
+                    .scope
+                    .as_ref()
+                    .unwrap()
+                    .permits("HydratedAgent0000", Some("/hydration"))
+            );
+        }
+        state.refresh_with(400, || Ok(rows(2))).unwrap();
+        assert!(!state.progress.refresh_failed);
+        assert_eq!(state.progress.unchanged_agents, 2);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.health_snapshot(400).status, "complete");
+    }
+
+    #[test]
+    fn population_health_snapshot_tracks_backlog_through_the_final_yield() {
+        let mut state = HydrationState::default();
+        assert_eq!(state.health_snapshot(1_000_000).status, "unknown");
+        state.refresh_with(1_000_000, || Ok(rows(940))).unwrap();
+        state.drain_with(|_| {}, || true);
+        let pending = state.health_snapshot(6_000_000);
+        assert_eq!(pending.status, "degraded");
+        assert_eq!(pending.reason, Some("population_hydration_incomplete"));
+        assert_eq!(pending.backlog_age_ms, Some(5_000));
+        assert_eq!(pending.inference_deferred_by_hydration, Some(true));
+        let progress = pending.progress.unwrap();
+        assert_eq!(progress.snapshot_agents, 940);
+        assert_eq!(progress.applied_agents, MAX_AGENTS_PER_SLICE);
+        assert_eq!(progress.pending_agents, 940 - MAX_AGENTS_PER_SLICE);
+        assert_eq!(state.health_snapshot(0).backlog_age_ms, Some(0));
+
+        while !state.pending.is_empty() {
+            state.drain_with(|_| {}, || true);
+        }
+        let final_slice = state.health_snapshot(7_000_000);
+        assert_eq!(final_slice.progress.unwrap().pending_agents, 0);
+        assert_eq!(
+            final_slice.status, "degraded",
+            "the inference yield is unfinished work"
+        );
+        assert_eq!(final_slice.inference_deferred_by_hydration, Some(true));
+        assert_eq!(final_slice.backlog_age_ms, Some(6_000));
+        // The next public tick consumes this yield before inference; an
+        // unchanged refresh then retains the population without replaying it.
+        state.resume_pending = false;
+        assert_eq!(state.health_snapshot(8_000_000).status, "complete");
+        state.refresh_with(9_000_000, || Ok(rows(940))).unwrap();
+        let unchanged = state.health_snapshot(10_000_000);
+        assert_eq!(unchanged.status, "complete");
+        assert_eq!(unchanged.progress.unwrap().unchanged_agents, 940);
+        assert_eq!(unchanged.backlog_age_ms, None);
+
+        state.progress.scope_unresolved_names = 1;
+        let restricted = state.health_snapshot(10_000_000);
+        assert_eq!(restricted.status, "degraded");
+        assert_eq!(restricted.reason, Some("population_scope_restricted"));
+        assert_eq!(restricted.inference_deferred_by_hydration, Some(false));
+    }
+
+    #[test]
+    fn population_health_snapshot_completion_does_not_claim_engine_admission() {
+        let mut engine = engine::AtcEngine::new(engine::AtcConfig {
+            max_tracked_agents: 1,
+            ..engine::AtcConfig::default()
+        });
+        assert!(engine.register_agent("OldAgent", "codex-cli", Some("/hydration")));
+        let mut state = HydrationState::default();
+        state.refresh_with(10, || Ok(rows(1))).unwrap();
+        let mut refusals = 0;
+        state.drain_with(
+            |row| {
+                if !engine.register_agent(&row.name, &row.program, Some(&row.project_key)) {
+                    refusals += 1;
+                }
+            },
+            || true,
+        );
+        assert_eq!(refusals, 1);
+        assert_eq!(engine.tracked_agents(), vec!["OldAgent"]);
+        assert_eq!(state.health_snapshot(20).status, "degraded");
+        state.resume_pending = false;
+        let completed = state.health_snapshot(30);
+        assert_eq!(completed.progress.unwrap().pending_agents, 0);
+        assert_eq!(completed.progress.unwrap().applied_agents, 1);
+        assert_eq!(
+            completed.status, "complete",
+            "queue processing must never claim overall engine health"
+        );
+        assert_eq!(completed.inference_deferred_by_hydration, Some(false));
+        assert_eq!(
+            engine.tracked_agents(),
+            vec!["OldAgent"],
+            "completing hydration grants no capacity admission"
+        );
+    }
+
+    #[test]
+    fn population_health_snapshot_observes_real_refresh_failure_and_recovery() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        assert_eq!(atc_population_health_snapshot(true, 10).status, "unknown");
+        sync_population_with(10, || {
+            let refreshing = atc_population_health_snapshot(true, 11);
+            assert_eq!(refreshing.status, "degraded");
+            assert_eq!(refreshing.reason, Some("population_refresh_in_progress"));
+            assert_eq!(refreshing.inference_deferred_by_hydration, Some(true));
+            assert!(refreshing.progress.unwrap().refresh_in_flight);
+            Ok(Vec::new())
+        })
+        .unwrap();
+        let empty = atc_population_health_snapshot(true, 20);
+        assert_eq!(
+            empty.status, "complete",
+            "a successfully observed empty roster is authoritative"
+        );
+        assert_eq!(empty.progress.unwrap().snapshot_agents, 0);
+        assert_eq!(empty.inference_deferred_by_hydration, Some(false));
+        assert!(sync_population_with(30, || Err("database unavailable".into())).is_err());
+        let failed = atc_population_health_snapshot(true, 40);
+        assert_eq!(failed.status, "degraded");
+        assert_eq!(failed.reason, Some("population_refresh_failed"));
+        assert_eq!(failed.inference_deferred_by_hydration, Some(true));
+        assert_eq!(failed.progress.unwrap().refresh_failures, 1);
+        assert!(failed.progress.unwrap().refresh_failed);
+        sync_population_with(50, || Ok(Vec::new())).unwrap();
+        let recovered = atc_population_health_snapshot(true, 60);
+        assert_eq!(recovered.status, "complete");
+        assert_eq!(recovered.progress.unwrap().refresh_failures, 1);
+        assert!(!recovered.progress.unwrap().refresh_failed);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn population_health_snapshot_and_readiness_never_wait_on_hydration() {
+        let _serial = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let held = hydration().lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker_config = config.clone();
+        let worker = std::thread::spawn(move || {
+            let snapshot = atc_population_health_snapshot(true, 10);
+            let disabled = atc_population_health_snapshot(false, 10);
+            let mut body = serde_json::json!({"status":"ready","durability_state":"not_probed"});
+            crate::enrich_readiness_response(
+                &worker_config,
+                &Mutex::new(crate::HealthEnrichmentCache::default()),
+                &mut body,
+            );
+            let _ = send.send((snapshot, disabled, body));
+        });
+        let observed = receive.recv_timeout(Duration::from_secs(1));
+        // Always release the lock and join, including a regression to a
+        // blocking implementation, so a failed assertion cannot strand a worker.
+        drop(held);
+        worker.join().unwrap();
+        let (snapshot, disabled, body) = observed.expect("health waited for the hydration lock");
+        assert_eq!(snapshot.status, "unknown");
+        assert_eq!(snapshot.reason, Some("population_state_busy"));
+        assert_eq!(snapshot.progress, None);
+        assert_eq!(snapshot.inference_deferred_by_hydration, None);
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["durability_state"], "not_probed");
+        assert_eq!(body["atc_population_hydration"]["status"], "unknown");
+        assert_eq!(
+            body["atc_population_hydration"]["reason"],
+            "population_state_busy"
+        );
+        assert!(body["atc_population_hydration"]["progress"].is_null());
+
+        let _ = std::panic::catch_unwind(|| {
+            let _held = hydration().lock().unwrap();
+            panic!("interrupted hydration update");
+        });
+        let poisoned = atc_population_health_snapshot(true, 20);
+        assert_eq!(poisoned.status, "unknown");
+        assert_eq!(poisoned.reason, Some("population_state_poisoned"));
+        assert_eq!(poisoned.progress, None);
+        assert!(
+            hydration().is_poisoned(),
+            "health must not silently repair poison"
+        );
+        super::super::reset_global_atc_state_for_test(&config);
     }
 
     #[test]
@@ -1246,5 +1669,464 @@ mod tests {
             summary.policy.fallback_reason.as_deref(),
             Some("population_hydration_incomplete")
         );
+    }
+
+    fn release_report(now: i64) -> AtcTickReport {
+        let mut report = tick_report(now).expect("planning report");
+        report.effects = vec![engine::AtcEffectPlan {
+            decision_id: 1,
+            effect_id: "late-release".into(),
+            experience_id: None,
+            claim_id: "claim".into(),
+            evidence_id: "evidence".into(),
+            trace_id: "trace".into(),
+            timestamp_micros: now,
+            kind: "release_reservations_requested".into(),
+            category: "liveness".into(),
+            agent: "HydratedAgent0000".into(),
+            project_key: Some("/hydration".into()),
+            policy_id: None,
+            policy_revision: 1,
+            message: None,
+            expected_loss: None,
+            semantics: engine::AtcEffectSemantics {
+                family: "reservation_release".into(),
+                risk_level: "high".into(),
+                utility_model: "test".into(),
+                operator_action: "test".into(),
+                remediation: "test".into(),
+                escalation_policy: "test".into(),
+                evidence_summary: "test".into(),
+                cooldown_key: "late-release".into(),
+                cooldown_micros: 1,
+                requires_project: true,
+                ack_required: false,
+                high_risk_intervention: true,
+                preconditions: Vec::new(),
+            },
+        }];
+        report.actions = vec![engine::AtcTickAction::ReleaseReservations {
+            agent: "HydratedAgent0000".into(),
+        }];
+        report
+    }
+
+    #[test]
+    fn release_execution_admission_waits_for_usable_population_evidence() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let unavailable = Err("agent_coverage_unavailable");
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Ok(()),
+            "standalone engine use before hydration remains supported"
+        );
+        {
+            let _state = hydration().lock().unwrap();
+            assert_eq!(
+                super::super::atc_release_capacity_admission(),
+                unavailable,
+                "contended population evidence must not block or authorize execution"
+            );
+        }
+        let refresh = PopulationRefresh::start(&mut hydration().lock().unwrap());
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        drop(refresh);
+        assert!(atc_population_hydration_stats().refresh_failed);
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+
+        sync_population_with(1_000_000, || Ok(rows(65))).unwrap();
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        while atc_population_hydration_stats().pending_agents > 0 {
+            tick_report(2_000_000).unwrap();
+        }
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            unavailable,
+            "the final inference yield is still incomplete population work"
+        );
+        tick_report(3_000_000).unwrap();
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+
+        let poisoned = std::panic::catch_unwind(|| {
+            let _state = hydration().lock().unwrap();
+            panic!("interrupted population update");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(super::super::atc_release_capacity_admission(), unavailable);
+        super::super::reset_global_atc_state_for_test(&config);
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn oversized_durable_metadata_suspends_public_inference_and_release_admission() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("population-metadata.db");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        fastmcp_core::block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+            &cx, &conn,
+        ))
+        .into_result()
+        .unwrap();
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'hydration', '/hydration', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'HydratedAgent0000', 'codex-cli', 'test', 1, {now})"
+        )).unwrap();
+        let pool =
+            mcp_agent_mail_db::create_pool_without_startup_init(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(atc_sync_population_from_db(&pool).unwrap().agents, 1);
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let planned = release_report(now + 1);
+        assert!(!hydration().lock().unwrap().resume_pending);
+        let admitted = super::super::admit_report(&epoch, planned, now + 1).unwrap();
+        let queued = admitted
+            .effects
+            .into_iter()
+            .find(|effect| effect.kind == "release_reservations_requested")
+            .expect("release was admitted before the invalid refresh");
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+        let mut projects = crate::AtcExecutorProjectCache::default();
+        assert_eq!(
+            crate::execute_atc_effect(None, crate::AtcExecutorMode::Live, &mut projects, &queued),
+            "failed:executor_unavailable",
+            "control: population admission permits reaching the runtime"
+        );
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now)
+        );
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        let oversized = "p".repeat(mcp_agent_mail_db::models::ATC_POPULATION_MAX_PROGRAM_BYTES + 1);
+        conn.execute_raw(&format!(
+            "UPDATE agents SET program = '{oversized}' WHERE id = 1"
+        ))
+        .unwrap();
+
+        assert!(
+            atc_sync_population_from_db(&pool)
+                .unwrap_err()
+                .contains("coverage is incomplete")
+        );
+        assert_eq!(
+            engine::atc_release_capacity_admission(),
+            Ok(()),
+            "engine capacity alone cannot detect a failed population refresh"
+        );
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Err("agent_coverage_unavailable")
+        );
+        assert_eq!(
+            crate::execute_atc_effect(None, crate::AtcExecutorMode::Live, &mut projects, &queued),
+            "suppressed:agent_coverage_unavailable",
+            "a previously admitted release must stop before runtime work"
+        );
+        for step in 2..=8 {
+            let report = super::super::atc_tick_report(now + step).unwrap();
+            assert!(report.effects.is_empty() && report.actions.is_empty());
+            assert_eq!(
+                report.summary.completeness,
+                engine::SnapshotCompleteness::Partial
+            );
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some("population_refresh_failed")
+            );
+        }
+        let state = hydration().lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert_eq!(state.previous_snapshot.len(), 1);
+        assert_eq!(
+            state.previous_snapshot.values().next().unwrap().program,
+            "codex-cli"
+        );
+        assert_eq!(state.progress.refresh_failures, 1);
+        drop(state);
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now)
+        );
+
+        conn.execute_raw(&format!(
+            "UPDATE agents SET program = 'claude-code', last_active_ts = {} WHERE id = 1",
+            now + 10
+        ))
+        .unwrap();
+        assert_eq!(atc_sync_population_from_db(&pool).unwrap().agents, 1);
+        assert!(!atc_population_hydration_stats().refresh_failed);
+        assert_eq!(
+            super::super::atc_release_capacity_admission(),
+            Err("agent_coverage_unavailable")
+        );
+        let recovered = super::super::atc_tick_report(now + 11).unwrap();
+        assert_eq!(
+            recovered.summary.completeness,
+            engine::SnapshotCompleteness::Full
+        );
+        assert_eq!(
+            engine::atc_agent_last_activity("HydratedAgent0000"),
+            Some(now + 10)
+        );
+        assert_eq!(super::super::atc_release_capacity_admission(), Ok(()));
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    fn add_passive_probe(report: &mut AtcTickReport) {
+        let mut probe = report.effects[0].clone();
+        probe.kind = "probe_agent".into();
+        probe.semantics.family = "liveness_probe".into();
+        probe.semantics.high_risk_intervention = false;
+        report.effects.push(probe);
+        report.actions.push(engine::AtcTickAction::ProbeAgent {
+            agent: "HydratedAgent0000".into(),
+        });
+    }
+
+    #[test]
+    fn empty_refresh_revokes_a_planned_release_without_a_new_admitted_tick() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let report = release_report(2_000_000);
+        sync_population_with(3_000_000, || Ok(Vec::new())).unwrap();
+        assert!(
+            super::super::delivery_state()
+                .lock()
+                .unwrap()
+                .last_tick_count
+                .is_none()
+        );
+        let returned = super::super::admit_report(&epoch, report, 2_000_000).unwrap();
+        assert!(returned.effects.is_empty() && returned.actions.is_empty());
+        assert_eq!(returned.summary.kernel.pending_effects, 0);
+        assert_eq!(atc_population_hydration_stats().scope_effects_withheld, 1);
+        assert_eq!(atc_population_hydration_stats().scope_actions_withheld, 1);
+        assert_eq!(super::super::atc_delivery_stats().admitted, 0);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn activity_refresh_during_report_observation_revokes_the_release() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        sync_population_with(1_000_000, || Ok(rows(1))).unwrap();
+        let _ = tick_report(2_000_000).unwrap();
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let mut report = release_report(3_000_000);
+        add_passive_probe(&mut report);
+        let mut observations = 0;
+        let returned = super::super::admit_report_with_activity(&epoch, report, 3_000_000, |_| {
+            observations += 1;
+            sync_population_with(4_000_000, || {
+                let mut fresh = rows(1);
+                fresh[0].last_active_ts = 4_000_000;
+                Ok(fresh)
+            })
+            .unwrap();
+            // Complete the hydration/inference turn, but do not admit a newer
+            // report. Tick ordering alone cannot reject the older release.
+            let _ = tick_report(5_000_000).unwrap();
+            Some(4_000_000)
+        })
+        .unwrap();
+        assert_eq!(observations, 1);
+        assert!(returned.effects.is_empty() && returned.actions.is_empty());
+        assert_eq!(atc_population_hydration_stats().scope_effects_withheld, 1);
+        assert_eq!(atc_population_hydration_stats().scope_actions_withheld, 1);
+        assert_eq!(super::super::atc_delivery_stats().admitted, 0);
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn in_flight_read_revokes_old_actionable_admission_without_waiting_for_io() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let report = release_report(2_000_000);
+        sync_population_with(3_000_000, || {
+            assert!(super::super::admit_report(&epoch, report, 2_000_000).is_none());
+            assert!(
+                super::super::delivery_state()
+                    .lock()
+                    .unwrap()
+                    .last_tick_count
+                    .is_none()
+            );
+            assert_eq!(
+                super::super::atc_delivery_stats(),
+                super::super::AtcDeliveryStats::default()
+            );
+            Ok(rows(1))
+        })
+        .unwrap();
+        assert!(super::super::atc_tick_report(4_000_000).is_some());
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn failed_incomplete_and_yielding_refreshes_do_not_grant_old_reports_authority() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        for count in [0, 1, 65] {
+            super::super::reset_global_atc_state_for_test(&config);
+            let epoch = super::super::capture_delivery_epoch().unwrap();
+            let report = release_report(2_000_000);
+            if count == 0 {
+                assert!(sync_population_with(3_000_000, || Err("read failed".into())).is_err());
+            } else {
+                sync_population_with(3_000_000, || Ok(rows(count))).unwrap();
+                assert!(hydration().lock().unwrap().resume_pending);
+            }
+            let before = atc_population_hydration_stats();
+            assert!(super::super::admit_report(&epoch, report, 2_000_000).is_none());
+            assert_eq!(atc_population_hydration_stats(), before);
+            assert!(
+                super::super::delivery_state()
+                    .lock()
+                    .unwrap()
+                    .last_tick_count
+                    .is_none()
+            );
+            assert_eq!(
+                super::super::atc_delivery_stats(),
+                super::super::AtcDeliveryStats::default()
+            );
+        }
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn admission_holds_population_authority_while_waiting_for_delivery_commit() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let epoch = super::super::capture_delivery_epoch().unwrap();
+        let mut report = release_report(2_000_000);
+        add_passive_probe(&mut report);
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                super::super::admit_report_with_activity(&epoch, report, 2_000_000, |_| {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Some(1_000_000)
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The worker has passed the early delivery check. Block only its
+            // final commit, then observe that it already owns population scope.
+            let delivery = super::super::delivery_state().lock().unwrap();
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let held = loop {
+                if matches!(hydration().try_lock(), Err(TryLockError::WouldBlock)) {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            // Always release before asserting/joining, even for the old code:
+            // the regression must fail rather than leave a blocked worker.
+            drop(delivery);
+            let returned = worker.join().unwrap().unwrap();
+            assert!(
+                held,
+                "population scope was not stable through final admission"
+            );
+            assert_eq!(returned.effects.len(), 1);
+            assert_eq!(returned.actions.len(), 1);
+        });
+        assert!(hydration().try_lock().is_ok());
+        super::super::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn repeated_empty_progress_remains_visible_during_population_read() {
+        let _guard = engine::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        super::super::reset_global_atc_state_for_test(&config);
+        let first = super::super::atc_tick_report(2_000_000).unwrap();
+        let before = super::super::atc_delivery_stats();
+        sync_population_with(3_000_000, || {
+            for _ in 0..16 {
+                let progress = super::super::atc_tick_report(4_000_000).unwrap();
+                assert_eq!(progress.summary.tick_count, first.summary.tick_count);
+                assert!(progress.effects.is_empty() && progress.actions.is_empty());
+                assert_eq!(
+                    progress.summary.policy.fallback_reason.as_deref(),
+                    Some("population_refresh_in_progress")
+                );
+                assert_eq!(super::super::atc_delivery_stats(), before);
+            }
+            Ok(Vec::new())
+        })
+        .unwrap();
+        super::super::reset_global_atc_state_for_test(&config);
     }
 }

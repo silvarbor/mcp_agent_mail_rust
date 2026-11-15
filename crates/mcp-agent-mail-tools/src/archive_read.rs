@@ -3,9 +3,11 @@
 //! Degraded mailbox reads are expensive: they replay the Git archive and merge
 //! readable live-only state into a disposable `SQLite` database.  This module
 //! gives every tool and resource in a process one owner for that work.  A
-//! snapshot is published only after indexed archive markers and exact live
-//! database generations taken before and after reconstruction agree, and its
-//! pool is incapable of mutation.
+//! snapshot is published only after indexed archive markers (including
+//! available cross-process epoch tokens) and exact live database generations
+//! taken before and after reconstruction agree, and its pool is incapable of
+//! mutation. These markers detect observed remote changes; they do not hold a
+//! cross-process mutation lease.
 
 use asupersync::Cx;
 use sha2::{Digest, Sha256};
@@ -279,8 +281,20 @@ pub struct WriteGuard {
 }
 
 impl WriteGuard {
+    #[cfg(test)]
     pub(crate) fn begin(storage_root: &Path, sqlite_path: Option<&Path>) -> Self {
         let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        Self::from_activity(storage_root, sqlite_path, write_activity)
+    }
+
+    /// Attach archive generation tracking to an already admitted live writer.
+    /// The caller retains the same database-promotion exclusion through this
+    /// guard; entering and leaving still invalidate every overlapping build.
+    pub(crate) fn from_activity(
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+        write_activity: mcp_agent_mail_db::write_barrier::WriteActivityGuard,
+    ) -> Self {
         WRITERS_ACTIVE.fetch_add(1, Ordering::AcqRel);
         WRITER_EPOCH.fetch_add(1, Ordering::AcqRel);
         let slot = sqlite_path
@@ -930,7 +944,12 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
 }
 
 fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireError>) {
-    mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+    // A last snapshot owner closes its pool and removes its temporary database
+    // family. Carry both displaced and rejected snapshots out of publication
+    // exclusion: cleanup has no authority over the newly published generation.
+    let mut retired = None;
+    let mut rejected = None;
+    let completion = mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
         let mut state = slot
             .state
             .lock()
@@ -940,11 +959,10 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             .as_ref()
             .is_none_or(|active| active.token != build.token)
         {
-            drop(state);
-            build.completion.finish(Err(AcquireError::Busy(
+            rejected = Some(result);
+            return Err(AcquireError::Busy(
                 "archive-read snapshot build ownership changed before publication".to_string(),
-            )));
-            return;
+            ));
         }
         let result = match result {
             Ok(output)
@@ -957,7 +975,7 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                     && mcp_agent_mail_storage::archive_mutation_epoch() == build.archive_epoch
                     && state.writers == 0 =>
             {
-                state.ready = Some(Ready {
+                retired = state.ready.replace(Ready {
                     generation: output.generation,
                     cheap: output.cheap,
                     decision: output.decision,
@@ -968,7 +986,8 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                 });
                 Ok(())
             }
-            Ok(_) => {
+            Ok(output) => {
+                rejected = Some(Ok(output));
                 tracing::debug!(
                     deadline_ok = Instant::now() < build.deadline,
                     invalidation_epoch = slot.invalidation_epoch.load(Ordering::Acquire),
@@ -989,13 +1008,14 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             Err(error) => Err(error),
         };
         state.building = None;
-        drop(state);
-        // Finishing outside the state lock keeps lock nesting one-level
-        // (completion has its own mutex); waiters re-check under the state
-        // lock with a bounded wait, so the tiny gap is at most one slice.
-        build.completion.finish(result);
+        result
     });
+    // Publish completion and wake readers before potentially slow destruction,
+    // outside both the slot mutex and the native archive publication fence.
+    build.completion.finish(completion);
     slot.wake.notify_all();
+    drop(retired);
+    drop(rejected);
 }
 
 fn claim_build(slot: &Slot, deadline: Instant) -> Result<Option<Build>, AcquireError> {
@@ -1251,13 +1271,35 @@ pub fn acquire_if_needed(
             // perturb. One content hash is vastly cheaper than a
             // reconstruction, and it is the same authority `run_build` already
             // publishes on.
-            let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
-                && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
+            //
+            // A sample can also meet another writer's `.git/index.lock` (the
+            // background index sync, Git run in the archive, another
+            // process). That is contention, not failure: retry the way a busy
+            // build is retried instead of failing the caller's read.
+            let cheap_fresh = if Instant::now().duration_since(exact_at) < exact_audit_interval() {
+                match cheap_generation(&slot.scope, caller_deadline) {
+                    Ok(cheap) => cheap == expected_cheap,
+                    Err(AcquireError::Busy(_)) => {
+                        wait_retry_slice(&slot);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
 
             let content_unchanged = if cheap_fresh {
                 true
             } else {
-                exact_generation(&slot.scope, caller_deadline)? == expected_exact
+                match exact_generation(&slot.scope, caller_deadline) {
+                    Ok(exact) => exact == expected_exact,
+                    Err(AcquireError::Busy(_)) => {
+                        wait_retry_slice(&slot);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
 
             if content_unchanged
@@ -1333,9 +1375,352 @@ pub fn writer_epoch_for_test() -> u64 {
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    use std::sync::Barrier;
+    use std::cell::RefCell;
+    use std::sync::{Barrier, mpsc};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SnapshotDropObserver {
+        path: PathBuf,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    std::thread_local! {
+        static SNAPSHOT_DROP_OBSERVER: RefCell<Option<SnapshotDropObserver>> =
+            const { RefCell::new(None) };
+    }
+
+    // Observe the real SharedSnapshot's last-owner destruction, immediately
+    // before its actual pool and temporary directory are dropped. No database,
+    // publication fence, or cleanup implementation is substituted by this hook.
+    impl Drop for SharedSnapshot {
+        fn drop(&mut self) {
+            let observer = SNAPSHOT_DROP_OBSERVER
+                .try_with(|slot| slot.borrow_mut().take())
+                .ok()
+                .flatten();
+            if let Some(observer) = observer {
+                assert_eq!(self.path(), observer.path);
+                observer.entered.send(()).expect("observe snapshot drop");
+                observer
+                    .release
+                    .recv_timeout(Duration::from_secs(15))
+                    .expect("release snapshot cleanup after bounded observations");
+            }
+        }
+    }
+
+    fn isolated_retirement_test() -> bool {
+        const CHILD: &str = "AM_TEST_ARCHIVE_SNAPSHOT_RETIREMENT_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("run isolated snapshot retirement test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    fn retirement_fixture() -> (tempfile::TempDir, Arc<Slot>, String) {
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("snapshot retirement fixture");
+        let root = directory.path().canonicalize().expect("canonical fixture");
+        let storage_root = root.join("archive");
+        let sqlite_path = root.join("missing-live.sqlite3");
+        write_archive_fixture(&storage_root);
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let slot = slot_for(scope(&storage_root, &sqlite_path).expect("snapshot scope"))
+            .expect("snapshot slot");
+        (directory, slot, database_url)
+    }
+
+    fn retirement_build(slot: &Slot, database_url: &str) -> (Build, BuildOutput) {
+        let build = claim_build(slot, Instant::now() + BUILD_TIMEOUT)
+            .expect("claim snapshot build")
+            .expect("snapshot build owner");
+        let output = run_build(slot, database_url, &build).expect("build actual archive snapshot");
+        assert!(matches!(&output.decision, Decision::Snapshot(_)));
+        (build, output)
+    }
+
+    fn snapshot_decision_path(decision: &Decision) -> Option<PathBuf> {
+        match decision {
+            Decision::Live => None,
+            Decision::Snapshot(snapshot) => Some(snapshot.path().to_path_buf()),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetirementCase {
+        Replacement,
+        Superseded,
+        StaleToken,
+    }
+
+    fn assert_snapshot_retirement_outside_publication(case: RetirementCase) {
+        let (_directory, slot, database_url) = retirement_fixture();
+        let live_before = snapshot_family(&slot.scope.sqlite_path);
+        let (first, output) = retirement_build(&slot, &database_url);
+        let first_path = snapshot_decision_path(&output.decision).expect("first snapshot path");
+        finish_build(&slot, &first, Ok(output));
+        assert_eq!(first.completion.result(), Some(Ok(())));
+
+        // Use the ordinary writer invalidation protocol to force a genuinely
+        // new reconstruction instead of cloning the existing ready decision.
+        drop(WriteGuard::begin(
+            &slot.scope.storage_root,
+            Some(&slot.scope.sqlite_path),
+        ));
+        let (build, output) = retirement_build(&slot, &database_url);
+        let output_path = snapshot_decision_path(&output.decision).expect("new snapshot path");
+        assert_ne!(output_path, first_path);
+        let (retiring_path, ready_path, newer_owner) = match case {
+            RetirementCase::Replacement => (first_path, output_path, None),
+            RetirementCase::Superseded => {
+                drop(WriteGuard::begin(
+                    &slot.scope.storage_root,
+                    Some(&slot.scope.sqlite_path),
+                ));
+                (output_path, first_path, None)
+            }
+            RetirementCase::StaleToken => {
+                fail_claimed_build(
+                    &slot,
+                    &build,
+                    AcquireError::Busy("fixture advanced build ownership".into()),
+                );
+                let newer = claim_build(&slot, Instant::now() + BUILD_TIMEOUT)
+                    .expect("claim newer build")
+                    .expect("newer build owner");
+                (output_path, first_path, Some(newer))
+            }
+        };
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let publisher_slot = Arc::clone(&slot);
+        let publisher_build = build.clone();
+        let observed_path = retiring_path.clone();
+        let publisher = std::thread::spawn(move || {
+            SNAPSHOT_DROP_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(SnapshotDropObserver {
+                    path: observed_path,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            finish_build(&publisher_slot, &publisher_build, Ok(output));
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let completion_before_cleanup = build.completion.result();
+        let state_before_cleanup = slot.state.try_lock().ok().map(|state| {
+            (
+                state
+                    .ready
+                    .as_ref()
+                    .and_then(|ready| snapshot_decision_path(&ready.decision)),
+                state.building.as_ref().map(|active| active.token),
+            )
+        });
+        let file_exists_during_cleanup = retiring_path.is_file();
+        let newer_completion_untouched = newer_owner
+            .as_ref()
+            .is_none_or(|newer| newer.completion.result().is_none());
+
+        let (fence_tx, fence_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                let _ = fence_tx.send(());
+            });
+        });
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        let waiter_slot = Arc::clone(&slot);
+        let mut waiter_build = build;
+        waiter_build.deadline = waiter_build
+            .deadline
+            .min(Instant::now() + Duration::from_secs(5));
+        let waiter = std::thread::spawn(move || {
+            let result = wait_for_build(&waiter_slot, &waiter_build, &Cx::for_testing());
+            let _ = waiter_tx.send(result);
+        });
+        let fence_before_cleanup = fence_rx.recv_timeout(Duration::from_secs(2));
+        let waiter_before_cleanup = waiter_rx.recv_timeout(Duration::from_secs(2));
+
+        // Release and join even against the old implementation, which keeps
+        // the native fence (and, for replacement, the slot) inside this drop.
+        let _ = release_tx.send(());
+        let publisher_result = publisher.join();
+        let contender_result = contender.join();
+        let waiter_result = waiter.join();
+        let expected_token = newer_owner.as_ref().map(|newer| newer.token);
+        if let Some(newer) = &newer_owner {
+            fail_claimed_build(&slot, newer, AcquireError::Busy("fixture finished".into()));
+        }
+        let retired_file_removed = !retiring_path.exists();
+        let live_after = snapshot_family(&slot.scope.sqlite_path);
+        reset_for_test();
+
+        assert!(
+            entered.is_ok(),
+            "the last snapshot owner must reach cleanup"
+        );
+        assert!(publisher_result.is_ok(), "snapshot publisher panicked");
+        assert!(contender_result.is_ok(), "native fence contender panicked");
+        assert!(waiter_result.is_ok(), "snapshot waiter panicked");
+        assert!(
+            fence_before_cleanup.is_ok(),
+            "snapshot retirement held the native publication fence"
+        );
+        assert_eq!(
+            state_before_cleanup,
+            Some((Some(ready_path), expected_token)),
+            "retirement must release the slot without replacing a newer build owner"
+        );
+        let build_succeeded = matches!(case, RetirementCase::Replacement);
+        assert_eq!(
+            completion_before_cleanup.as_ref().map(Result::is_ok),
+            Some(build_succeeded),
+            "build completion must precede snapshot cleanup"
+        );
+        assert_eq!(
+            waiter_before_cleanup.as_ref().ok().map(Result::is_ok),
+            Some(build_succeeded),
+            "a real build waiter must finish while cleanup remains blocked"
+        );
+        assert!(newer_completion_untouched);
+        assert!(file_exists_during_cleanup);
+        assert!(
+            retired_file_removed,
+            "the actual temporary family must retire"
+        );
+        assert_eq!(live_after, live_before);
+    }
+
+    #[test]
+    fn snapshot_replacement_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::Replacement);
+        }
+    }
+
+    #[test]
+    fn superseded_snapshot_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::Superseded);
+        }
+    }
+
+    #[test]
+    fn stale_snapshot_result_releases_publication_before_retirement() {
+        if !isolated_retirement_test() {
+            assert_snapshot_retirement_outside_publication(RetirementCase::StaleToken);
+        }
+    }
+
+    #[test]
+    fn retired_snapshot_remains_queryable_until_its_last_reader_releases_it() {
+        if isolated_retirement_test() {
+            return;
+        }
+        let (_directory, slot, database_url) = retirement_fixture();
+        let (first, output) = retirement_build(&slot, &database_url);
+        let reader = output.decision.snapshot().expect("reader owns snapshot");
+        let reader_path = reader.path().to_path_buf();
+        finish_build(&slot, &first, Ok(output));
+        drop(WriteGuard::begin(
+            &slot.scope.storage_root,
+            Some(&slot.scope.sqlite_path),
+        ));
+        let (replacement, output) = retirement_build(&slot, &database_url);
+        let replacement_path =
+            snapshot_decision_path(&output.decision).expect("replacement snapshot path");
+        finish_build(&slot, &replacement, Ok(output));
+        assert_eq!(replacement.completion.result(), Some(Ok(())));
+        assert_eq!(Arc::strong_count(&reader), 1);
+        assert!(
+            reader_path.is_file(),
+            "the old reader still owns its family"
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("query retained snapshot");
+        let cx = Cx::for_testing();
+        let conn = match runtime.block_on(reader.pool.acquire(&cx)) {
+            asupersync::Outcome::Ok(conn) => conn,
+            asupersync::Outcome::Err(error) => {
+                panic!("retired snapshot reader could not acquire its pool: {error}")
+            }
+            asupersync::Outcome::Cancelled(_) => panic!("retired snapshot reader was cancelled"),
+            asupersync::Outcome::Panicked(_) => panic!("retired snapshot reader panicked"),
+        };
+        let rows = conn
+            .query_sync("SELECT subject FROM messages WHERE id = 1", &[])
+            .expect("query old immutable snapshot after replacement");
+        assert_eq!(
+            rows[0].get_named::<String>("subject").expect("subject"),
+            "hello"
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[])
+                .expect("query-only reader")[0]
+                .get_named::<i64>("query_only")
+                .expect("query-only flag"),
+            1
+        );
+        drop(conn);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observed_path = reader_path.clone();
+        let last_reader = std::thread::spawn(move || {
+            SNAPSHOT_DROP_OBSERVER.with(|observer| {
+                *observer.borrow_mut() = Some(SnapshotDropObserver {
+                    path: observed_path,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            drop(reader);
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let ready_while_reader_retires = slot.state.try_lock().ok().and_then(|state| {
+            state
+                .ready
+                .as_ref()
+                .and_then(|ready| snapshot_decision_path(&ready.decision))
+        });
+        let (fence_tx, fence_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                let _ = fence_tx.send(());
+            });
+        });
+        let fence_before_cleanup = fence_rx.recv_timeout(Duration::from_secs(2));
+        let _ = release_tx.send(());
+        let reader_result = last_reader.join();
+        let contender_result = contender.join();
+        let retired_file_removed = !reader_path.exists();
+        reset_for_test();
+
+        assert!(entered.is_ok(), "the last reader must own actual cleanup");
+        assert!(reader_result.is_ok());
+        assert!(contender_result.is_ok());
+        assert!(fence_before_cleanup.is_ok());
+        assert_eq!(ready_while_reader_retires, Some(replacement_path));
+        assert!(retired_file_removed);
+    }
 
     /// Proves the configured stack actually carries a frame depth that would
     /// abort on the 2 MiB default, i.e. that `.stack_size()` is really applied.
@@ -1373,6 +1758,10 @@ mod tests {
             ..mcp_agent_mail_core::Config::default()
         };
         mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
+        write_archive_fixture_files(root);
+    }
+
+    fn write_archive_fixture_files(root: &Path) {
         let project = root.join("projects").join("single-flight-project");
         let agent = project.join("agents").join("Alice");
         let messages = project.join("messages").join("2026").join("07");
@@ -1520,8 +1909,12 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_for_test();
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage_root = directory.path().join("archive");
-        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let fixture_root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical fixture root");
+        let storage_root = fixture_root.join("archive");
+        let sqlite_path = fixture_root.join("missing-live.sqlite3");
         write_archive_fixture(&storage_root);
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let slot = slot_for(scope(&storage_root, &sqlite_path).expect("scope")).expect("slot");
@@ -1589,6 +1982,171 @@ mod tests {
         let moved = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
             .expect("moved generation");
         assert_ne!(moved, first);
+    }
+
+    #[test]
+    fn cached_snapshot_refreshes_after_remote_uncommitted_native_profile_write() {
+        const CHILD_ROOT: &str = "AM_TEST_REMOTE_ARCHIVE_PROFILE_ROOT";
+        const CHILD_COMPLETE: &str = "remote native profile write complete";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            use std::io::Write as _;
+
+            let config = mcp_agent_mail_core::Config {
+                storage_root: PathBuf::from(root),
+                ..mcp_agent_mail_core::Config::default()
+            };
+            let archive = mcp_agent_mail_storage::open_archive(&config, "single-flight-project")
+                .expect("open child archive")
+                .expect("existing child project");
+            mcp_agent_mail_storage::write_agent_profile_with_config(
+                &archive,
+                &config,
+                &serde_json::json!({
+                    "name": "Alice",
+                    "program": "remote-native",
+                    "model": "test",
+                    "registered_ts": "2026-07-19T00:00:00Z",
+                }),
+            )
+            .expect("complete native profile mutation in another process");
+            println!("{CHILD_COMPLETE}");
+            std::io::stdout().flush().expect("flush child completion");
+            // The physical write has completed, but its queued Git commit is
+            // deliberately left pending, as after a CLI exits or a crash.
+            std::process::exit(0);
+        }
+
+        fn index_signature(git_dir: &Path) -> [u8; 32] {
+            let mut hasher = Sha256::new();
+            for exact in [false, true] {
+                hash_tree(
+                    git_dir,
+                    &git_dir.join("index"),
+                    &mut hasher,
+                    exact,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .expect("sample index metadata and bytes");
+            }
+            hasher.finalize().into()
+        }
+
+        fn snapshot_program(snapshot: &SharedSnapshot) -> String {
+            private_snapshot_probe(snapshot.path())
+                .expect("open immutable snapshot")
+                .query_sync("SELECT program FROM agents WHERE name = 'Alice'", &[])
+                .expect("read reconstructed profile")[0]
+                .get_named::<String>("program")
+                .expect("profile program")
+        }
+
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        // Bootstrap directly so the parent's storage index-sync worker cannot
+        // invalidate the snapshot and hide a missing remote epoch observation.
+        let repo = git2::Repository::init(&storage_root).expect("initialize fixture repo");
+        write_archive_fixture_files(&storage_root);
+        let mut index = repo.index().expect("fixture index");
+        let tree_id = index.write_tree().expect("empty initial tree");
+        index.write().expect("write initial shared index");
+        let tree = repo.find_tree(tree_id).expect("initial tree");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("fixture author");
+        let head_before = repo
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .expect("initial HEAD");
+        fs::write(
+            repo.path()
+                .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+            format!("1{}", "ab".repeat(16)),
+        )
+        .expect("seed existing archive epoch protocol");
+
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let cx = Cx::for_testing();
+        let acquire = || {
+            acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                .expect("acquire degraded read")
+                .expect("missing live database requires a snapshot")
+        };
+        let first = acquire();
+        assert_eq!(snapshot_program(&first), "test");
+        assert!(
+            Arc::ptr_eq(&first, &acquire()),
+            "warm reads must use the cache"
+        );
+        let slot = slot_for(scope(&storage_root, &sqlite_path).expect("scope")).expect("slot");
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 1);
+        let archive_before = mcp_agent_mail_storage::archive_read_generation(&storage_root)
+            .expect("archive generation before child");
+        let index_before = index_signature(repo.path());
+        let local_epoch_before = mcp_agent_mail_storage::archive_mutation_epoch();
+        let writer_epoch_before = WRITER_EPOCH.load(Ordering::Acquire);
+        let live_before = snapshot_family(&sqlite_path);
+
+        // The real ref lock prevents the child coalescer from advancing HEAD
+        // even if it runs before process::exit. Native commits build private
+        // indexes under that lock, leaving the shared index unchanged too.
+        let refname = repo
+            .head()
+            .expect("fixture HEAD")
+            .name()
+            .expect("HEAD ref")
+            .to_string();
+        let mut transaction = repo.transaction().expect("reference transaction");
+        transaction.lock_ref(&refname).expect("hold HEAD ref");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "archive_read::tests::cached_snapshot_refreshes_after_remote_uncommitted_native_profile_write",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &storage_root)
+            .env("AM_ARCHIVE_BATCH_MS", "5000")
+            .output()
+            .expect("run remote native writer");
+        drop(transaction);
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETE),
+            "remote writer must execute and complete:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            repo.head().expect("unchanged HEAD").target(),
+            Some(head_before)
+        );
+        assert_eq!(index_signature(repo.path()), index_before);
+        assert_eq!(
+            mcp_agent_mail_storage::archive_mutation_epoch(),
+            local_epoch_before
+        );
+        assert_eq!(WRITER_EPOCH.load(Ordering::Acquire), writer_epoch_before);
+        assert_eq!(snapshot_family(&sqlite_path), live_before);
+        assert_ne!(
+            mcp_agent_mail_storage::archive_read_generation(&storage_root)
+                .expect("archive generation after child"),
+            archive_before,
+            "only the persisted epoch can expose this completed remote write"
+        );
+
+        let refreshed = acquire();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(snapshot_program(&refreshed), "remote-native");
+        assert_eq!(
+            snapshot_program(&first),
+            "test",
+            "prior snapshots stay immutable"
+        );
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 2);
+        assert_eq!(snapshot_family(&sqlite_path), live_before);
+        drop((first, refreshed));
+        reset_for_test();
     }
 
     #[test]
@@ -1692,6 +2250,41 @@ mod tests {
         drop(conn);
         assert_eq!(snapshot_family(snapshot.path()), family_before);
         drop(snapshots);
+        reset_for_test();
+    }
+
+    #[test]
+    fn ready_snapshot_read_waits_out_a_held_git_index_lock() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        write_archive_fixture(&storage_root);
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let cx = Cx::for_testing();
+        acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+            .expect("cold acquire")
+            .expect("archive must require a snapshot");
+
+        // Another writer (the background index sync, Git run in the archive,
+        // another process) holds the index lock while the next read samples
+        // its ready snapshot's generation.
+        let lock = storage_root.join(".git").join("index.lock");
+        std::fs::write(&lock, b"").expect("hold index lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::remove_file(&lock).expect("release index lock");
+        });
+        let reread = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx);
+        releaser.join().expect("releaser thread");
+        assert!(
+            matches!(reread, Ok(Some(_))),
+            "a held index lock is contention to wait out, not a failed read: {:?}",
+            reread.err()
+        );
         reset_for_test();
     }
 

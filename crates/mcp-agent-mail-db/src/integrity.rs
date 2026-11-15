@@ -143,6 +143,9 @@ struct IntegrityCheckState {
     /// transient failure earlier but is healthy now reports 0 here even while
     /// `failures_total` stays elevated (#164).
     failures_since_last_ok: AtomicU64,
+    /// Never-written orphan pages the latest full check was accepted with
+    /// (see [`record_reconciled_acceptance`]); zero after any other full check.
+    never_written_orphan_pages: AtomicU64,
 }
 
 impl IntegrityCheckState {
@@ -157,6 +160,7 @@ impl IntegrityCheckState {
             checks_total: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
             failures_since_last_ok: AtomicU64::new(0),
+            never_written_orphan_pages: AtomicU64::new(0),
         }
     }
 }
@@ -195,6 +199,13 @@ pub struct IntegrityMetrics {
     /// healthy regardless of how large `failures_total` is.
     #[serde(default)]
     pub failures_since_last_ok: u64,
+    /// Pages the latest full check reported as never used and the canonical
+    /// second opinion proved never written (zero-filled, unreferenced). They
+    /// are leaked space, not data damage: the full check counts as passed and
+    /// a `VACUUM`-class rewrite reclaims them. Zero when the latest full check
+    /// had no such finding.
+    #[serde(default)]
+    pub never_written_orphan_pages: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,7 +250,34 @@ pub fn integrity_metrics() -> IntegrityMetrics {
             .load(Ordering::Relaxed)
             .saturating_add(runtime_failures),
         failures_since_last_ok: s.failures_since_last_ok.load(Ordering::Relaxed),
+        never_written_orphan_pages: s.never_written_orphan_pages.load(Ordering::Relaxed),
     }
+}
+
+/// Record that the reconciled verdict accepted a check the primary probe failed.
+///
+/// [`evaluate_check_rows`] stores the primary engine's raw outcome. When the
+/// pool then reconciles that failure against the canonical second opinion and
+/// accepts the file (`crate::pool`'s reconcile step), the stored outcome must
+/// follow the reconciled verdict: the guard's sticky "latest full check failed"
+/// gate and the health surface both read it, and would otherwise keep refusing
+/// a file the pool has just certified.
+///
+/// `never_written_orphan_pages` is the size of the proven never-written class
+/// the acceptance rests on (zero for every other accepted class). It is
+/// retained for full checks so the leak stays visible while it stands.
+/// The lifetime `failures_total` tally is left as recorded.
+pub fn record_reconciled_acceptance(kind: CheckKind, never_written_orphan_pages: u64) {
+    let s = state();
+    let passed = IntegrityCheckOutcome::Passed.as_storage_u8();
+    s.last_check_outcome.store(passed, Ordering::Relaxed);
+    if kind == CheckKind::Full {
+        s.last_full_check_outcome.store(passed, Ordering::Relaxed);
+        s.never_written_orphan_pages
+            .store(never_written_orphan_pages, Ordering::Relaxed);
+    }
+    s.last_ok_ts.store(crate::now_micros(), Ordering::Relaxed);
+    s.failures_since_last_ok.store(0, Ordering::Relaxed);
 }
 
 #[must_use]
@@ -277,6 +315,11 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
     ) {
         Ok(conn) => conn,
         Err(error) => {
+            if !crate::error::classify_db_error_message(&error.to_string()).safe_to_retry {
+                mcp_agent_mail_core::global_metrics()
+                    .corruption
+                    .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::OpenFailure);
+            }
             return MailboxIntegrityVerdict {
                 status: MailboxIntegrityStatus::Broken,
                 metrics: metrics_before,
@@ -916,8 +959,21 @@ where
 {
     let start = std::time::Instant::now();
     let rows: Vec<Row> =
-        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind)
-            .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind).map_err(
+            |error| {
+                if crate::error::contains_fts_index_corruption(&error) {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+                }
+                if crate::error::contains_foreign_key_inconsistency(&error) {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+                }
+                DbError::Sqlite(format!("{kind} failed: {error}"))
+            },
+        )?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
@@ -953,6 +1009,8 @@ pub fn evaluate_check_rows(
         s.last_full_check_ts.store(now, Ordering::Relaxed);
         s.last_full_check_outcome
             .store(outcome.as_storage_u8(), Ordering::Relaxed);
+        // A reconciled acceptance re-records the proven class afterwards.
+        s.never_written_orphan_pages.store(0, Ordering::Relaxed);
     }
     s.checks_total.fetch_add(1, Ordering::Relaxed);
     if ok {
@@ -980,6 +1038,22 @@ pub fn evaluate_check_rows(
         mcp_agent_mail_core::global_metrics()
             .corruption
             .record_detection(source);
+        if details
+            .iter()
+            .any(|detail| crate::error::contains_fts_index_corruption(detail))
+        {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+        }
+        if details
+            .iter()
+            .any(|detail| crate::error::contains_foreign_key_inconsistency(detail))
+        {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+        }
     }
 
     let result = IntegrityCheckResult {
@@ -1554,6 +1628,7 @@ mod tests {
         s.failures_total.store(failures_total, Ordering::Relaxed);
         s.failures_since_last_ok
             .store(failures_total, Ordering::Relaxed);
+        s.never_written_orphan_pages.store(0, Ordering::Relaxed);
     }
 
     #[test]
@@ -1596,6 +1671,56 @@ mod tests {
             "a failed check must increment failures_since_last_ok"
         );
         assert!(m.failures_total >= 1);
+    }
+
+    /// A failed primary full check that the pool reconciles and accepts must
+    /// not leave the sticky "latest full check failed" outcome behind, and the
+    /// accepted never-written orphan class stays visible until the next raw
+    /// full result.
+    #[test]
+    fn reconciled_acceptance_replaces_the_failed_full_outcome_and_records_orphans() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        set_state_for_tests(0, 0, 0, 0, 0);
+
+        let _ = evaluate_check_rows(&[], CheckKind::Full, 0)
+            .expect_err("empty full-check rows must record a failed full outcome");
+        let failed = integrity_metrics();
+        assert_eq!(
+            failed.last_full_check_outcome,
+            IntegrityCheckOutcome::Failed
+        );
+        assert!(failed.last_ok_ts < failed.last_check_ts);
+
+        record_reconciled_acceptance(CheckKind::Full, 425);
+        let accepted = integrity_metrics();
+        assert_eq!(
+            accepted.last_full_check_outcome,
+            IntegrityCheckOutcome::Passed
+        );
+        assert_eq!(accepted.last_check_outcome, IntegrityCheckOutcome::Passed);
+        assert_eq!(accepted.never_written_orphan_pages, 425);
+        assert_eq!(accepted.failures_since_last_ok, 0);
+        assert!(
+            accepted.last_ok_ts >= accepted.last_check_ts,
+            "the CLI health probe reads last_ok_ts < last_check_ts as a failed latest check"
+        );
+        assert!(
+            accepted.failures_total >= 1,
+            "the lifetime tally keeps the primary engine's failure"
+        );
+
+        // A reconciled quick acceptance says nothing about the full check.
+        let _ = evaluate_check_rows(&[], CheckKind::Full, 0);
+        record_reconciled_acceptance(CheckKind::Quick, 0);
+        let quick_only = integrity_metrics();
+        assert_eq!(
+            quick_only.last_full_check_outcome,
+            IntegrityCheckOutcome::Failed
+        );
+        assert_eq!(
+            quick_only.never_written_orphan_pages, 0,
+            "a later raw full result clears the recorded class"
+        );
     }
 
     #[test]
@@ -2160,8 +2285,8 @@ mod tests {
         let obj = json.as_object().expect("should be object");
         assert_eq!(
             obj.len(),
-            9,
-            "IntegrityMetrics should have exactly 9 fields"
+            10,
+            "IntegrityMetrics should have exactly 10 fields"
         );
         for key in &[
             "last_ok_ts",
@@ -2173,6 +2298,7 @@ mod tests {
             "checks_total",
             "failures_total",
             "failures_since_last_ok",
+            "never_written_orphan_pages",
         ] {
             assert!(obj.contains_key(*key), "missing field: {key}");
         }
@@ -2747,5 +2873,100 @@ mod tests {
         );
         assert!(message.contains("idx_agents_last_active_id_desc"));
         assert!(message.contains("GH#214"));
+    }
+
+    #[test]
+    fn all_five_additional_corruption_detection_sources_record_live_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. OpenFailure: inspect_mailbox_integrity on a corrupt file that cannot open as SQLite
+        let corrupt_db = dir.path().join("corrupt_open.sqlite3");
+        std::fs::write(&corrupt_db, b"not a valid sqlite header at all!!").expect("write garbage");
+        let open_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .open_failures_total;
+        let verdict = inspect_mailbox_integrity(&corrupt_db, CheckKind::Quick);
+        assert_eq!(verdict.status, MailboxIntegrityStatus::Broken);
+        let open_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .open_failures_total;
+        assert!(
+            open_after > open_before,
+            "inspect_mailbox_integrity on unopenable DB must increment open_failures_total ({open_before} -> {open_after})"
+        );
+
+        // 2. WalShmMismatch: truncated WAL sidecar classification
+        let wal_db = dir.path().join("wal_drift.sqlite3");
+        let conn = DbConn::open_file(wal_db.display().to_string()).expect("open wal_db");
+        conn.execute_raw("PRAGMA journal_mode = WAL; CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .expect("setup wal_db");
+        drop(conn);
+        let wal_sidecar = dir.path().join("wal_drift.sqlite3-wal");
+        std::fs::write(&wal_sidecar, [0x11_u8; 8]).expect("write truncated 8-byte wal");
+        let wal_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .wal_shm_mismatch_total;
+        let classification = crate::wal_classify::classify_wal_sidecar(&wal_db);
+        assert!(classification.state.is_damaged());
+        let wal_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .wal_shm_mismatch_total;
+        assert!(
+            wal_after > wal_before,
+            "damaged WAL sidecar classification must increment wal_shm_mismatch_total ({wal_before} -> {wal_after})"
+        );
+
+        // 3. SchemaSmoke: validate_startup_schema_gate on an empty DB missing required tables
+        let empty_conn = DbConn::open_memory().expect("open empty memory db");
+        let schema_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .schema_smoke_failures_total;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+        let gate_outcome = runtime.block_on(crate::schema::validate_startup_schema_gate(
+            &cx,
+            &empty_conn,
+        ));
+        assert!(matches!(gate_outcome, asupersync::Outcome::Err(_)));
+        let schema_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .schema_smoke_failures_total;
+        assert!(
+            schema_after > schema_before,
+            "validate_startup_schema_gate failure must increment schema_smoke_failures_total ({schema_before} -> {schema_after})"
+        );
+
+        // 4 + 5. FtsCheck and FkCheck via evaluate_check_rows
+        let fts_fk_before = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+        let fts_row = Row::new(
+            vec!["integrity_check".to_string()],
+            vec![sqlmodel_core::Value::Text(
+                "malformed inverted index for FTS5 table fts_messages".to_string(),
+            )],
+        );
+        let fk_row = Row::new(
+            vec!["integrity_check".to_string()],
+            vec![sqlmodel_core::Value::Text(
+                "foreign_key_check reported orphaned recipient row".to_string(),
+            )],
+        );
+        let _ = evaluate_check_rows(&[fts_row, fk_row], CheckKind::Full, 10);
+        let fts_fk_after = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+        assert!(
+            fts_fk_after.fts_check_failures_total > fts_fk_before.fts_check_failures_total,
+            "FTS integrity failure must increment fts_check_failures_total"
+        );
+        assert!(
+            fts_fk_after.fk_check_failures_total > fts_fk_before.fk_check_failures_total,
+            "FK integrity failure must increment fk_check_failures_total"
+        );
     }
 }

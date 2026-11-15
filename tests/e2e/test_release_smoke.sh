@@ -7,19 +7,28 @@
 # reads + independent full integrity_check, and a >= 5 minute mixed soak that
 # bounds SQLite descriptors and requires drain progress in every 10 s window,
 # a fetch_inbox p99 budget, no EMFILE, zombies, HTTP restarts or archive
-# re-roots. An optional control binary (usually the previous release) runs the
-# same phases in the same invocation for an A/B receipt; only the candidate
-# gates.
+# re-roots, then a >= 8 minute swarm of >= 60 agents (own MCP sessions, 3
+# projects, reservations included, SIGKILL + restart at the midpoint) that
+# bounds send/reserve/release p99 and requires zero acknowledged-id loss and
+# archive convergence after the load (br-kp1in.34). An optional control binary
+# (usually the previous release) runs the same phases in the same invocation
+# for an A/B receipt; only the candidate gates.
 #
-# Run via:
-#   am e2e run --project . release_smoke
+# Run via (the default 600 s suite timeout is too short for the swarm phase):
+#   am e2e run --project . --timeout 3600 release_smoke
 #   AM_RELEASE_SMOKE_BIN=/path/to/am \
 #   AM_RELEASE_SMOKE_CONTROL_BIN=$HOME/.local/bin/am ./tests/e2e/test_release_smoke.sh
 #
 # Knobs: AM_RELEASE_SMOKE_SOAK_SECS (default and release minimum 300),
-#        AM_RELEASE_SMOKE_CONVERGE_SECS (default and release maximum 300).
-# A shorter soak or a looser convergence bound can run for development but
-# yields NO_VERDICT, never PASS.
+#        AM_RELEASE_SMOKE_CONVERGE_SECS (default and release maximum 300),
+#        AM_RELEASE_SMOKE_SWARM_AGENTS (default and release minimum 60; 0 skips),
+#        AM_RELEASE_SMOKE_SWARM_SECS (default and release minimum 480).
+#        AM_RELEASE_SMOKE_ARCHIVE_CONTENTION=1 adds a second full swarm with
+#        sparse recurring-thread conflicts interleaved across the 3 projects.
+#        AM_RELEASE_SMOKE_CONTROL_FIRST=1 reverses the A/B order; use with a
+#        control binary and alternate across retained comparison invocations.
+# A shorter soak, a smaller or shorter swarm, or a looser convergence bound
+# can run for development but yields NO_VERDICT, never PASS.
 
 set -euo pipefail
 
@@ -44,6 +53,12 @@ fi
 CONTROL_ARGS=()
 if [ -n "${AM_RELEASE_SMOKE_CONTROL_BIN:-}" ]; then
     CONTROL_ARGS=(--control-bin "${AM_RELEASE_SMOKE_CONTROL_BIN}")
+fi
+if [ "${AM_RELEASE_SMOKE_CONTROL_FIRST:-0}" = "1" ]; then
+    CONTROL_ARGS+=(--control-first)
+fi
+if [ "${AM_RELEASE_SMOKE_ARCHIVE_CONTENTION:-0}" = "1" ]; then
+    CONTROL_ARGS+=(--archive-contention)
 fi
 e2e_log "candidate: ${CANDIDATE}"
 e2e_log "control:   ${AM_RELEASE_SMOKE_CONTROL_BIN:-<none>}"

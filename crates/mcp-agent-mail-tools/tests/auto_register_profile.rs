@@ -1,4 +1,5 @@
-//! Recipient resolution across projects, through the real tool entry points.
+//! Tool behaviour through the real tool entry points: recipient resolution
+//! across projects, and what the session macros and summaries do to an agent.
 //!
 //! GH#301: a `send_message` to an unregistered same-project recipient
 //! auto-registers a placeholder agent (when `MESSAGING_AUTO_REGISTER_RECIPIENTS`
@@ -58,6 +59,11 @@ where
     let db_path = format!("/tmp/auto-register-profile-{suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/auto-register-profile-storage-{suffix}");
+    std::fs::create_dir_all(&storage_root).expect("create test storage root");
+    let storage_root = std::fs::canonicalize(&storage_root)
+        .expect("canonical test storage root")
+        .to_string_lossy()
+        .into_owned();
     let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
@@ -104,6 +110,199 @@ fn find_agent_profiles(storage_root: &str, agent: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     walk(Path::new(storage_root), agent, &mut found);
     found
+}
+
+/// GH#371: explicit task identities retain their first registered spelling,
+/// share case-insensitive uniqueness, and remain one archive component.
+#[test]
+fn explicit_task_identities_keep_canonical_registration_and_archive() {
+    run_with_storage(|cx, storage_root| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = format!("/tmp/task-identity-{}", unique_suffix());
+        let original_id = register_open_agent(&ctx, &project, "App-X.Refactor_1").await;
+        let updated: Value = serde_json::from_str(
+            &register_agent(
+                &ctx,
+                project.clone(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some("app-x.refactor_1".to_string()),
+                Some("resumed task".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("resume using a differently cased task name"),
+        )
+        .expect("registration JSON");
+        assert_eq!(updated["id"], original_id);
+        assert_eq!(updated["name"], "App-X.Refactor_1");
+        assert_eq!(updated["task_description"], "resumed task");
+
+        for hint in ["worker_42", "WORKER_42"] {
+            let created = mcp_agent_mail_tools::create_agent_identity(
+                &ctx,
+                project.clone(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some(hint.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await;
+            if hint == "worker_42" {
+                let created: Value = serde_json::from_str(&created.expect("create task identity"))
+                    .expect("creation JSON");
+                assert_eq!(created["name"], "worker_42");
+                assert_eq!(created["registration_token_returned"], false);
+                assert!(created.get("registration_token").is_none());
+            } else {
+                let err = created.expect_err("case variants cannot create a second identity");
+                assert!(err.message.contains("already exists"), "{err:?}");
+            }
+        }
+        assert_eq!(delivery_counts(&cx).await.2, 2);
+
+        mcp_agent_mail_storage::wbq_flush();
+        for name in ["App-X.Refactor_1", "worker_42"] {
+            let profiles = find_agent_profiles(&storage_root, name);
+            assert_eq!(profiles.len(), 1, "{name}: {profiles:?}");
+            let profile: Value = serde_json::from_str(
+                &std::fs::read_to_string(&profiles[0]).expect("read canonical profile"),
+            )
+            .expect("profile JSON");
+            assert_eq!(profile["name"], name);
+        }
+        assert_eq!(
+            find_agent_profiles(&storage_root, "app-x.refactor_1"),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            find_agent_profiles(&storage_root, "WORKER_42"),
+            Vec::<PathBuf>::new()
+        );
+    });
+}
+
+/// Dots in an explicit identity are literal name characters. Both local and
+/// project-qualified delivery resolve canonical identities through the DB.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn explicit_task_identities_send_ack_and_reply_across_projects() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        for cross_project in [false, true] {
+            let source = format!("/tmp/task-mail-source-{}", unique_suffix());
+            let target = if cross_project {
+                format!("/tmp/task-mail-target-{}", unique_suffix())
+            } else {
+                source.clone()
+            };
+            register_open_agent(&ctx, &source, "App-X.Refactor_1").await;
+            register_open_agent(&ctx, &target, "Review.Worker_2").await;
+            let sender_token = register_for_token(&ctx, &source, "app-x.refactor_1").await;
+            if cross_project {
+                macro_contact_handshake(
+                    &ctx,
+                    source.clone(),
+                    Some("App-X.Refactor_1".to_string()),
+                    Some("Review.Worker_2".to_string()),
+                    None,
+                    None,
+                    Some(target.clone()),
+                    Some("task identity routing".to_string()),
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("approve cross-project contact");
+            }
+            let recipient = if cross_project {
+                format!("review.worker_2@{target}")
+            } else {
+                "review.worker_2".to_string()
+            };
+            let sent: Value = serde_json::from_str(
+                &send_in_plan_thread(
+                    &ctx,
+                    &source,
+                    "app-x.refactor_1",
+                    &recipient,
+                    Some(sender_token),
+                )
+                .await
+                .expect("send using case-insensitive task identities"),
+            )
+            .expect("send JSON");
+            assert_eq!(sent["verified_sender"], true);
+            let payload = &sent["deliveries"][0]["payload"];
+            let message_id = payload["id"].as_i64().expect("message id");
+            assert_eq!(payload["to"], serde_json::json!(["Review.Worker_2"]));
+            let inbox = peek_inbox(&ctx, &target, "REVIEW.WORKER_2").await;
+            assert!(inbox.iter().any(|message| {
+                message["id"] == message_id && message["from"] == "App-X.Refactor_1"
+            }));
+
+            let acked: Value = serde_json::from_str(
+                &acknowledge_message(
+                    &ctx,
+                    target.clone(),
+                    "review.worker_2".to_string(),
+                    message_id,
+                    None,
+                )
+                .await
+                .expect("acknowledge using a task identity"),
+            )
+            .expect("ack JSON");
+            assert_eq!(acked["acknowledged"], true);
+            let reply: Value = serde_json::from_str(
+                &reply_message(
+                    &ctx,
+                    target.clone(),
+                    message_id,
+                    "review.worker_2".to_string(),
+                    "Reviewed.".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("reply to the original task identity"),
+            )
+            .expect("reply JSON");
+            assert_eq!(reply["reply_to"], message_id);
+            assert_eq!(reply["thread_id"], "th-plan");
+            assert_eq!(reply["to"], serde_json::json!(["App-X.Refactor_1"]));
+            let sender_inbox = peek_inbox(&ctx, &source, "APP-X.REFACTOR_1").await;
+            assert!(sender_inbox.iter().any(|message| {
+                message["id"] == reply["id"] && message["from"] == "Review.Worker_2"
+            }));
+        }
+    });
 }
 
 #[test]
@@ -554,7 +753,21 @@ fn display_name_demo_preserves_routing_and_history() {
             assert_eq!(renamed["name"], "BlueLake");
             assert_eq!(renamed["id"], first_id);
             assert_eq!(renamed["display_name"], "Officer Alpha");
-            let after_rename = peek_inbox(&ctx, &project, "BlueLake").await;
+            let mut after_rename = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_rename.len(), 1);
+            assert_eq!(
+                after_rename[0]["to_display_names"],
+                serde_json::json!({"BlueLake": "Officer Alpha"})
+            );
+            // Labels are a current profile projection; the stored message
+            // and its routing identity remain unchanged after a relabel.
+            let mut history = history;
+            for messages in [&mut after_rename, &mut history] {
+                messages[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("to_display_names");
+            }
             assert_eq!(after_rename, history);
             println!(
                 "Officer Alpha <BlueLake> (id={first_id}); history unchanged: message {}",
@@ -615,7 +828,17 @@ fn display_name_demo_preserves_routing_and_history() {
             assert!(cleared.get("display_name").is_none());
             assert_eq!(cleared["id"], first_id);
             assert_eq!(cleared["name"], "BlueLake");
-            assert_eq!(peek_inbox(&ctx, &project, "BlueLake").await, after_rename);
+            let mut after_clear = peek_inbox(&ctx, &project, "BlueLake").await;
+            assert_eq!(after_clear.len(), 1);
+            assert_eq!(
+                after_clear[0]["to_display_names"],
+                serde_json::json!({"BlueLake": null})
+            );
+            after_clear[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("to_display_names");
+            assert_eq!(after_clear, history);
             mcp_agent_mail_storage::wbq_flush();
             let archived: Value = serde_json::from_str(
                 &std::fs::read_to_string(&profiles[0]).expect("read cleared profile"),
@@ -1067,7 +1290,7 @@ async fn agent_names(ctx: &McpContext, project: &str) -> Vec<String> {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
-    run_with_storage(|cx, _storage_root| async move {
+    run_with_storage(|cx, storage_root| async move {
         let ctx = McpContext::new(cx.clone(), 1);
         let frontend = format!("/tmp/xq-frontend-{}", unique_suffix());
         let backend = format!("/tmp/xq-backend-{}", unique_suffix());
@@ -1315,6 +1538,49 @@ fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
                 .any(|m| m["id"] == reply["id"] && m["from"] == "GreenCastle"),
             "the reply lands in BlueLake's frontend inbox: {blue_inbox:?}"
         );
+        mcp_agent_mail_storage::wbq_flush();
+        let archived_before_replay = archive_delivery_files(&storage_root);
+        let canonical_message = |slug: &str, id: i64| {
+            let root = Path::new(&storage_root)
+                .join("projects")
+                .join(slug)
+                .join("messages");
+            let suffix = format!("__{id}.md");
+            let paths: Vec<_> = archived_before_replay
+                .keys()
+                .filter(|path| {
+                    path.starts_with(&root)
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
+                })
+                .collect();
+            assert_eq!(paths.len(), 1, "one canonical message {id}: {paths:?}");
+            mcp_agent_mail_storage::read_message_file(paths[0])
+                .expect("read canonical cross-project message")
+        };
+        let reply_id = reply["id"].as_i64().expect("reply id");
+        let (archived_reply, archived_body) = canonical_message(
+            frontend_row["slug"].as_str().expect("frontend slug"),
+            reply_id,
+        );
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+        let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+        let rows = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages WHERE id = ?",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(reply_id)],
+            )
+            .expect("durable cross-project reply metadata");
+        let metadata: String = rows[0].get_named("archive_metadata_json").unwrap();
+        let metadata: Value = serde_json::from_str(&metadata).expect("durable reply JSON");
+        assert_eq!(metadata["reply_to"], api_change);
+        assert_eq!(archived_reply["reply_to"], metadata["reply_to"]);
+        assert_eq!(archived_body, "Bumped.");
+        let (archived_send, _) = canonical_message(&backend_slug, api_change);
+        assert!(archived_send.get("reply_to").is_none());
+        drop(conn);
+
         // A retried reply replays instead of sending twice.
         let counts = delivery_counts(&cx).await;
         let replayed: Value = serde_json::from_str(
@@ -1342,6 +1608,11 @@ fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
         assert_eq!(replayed["id"], reply["id"]);
         assert_eq!(replayed["idempotent_replay"], true);
         assert_eq!(delivery_counts(&cx).await, counts);
+        mcp_agent_mail_storage::wbq_flush();
+        assert_eq!(
+            archive_delivery_files(&storage_root),
+            archived_before_replay
+        );
 
         // No placeholder in either project.
         assert_eq!(
@@ -1576,5 +1847,222 @@ fn qualified_send_consent_cannot_be_forged_by_the_sender() {
             .expect_err("block_all recipient");
         assert_eq!(code(&err).as_deref(), Some("CONTACT_BLOCKED"), "{err:?}");
         assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
+    });
+}
+
+/// A welcome with a body but no subject is not sent, and the handshake says why
+/// instead of returning a bare `welcome_message: null`.
+#[test]
+fn handshake_reports_a_half_written_welcome() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-welcome-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        let handshake: Value = serde_json::from_str(
+            &macro_contact_handshake(
+                &ctx,
+                project.clone(),
+                Some("GreenCastle".to_string()),
+                Some("BlueLake".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                Some("hi".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("handshake"),
+        )
+        .expect("handshake JSON");
+        assert!(handshake["welcome_message"].is_null(), "{handshake}");
+        assert!(
+            handshake["welcome_skipped_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("welcome_incomplete")),
+            "{handshake}"
+        );
+    });
+}
+
+/// A single-thread summary covers the whole thread; `per_thread_limit` (a
+/// multi-thread knob, default 50) cuts it only when given.
+#[test]
+fn single_thread_summary_counts_the_whole_thread() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-summary-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        for _ in 0..55 {
+            send_in_plan_thread(&ctx, &project, "GreenCastle", "BlueLake", None)
+                .await
+                .expect("send");
+        }
+        let total = |limit: Option<i32>| {
+            let ctx = &ctx;
+            let project = project.clone();
+            async move {
+                let raw = mcp_agent_mail_tools::summarize_thread(
+                    ctx,
+                    project,
+                    "th-plan".to_string(),
+                    None,
+                    Some(false),
+                    None,
+                    limit,
+                )
+                .await
+                .expect("summarize_thread");
+                let summary: Value = serde_json::from_str(&raw).expect("summary JSON");
+                summary["summary"]["total_messages"].as_i64()
+            }
+        };
+        assert_eq!(total(None).await, Some(55));
+        assert_eq!(total(Some(10)).await, Some(10), "an explicit limit applies");
+    });
+}
+
+/// Send from `from` to `to` in thread th-plan, optionally verified.
+async fn send_in_plan_thread(
+    ctx: &McpContext,
+    project: &str,
+    from: &str,
+    to: &str,
+    token: Option<String>,
+) -> Result<String, fastmcp::McpError> {
+    send_message(
+        ctx,
+        project.to_string(),
+        from.to_string(),
+        vec![to.to_string()],
+        "plan".to_string(),
+        "body".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("th-plan".to_string()),
+        None,
+        None,
+        None,
+        token,
+        None,
+    )
+    .await
+}
+
+/// Register `name` in `project`; returns its registration token.
+async fn register_for_token(ctx: &McpContext, project: &str, name: &str) -> String {
+    let raw = register_agent(
+        ctx,
+        project.to_string(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some(name.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register_agent");
+    let agent: Value = serde_json::from_str(&raw).expect("agent JSON");
+    agent["registration_token"]
+        .as_str()
+        .expect("token")
+        .to_string()
+}
+
+/// `macro_prepare_thread` registers only as a convenience: it must not rotate a
+/// running agent's token (its verified sends would start failing).
+/// `register_agent` itself still rotates.
+#[test]
+fn macro_prepare_thread_keeps_the_running_agents_token() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-prepare-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        let token = register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        send_in_plan_thread(&ctx, &project, "GreenCastle", "BlueLake", None)
+            .await
+            .expect("send to BlueLake");
+
+        let prepared: Value = serde_json::from_str(
+            &mcp_agent_mail_tools::macro_prepare_thread(
+                &ctx,
+                project.clone(),
+                "th-plan".to_string(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some("BlueLake".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("macro_prepare_thread"),
+        )
+        .expect("prepare JSON");
+        // Present (the Python response always carried it) but null: the kept
+        // token is never echoed.
+        assert_eq!(
+            prepared["agent"].get("registration_token"),
+            Some(&serde_json::Value::Null),
+            "{prepared}"
+        );
+        assert!(
+            prepared["inbox"]
+                .as_array()
+                .is_some_and(|inbox| inbox.iter().any(|msg| msg["thread_id"] == "th-plan")),
+            "{prepared}"
+        );
+
+        send_in_plan_thread(
+            &ctx,
+            &project,
+            "BlueLake",
+            "GreenCastle",
+            Some(token.clone()),
+        )
+        .await
+        .expect("BlueLake's original token still verifies");
+
+        register_for_token(&ctx, &project, "BlueLake").await;
+        let err = send_in_plan_thread(&ctx, &project, "BlueLake", "GreenCastle", Some(token))
+            .await
+            .expect_err("register_agent rotated the token");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_util::tool_error_code(&err),
+            Some("SENDER_TOKEN_MISMATCH")
+        );
     });
 }

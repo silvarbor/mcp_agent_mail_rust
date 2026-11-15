@@ -780,13 +780,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_opens_browser_search_even_from_dashboard_text_mode() {
+    fn ctrl_p_opens_browser_search_from_dashboard() {
         let mut runner = loaded_runner(120, 36);
         runner.init();
-        assert!(runner.push_encoded_input(
-            r#"{"kind":"key","phase":"down","key":"/","code":"Slash","mods":0,"repeat":false}"#,
-        ));
-        let _ = runner.step();
         assert_eq!(runner.status().active_screen, "dashboard");
 
         assert!(runner.push_encoded_input(

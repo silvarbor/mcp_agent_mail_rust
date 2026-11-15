@@ -14,12 +14,14 @@ use crate::idempotency::{
     idempotency_retention_secs,
 };
 use crate::models::{
-    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
-    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
+    ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+    ATC_POPULATION_MAX_PROJECT_BYTES, AgentLinkRow, AgentRow, AtcPopulationAgentRow,
+    FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::{CancelReason, Outcome};
+use mcp_agent_mail_core::experience::validate_atc_context;
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
     ExperienceOutcome, ExperienceRow, ExperienceState, FEATURE_SCHEMA_VERSION, FeatureExtension,
@@ -58,6 +60,9 @@ thread_local! {
     /// Whether the message write serializer was held when each post-commit
     /// visibility probe on this thread started (br-kp1in.32 regression test).
     static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, for each writer post-commit sample (br-qbhs0).
+    static SERIALIZER_LOCKED_AT_WRITER_SAMPLE: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Fresh durability-probe connections opened on this thread (br-v0ucm).
     static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -704,6 +709,12 @@ fn merge_context_patch(
     let Some(patch) = patch else {
         return Ok(existing);
     };
+    // Bound both operands before the recursive merge can clone or descend
+    // into caller-supplied JSON. The merged row is checked again before SQL.
+    validate_atc_content("context_patch", None, validate_atc_context(patch))?;
+    if let Some(value) = existing.as_ref() {
+        validate_atc_content("context_patch", None, validate_atc_context(value))?;
+    }
     let serde_json::Value::Object(patch_map) = patch else {
         return Err(DbError::invalid(
             "context_patch",
@@ -722,6 +733,19 @@ fn merge_context_patch(
     };
     merge_json_object(&mut merged, patch_map);
     Ok(Some(serde_json::Value::Object(merged)))
+}
+
+/// Report only trusted operation/state labels and a static rejection category.
+/// Never include a payload, JSON key, project key, or supplied label in errors.
+fn validate_atc_content(
+    api: &'static str,
+    state: Option<ExperienceState>,
+    result: std::result::Result<(), &'static str>,
+) -> std::result::Result<(), DbError> {
+    result.map_err(|category| {
+        tracing::warn!(api, ?state, category, "ATC persistence rejected content");
+        DbError::invalid("atc_content", category)
+    })
 }
 
 pub(crate) fn decode_atc_experience_row(
@@ -1787,6 +1811,89 @@ fn wal_checkpoint_progress(rows: &[SqlRow]) -> Option<WalCheckpointProgress> {
     })
 }
 
+/// Smallest WAL a reset is attempted for, whatever `journal_size_limit` says:
+/// a zero limit must not make every contended commit hold the pool.
+const WAL_RESET_MIN_BYTES: i64 = 1 << 20;
+/// How long a WAL reset waits for in-flight transactions before it reopens
+/// the pool without truncating.
+const WAL_RESET_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// After a reset that could not truncate, commits skip resets for this long.
+const WAL_RESET_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `wal_frames` WAL frames exceed this connection's
+/// `journal_size_limit`. A negative limit (unbounded WAL) never does.
+fn wal_exceeds_journal_size_limit(conn: &crate::DbConn, wal_frames: i64) -> bool {
+    if wal_frames <= 0 {
+        return false;
+    }
+    let pragma = |sql: &str| {
+        conn.query_sync(sql, &[])
+            .ok()?
+            .first()?
+            .get(0)
+            .and_then(value_as_i64)
+    };
+    let (Some(limit), Some(page_size)) = (
+        pragma("PRAGMA journal_size_limit;"),
+        pragma("PRAGMA page_size;"),
+    ) else {
+        return false;
+    };
+    // Each WAL frame is a 24-byte header plus one page.
+    limit >= 0
+        && wal_frames.saturating_mul(page_size.saturating_add(24)) > limit.max(WAL_RESET_MIN_BYTES)
+}
+
+/// Truncate an over-limit WAL after a commit whose checkpoint was refused
+/// (br-v0ucm). FrankenSQLite refuses every checkpoint while any concurrent
+/// transaction is active, so under continuous load the WAL never resets.
+/// This closes `gate` ([`crate::pool::WAL_RESET_GATE`] outside tests) so new
+/// checkouts wait, retries a zero-wait TRUNCATE until the in-flight
+/// transactions finish, and reopens the gate. Returns whether the WAL was
+/// truncated. A truncate also publishes this commit, so the caller keeps its
+/// connection.
+fn reset_over_limit_wal(cx: &Cx, conn: &crate::DbConn, gate: &crate::pool::WalResetGate) -> bool {
+    let Some(_hold) = gate.try_close() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        match conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]) {
+            Ok(rows)
+                if wal_checkpoint_progress(&rows)
+                    .is_some_and(WalCheckpointProgress::fully_published) =>
+            {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    attempts,
+                    waited_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "wal_reset_truncated"
+                );
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    error = %error,
+                    "wal_reset_checkpoint_failed"
+                );
+                break;
+            }
+        }
+        if started.elapsed() >= WAL_RESET_DRAIN_BUDGET || cx.checkpoint().is_err() {
+            break;
+        }
+        // Commits run on blocking workers (see `mvcc_backoff`).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    gate.defer_retry(WAL_RESET_RETRY_COOLDOWN);
+    tracing::debug!(db_path = %conn.path(), attempts, "wal_reset_deferred");
+    false
+}
+
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
         Outcome::Ok(_) => {
@@ -1802,6 +1909,17 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                                 .is_some_and(WalCheckpointProgress::fully_published) =>
                         {
                             // Canonical publication completed without waiting.
+                        }
+                        Ok(rows)
+                            if wal_checkpoint_progress(&rows).is_some_and(|progress| {
+                                wal_exceeds_journal_size_limit(tracked.inner, progress.log)
+                            }) && reset_over_limit_wal(
+                                cx,
+                                tracked.inner,
+                                &crate::pool::WAL_RESET_GATE,
+                            ) =>
+                        {
+                            // The truncate published this commit too.
                         }
                         Ok(rows) => {
                             retire = true;
@@ -1884,30 +2002,58 @@ async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome
 
 /// Begin a transaction that guarantees a fresh WAL snapshot for a read.
 ///
-/// Writable pools keep Bug #85's `BEGIN IMMEDIATE`, which both re-pins the
-/// snapshot and serializes against an in-flight release. Query-only pools —
-/// every GH#198 read surface — cannot take a write lock ("attempt to write a
-/// readonly database" turned the file_reservations resource into a hard error,
-/// br-lwwq5), so fall back to an explicit deferred `BEGIN`: starting any new
-/// transaction re-pins the connection to the newest committed frame, which is
-/// all the freshness contract needs on a pool that can never write.
+/// An explicit deferred transaction re-pins a pooled connection to committed
+/// state while keeping every observation in that transaction on one snapshot.
+/// `BEGIN IMMEDIATE` is unnecessary for these pure readers: it takes the writer
+/// lock, blocks observations behind unrelated writes, and fails on query-only
+/// pools. Actual mutations acquire their own write transaction and revalidate
+/// their authority there. End these read transactions with [`commit_read_tx`].
 async fn begin_fresh_snapshot_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    match begin_immediate_tx(cx, tracked).await {
-        Outcome::Err(error)
-            if {
-                let message = error.to_string().to_ascii_lowercase();
-                message.contains("readonly database") || message.contains("query_only")
-            } =>
-        {
-            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
-        }
-        out => out,
-    }
+    map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
 }
 
-/// Rollback the current transaction (best-effort, errors ignored).
-async fn rollback_tx(cx: &Cx, tracked: &TrackedConnection<'_>) {
-    let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
+/// Finish transaction cleanup even when its request has been cancelled.
+///
+/// The driver's async SQL adapter checks cancellation before executing *any*
+/// statement, including ROLLBACK. Reusing that cancelled context can return an
+/// open transaction to the pool. Its underlying SQL calls are synchronous under
+/// the connection mutex, so one raw rollback here cannot overtake an outstanding
+/// statement. Do not change the caller's cancellation state or spawn cleanup work.
+/// A checkout whose cleanup fails must be retired instead of returned idle.
+fn rollback_tx(_cx: &Cx, tracked: &TrackedConnection<'_>) -> std::future::Ready<()> {
+    tracked
+        .transaction_write_intent
+        .observe_execute_statement("ROLLBACK");
+    let started = crate::tracking::query_timer();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracked.inner.execute_raw("ROLLBACK")
+    }));
+    crate::tracking::record_query("ROLLBACK", crate::tracking::elapsed_us(started));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(SqlError::Query(error)))
+            if error.message == "cannot rollback - no transaction is active" =>
+        {
+            // A failed BEGIN (or a commit that already ended its transaction)
+            // needs no rollback and does not poison an otherwise healthy handle.
+        }
+        Ok(Err(error)) => {
+            tracked.retire_on_drop();
+            tracing::warn!(
+                db_path = %tracked.inner.path(),
+                error = %error,
+                "transaction_rollback_failed_retiring_connection"
+            );
+        }
+        Err(_) => {
+            tracked.retire_on_drop();
+            tracing::warn!(
+                db_path = %tracked.inner.path(),
+                "transaction_rollback_panicked_retiring_connection"
+            );
+        }
+    }
+    std::future::ready(())
 }
 
 /// Unwrap an `Outcome` inside a transaction: on non-`Ok`, rollback and return early.
@@ -2414,6 +2560,7 @@ async fn fetch_durable_atc_experience_by_id(
 
 fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbConn, DbError> {
     pool.validated_sqlite_path("fresh file-backed connection")?;
+    pool.verify_sqlite_authority("fresh file-backed connection")?;
     let conn = crate::DbConn::open_file(pool.sqlite_path())
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
@@ -2664,8 +2811,9 @@ fn append_atc_experience_file_backed(
         // safety boundary. Enforce the configured ceiling before this insert
         // commits so a burst cannot recreate the historic unbounded-growth
         // incident during the sweep interval.
+        let mut evicted = 0;
         if inserted > 0 && pool.atc_experience_max_rows() > 0 {
-            let evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
+            evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
                 &conn,
                 pool.atc_experience_max_rows(),
             )?;
@@ -2677,13 +2825,19 @@ fn append_atc_experience_file_backed(
                 );
             }
         }
-        commit_canonical_atc_write_tx(&conn)
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok::<usize, DbError>(evicted)
     })();
     if write_result.is_err() {
         rollback_canonical_atc_write_tx(&conn);
     }
     close_canonical_db_conn(conn, "canonical ATC append connection");
-    write_result?;
+    let evicted = write_result?;
+    if evicted > 0 {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_retention_deleted(u64::try_from(evicted).unwrap_or(u64::MAX));
+    }
 
     canonical_fetch_atc_experience_by_decision_effect(pool, decision_id, effect_id)?.ok_or_else(
         || {
@@ -2694,6 +2848,92 @@ fn append_atc_experience_file_backed(
     )
 }
 
+/// Prepare a complete replacement in memory, without mutating SQLite. Both
+/// storage implementations use this before their single transactional UPDATE.
+fn prepare_atc_experience_transition(
+    experience: &mut ExperienceRow,
+    new_state: ExperienceState,
+    ts_micros: i64,
+    non_execution_reason: Option<&NonExecutionReason>,
+    context_patch: Option<&serde_json::Value>,
+    dispatch_if_planned: bool,
+) -> std::result::Result<(), DbError> {
+    validate_atc_content(
+        "transition_atc_experience",
+        Some(experience.state),
+        experience.validate_content(),
+    )?;
+
+    // Execution capture used to commit Dispatched before checking the final
+    // execution metadata. Stage both lifecycle steps in the same transaction
+    // so a rejected patch cannot leave a partially advanced experience.
+    if dispatch_if_planned && experience.state == ExperienceState::Planned {
+        experience.state = ExperienceState::Dispatched;
+        experience.dispatched_ts_micros.get_or_insert(ts_micros);
+    }
+
+    if experience.state != new_state
+        && let Err(reason) = validate_transition(experience.state, new_state)
+    {
+        return Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {} cannot transition from {} to {}: {reason}",
+                experience.experience_id, experience.state, new_state
+            ),
+        ));
+    }
+    if non_execution_reason.is_some() && !new_state.is_non_execution() {
+        return Err(DbError::invalid(
+            "non_execution_reason",
+            format!(
+                "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
+            ),
+        ));
+    }
+    if new_state.is_non_execution()
+        && experience.state != new_state
+        && non_execution_reason.is_none()
+    {
+        return Err(DbError::invalid(
+            "non_execution_reason",
+            format!("non_execution_reason is required when transitioning to {new_state}"),
+        ));
+    }
+
+    experience.state = new_state;
+    match new_state {
+        ExperienceState::Planned | ExperienceState::Open => {}
+        ExperienceState::Dispatched => {
+            experience.dispatched_ts_micros.get_or_insert(ts_micros);
+        }
+        ExperienceState::Executed
+        | ExperienceState::Failed
+        | ExperienceState::Throttled
+        | ExperienceState::Suppressed
+        | ExperienceState::Skipped => {
+            experience.executed_ts_micros.get_or_insert(ts_micros);
+        }
+        ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
+            experience.resolved_ts_micros.get_or_insert(ts_micros);
+        }
+    }
+
+    if new_state.is_non_execution() {
+        if let Some(reason) = non_execution_reason {
+            experience.non_execution_reason = Some(reason.clone());
+        }
+    } else {
+        experience.non_execution_reason = None;
+    }
+    experience.context = merge_context_patch(experience.context.take(), context_patch)?;
+    validate_atc_content(
+        "transition_atc_experience",
+        Some(new_state),
+        experience.validate_content(),
+    )
+}
+
 fn transition_atc_experience_file_backed(
     pool: &DbPool,
     experience_id: u64,
@@ -2701,6 +2941,7 @@ fn transition_atc_experience_file_backed(
     ts_micros: i64,
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
+    dispatch_if_planned: bool,
 ) -> std::result::Result<(), DbError> {
     let sql_experience_id = i64::try_from(experience_id).map_err(|_| {
         DbError::Internal(format!(
@@ -2727,75 +2968,14 @@ fn transition_atc_experience_file_backed(
         };
         let mut experience = decode_atc_experience_row(stored)?;
 
-        if experience.state != new_state
-            && let Err(reason) = validate_transition(experience.state, new_state)
-        {
-            return Err(DbError::invalid(
-                "state",
-                format!(
-                    "experience {experience_id} cannot transition from {} to {}: {reason}",
-                    experience.state, new_state
-                ),
-            ));
-        }
-
-        if non_execution_reason.is_some() && !new_state.is_non_execution() {
-            return Err(DbError::invalid(
-                "non_execution_reason",
-                format!(
-                    "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
-                ),
-            ));
-        }
-        if new_state.is_non_execution()
-            && experience.state != new_state
-            && non_execution_reason.is_none()
-        {
-            return Err(DbError::invalid(
-                "non_execution_reason",
-                format!("non_execution_reason is required when transitioning to {new_state}"),
-            ));
-        }
-
-        if let Err(reason) = experience.transition_to(new_state) {
-            return Err(DbError::invalid(
-                "state",
-                format!("experience {experience_id} transition rejected: {reason}"),
-            ));
-        }
-
-        match new_state {
-            ExperienceState::Planned => {}
-            ExperienceState::Dispatched => {
-                if experience.dispatched_ts_micros.is_none() {
-                    experience.dispatched_ts_micros = Some(ts_micros);
-                }
-            }
-            ExperienceState::Executed
-            | ExperienceState::Failed
-            | ExperienceState::Throttled
-            | ExperienceState::Suppressed
-            | ExperienceState::Skipped => {
-                if experience.executed_ts_micros.is_none() {
-                    experience.executed_ts_micros = Some(ts_micros);
-                }
-            }
-            ExperienceState::Open => {}
-            ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
-                if experience.resolved_ts_micros.is_none() {
-                    experience.resolved_ts_micros = Some(ts_micros);
-                }
-            }
-        }
-
-        if new_state.is_non_execution() {
-            if let Some(reason) = non_execution_reason {
-                experience.non_execution_reason = Some(reason.clone());
-            }
-        } else {
-            experience.non_execution_reason = None;
-        }
-        experience.context = merge_context_patch(experience.context.take(), context_patch)?;
+        prepare_atc_experience_transition(
+            &mut experience,
+            new_state,
+            ts_micros,
+            non_execution_reason,
+            context_patch,
+            dispatch_if_planned,
+        )?;
 
         let non_exec_json =
             encode_json_optional(&experience.non_execution_reason, "non_execution_json")?;
@@ -2907,7 +3087,8 @@ fn resolve_atc_experience_file_backed(
     pool: &DbPool,
     experience_id: u64,
     outcome: &ExperienceOutcome,
-) -> std::result::Result<(), DbError> {
+    policy: AtcOutcomeResolutionPolicy,
+) -> std::result::Result<AtcMessageOutcomeUpdate, DbError> {
     let id = i64::try_from(experience_id).map_err(|_| {
         DbError::Internal(format!(
             "experience_id exceeds SQLite INTEGER range: {experience_id}"
@@ -2915,33 +3096,39 @@ fn resolve_atc_experience_file_backed(
     })?;
     let outcome_json = encode_json(outcome, "outcome_json")?;
 
-    let conn = open_canonical_atc_conn(pool, "resolve_atc_experience")?;
+    let conn = open_canonical_atc_conn(pool, policy.api())?;
     let result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+        let rows = canonical_query_atc_rows(
+            &conn,
+            &select_sql,
+            &[Value::BigInt(id)],
+            "resolve_atc_experience select",
+        )?;
+        let experience = rows
+            .first()
+            .map(decode_atc_experience_row)
+            .transpose()?
+            .ok_or_else(|| DbError::not_found("experience", experience_id.to_string()))?;
+        let update = atc_outcome_resolution_update(&experience, outcome, policy)?;
+        if update == AtcMessageOutcomeUpdate::Unchanged {
+            commit_canonical_atc_write_tx(&conn)?;
+            return Ok(update);
+        }
         let sql = "UPDATE atc_experiences \
                    SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
-                   WHERE experience_id = ? AND state = 'open'";
+                   WHERE experience_id = ? AND state = ?";
         let params = [
             Value::BigInt(outcome.observed_ts_micros),
             Value::Text(outcome_json),
             Value::BigInt(id),
+            Value::Text(experience.state.to_string()),
         ];
-        let rows_affected =
-            canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
-        if rows_affected == 0 {
-            let rows = canonical_query_atc_rows(
-                &conn,
-                "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
-                &[Value::BigInt(id)],
-                "resolve_atc_experience select",
-            )?;
-            let state = rows
-                .first()
-                .map(|row| row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state")))
-                .transpose()?;
-            resolve_atc_experience_noop_result(state, experience_id)?;
-        }
-        commit_canonical_atc_write_tx(&conn)
+        canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok(update)
     })();
     if result.is_err() {
         rollback_canonical_atc_write_tx(&conn);
@@ -2965,16 +3152,19 @@ fn overwrite_resolved_atc_experience_outcome_file_backed(
     let conn = open_canonical_atc_conn(pool, "overwrite_resolved_atc_experience_outcome")?;
     let result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
         let rows = canonical_query_atc_rows(
             &conn,
-            "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
+            &select_sql,
             &[Value::BigInt(id)],
             "overwrite_resolved_atc_experience_outcome select",
         )?;
         let row = rows
             .first()
             .ok_or_else(|| DbError::not_found("experience", experience_id.to_string()))?;
-        let current_state: ExperienceState = parse_enum(row_text(row, 0, "state")?, "state")?;
+        let experience = decode_atc_experience_row(row)?;
+        let current_state = experience.state;
         if current_state != ExperienceState::Resolved {
             return Err(DbError::invalid(
                 "state",
@@ -2983,6 +3173,11 @@ fn overwrite_resolved_atc_experience_outcome_file_backed(
                 ),
             ));
         }
+        validate_atc_content(
+            "overwrite_resolved_atc_experience_outcome",
+            Some(current_state),
+            experience.validate_content_with_outcome(outcome),
+        )?;
         canonical_execute_atc(
             &conn,
             "UPDATE atc_experiences \
@@ -3004,18 +3199,44 @@ fn overwrite_resolved_atc_experience_outcome_file_backed(
     result
 }
 
-fn resolve_atc_experience_noop_result(
-    current_state: Option<ExperienceState>,
-    experience_id: u64,
-) -> std::result::Result<(), DbError> {
-    match current_state {
-        Some(ExperienceState::Resolved) => Ok(()),
-        Some(current_state) => Err(DbError::invalid(
-            "state",
-            format!("experience {experience_id} is {current_state}, must be open to resolve"),
-        )),
-        None => Err(DbError::not_found("experience", experience_id.to_string())),
+fn validate_atc_resolution(
+    experience: &ExperienceRow,
+    resolution: &ResolutionKind,
+) -> std::result::Result<bool, DbError> {
+    let current_state = experience.state;
+    let target = resolution.target_state();
+    if current_state == target {
+        return Ok(false);
     }
+    if current_state.is_terminal() {
+        return Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {} already terminal as {current_state}, cannot re-resolve as {target}",
+                experience.experience_id
+            ),
+        ));
+    }
+    if current_state != ExperienceState::Open {
+        return Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {} is {current_state}, must be open to resolve",
+                experience.experience_id
+            ),
+        ));
+    }
+    validate_atc_content(
+        "resolve_experience",
+        Some(current_state),
+        match resolution {
+            ResolutionKind::Resolved(outcome) => experience.validate_content_with_outcome(outcome),
+            ResolutionKind::Censored { .. } | ResolutionKind::Expired { .. } => {
+                experience.validate_content()
+            }
+        },
+    )?;
+    Ok(true)
 }
 
 fn resolve_experience_file_backed(
@@ -3033,36 +3254,20 @@ fn resolve_experience_file_backed(
     let result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
 
-        let select_sql = "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
         let rows = canonical_query_atc_rows(
             &conn,
-            select_sql,
+            &select_sql,
             &[Value::BigInt(id)],
             "resolve_experience select",
         )?;
         let row = rows
             .first()
             .ok_or_else(|| DbError::not_found("experience", experience_id.to_string()))?;
-        let current_state: ExperienceState = parse_enum(row_text(row, 0, "state")?, "state")?;
-        let target = resolution.target_state();
-
-        if current_state == target {
-            return Ok(());
-        }
-        if current_state.is_terminal() {
-            return Err(DbError::invalid(
-                "state",
-                format!(
-                    "experience {experience_id} already terminal as {current_state}, \
-                     cannot re-resolve as {target}"
-                ),
-            ));
-        }
-        if current_state != ExperienceState::Open {
-            return Err(DbError::invalid(
-                "state",
-                format!("experience {experience_id} is {current_state}, must be open to resolve"),
-            ));
+        let experience = decode_atc_experience_row(row)?;
+        if !validate_atc_resolution(&experience, resolution)? {
+            return commit_canonical_atc_write_tx(&conn);
         }
 
         match resolution {
@@ -4035,6 +4240,66 @@ static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Global counter: MVCC conflicts that exhausted all retries.
 static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Global counter: total plain SQLite write-contention retries performed.
+static WRITE_CONTENTION_RETRIES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Global counter: plain SQLite write-contention conflicts that exhausted all retries.
+static WRITE_CONTENTION_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+struct RollingMinuteCounter {
+    timestamps_ms: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+impl RollingMinuteCounter {
+    const fn new() -> Self {
+        Self {
+            timestamps_ms: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn current_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn record(&self) {
+        let now_ms = Self::current_epoch_ms();
+        let cutoff_ms = now_ms.saturating_sub(60_000);
+        let mut guard = self
+            .timestamps_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.front().is_some_and(|ts| *ts < cutoff_ms) {
+            guard.pop_front();
+        }
+        if guard.len() >= 16_384 {
+            guard.pop_front();
+        }
+        guard.push_back(now_ms);
+    }
+
+    fn count_last_minute(&self) -> u64 {
+        let now_ms = Self::current_epoch_ms();
+        let cutoff_ms = now_ms.saturating_sub(60_000);
+        let mut guard = self
+            .timestamps_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.front().is_some_and(|ts| *ts < cutoff_ms) {
+            guard.pop_front();
+        }
+        u64::try_from(guard.len()).unwrap_or(u64::MAX)
+    }
+}
+
+static MVCC_RETRIES_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static MVCC_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static WRITE_CONTENTION_RETRIES_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+static WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE: RollingMinuteCounter = RollingMinuteCounter::new();
+
 /// Check if a [`DbError`] is an MVCC write conflict.
 ///
 /// `BusySnapshot` arrives from frankensqlite as a lock-classified
@@ -4167,6 +4432,7 @@ where
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
                 MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MVCC_RETRIES_LAST_MINUTE.record();
                 tracing::warn!(
                     attempt,
                     max_retries = max,
@@ -4179,6 +4445,8 @@ where
                 }
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
+                WRITE_CONTENTION_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                WRITE_CONTENTION_RETRIES_LAST_MINUTE.record();
                 tracing::warn!(
                     attempt,
                     max_retries = max,
@@ -4192,6 +4460,7 @@ where
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MVCC_EXHAUSTED_LAST_MINUTE.record();
                 tracing::error!(
                     attempts = max + 1,
                     error = %e,
@@ -4201,6 +4470,8 @@ where
                 return Outcome::Err(exhausted(e));
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) => {
+                WRITE_CONTENTION_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE.record();
                 tracing::error!(
                     attempts = max + 1,
                     error = %e,
@@ -4283,15 +4554,27 @@ fn mvcc_backoff(cx: &Cx, attempt: u32) -> std::result::Result<(), CancelReason> 
     }
 }
 
-/// Snapshot of MVCC retry metrics for health/diagnostics.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Snapshot of MVCC and write-contention retry metrics for health/diagnostics (br-kp1in.16).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MvccRetryMetrics {
     pub max_retries: u32,
     pub retries_total: u64,
     pub exhausted_total: u64,
+    #[serde(default)]
+    pub retries_last_minute: u64,
+    #[serde(default)]
+    pub exhausted_last_minute: u64,
+    #[serde(default)]
+    pub write_contention_retries_total: u64,
+    #[serde(default)]
+    pub write_contention_exhausted_total: u64,
+    #[serde(default)]
+    pub write_contention_retries_last_minute: u64,
+    #[serde(default)]
+    pub write_contention_exhausted_last_minute: u64,
 }
 
-/// Get current MVCC retry metrics.
+/// Get current MVCC and write-contention retry metrics, including per-minute rolling rates.
 #[must_use]
 pub fn mvcc_retry_metrics() -> MvccRetryMetrics {
     use std::sync::atomic::Ordering;
@@ -4299,6 +4582,14 @@ pub fn mvcc_retry_metrics() -> MvccRetryMetrics {
         max_retries: *MVCC_MAX_RETRIES,
         retries_total: MVCC_RETRIES_TOTAL.load(Ordering::Relaxed),
         exhausted_total: MVCC_EXHAUSTED_TOTAL.load(Ordering::Relaxed),
+        retries_last_minute: MVCC_RETRIES_LAST_MINUTE.count_last_minute(),
+        exhausted_last_minute: MVCC_EXHAUSTED_LAST_MINUTE.count_last_minute(),
+        write_contention_retries_total: WRITE_CONTENTION_RETRIES_TOTAL.load(Ordering::Relaxed),
+        write_contention_exhausted_total: WRITE_CONTENTION_EXHAUSTED_TOTAL.load(Ordering::Relaxed),
+        write_contention_retries_last_minute: WRITE_CONTENTION_RETRIES_LAST_MINUTE
+            .count_last_minute(),
+        write_contention_exhausted_last_minute: WRITE_CONTENTION_EXHAUSTED_LAST_MINUTE
+            .count_last_minute(),
     }
 }
 
@@ -4499,52 +4790,58 @@ pub async fn get_project_by_slug(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    // Live inbox wrappers start with a fresh read-cache generation. Scope
+    // queries can encounter transient recovery contention after checkout,
+    // before the inbox's own retry loop; retry the complete idempotent lookup.
+    run_read_with_mvcc_retry(cx, "get_project_by_slug", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
-    let params = [Value::Text(slug.to_string())];
+        let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE slug = ? LIMIT 1";
+        let params = [Value::Text(slug.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(row) = rows.first() {
-                match decode_project_row(row) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => {
+                if let Some(row) = rows.first() {
+                    match decode_project_row(row) {
+                        Ok(row) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Err(e) => Outcome::Err(e),
                     }
-                    Err(e) => Outcome::Err(e),
-                }
-            } else {
-                match find_project_in_inventory(
-                    cx,
-                    &tracked,
-                    is_orphan_placeholder_identifier(slug),
-                    |project| project.slug.eq_ignore_ascii_case(slug),
-                )
-                .await
-                {
-                    Outcome::Ok(Some(row)) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+                } else {
+                    match find_project_in_inventory(
+                        cx,
+                        &tracked,
+                        is_orphan_placeholder_identifier(slug),
+                        |project| project.slug.eq_ignore_ascii_case(slug),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(Some(row)) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
-                    Outcome::Err(e) => Outcome::Err(e),
-                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    })
+    .await
 }
 
 /// Look up a project by its exact `human_key`, then by the filesystem alias
@@ -4567,52 +4864,56 @@ pub async fn get_project_by_human_key_exact(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    run_read_with_mvcc_retry(cx, "get_project_by_human_key_exact", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
-    let params = [Value::Text(human_key.to_string())];
+        let sql =
+            "SELECT id, slug, human_key, created_at FROM projects WHERE human_key = ? LIMIT 1";
+        let params = [Value::Text(human_key.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => {
-            if let Some(row) = rows.first() {
-                match decode_project_row(row) {
-                    Ok(row) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => {
+                if let Some(row) = rows.first() {
+                    match decode_project_row(row) {
+                        Ok(row) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Err(e) => Outcome::Err(e),
                     }
-                    Err(e) => Outcome::Err(e),
-                }
-            } else {
-                match find_project_in_inventory(
-                    cx,
-                    &tracked,
-                    is_orphan_placeholder_identifier(human_key),
-                    |project| project_matches_human_key_alias(project, human_key, human_key),
-                )
-                .await
-                {
-                    Outcome::Ok(Some(row)) => {
-                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                        Outcome::Ok(row)
+                } else {
+                    match find_project_in_inventory(
+                        cx,
+                        &tracked,
+                        is_orphan_placeholder_identifier(human_key),
+                        |project| project_matches_human_key_alias(project, human_key, human_key),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(Some(row)) => {
+                            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                            Outcome::Ok(row)
+                        }
+                        Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                        Outcome::Err(e) => Outcome::Err(e),
+                        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                        Outcome::Panicked(p) => Outcome::Panicked(p),
                     }
-                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
-                    Outcome::Err(e) => Outcome::Err(e),
-                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                    Outcome::Panicked(p) => Outcome::Panicked(p),
                 }
             }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    })
+    .await
 }
 
 /// Look up a project by `human_key`, with the stable-slug fallback.
@@ -4699,6 +5000,16 @@ pub async fn get_project_by_id(
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }
+}
+
+/// Whether `project` is an orphaned-project placeholder, not a real project.
+///
+/// Placeholders (`[unknown-project-<id>]`) surface rows whose `projects` row
+/// was deleted. They must not be granted new file reservations; cleanup
+/// (release) and the contact tools still accept them.
+#[must_use]
+pub fn is_orphan_project_placeholder(project: &ProjectRow) -> bool {
+    is_orphan_placeholder_identifier(&project.slug)
 }
 
 /// Whether `identifier` has the shape of an orphaned-project placeholder
@@ -6344,45 +6655,49 @@ pub async fn get_agent(
         return Outcome::Ok(cached);
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    run_read_with_mvcc_retry(cx, "get_agent", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
 
-    let tracked = tracked(&*conn);
+        let tracked = tracked(&*conn);
 
-    // Optimized: filter by name directly in SQL (case-insensitive).
-    //
-    // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
-    // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
-    // created by a concurrent multi-pane registration race). `LIMIT 1` with no
-    // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
-    // could resolve to a different `agent_id` over time — leaking file
-    // reservations (release resolves to a different id than grant did). Pin a
-    // stable canonical row: the first-registered (lowest `id`) variant. Grant
-    // and release then always resolve to the same row.
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
+        // Optimized: filter by name directly in SQL (case-insensitive).
+        //
+        // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
+        // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
+        // created by a concurrent multi-pane registration race). `LIMIT 1` with no
+        // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
+        // could resolve to a different `agent_id` over time — leaking file
+        // reservations (release resolves to a different id than grant did). Pin a
+        // stable canonical row: the first-registered (lowest `id`) variant. Grant
+        // and release then always resolve to the same row.
+        let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token, retired_at, display_name \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
                ORDER BY id ASC LIMIT 1";
-    let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+        let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
-            |row| {
-                let agent = decode_agent_row_indexed(row);
-                crate::cache::read_cache().put_agent_scoped(&cache_scope_for_pool(pool), &agent);
-                Outcome::Ok(agent)
-            },
-        ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+        match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(rows) => rows.first().map_or_else(
+                || Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}"))),
+                |row| {
+                    let agent = decode_agent_row_indexed(row);
+                    crate::cache::read_cache()
+                        .put_agent_scoped(&cache_scope_for_pool(pool), &agent);
+                    Outcome::Ok(agent)
+                },
+            ),
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        }
+    })
+    .await
 }
 
 /// Get agent by id (cache-first).
@@ -6468,28 +6783,22 @@ pub async fn list_agents(
     list_agents_bounded(cx, pool, project_id, None, None).await
 }
 
-/// Read profiles in one statement for cross-project inbox views, including
-/// historical sender identities. Ordering matches `list_agents`' selection.
-pub async fn list_mail_ui_agent_profiles(
+/// Read one project's current labels keyed by case-insensitive stable address.
+pub async fn list_agent_display_names(
     cx: &Cx,
     pool: &DbPool,
-) -> Outcome<Vec<AgentRow>, DbError> {
+    project_id: i64,
+) -> Outcome<BTreeMap<String, Option<String>>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    let tracked = tracked(&*conn);
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token, retired_at, display_name FROM agents \
-               ORDER BY last_active_ts DESC, id DESC";
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &[]).await) {
-        Outcome::Ok(rows) => Outcome::Ok(rows.iter().map(decode_agent_row_indexed).collect()),
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    let db_conn: &crate::DbConn = &conn;
+    match crate::sync::agent_display_names_from_conn(db_conn, project_id) {
+        Ok(labels) => Outcome::Ok(labels),
+        Err(error) => Outcome::Err(error),
     }
 }
 
@@ -6549,6 +6858,35 @@ pub async fn list_agent_roster(
     }
 }
 
+// Bound each projected value in SQL, before the driver materializes strings.
+// A NULL is a refusal witness, not a row to omit: the caller must fail the
+// entire refresh so an incomplete roster cannot authorize automatic effects.
+// BLOB length counts UTF-8 bytes and includes suffixes after an embedded NUL.
+const ATC_POPULATION_SQL: &str = "\
+SELECT p.id, \
+       CASE WHEN length(CAST(p.human_key AS BLOB)) <= ?3 THEN p.human_key ELSE NULL END, \
+       CASE WHEN length(CAST(a.name AS BLOB)) <= ?4 THEN a.name ELSE NULL END, \
+       CASE WHEN length(CAST(a.program AS BLOB)) <= ?5 THEN a.program ELSE NULL END, \
+       a.last_active_ts \
+FROM agents AS a \
+JOIN projects AS p ON p.id = a.project_id \
+WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?1) \
+  AND a.retired_at IS NULL \
+  AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations) \
+ORDER BY a.last_active_ts DESC, a.id DESC \
+LIMIT ?2";
+
+fn atc_population_query_params(min_last_active_ts: i64, limit: usize) -> [Value; 5] {
+    let limit = limit.min(mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX);
+    [
+        Value::BigInt(min_last_active_ts),
+        Value::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_PROJECT_BYTES).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_NAME_BYTES).unwrap_or(i64::MAX)),
+        Value::BigInt(i64::try_from(ATC_POPULATION_MAX_PROGRAM_BYTES).unwrap_or(i64::MAX)),
+    ]
+}
+
 /// Load the bounded, recent agent population needed by the ATC operator.
 ///
 /// This deliberately performs one joined query for the entire mailbox. The
@@ -6556,6 +6894,9 @@ pub async fn list_agent_roster(
 /// query/runtime boundaries on every periodic ATC refresh; on a mailbox with
 /// hundreds of projects that dominated the operator tick and caused sustained
 /// allocator churn (GH#190).
+/// Count and metadata-byte bounds apply before materializing the projection.
+/// An oversized selected identity fails the entire refresh without altering
+/// mailbox data or silently omitting evidence from the population.
 pub async fn list_atc_population_snapshot(
     cx: &Cx,
     pool: &DbPool,
@@ -6569,38 +6910,33 @@ pub async fn list_atc_population_snapshot(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
     let tracked = tracked(&*conn);
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let sql = "SELECT p.id, p.human_key, a.name, a.program, a.last_active_ts \
-               FROM agents AS a \
-               JOIN projects AS p ON p.id = a.project_id \
-               WHERE (a.last_active_ts <= 0 OR a.last_active_ts >= ?) \
-                 AND a.retired_at IS NULL \
-                 AND a.id NOT IN (SELECT agent_id FROM agent_deregistrations) \
-               ORDER BY a.last_active_ts DESC, a.id DESC \
-               LIMIT ?";
-    let params = [Value::BigInt(min_last_active_ts), Value::BigInt(limit)];
+    let params = atc_population_query_params(min_last_active_ts, limit);
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+    match map_sql_outcome(traw_query(cx, &tracked, ATC_POPULATION_SQL, &params).await) {
         Outcome::Ok(rows) => {
-            let get_string = |row: &SqlRow, index: usize| {
-                row.get(index)
-                    .and_then(|value| match value {
-                        Value::Text(value) => Some(value.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
+            let get_string = |row: &SqlRow, index: usize, max_bytes: usize| match row.get(index) {
+                Some(Value::Text(value)) if value.len() <= max_bytes => Ok(value.clone()),
+                _ => Err(DbError::invalid(
+                    "atc_population",
+                    "ATC population metadata exceeds byte limits or is not text; coverage is incomplete",
+                )),
             };
-            Outcome::Ok(
-                rows.iter()
-                    .map(|row| AtcPopulationAgentRow {
+            match rows
+                .iter()
+                .map(|row| {
+                    Ok(AtcPopulationAgentRow {
                         project_id: row.get(0).and_then(value_as_i64).unwrap_or_default(),
-                        project_key: get_string(row, 1),
-                        name: get_string(row, 2),
-                        program: get_string(row, 3),
+                        project_key: get_string(row, 1, ATC_POPULATION_MAX_PROJECT_BYTES)?,
+                        name: get_string(row, 2, ATC_POPULATION_MAX_NAME_BYTES)?,
+                        program: get_string(row, 3, ATC_POPULATION_MAX_PROGRAM_BYTES)?,
                         last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
                     })
-                    .collect(),
-            )
+                })
+                .collect::<std::result::Result<Vec<_>, DbError>>()
+            {
+                Ok(population) => Outcome::Ok(population),
+                Err(error) => Outcome::Err(error),
+            }
         }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -7340,6 +7676,169 @@ pub async fn list_deregistered_agent_ids(
     }
 }
 
+/// Result of changing an operator-owned inactivity-reaper exemption.
+#[derive(Debug, Clone)]
+pub struct AgentReaperExemptionUpdate {
+    pub agent: AgentRow,
+    pub previous_exempt: bool,
+    pub changed: bool,
+    pub deregistered_at: Option<i64>,
+}
+
+async fn resolve_agent_for_operator(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    name: &str,
+) -> Outcome<(AgentRow, Option<i64>), DbError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Outcome::Err(DbError::invalid("agent_name", "agent name cannot be empty"));
+    }
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+             a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+             a.reaper_exempt, a.registration_token, a.retired_at, d.deregistered_at \
+             FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.project_id = ? AND a.name = ? COLLATE NOCASE ORDER BY a.id ASC LIMIT 2",
+            &[Value::BigInt(project_id), Value::Text(name.to_string())],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if rows.len() > 1 {
+        return Outcome::Err(DbError::invalid(
+            "agent_name",
+            format!("agent name {name:?} is ambiguous in project {project_id}"),
+        ));
+    }
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")));
+    };
+    Outcome::Ok((
+        decode_agent_row_indexed(row),
+        row.get(13).and_then(value_as_i64),
+    ))
+}
+
+/// Resolve one existing identity for an operator without caching or mutating it.
+///
+/// The lifecycle timestamp comes from the same SELECT as the agent. Unlike
+/// ordinary compatibility lookups, an operator mutation must refuse legacy
+/// case-variant duplicates rather than silently choose one of them.
+pub async fn get_agent_for_operator(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+) -> Outcome<(AgentRow, Option<i64>), DbError> {
+    run_read_with_mvcc_retry(cx, "get_agent_for_operator", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        resolve_agent_for_operator(cx, &tracked(&*conn), project_id, name).await
+    })
+    .await
+}
+
+/// Change only the reaper exemption on a uniquely resolved existing identity.
+///
+/// This does not register, revive, touch or rotate credentials. Retired and
+/// deregistered identities retain their lifecycle state, and a same-value
+/// request performs no UPDATE. Archive publishers receive the tombstone from
+/// the same transaction so writing an updated profile preserves it as well.
+pub async fn set_agent_reaper_exempt(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+    exempt: bool,
+) -> Outcome<AgentReaperExemptionUpdate, DbError> {
+    let update = match run_with_mvcc_retry(cx, "set_agent_reaper_exempt", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let (mut agent, deregistered_at) = try_in_tx!(
+            cx,
+            &tracked,
+            resolve_agent_for_operator(cx, &tracked, project_id, name).await
+        );
+        let previous_exempt = agent.reaper_exempt != 0;
+        let changed = previous_exempt != exempt;
+        if !changed {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(AgentReaperExemptionUpdate {
+                agent,
+                previous_exempt,
+                changed,
+                deregistered_at,
+            });
+        }
+        let Some(agent_id) = agent.id else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "operator lookup returned agent without id for {project_id}:{name}"
+            )));
+        };
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET reaper_exempt = ? WHERE id = ?",
+                    &[Value::BigInt(i64::from(exempt)), Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        if affected != 1 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        }
+        agent.reaper_exempt = i64::from(exempt);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(AgentReaperExemptionUpdate {
+            agent,
+            previous_exempt,
+            changed,
+            deregistered_at,
+        })
+    })
+    .await
+    {
+        Outcome::Ok(update) => update,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    if update.changed {
+        let cache = crate::cache::read_cache();
+        let scope = cache_scope_for_pool(pool);
+        let agent = &update.agent;
+        cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+        cache.put_agent_scoped(&scope, agent);
+    }
+    Outcome::Ok(update)
+}
+
 /// Set or clear an agent's retirement timestamp.
 pub async fn set_agent_retired_at(
     cx: &Cx,
@@ -7437,6 +7936,106 @@ pub async fn set_agent_retired_at(
     cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
     cache.put_agent_scoped(&scope, &agent);
     Outcome::Ok(agent)
+}
+
+/// Retire an agent only if it is still eligible for the operator's stale sweep.
+///
+/// Candidate lists are observations, not mutation authority: an agent may
+/// become active, exempt, retired or deregistered before the sweep reaches it.
+/// Recheck the complete predicate in the write transaction. `Some` describes
+/// a new retirement; `None` means the current row no longer qualifies. This
+/// never refreshes activity, rotates credentials, or changes other metadata.
+pub async fn retire_agent_if_stale(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    cutoff_us: i64,
+    retired_at: i64,
+) -> Outcome<Option<AgentRow>, DbError> {
+    let changed = match run_with_mvcc_retry(cx, "retire_agent_if_stale", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        if try_in_tx!(
+            cx,
+            &tracked,
+            get_agent_deregistered_at_in_tx(cx, &tracked, agent_id).await
+        )
+        .is_some()
+        {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        }
+
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "UPDATE agents SET retired_at = ? WHERE id = ? \
+                     AND last_active_ts < ? AND retired_at IS NULL AND reaper_exempt = 0",
+                    &[
+                        Value::BigInt(retired_at),
+                        Value::BigInt(agent_id),
+                        Value::BigInt(cutoff_us),
+                    ],
+                )
+                .await
+            )
+        );
+        // Read through the same transaction, including no-op updates, so a
+        // missing identity is an explicit error rather than a reported skip.
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token, retired_at \
+                     FROM agents WHERE id = ? LIMIT 1",
+                    &[Value::BigInt(agent_id)],
+                )
+                .await
+            )
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+        };
+        if affected == 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Ok(None);
+        }
+        let agent = decode_agent_row_indexed(row);
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(Some(agent))
+    })
+    .await
+    {
+        Outcome::Ok(changed) => changed,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    if let Some(agent) = &changed {
+        let cache = crate::cache::read_cache();
+        let scope = cache_scope_for_pool(pool);
+        cache.invalidate_agent_scoped(&scope, agent.project_id, &agent.name, agent.id);
+        cache.put_agent_scoped(&scope, agent);
+    }
+    Outcome::Ok(changed)
 }
 
 /// Mark an agent deregistered while preserving its row, reservations, and message history.
@@ -7694,6 +8293,52 @@ pub struct ThreadMessageRow {
     pub from: String,
 }
 
+/// The exact conversation key used by project browsing and its detail links.
+///
+/// Only absent, empty, or ASCII-space-only keys denote an unthreaded root.
+/// Preserve every other key verbatim, including leading zeroes, surrounding
+/// spaces and Unicode whitespace. This matches SQLite's one-argument `TRIM`.
+#[must_use]
+pub fn canonical_thread_id(message_id: i64, thread_id: Option<&str>) -> String {
+    thread_id
+        .filter(|key| !key.trim_matches(' ').is_empty())
+        .map_or_else(|| message_id.to_string(), str::to_string)
+}
+
+/// A stable position in the project's conversation list. Messages accepted
+/// after `snapshot_id` are hidden until the reader starts a fresh browse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectThreadCursor {
+    pub snapshot_id: i64,
+    pub anchor_created_ts: i64,
+    pub anchor_message_id: i64,
+    pub newer: bool,
+}
+
+/// Body-free metadata for one canonical project conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectThreadSummary {
+    pub thread_id: String,
+    /// Subject of the newest message by `(created_ts, id)`, not the largest id.
+    pub subject: String,
+    pub message_count: i64,
+    pub first_created_ts: i64,
+    pub last_created_ts: i64,
+    pub last_message_id: i64,
+}
+
+/// A bounded, bidirectionally navigable page ordered by most recent activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectThreadPage {
+    pub threads: Vec<ProjectThreadSummary>,
+    pub snapshot_id: i64,
+    pub next_cursor: Option<ProjectThreadCursor>,
+    pub previous_cursor: Option<ProjectThreadCursor>,
+}
+
+/// Shared upper bound for the web conversation browser and direct DB callers.
+pub const MAX_PROJECT_THREADS_PAGE_SIZE: usize = 200;
+
 /// Recipient details for a single message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecipientDetailRow {
@@ -7918,11 +8563,13 @@ pub async fn create_message(
     // once-per-process scan; it only matters before pool warmup has repaired
     // the durable floor in this process.
     let id_allocator = pool.message_id_allocator();
-    let storage_root = match pool.validated_storage_root("message creation archive allocator") {
-        Ok(storage_root) => storage_root,
-        Err(error) => return Outcome::Err(error),
-    };
-    let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
+    if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+        return Outcome::Err(error);
+    }
+    let archive_seed = match pool
+        .archive_seed(cx, "message creation archive allocator")
+        .await
+    {
         Outcome::Ok(seed) => seed,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -7930,6 +8577,9 @@ pub async fn create_message(
     };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            return Outcome::Err(error);
+        }
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -7943,6 +8593,12 @@ pub async fn create_message(
             &tracked,
             elect_message_id_in_tx(cx, &tracked, archive_seed).await
         );
+        run_after_message_id_election_hook(message_id);
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
+        }
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
@@ -7982,7 +8638,16 @@ pub async fn create_message(
             attachments: attachments.to_string(),
         };
 
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            return Outcome::Err(error);
+        }
         Outcome::Ok(row)
     })
     .await
@@ -8021,6 +8686,61 @@ pub async fn create_message(
 /// Returns an id strictly greater than the durable sequence, the live
 /// `MAX(messages.id)`, and the archive seed. Exhausting the positive i64
 /// row-id range fails closed with the whole transaction rolled back.
+fn ensure_message_id_allocator_live(
+    allocator: &crate::id_floor::MessageIdAllocator,
+) -> std::result::Result<(), DbError> {
+    if allocator.is_retired() {
+        return Err(DbError::Internal(
+            "message id allocator was retired after database recovery".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+type AfterMessageIdElectionHook = std::sync::Arc<dyn Fn(i64) + Send + Sync>;
+
+static AFTER_MESSAGE_ID_ELECTION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<AfterMessageIdElectionHook>>,
+> = std::sync::OnceLock::new();
+
+fn run_after_message_id_election_hook(elected_id: i64) {
+    let hook = AFTER_MESSAGE_ID_ELECTION_HOOK.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
+    if let Some(hook) = hook {
+        hook(elected_id);
+    }
+}
+
+#[doc(hidden)]
+pub struct AfterMessageIdElectionHookGuard;
+
+impl Drop for AfterMessageIdElectionHookGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = AFTER_MESSAGE_ID_ELECTION_HOOK.get() {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn install_after_message_id_election_hook_for_test<F>(
+    hook: F,
+) -> AfterMessageIdElectionHookGuard
+where
+    F: Fn(i64) + Send + Sync + 'static,
+{
+    let slot = AFTER_MESSAGE_ID_ELECTION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(hook));
+    AfterMessageIdElectionHookGuard
+}
+
 async fn elect_message_id_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -8164,6 +8884,7 @@ pub async fn create_message_with_recipients(
         ack_required,
         attachments,
         recipients,
+        None,
     )
     .await
 }
@@ -8173,6 +8894,10 @@ pub async fn create_message_with_recipients(
 /// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
 /// records authoritative absence, allowing a fresh threaded send to recover
 /// even if its first archive write and journal enqueue both fail.
+///
+/// `project_mailbox` is `Some(kind)` (`to` or `cc`) when the message is also
+/// addressed to its project's shared mailbox (GH#282): one
+/// `project_mailbox_deliveries` row is written in the same transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -8188,6 +8913,7 @@ pub async fn create_message_with_recipients_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
 ) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
         cx,
@@ -8203,6 +8929,7 @@ pub async fn create_message_with_recipients_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         None,
     )
     .await
@@ -8261,6 +8988,7 @@ pub async fn create_message_with_recipients_idempotent(
         ack_required,
         attachments,
         recipients,
+        None,
         claim,
     )
     .await
@@ -8282,6 +9010,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
@@ -8298,6 +9027,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         Some(claim),
     )
     .await
@@ -8318,8 +9048,15 @@ async fn create_message_with_recipients_impl(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
+    project_mailbox: Option<&str>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if project_mailbox.is_some_and(|kind| !matches!(kind, "to" | "cc")) {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "project_mailbox",
+            message: "a project mailbox delivery is addressed as to or cc".to_string(),
+        });
+    }
     if reply_to.is_some_and(|parent| parent <= 0)
         || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
     {
@@ -8329,9 +9066,9 @@ async fn create_message_with_recipients_impl(
                 .to_string(),
         });
     }
-    // Held from id election through the insert transaction and the writer's own
-    // post-commit sample, then released before the fresh-handle visibility
-    // probe (br-kp1in.32).
+    // Held from id election through the insert transaction, then released
+    // before the writer's post-commit sample and the fresh-handle visibility
+    // probe (br-kp1in.32, br-qbhs0).
     let serializer_guard = match lock_message_write_serializer(cx).await {
         Ok(guard) => guard,
         Err(asupersync::sync::LockError::Cancelled) => {
@@ -8368,7 +9105,7 @@ async fn create_message_with_recipients_impl(
     let now = now_micros();
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
-    let (row, writer_post_commit_counts) = {
+    let (row, conn) = {
         // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
         // durably inside the insert transaction (see
         // `create_message_with_recipients_tx`) rather than relying on the
@@ -8385,6 +9122,9 @@ async fn create_message_with_recipients_impl(
         // inside the retried transaction, so a rolled-back attempt never
         // burns an id.
         let id_allocator = pool.message_id_allocator();
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            return Outcome::Err(error);
+        }
         let mut archive_seed = if idempotency.is_some() {
             // Warm keyed sends need only the authoritative insert transaction;
             // this lookup performs no archive validation or filesystem work.
@@ -8394,20 +9134,23 @@ async fn create_message_with_recipients_impl(
             }
         } else {
             // No key can replay, so preserve the ordinary one-transaction path.
-            let storage_root =
-                match pool.validated_storage_root("message creation archive allocator") {
-                    Ok(root) => root,
-                    Err(error) => return Outcome::Err(error),
-                };
-            Some(match id_allocator.archive_seed(cx, storage_root).await {
-                Outcome::Ok(seed) => seed,
-                Outcome::Err(error) => return Outcome::Err(error),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            })
+            Some(
+                match pool
+                    .archive_seed(cx, "message creation archive allocator")
+                    .await
+                {
+                    Outcome::Ok(seed) => seed,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                },
+            )
         };
         let (created_outcome, conn) = loop {
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || async {
+                if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+                    return Outcome::Err(error);
+                }
                 let conn = match acquire_conn(cx, pool).await {
                     Outcome::Ok(c) => c,
                     Outcome::Err(e) => return Outcome::Err(e),
@@ -8418,6 +9161,7 @@ async fn create_message_with_recipients_impl(
                 match create_message_with_recipients_tx(
                     cx,
                     &tracked,
+                    &id_allocator,
                     project_id,
                     sender_id,
                     subject,
@@ -8429,6 +9173,7 @@ async fn create_message_with_recipients_impl(
                     ack_required,
                     attachments,
                     recipients,
+                    project_mailbox,
                     now,
                     archive_seed,
                     idempotency,
@@ -8452,15 +9197,9 @@ async fn create_message_with_recipients_impl(
                     // The key check found a fresh request and rolled back.
                     // Scan without holding transaction/page authority, then
                     // repeat the authoritative check in the insert transaction.
-                    let storage_root =
-                        match pool.validated_storage_root("message creation archive allocator") {
-                            Ok(root) => root,
-                            Err(error) => return Outcome::Err(error),
-                        };
                     archive_seed = Some(
                         match pool
-                            .message_id_allocator()
-                            .archive_seed(cx, storage_root)
+                            .archive_seed(cx, "message creation archive allocator")
                             .await
                         {
                             Outcome::Ok(seed) => seed,
@@ -8475,7 +9214,6 @@ async fn create_message_with_recipients_impl(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
-        let tracked = tracked(&*conn);
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -8497,8 +9235,23 @@ async fn create_message_with_recipients_impl(
                 return Outcome::Ok(IdempotentOutcome::Conflict(info));
             }
         };
-
-        let writer_post_commit_counts = if let Some(message_id) = row.id {
+        (row, conn)
+    };
+    // The insert is committed. The writer samples its own rows and the
+    // fresh-handle probe re-proves them without the serializer, so neither
+    // holds every other in-process send behind it (br-kp1in.32, br-qbhs0: the
+    // sample was ~10% of the serializer's hold). Only this call's compensating
+    // delete can remove these rows, and it re-takes the serializer. A probe
+    // miss still cannot delete a message the writer's sample confirmed
+    // (GH#179).
+    drop(serializer_guard);
+    #[cfg(test)]
+    SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| {
+        seen.borrow_mut().push(MESSAGE_WRITE_SERIALIZER.is_locked());
+    });
+    let writer_post_commit_counts = {
+        let tracked = tracked(&*conn);
+        if let Some(message_id) = row.id {
             let message_rows = match map_sql_outcome(
                 traw_query(
                     cx,
@@ -8529,17 +9282,9 @@ async fn create_message_with_recipients_impl(
             }
         } else {
             WriterPostCommitCounts::default()
-        };
-
-        drop(conn);
-        (row, writer_post_commit_counts)
+        }
     };
-    // The insert is committed and the writer sampled its own rows; the
-    // fresh-handle probe below opens its own connections per query and must not
-    // hold every other in-process send behind it. A probe miss still cannot
-    // delete a message the writer's sample confirmed (GH#179), and the rare
-    // compensating delete re-takes the serializer.
-    drop(serializer_guard);
+    drop(conn);
 
     let Some(message_id) = row.id else {
         return Outcome::Err(DbError::Internal(
@@ -8647,16 +9392,34 @@ async fn ensure_message_participants_active_in_tx(
         }
     }
 
+    // Cross-project messages may have a sender in a different project from
+    // their recipients. Their routing is validated separately.
+    ensure_agents_active_in_tx(cx, tracked, &participant_ids, None).await
+}
+
+/// Revalidate distinct agent identities at the same transaction boundary as
+/// the new work they authorize. Reservations and contacts additionally require
+/// participants to belong to their project; cached tool-layer checks are insufficient.
+async fn ensure_agents_active_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_ids: &[i64],
+    project_id: Option<i64>,
+) -> Outcome<(), DbError> {
     let mut states: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
-    for chunk in participant_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let sql = format!(
+    for chunk in agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let mut sql = format!(
             "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
              FROM agents a \
              LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
              WHERE a.id IN ({})",
             placeholders(chunk.len())
         );
-        let params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        let mut params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        if let Some(project_id) = project_id {
+            sql.push_str(" AND a.project_id = ?");
+            params.push(Value::BigInt(project_id));
+        }
         let rows = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
             Outcome::Ok(rows) => rows,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -8685,9 +9448,13 @@ async fn ensure_message_participants_active_in_tx(
         }
     }
 
-    for agent_id in participant_ids {
-        let Some((name, retired_at, deregistered_at)) = states.remove(&agent_id) else {
-            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+    for agent_id in agent_ids {
+        let Some((name, retired_at, deregistered_at)) = states.remove(agent_id) else {
+            let identifier = project_id.map_or_else(
+                || agent_id.to_string(),
+                |project_id| format!("{agent_id} in project {project_id}"),
+            );
+            return Outcome::Err(DbError::not_found("Agent", identifier));
         };
         if let Some(timestamp) = deregistered_at {
             return Outcome::Err(DbError::invalid(
@@ -8718,6 +9485,7 @@ const INSERT_MESSAGE_RECIPIENT_SQL: &str = "INSERT INTO message_recipients \
 async fn create_message_with_recipients_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
+    id_allocator: &crate::id_floor::MessageIdAllocator,
     project_id: i64,
     sender_id: i64,
     subject: &str,
@@ -8729,6 +9497,7 @@ async fn create_message_with_recipients_tx(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     now: i64,
     archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
@@ -8805,6 +9574,12 @@ async fn create_message_with_recipients_tx(
         tracked,
         elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
+    run_after_message_id_election_hook(message_id);
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(error);
+    }
     if reply_to == Some(message_id) {
         rollback_tx(cx, tracked).await;
         return Outcome::Err(DbError::InvalidArgument {
@@ -8844,6 +9619,38 @@ async fn create_message_with_recipients_tx(
                     _ => to_names.push(name.clone()),
                 }
             }
+        }
+    }
+
+    // GH#282: the shared-mailbox address appears in the slot the sender used,
+    // so every reader of the envelope (and the archive frontmatter) shows that
+    // the message went to the project, not only to the named agents.
+    if let Some(kind) = project_mailbox {
+        let slug_rows = try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    tracked,
+                    "SELECT slug FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .await
+            )
+        );
+        let Some(slug) = slug_rows
+            .first()
+            .and_then(|row| row.get_as::<String>(0).ok())
+        else {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_id.to_string()));
+        };
+        let address = crate::project_mailbox::project_mailbox_address(&slug);
+        if kind == "cc" {
+            cc_names.push(address);
+        } else {
+            to_names.push(address);
         }
     }
 
@@ -8921,6 +9728,8 @@ async fn create_message_with_recipients_tx(
     // recipient ids before this runs, so a genuinely distinct recipient is
     // never silently dropped; the post-commit visibility probe still verifies
     // every distinct recipient is present.
+    let mut delivered_agent_ids = Vec::with_capacity(recipients.len());
+    let mut recount_agent_ids = Vec::new();
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
@@ -8930,7 +9739,8 @@ async fn create_message_with_recipients_tx(
         match map_sql_outcome(
             traw_execute(cx, tracked, INSERT_MESSAGE_RECIPIENT_SQL, &params).await,
         ) {
-            Outcome::Ok(_) => {}
+            Outcome::Ok(0) => recount_agent_ids.push(*agent_id),
+            Outcome::Ok(_) => delivered_agent_ids.push(*agent_id),
             Outcome::Err(error) => {
                 let existing_rows = match map_sql_outcome(
                     traw_query(
@@ -8961,11 +9771,60 @@ async fn create_message_with_recipients_tx(
         }
     }
 
-    let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
+    // GH#282: one delivery row for the project's shared mailbox. Per-agent
+    // read/ack receipts are created lazily, never here.
+    if let Some(kind) = project_mailbox {
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    "INSERT INTO project_mailbox_deliveries \
+                     (message_id, project_id, kind, delivered_ts) VALUES (?, ?, ?, ?)",
+                    &[
+                        Value::BigInt(message_id),
+                        Value::BigInt(project_id),
+                        Value::Text(kind.to_string()),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+        // The delivery's single cursor event for restart-safe monitors.
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(message_id),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+    }
+
     try_in_tx!(
         cx,
         tracked,
-        rebuild_agents_inbox_stats_in_tx(cx, tracked, &recipient_agent_ids).await
+        add_new_message_to_inbox_stats_in_tx(
+            cx,
+            tracked,
+            &delivered_agent_ids,
+            &recount_agent_ids,
+            ack_required,
+            now,
+        )
+        .await
     );
 
     // Record the idempotency key + serialized result in the SAME transaction as
@@ -8997,8 +9856,17 @@ async fn create_message_with_recipients_tx(
         );
     }
 
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(error);
+    }
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        return Outcome::Err(error);
+    }
 
     Outcome::Ok(Some(IdempotentOutcome::Fresh(row)))
 }
@@ -9371,11 +10239,326 @@ pub async fn get_messages_details_by_ids(
     Outcome::Ok(out)
 }
 
+// No bodies, recipients, attachments or subjects enter the window sort. The
+// covering index keeps this an O(project metadata) pass, independent of body
+// size, and only the selected page's subjects are fetched afterward. A stored
+// summary table would require extra write/import/recovery invariants; an
+// expression index is not supported by the runtime schema reader.
+const PROJECT_THREAD_RANKED_SQL: &str = "WITH scoped AS (\
+    SELECT id, created_ts, \
+           CASE WHEN thread_id IS NOT NULL AND TRIM(thread_id) <> '' \
+                THEN thread_id ELSE CAST(id AS TEXT) END AS conversation_key \
+    FROM messages INDEXED BY idx_messages_project_thread_activity \
+    WHERE project_id = ?1 AND id <= ?2\
+), ranked AS (\
+    SELECT id, created_ts, conversation_key, \
+           ROW_NUMBER() OVER (PARTITION BY conversation_key ORDER BY created_ts DESC, id DESC) AS position, \
+           COUNT(*) OVER (PARTITION BY conversation_key) AS message_count, \
+           MIN(created_ts) OVER (PARTITION BY conversation_key) AS first_created_ts \
+    FROM scoped\
+) \
+SELECT conversation_key, message_count, first_created_ts, created_ts, id \
+FROM ranked WHERE position = 1";
+
+fn project_thread_page_sql(cursor: Option<&ProjectThreadCursor>) -> String {
+    use std::fmt::Write as _;
+
+    let mut sql = PROJECT_THREAD_RANKED_SQL.to_string();
+    // Keep one parameter map across the scoped CTE and the outer page query.
+    let limit_slot = if cursor.is_some() { 6 } else { 3 };
+    if let Some(cursor) = cursor {
+        let comparison = if cursor.newer { ">" } else { "<" };
+        let _ = write!(
+            sql,
+            " AND (created_ts {comparison} ?3 OR (created_ts = ?4 AND id {comparison} ?5))"
+        );
+    }
+    if cursor.is_some_and(|cursor| cursor.newer) {
+        let _ = write!(sql, " ORDER BY created_ts ASC, id ASC LIMIT ?{limit_slot}");
+    } else {
+        let _ = write!(
+            sql,
+            " ORDER BY created_ts DESC, id DESC LIMIT ?{limit_slot}"
+        );
+    }
+    sql
+}
+
+fn decode_project_thread_summary(
+    row: &SqlRow,
+) -> std::result::Result<ProjectThreadSummary, DbError> {
+    Ok(ProjectThreadSummary {
+        thread_id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
+        subject: String::new(),
+        message_count: row.get_as(1).map_err(|error| map_sql_error(&error))?,
+        first_created_ts: row.get_as(2).map_err(|error| map_sql_error(&error))?,
+        last_created_ts: row.get_as(3).map_err(|error| map_sql_error(&error))?,
+        last_message_id: row.get_as(4).map_err(|error| map_sql_error(&error))?,
+    })
+}
+
+/// Browse complete project conversations, including roots with no explicit key.
+///
+/// Groups before applying the page limit, so one busy conversation never
+/// crowds older conversations out of the browser. The `(created_ts, id)` pair
+/// breaks timestamp ties deterministically. The initial high-water message id
+/// is carried through both directions, preventing concurrent new messages or
+/// replies (including backdated inserts) from shifting later pages. Existing
+/// message edits/deletions are reflected; this is not a retained DB snapshot.
+#[allow(clippy::too_many_lines)]
+pub async fn list_project_threads(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    limit: usize,
+    cursor: Option<&ProjectThreadCursor>,
+) -> Outcome<ProjectThreadPage, DbError> {
+    if cursor.is_some_and(|cursor| {
+        cursor.snapshot_id < 0
+            || cursor.anchor_message_id <= 0
+            || cursor.anchor_message_id > cursor.snapshot_id
+    }) {
+        return Outcome::Err(DbError::invalid("cursor", "invalid conversation position"));
+    }
+    let limit = limit.clamp(1, MAX_PROJECT_THREADS_PAGE_SIZE);
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let snapshot_id = if let Some(cursor) = cursor {
+        cursor.snapshot_id
+    } else {
+        let rows = match map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT COALESCE(MAX(id), 0) FROM messages \
+                 INDEXED BY idx_messages_project_thread_activity WHERE project_id = ?",
+                &[Value::BigInt(project_id)],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match rows.first().map(|row| row.get_as::<i64>(0)) {
+            Some(Ok(id)) => id,
+            Some(Err(error)) => return Outcome::Err(map_sql_error(&error)),
+            None => return Outcome::Err(DbError::Internal("missing message high water".into())),
+        }
+    };
+
+    let mut params = vec![Value::BigInt(project_id), Value::BigInt(snapshot_id)];
+    if let Some(cursor) = cursor {
+        params.extend([
+            Value::BigInt(cursor.anchor_created_ts),
+            Value::BigInt(cursor.anchor_created_ts),
+            Value::BigInt(cursor.anchor_message_id),
+        ]);
+    }
+    let Ok(fetch_limit) = i64::try_from(limit + 1) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+    params.push(Value::BigInt(fetch_limit));
+    let rows = match map_sql_outcome(
+        traw_query(cx, &tracked, &project_thread_page_sql(cursor), &params).await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut threads = match rows
+        .iter()
+        .map(decode_project_thread_summary)
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(threads) => threads,
+        Err(error) => return Outcome::Err(error),
+    };
+    let more_in_direction = threads.len() > limit;
+    threads.truncate(limit);
+    let newer = cursor.is_some_and(|cursor| cursor.newer);
+    if newer {
+        threads.reverse();
+    }
+
+    if !threads.is_empty() {
+        let sql = format!(
+            "SELECT id, subject FROM messages WHERE project_id = ? AND id IN ({})",
+            placeholders(threads.len())
+        );
+        let mut params = vec![Value::BigInt(project_id)];
+        params.extend(threads.iter().map(|row| Value::BigInt(row.last_message_id)));
+        let subjects = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let subjects = subjects
+            .iter()
+            .map(|row| Ok((row.get_as::<i64>(0)?, row.get_as::<String>(1)?)))
+            .collect::<std::result::Result<HashMap<_, _>, SqlError>>();
+        let mut subjects = match subjects {
+            Ok(subjects) => subjects,
+            Err(error) => return Outcome::Err(map_sql_error(&error)),
+        };
+        for thread in &mut threads {
+            thread.subject = subjects.remove(&thread.last_message_id).unwrap_or_default();
+        }
+    }
+
+    let make_cursor = |row: &ProjectThreadSummary, newer| ProjectThreadCursor {
+        snapshot_id,
+        anchor_created_ts: row.last_created_ts,
+        anchor_message_id: row.last_message_id,
+        newer,
+    };
+    let has_older = if newer {
+        cursor.is_some()
+    } else {
+        more_in_direction
+    };
+    let has_newer = if newer {
+        more_in_direction
+    } else {
+        cursor.is_some()
+    };
+    let next_cursor = threads
+        .last()
+        .filter(|_| has_older)
+        .map(|row| make_cursor(row, false));
+    let previous_cursor = threads
+        .first()
+        .filter(|_| has_newer)
+        .map(|row| make_cursor(row, true));
+    Outcome::Ok(ProjectThreadPage {
+        threads,
+        snapshot_id,
+        next_cursor,
+        previous_cursor,
+    })
+}
+
+/// Fetch one canonical conversation without the numeric-seed expansion of
+/// [`list_thread_messages`].
+///
+/// A numeric key only admits its root when that
+/// root's canonical key is exactly equal; `0042`, `+42` and a message numbered
+/// 42 that belongs to another named thread cannot collide with key `42`.
+#[allow(clippy::too_many_lines)]
+pub async fn list_canonical_thread_messages(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    thread_id: &str,
+    limit: Option<usize>,
+) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    if thread_id.trim_matches(' ').is_empty() || limit == Some(0) {
+        return Outcome::Ok(Vec::new());
+    }
+    let mut ids = {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+        let mut sql = "SELECT id, created_ts FROM messages \
+            WHERE project_id = ? AND thread_id = ? \
+            ORDER BY created_ts DESC, id DESC"
+            .to_string();
+        let mut params = vec![Value::BigInt(project_id), Value::Text(thread_id.into())];
+        if let Some(limit) = limit {
+            let Ok(limit) = i64::try_from(limit) else {
+                return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+            };
+            sql.push_str(" LIMIT ?");
+            params.push(Value::BigInt(limit));
+        }
+        let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let mut ids = match rows
+            .iter()
+            .map(|row| Ok((row.get_as::<i64>(0)?, row.get_as::<i64>(1)?)))
+            .collect::<std::result::Result<Vec<_>, SqlError>>()
+        {
+            Ok(ids) => ids,
+            Err(error) => return Outcome::Err(map_sql_error(&error)),
+        };
+        if let Ok(root_id) = thread_id.parse::<i64>()
+            && root_id.to_string() == thread_id
+            && !ids.iter().any(|(id, _)| *id == root_id)
+        {
+            let rows = match map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, created_ts, thread_id FROM messages WHERE id = ? AND project_id = ?",
+                    &[Value::BigInt(root_id), Value::BigInt(project_id)],
+                )
+                .await,
+            ) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            if let Some(row) = rows.first() {
+                let key = match row.get_as::<Option<String>>(2) {
+                    Ok(key) => key,
+                    Err(error) => return Outcome::Err(map_sql_error(&error)),
+                };
+                if canonical_thread_id(root_id, key.as_deref()) == thread_id {
+                    let created_ts = match row.get_as::<i64>(1) {
+                        Ok(created_ts) => created_ts,
+                        Err(error) => return Outcome::Err(map_sql_error(&error)),
+                    };
+                    ids.push((root_id, created_ts));
+                }
+            }
+        }
+        ids
+    };
+    ids.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(right.0.cmp(&left.0)));
+    if let Some(limit) = limit {
+        ids.truncate(limit);
+    }
+    let ids = ids.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    match get_messages_details_by_ids(cx, pool, &ids, Some(project_id)).await {
+        Outcome::Ok(mut messages) => {
+            // Recheck the key after hydration: an intervening import/update
+            // must not turn a previously scoped id into a foreign thread.
+            messages.retain(|message| {
+                canonical_thread_id(message.id, message.thread_id.as_deref()) == thread_id
+            });
+            messages.sort_by_key(|message| (message.created_ts, message.id));
+            Outcome::Ok(messages)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 /// List messages for a thread.
 ///
 /// Thread semantics:
 /// - If `thread_id` is a numeric string, it is treated as a root message id.
-///   The thread includes the root message (`id = root`) and any replies (`thread_id = "{root}"`).
+///   The thread includes the root message (`id = root`), any replies
+///   (`thread_id = "{root}"`), and, when the root itself belongs to a named
+///   thread (`thread_id = "TKT-123"`), that whole thread.
 /// - Otherwise, the thread includes messages where `thread_id = thread_id`.
 /// - If `limit` is set, the most recent `limit` messages are selected and returned in
 ///   chronological order (oldest-to-newest within that limited window).
@@ -9387,6 +10570,8 @@ pub async fn list_thread_messages(
     thread_id: &str,
     limit: Option<usize>,
 ) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    const SEED_THREAD_SQL: &str =
+        "SELECT s.thread_id FROM messages s WHERE s.id = ? AND s.project_id = ?";
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9403,6 +10588,10 @@ pub async fn list_thread_messages(
         params.push(Value::BigInt(root_id));
     }
     params.push(Value::Text(thread_id.to_string()));
+    if let Ok(root_id) = thread_id.parse::<i64>() {
+        params.push(Value::BigInt(root_id));
+        params.push(Value::BigInt(project_id));
+    }
 
     let (sql, reverse_to_chronological) = match (is_root, limit) {
         (true, Some(lim)) => {
@@ -9420,7 +10609,7 @@ pub async fn list_thread_messages(
                             COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                      FROM messages m \
                      LEFT JOIN agents a ON a.id = m.sender_id \
-                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                      ORDER BY created_ts DESC, id DESC \
                      LIMIT ?"
                 ),
@@ -9437,7 +10626,7 @@ pub async fn list_thread_messages(
                         COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                  FROM messages m \
                  LEFT JOIN agents a ON a.id = m.sender_id \
-                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                  ORDER BY created_ts ASC, id ASC"
             ),
             false,
@@ -10026,6 +11215,89 @@ pub async fn list_message_recipient_names_by_message(
     Outcome::Ok(out)
 }
 
+/// Select message IDs with at least one delivery of `kind` in this project.
+///
+/// Reads the delivery table, rather than the denormalized recipient names, and
+/// returns no recipient identities (in particular, no BCC names). Batching
+/// keeps a large search page below the engine's parameter limit.
+pub async fn message_ids_with_recipient_kind(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    kind: &str,
+    message_ids: &[i64],
+) -> Outcome<HashSet<i64>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(HashSet::new());
+    }
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let mut out = HashSet::new();
+    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let sql = format!(
+            "SELECT DISTINCT r.message_id \
+             FROM message_recipients r JOIN messages m ON m.id = r.message_id \
+             WHERE m.project_id = ? AND r.kind = ? \
+               AND r.message_id IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(chunk.len() + 2);
+        params.push(Value::BigInt(project_id));
+        params.push(Value::Text(kind.to_string()));
+        params.extend(chunk.iter().copied().map(Value::BigInt));
+        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+            Outcome::Ok(rows) => {
+                for row in rows {
+                    match row.get_as::<i64>(0) {
+                        Ok(id) => {
+                            out.insert(id);
+                        }
+                        Err(error) => return Outcome::Err(map_sql_error(&error)),
+                    }
+                }
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    Outcome::Ok(out)
+}
+
+/// Whether this project has any delivery of `kind`.
+///
+/// A filtered search can prove that later pages cannot match without walking
+/// the entire search result set. Other projects do not defeat this shortcut.
+pub async fn project_has_recipient_kind(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    kind: &str,
+) -> Outcome<bool, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT 1 FROM message_recipients r \
+               JOIN messages m ON m.id = r.message_id \
+               WHERE m.project_id = ? AND r.kind = ? LIMIT 1";
+    let params = [Value::BigInt(project_id), Value::Text(kind.to_string())];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => Outcome::Ok(!rows.is_empty()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Get message by ID
 pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<MessageRow, DbError> {
     let conn = match acquire_conn(cx, pool).await {
@@ -10126,6 +11398,7 @@ pub struct InboxRow {
     pub message: MessageRow,
     pub kind: String,
     pub sender_name: String,
+    pub sender_display_name: Option<String>,
     pub read_ts: Option<i64>,
     pub ack_ts: Option<i64>,
 }
@@ -10666,10 +11939,14 @@ async fn fetch_inbox_impl(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    // Failed cleanup, cancellation during backoff, and unwinding must never
+    // return an uncertain read transaction to the live pool.
+    conn.retire_on_drop.store(true, Ordering::Release);
 
     let run_query = || {
-        crate::sync::fetch_inbox_filtered_rows_from_conn(
-            &conn,
+        crate::sync::fetch_inbox_filtered_rows_with_cx(
+            cx,
+            &**conn,
             project_id,
             agent_id,
             since_ts,
@@ -10697,7 +11974,7 @@ async fn fetch_inbox_impl(
     let mut attempt: u32 = 0;
     let result = loop {
         match run_query() {
-            Err(error)
+            Outcome::Err(error)
                 if attempt < *MVCC_MAX_RETRIES && is_plain_write_contention_error(&error) =>
             {
                 attempt += 1;
@@ -10714,10 +11991,12 @@ async fn fetch_inbox_impl(
         }
     };
 
-    match result {
-        Ok(rows) => Outcome::Ok(rows),
-        Err(error) => Outcome::Err(error),
+    // A successful retry cannot prove an earlier failed SAVEPOINT release
+    // cleaned up its read transaction. Reuse only a clean first attempt.
+    if attempt == 0 && matches!(&result, Outcome::Ok(_)) {
+        conn.retire_on_drop.store(false, Ordering::Release);
     }
+    result
 }
 
 fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, DbError> {
@@ -10737,132 +12016,110 @@ fn decode_message_row_indexed(row: &SqlRow) -> std::result::Result<MessageRow, D
     })
 }
 
-/// A bounded, join-free message window for the unified inbox. Filter before
-/// limiting; the `(created_ts, id)` cursor also advances past undelivered rows.
-pub async fn list_mail_ui_message_window(
-    cx: &Cx,
-    pool: &DbPool,
-    before: Option<(i64, i64)>,
-    importance: Option<&str>,
-    limit: usize,
-) -> Outcome<Vec<MessageRow>, DbError> {
-    let Ok(limit) = i64::try_from(limit) else {
-        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
-    };
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
-    let mut sql = String::from(
-        "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, \
-        importance, ack_required, created_ts, recipients_json, attachments FROM messages WHERE 1 = 1",
-    );
-    let mut params = Vec::new();
-    if let Some((created_ts, id)) = before {
-        sql.push_str(" AND (created_ts < ? OR (created_ts = ? AND id < ?))");
-        params.extend([
-            Value::BigInt(created_ts),
-            Value::BigInt(created_ts),
-            Value::BigInt(id),
-        ]);
-    }
-    if let Some(importance) = importance {
-        sql.push_str(" AND importance = ? COLLATE NOCASE");
-        params.push(Value::Text(importance.to_string()));
-    }
-    sql.push_str(" ORDER BY created_ts DESC, id DESC LIMIT ?");
-    params.push(Value::BigInt(limit));
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => match rows.iter().map(decode_message_row_indexed).collect() {
-            Ok(messages) => Outcome::Ok(messages),
-            Err(error) => Outcome::Err(error),
-        },
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
-}
-
-/// Read receipt metadata without repeating message bodies for every delivery.
-#[derive(Debug)]
-pub struct MailUiReceiptRow {
-    pub message_id: i64,
-    pub agent_id: i64,
-    pub read_ts: Option<i64>,
-    pub ack_ts: Option<i64>,
-}
-
-pub async fn list_mail_ui_receipts(
-    cx: &Cx,
-    pool: &DbPool,
-    message_ids: &[i64],
-) -> Outcome<Vec<MailUiReceiptRow>, DbError> {
-    if message_ids.is_empty() {
-        return Outcome::Ok(Vec::new());
-    }
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    let tracked = tracked(&*conn);
-    let mut receipts = Vec::new();
-    for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let sql = format!(
-            "SELECT message_id, agent_id, read_ts, ack_ts FROM message_recipients \
-            WHERE message_id IN ({})",
-            placeholders(chunk.len())
-        );
-        let params = chunk.iter().copied().map(Value::BigInt).collect::<Vec<_>>();
-        match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-            Outcome::Ok(rows) => {
-                for row in rows {
-                    let decoded = (|| -> std::result::Result<MailUiReceiptRow, DbError> {
-                        Ok(MailUiReceiptRow {
-                            message_id: row.get_as(0).map_err(|error| map_sql_error(&error))?,
-                            agent_id: row.get_as(1).map_err(|error| map_sql_error(&error))?,
-                            read_ts: row.get_as(2).map_err(|error| map_sql_error(&error))?,
-                            ack_ts: row.get_as(3).map_err(|error| map_sql_error(&error))?,
-                        })
-                    })();
-                    match decoded {
-                        Ok(receipt) => receipts.push(receipt),
-                        Err(error) => return Outcome::Err(error),
-                    }
-                }
-            }
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        }
-    }
-    Outcome::Ok(receipts)
-}
-
 fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbError> {
     let message = decode_message_row_indexed(row)?;
     let kind: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
     let sender_name: String = row.get_as(13).map_err(|e| map_sql_error(&e))?;
     let read_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
     let ack_ts: Option<i64> = row.get_as(15).map_err(|e| map_sql_error(&e))?;
+    let sender_display_name: Option<String> = row.get_as(16).map_err(|e| map_sql_error(&e))?;
 
     Ok(InboxRow {
         message,
         kind,
         sender_name,
+        sender_display_name,
         read_ts,
         ack_ts,
     })
 }
 
 #[derive(Clone, Copy)]
-struct ProductInboxQueryOptions {
+struct ProductInboxQueryOptions<'a> {
     urgent_only: bool,
     body_policy: InboxBodyPolicy,
+    viewer_ids: Option<&'a [i64]>,
+}
+
+/// Resolve the canonical viewer in every linked project in one read.
+///
+/// Match `get_agent`'s lowest-ID rule for legacy case-variant registrations. The
+/// returned IDs can pin a later inbox read to exactly these identities, even
+/// if product links or same-name registrations change during authorization.
+pub async fn product_inbox_agents(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+                      a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+                      a.reaper_exempt, a.registration_token, a.retired_at \
+               FROM product_project_links ppl JOIN agents a ON a.project_id = ppl.project_id \
+               WHERE ppl.product_id = ? AND a.name = ? COLLATE NOCASE \
+               ORDER BY a.project_id ASC, a.id ASC";
+    let params = [
+        Value::BigInt(product_id),
+        Value::Text(agent_name.to_string()),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut seen_projects = HashSet::new();
+            let agents = rows
+                .iter()
+                .map(decode_agent_row_indexed)
+                .filter(|agent| seen_projects.insert(agent.project_id))
+                .collect();
+            Outcome::Ok(agents)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Read only the preflighted viewers.
+///
+/// Both mailbox arms still require current
+/// membership in this product; new links or name aliases cannot expand the
+/// caller's authorized identity scope between preflight and the read.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_inbox_for_product_agent_scoped(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    viewer_ids: &[i64],
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_for_product_agent_impl(
+        cx,
+        pool,
+        product_id,
+        agent_name,
+        since_ts,
+        limit,
+        ProductInboxQueryOptions {
+            urgent_only,
+            body_policy: if include_bodies {
+                InboxBodyPolicy::Full
+            } else {
+                InboxBodyPolicy::MetadataOnly
+            },
+            viewer_ids: Some(viewer_ids),
+        },
+    )
+    .await
 }
 
 pub async fn fetch_inbox_for_product_agent(
@@ -10884,6 +12141,7 @@ pub async fn fetch_inbox_for_product_agent(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::Full,
+            viewer_ids: None,
         },
     )
     .await
@@ -10908,6 +12166,7 @@ pub async fn fetch_inbox_for_product_agent_metadata(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            viewer_ids: None,
         },
     )
     .await
@@ -10920,7 +12179,7 @@ async fn fetch_inbox_for_product_agent_impl(
     agent_name: &str,
     since_ts: Option<i64>,
     limit: usize,
-    options: ProductInboxQueryOptions,
+    options: ProductInboxQueryOptions<'_>,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -10941,7 +12200,8 @@ async fn fetch_inbox_for_product_agent_impl(
     let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
+                r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts, \
+                s.display_name AS sender_display_name \
          FROM product_project_links ppl \
          JOIN agents recipient ON recipient.project_id = ppl.project_id AND recipient.name = ? COLLATE NOCASE \
          JOIN message_recipients r ON r.agent_id = recipient.id \
@@ -10950,36 +12210,86 @@ async fn fetch_inbox_for_product_agent_impl(
          WHERE ppl.product_id = ?"
     );
 
-    let mut params = vec![
+    // GH#282: the same agents' views of each linked project's shared mailbox,
+    // under the same filters. Both arms run as ONE fan-in statement whatever
+    // the number of linked projects. The pinned compound-select executor
+    // applies LIMIT without bindings, so the (integer) limit is rendered.
+    let mut shared_sql = crate::project_mailbox::product_inbox_select_sql(body_select);
+    if let Some(viewer_ids) = options.viewer_ids {
+        if viewer_ids.is_empty() {
+            return Outcome::Ok(Vec::new());
+        }
+        // IDs are typed database identities, not caller-supplied SQL. Render
+        // them to avoid multiplying bind parameters across the two arms.
+        let ids = viewer_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(" AND recipient.id IN (");
+        sql.push_str(&ids);
+        sql.push(')');
+        shared_sql.push_str(" AND viewer.id IN (");
+        shared_sql.push_str(&ids);
+        shared_sql.push(')');
+    }
+    let mut arm_params = vec![
         Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
         Value::Text(agent_name.to_string()),
         Value::BigInt(product_id),
     ];
-    if options.urgent_only {
-        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    for query in [&mut sql, &mut shared_sql] {
+        if options.urgent_only {
+            query.push_str(" AND m.importance IN ('high', 'urgent')");
+        }
+        if since_ts.is_some() {
+            query.push_str(" AND m.created_ts > ?");
+        }
     }
     if let Some(ts) = since_ts {
-        sql.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(ts));
+        arm_params.push(Value::BigInt(ts));
     }
-    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
-    params.push(Value::BigInt(limit_i64));
+    let compound =
+        format!("{sql} UNION ALL {shared_sql} ORDER BY created_ts DESC, id DESC LIMIT {limit_i64}");
+    let compound_params = [arm_params.as_slice(), arm_params.as_slice()].concat();
 
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_inbox_row_indexed(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(error) => return Outcome::Err(error),
-                }
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &compound, &compound_params).await) {
+        Outcome::Ok(rows) => rows,
+        // Only a mailbox with no surviving shared authority can use the
+        // pre-upgrade fallback. Missing delivery tables must not hide retained
+        // receipts or shared delivery events behind a direct-only success.
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            if let Err(error) =
+                crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+            {
+                return Outcome::Err(error);
             }
-            Outcome::Ok(out)
+            let direct = format!("{sql} ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+            let mut direct_params = arm_params;
+            direct_params.push(Value::BigInt(limit_i64));
+            match map_sql_outcome(traw_query(cx, &tracked, &direct, &direct_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
         }
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_inbox_row_indexed(&row) {
+            Ok(decoded) => out.push(decoded),
+            Err(error) => return Outcome::Err(error),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Search messages using FTS5
@@ -11940,6 +13250,74 @@ pub async fn add_recipients(
 }
 
 /// Mark message as read
+/// GH#282: record a lazy shared-mailbox receipt when `message_id` is a
+/// project mailbox delivery visible to `agent_id`, inside the caller's write
+/// transaction. `Ok(None)` when it is not one, so the caller keeps its
+/// not-a-recipient error; otherwise the stored `(read_ts, ack_ts)`. Never
+/// rolls back: the caller owns the transaction.
+async fn record_project_mailbox_receipt_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    message_id: i64,
+    update: crate::project_mailbox::ReceiptUpdate,
+    now: i64,
+) -> Outcome<Option<(Option<i64>, Option<i64>)>, DbError> {
+    let (sql, params) = crate::project_mailbox::visible_receipt_query(agent_id, message_id);
+    match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+        Outcome::Ok(rows) if rows.is_empty() => return Outcome::Ok(None),
+        Outcome::Ok(_) => {}
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            return Outcome::Ok(None);
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+    for (sql, params) in
+        crate::project_mailbox::receipt_write_statements(update, message_id, agent_id, now)
+    {
+        match map_sql_outcome(traw_execute(cx, tracked, sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT read_ts, ack_ts FROM project_mailbox_receipts \
+             WHERE message_id = ? AND agent_id = ?",
+            &[Value::BigInt(message_id), Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::Internal(format!(
+            "project mailbox receipt for {agent_id}:{message_id} was not stored"
+        )));
+    };
+    let integer = |index: usize| {
+        row.get(index).and_then(|value| match value {
+            Value::BigInt(n) => Some(*n),
+            Value::Int(n) => Some(i64::from(*n)),
+            _ => None,
+        })
+    };
+    Outcome::Ok(Some((integer(0), integer(1))))
+}
+
 pub async fn mark_message_read(
     cx: &Cx,
     pool: &DbPool,
@@ -11992,14 +13370,32 @@ pub async fn mark_message_read(
             "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-            Outcome::Ok(rows) => {
-                if rows.is_empty() {
+            Outcome::Ok(rows) if rows.is_empty() => {
+                // GH#282: not a direct recipient; a project mailbox delivery
+                // records the agent's own lazy receipt instead.
+                let receipt = try_in_tx!(
+                    cx,
+                    &tracked,
+                    record_project_mailbox_receipt_in_tx(
+                        cx,
+                        &tracked,
+                        agent_id,
+                        message_id,
+                        crate::project_mailbox::ReceiptUpdate::Read,
+                        now,
+                    )
+                    .await
+                );
+                let Some((Some(read_ts), _)) = receipt else {
                     rollback_tx(cx, &tracked).await;
                     return Outcome::Err(DbError::not_found(
                         "MessageRecipient",
                         format!("{agent_id}:{message_id}"),
                     ));
-                }
+                };
+                read_ts
+            }
+            Outcome::Ok(rows) => {
                 let Some(ts) = rows
                     .first()
                     .and_then(|r| r.get(0))
@@ -12117,104 +13513,11 @@ pub async fn mark_all_messages_read_in_project(
     project_id: i64,
     agent_id: i64,
 ) -> Outcome<i64, DbError> {
-    let now = now_micros();
-
-    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        // Identify which messages are actually unread for this agent in this project.
-        // We do this explicitly to avoid trusting unreliable rows_affected from UPDATE.
-        let find_sql = "SELECT m.id FROM message_recipients r \
-                        JOIN messages m ON m.id = r.message_id \
-                        WHERE r.agent_id = ? AND r.read_ts IS NULL \
-                        AND m.project_id = ?";
-        let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-        // Route through try_in_tx! so the open BEGIN CONCURRENT is rolled back on
-        // cancel/panic too (the bare match previously only rolled back on Err,
-        // leaking a half-open transaction back into the pool on cancellation).
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
-        );
-
-        let mut message_ids = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(message_id) = row_first_i64(row) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "unread inbox query returned a message without an integer id".to_string(),
-                ));
-            };
-            message_ids.push(message_id);
-        }
-
-        if !message_ids.is_empty() {
-            // Update the exact rows selected above. In addition to keeping the
-            // count truthful, bounded chunks avoid executor limits in large
-            // subquery-backed UPDATEs and keep the whole operation atomic.
-            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let ph = placeholders(chunk.len());
-                let sql = format!(
-                    "UPDATE message_recipients \
-                     SET read_ts = ? \
-                     WHERE agent_id = ? AND read_ts IS NULL \
-                     AND message_id IN ({ph})"
-                );
-                let mut params = Vec::with_capacity(2 + chunk.len());
-                params.push(Value::BigInt(now));
-                params.push(Value::BigInt(agent_id));
-                params.extend(chunk.iter().copied().map(Value::BigInt));
-                try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
-                );
-            }
-
-            // Do not report a successful bulk transition unless every row
-            // selected in this transaction is now read. A partial executor
-            // result must roll the entire transaction back rather than leave
-            // inbox state and the returned count out of sync.
-            let unread_after = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
-            );
-            if !unread_after.is_empty() {
-                let remaining = unread_after.len();
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(format!(
-                    "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
-                )));
-            }
-
-            // Rebuild inbox_stats from ground truth.
-            try_in_tx!(
-                cx,
-                &tracked,
-                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
-            );
-        }
-
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        // Post-commit invalidation — see mark_message_read.
-        crate::cache::read_cache()
-            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
-        let count_i64 =
-            i64::try_from(message_ids.len()).expect("message recipient count fits in i64");
-        Outcome::Ok(count_i64)
-    })
-    .await
+    // The web action has no cap, but it must use the same shared visibility,
+    // receipt verification and single transaction as the MCP/CLI action.
+    mark_messages_read_bulk(cx, pool, project_id, agent_id, None, usize::MAX)
+        .await
+        .map(|outcome| i64::try_from(outcome.marked).expect("selected message count fits in i64"))
 }
 
 /// Result of a capped bulk mark-read pass (GH#273).
@@ -12225,6 +13528,164 @@ pub struct BulkMarkReadOutcome {
     /// True when more unread messages matching the filters remain (the caller
     /// should call again to continue draining the backlog).
     pub more: bool,
+}
+
+struct BulkReadReceipt {
+    message_id: i64,
+    ack_ts: Option<i64>,
+    shared: bool,
+}
+
+fn decode_bulk_read_receipts(
+    rows: &[SqlRow],
+    shared: bool,
+) -> std::result::Result<Vec<BulkReadReceipt>, DbError> {
+    rows.iter()
+        .map(|row| {
+            Ok(BulkReadReceipt {
+                message_id: row
+                    .get_named("message_id")
+                    .map_err(|error| DbError::Sqlite(error.to_string()))?,
+                ack_ts: crate::project_mailbox::receipt_timestamp(row, "ack_ts")?,
+                shared,
+            })
+        })
+        .collect()
+}
+
+async fn select_bulk_read_receipts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    agent_id: i64,
+    older_than_us: Option<i64>,
+    limit: usize,
+) -> Outcome<(Vec<BulkReadReceipt>, bool), DbError> {
+    // Each lane over-fetches one; merging before truncation gives direct and
+    // shared mail one globally oldest-first budget. Shared visibility excludes
+    // every direct delivery, including direct messages that are already read.
+    let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut direct_sql = String::from(
+        "SELECT m.id AS message_id, r.ack_ts AS ack_ts FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE r.agent_id = ? AND r.read_ts IS NULL AND m.project_id = ?",
+    );
+    let mut direct_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+    if let Some(cutoff) = older_than_us {
+        direct_sql.push_str(" AND m.created_ts <= ?");
+        direct_params.push(Value::BigInt(cutoff));
+    }
+    direct_sql.push_str(" ORDER BY m.id LIMIT ?");
+    direct_params.push(Value::BigInt(overfetch));
+    let direct_rows = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(traw_query(cx, tracked, &direct_sql, &direct_params).await)
+    );
+    let (shared_sql, shared_params) = crate::project_mailbox::unread_visible_query(
+        agent_id,
+        project_id,
+        older_than_us,
+        overfetch,
+    );
+    let shared_rows =
+        match map_sql_outcome(traw_query(cx, tracked, &shared_sql, &shared_params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error)
+                if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                    &error.to_string(),
+                ) =>
+            {
+                if let Err(error) = crate::project_mailbox::allow_absent_shared_schema(
+                    tracked.inner,
+                    &error.to_string(),
+                ) {
+                    return Outcome::Err(error);
+                }
+                Vec::new()
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    let mut receipts = match decode_bulk_read_receipts(&direct_rows, false) {
+        Ok(receipts) => receipts,
+        Err(error) => return Outcome::Err(error),
+    };
+    match decode_bulk_read_receipts(&shared_rows, true) {
+        Ok(shared) => receipts.extend(shared),
+        Err(error) => return Outcome::Err(error),
+    }
+    receipts.sort_unstable_by_key(|receipt| receipt.message_id);
+    let more = receipts.len() > limit;
+    receipts.truncate(limit);
+    Outcome::Ok((receipts, more))
+}
+
+async fn verify_bulk_read_receipts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    now: i64,
+    receipts: &[BulkReadReceipt],
+) -> Outcome<(), DbError> {
+    for (shared, table) in [
+        (false, "message_recipients"),
+        (true, "project_mailbox_receipts"),
+    ] {
+        let expected: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt.shared == shared)
+            .collect();
+        for chunk in expected.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT message_id, read_ts, ack_ts FROM {table} \
+                 WHERE agent_id = ? AND message_id IN ({ph}) ORDER BY message_id"
+            );
+            let mut params = Vec::with_capacity(1 + chunk.len());
+            params.push(Value::BigInt(agent_id));
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|receipt| Value::BigInt(receipt.message_id)),
+            );
+            let rows = try_in_tx!(
+                cx,
+                tracked,
+                map_sql_outcome(traw_query(cx, tracked, &sql, &params).await)
+            );
+            if rows.len() != chunk.len() {
+                return Outcome::Err(DbError::Internal(format!(
+                    "bulk mark-read did not store every selected {table} receipt for agent {agent_id}"
+                )));
+            }
+            for (row, expected) in rows.iter().zip(chunk) {
+                let message_id = match row.get_named::<i64>("message_id") {
+                    Ok(message_id) => message_id,
+                    Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                };
+                let read_ts = match crate::project_mailbox::receipt_timestamp(row, "read_ts") {
+                    Ok(timestamp) => timestamp,
+                    Err(error) => return Outcome::Err(error),
+                };
+                let ack_ts = match crate::project_mailbox::receipt_timestamp(row, "ack_ts") {
+                    Ok(timestamp) => timestamp,
+                    Err(error) => return Outcome::Err(error),
+                };
+                if message_id != expected.message_id
+                    || read_ts != Some(now)
+                    || ack_ts != expected.ack_ts
+                {
+                    return Outcome::Err(DbError::Internal(format!(
+                        "bulk mark-read did not store the expected read-only receipt for message {} and agent {agent_id}",
+                        expected.message_id
+                    )));
+                }
+            }
+        }
+    }
+    Outcome::Ok(())
 }
 
 /// Mark up to `limit` unread messages read for one agent in one project.
@@ -12241,6 +13702,8 @@ pub struct BulkMarkReadOutcome {
 ///   (lowest id) are marked first, and the returned `more` flag reports
 ///   whether eligible unread rows remain past the cap.
 ///
+/// Direct and visible shared-project mail share that one limit. A direct
+/// delivery takes precedence over the same message's shared delivery.
 /// Read receipts only: acknowledgement state (`ack_ts`) is never touched.
 pub async fn mark_messages_read_bulk(
     cx: &Cx,
@@ -12259,103 +13722,80 @@ pub async fn mark_messages_read_bulk(
     let now = now_micros();
 
     run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Select the exact unread rows this call will transition (oldest-first
-        // by id, over-fetch by one to detect remaining backlog) so the count
-        // and the `more` flag are truthful even with unreliable rows_affected.
-        let mut find_sql = String::from(
-            "SELECT m.id FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE r.agent_id = ? AND r.read_ts IS NULL \
-             AND m.project_id = ?",
-        );
-        let mut find_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
-        if let Some(cutoff) = older_than_us {
-            find_sql.push_str(" AND m.created_ts <= ?");
-            find_params.push(Value::BigInt(cutoff));
-        }
-        find_sql.push_str(" ORDER BY m.id LIMIT ?");
-        let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        find_params.push(Value::BigInt(overfetch));
-
-        let rows = try_in_tx!(
+        let (receipts, more) = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &find_sql, &find_params).await)
+            select_bulk_read_receipts_in_tx(
+                cx,
+                &tracked,
+                project_id,
+                agent_id,
+                older_than_us,
+                limit,
+            )
+            .await
         );
-
-        let mut message_ids = Vec::with_capacity(rows.len().min(limit));
-        for row in &rows {
-            let Some(message_id) = row_first_i64(row) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "bulk mark-read query returned a message without an integer id".to_string(),
-                ));
-            };
-            if message_ids.len() < limit {
-                message_ids.push(message_id);
-            }
+        let direct_ids: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| !receipt.shared)
+            .map(|receipt| receipt.message_id)
+            .collect();
+        for chunk in direct_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "UPDATE message_recipients SET read_ts = ? \
+                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
+            );
+            let mut params = Vec::with_capacity(2 + chunk.len());
+            params.push(Value::BigInt(now));
+            params.push(Value::BigInt(agent_id));
+            params.extend(chunk.iter().copied().map(Value::BigInt));
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+            );
         }
-        let more = rows.len() > limit;
-
-        if !message_ids.is_empty() {
-            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let ph = placeholders(chunk.len());
-                let sql = format!(
-                    "UPDATE message_recipients \
-                     SET read_ts = ? \
-                     WHERE agent_id = ? AND read_ts IS NULL \
-                     AND message_id IN ({ph})"
-                );
-                let mut params = Vec::with_capacity(2 + chunk.len());
-                params.push(Value::BigInt(now));
-                params.push(Value::BigInt(agent_id));
-                params.extend(chunk.iter().copied().map(Value::BigInt));
+        for receipt in receipts.iter().filter(|receipt| receipt.shared) {
+            for (sql, params) in crate::project_mailbox::receipt_write_statements(
+                crate::project_mailbox::ReceiptUpdate::Read,
+                receipt.message_id,
+                agent_id,
+                now,
+            ) {
                 try_in_tx!(
                     cx,
                     &tracked,
-                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                    map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
                 );
-
-                // Do not report success unless every selected row in this
-                // chunk is now read (see mark_all_messages_read_in_project).
-                let verify_sql = format!(
-                    "SELECT COUNT(*) FROM message_recipients \
-                     WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
-                );
-                let mut verify_params = Vec::with_capacity(1 + chunk.len());
-                verify_params.push(Value::BigInt(agent_id));
-                verify_params.extend(chunk.iter().copied().map(Value::BigInt));
-                let verify_rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &verify_params).await)
-                );
-                let remaining = verify_rows.first().and_then(row_first_i64).unwrap_or(0);
-                if remaining > 0 {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::Internal(format!(
-                        "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
-                    )));
-                }
             }
-
-            // Rebuild inbox_stats from ground truth.
+        }
+        if !direct_ids.is_empty() {
             try_in_tx!(
                 cx,
                 &tracked,
                 rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
             );
         }
+        // Check the complete selected set after every write, including the
+        // stats rebuild. Suppressed inserts/updates, missing rows, ACK changes
+        // and a later write undoing an earlier chunk must all roll back both
+        // delivery lanes instead of reporting a partially successful drain.
+        try_in_tx!(
+            cx,
+            &tracked,
+            verify_bulk_read_receipts_in_tx(cx, &tracked, agent_id, now, &receipts).await
+        );
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         // Post-commit invalidation — see mark_message_read.
@@ -12363,7 +13803,7 @@ pub async fn mark_messages_read_bulk(
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
         Outcome::Ok(BulkMarkReadOutcome {
-            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            marked: u64::try_from(receipts.len()).expect("selected message count fits in u64"),
             more,
         })
     })
@@ -12375,11 +13815,25 @@ pub async fn mark_messages_read_bulk(
 /// requires acknowledgement — every recipient has acknowledged it. A message
 /// with no recipient rows left (e.g. repaired FK orphans) is vacuously
 /// settled. The caller adds the age horizon (`m.created_ts <= ?`).
-const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+// GH#282: a project mailbox message is settled only once every agent that can
+// see it has read it (and acknowledged it when required). It has no
+// message_recipients rows, so the first clause alone would call it settled at
+// once.
+const SETTLED_MESSAGE_PREDICATE: &str = concat!(
+    "NOT EXISTS (\
      SELECT 1 FROM message_recipients r \
      WHERE r.message_id = m.id \
        AND (r.read_ts IS NULL \
-            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL))) \
+     AND NOT EXISTS (\
+     SELECT 1 FROM project_mailbox_deliveries d \
+     JOIN agents viewer ON viewer.project_id = d.project_id \
+     LEFT JOIN project_mailbox_receipts pr \
+            ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+     WHERE d.message_id = m.id AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    " AND (pr.read_ts IS NULL OR (m.ack_required != 0 AND pr.ack_ts IS NULL)))"
+);
 
 /// Maximum message payload admitted to an archive observation.
 pub const MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
@@ -12396,8 +13850,15 @@ pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
 /// body is not repeated for every recipient. Archive verification and the final
 /// retention transaction use this same projection. The final identity/receipt
 /// columns also detect changes that do not alter a rendered recipient name.
+/// A project shared-mailbox delivery (GH#282) is the last row (`row_kind` 2),
+/// named by its `project:<slug>` address, with no recipient id or receipts.
 /// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
 /// then append the fixed recipient limit plus two rows as an overflow witness.
+/// Each source is narrowed before joining identities. In the pinned runtime,
+/// combining the message ID with the cross-table byte bound in an outer WHERE
+/// prevents the primary-key lookup and repeatedly scans unrelated mailbox rows
+/// (GH#354). The derived tables retain one statement/snapshot and leave the
+/// complete byte bound, missing-identity witnesses, and retention projection intact.
 pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
 SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
        m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
@@ -12407,10 +13868,12 @@ SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.t
        NULL AS recipient_name, NULL AS recipient_kind, \
        m.sender_id, a.project_id AS sender_project_id, \
        NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
-FROM messages m JOIN projects p ON p.id = m.project_id \
+FROM (SELECT id, project_id, sender_id, subject, body_md, thread_id, topic, \
+             importance, ack_required, created_ts, recipients_json, attachments, \
+             archive_metadata_json FROM messages WHERE id = ?1) m \
+JOIN projects p ON p.id = m.project_id \
 JOIN agents a ON a.id = m.sender_id \
-WHERE m.id = ?1 AND \
-      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+WHERE length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
       length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
       length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
       length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
@@ -12427,8 +13890,18 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.read_ts ELSE 'invalid_receipt' END, \
        CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
             THEN mr.ack_ts ELSE 'invalid_receipt' END \
-FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
-WHERE mr.message_id = ?1 \
+FROM (SELECT message_id, agent_id, kind, read_ts, ack_ts \
+      FROM message_recipients WHERE message_id = ?1) mr \
+LEFT JOIN agents a ON a.id = mr.agent_id \
+UNION ALL \
+SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, NULL, d.project_id, \
+       CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
+       CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
+       NULL, NULL, NULL, NULL \
+FROM (SELECT message_id, project_id, kind \
+      FROM project_mailbox_deliveries WHERE message_id = ?1) d \
+LEFT JOIN projects p ON p.id = d.project_id \
 ORDER BY row_kind, recipient_id";
 
 const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
@@ -12799,6 +14272,15 @@ pub async fn prune_verified_settled_messages(
                 map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
             );
 
+            for table in ["project_mailbox_receipts", "project_mailbox_deliveries"] {
+                let del_shared = format!("DELETE FROM {table} WHERE message_id IN ({ph})");
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &del_shared, &chunk_params).await)
+                );
+            }
+
             let del_recipients =
                 format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
             let recipients_deleted = try_in_tx!(
@@ -12984,14 +14466,32 @@ async fn acknowledge_message_impl(
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let (read_ts, ack_ts) =
             match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-                Outcome::Ok(rows) => {
-                    if rows.is_empty() {
+                Outcome::Ok(rows) if rows.is_empty() => {
+                    // GH#282: a project mailbox delivery records this agent's
+                    // own lazy acknowledgement; other agents stay unacked.
+                    let receipt = try_in_tx!(
+                        cx,
+                        &tracked,
+                        record_project_mailbox_receipt_in_tx(
+                            cx,
+                            &tracked,
+                            agent_id,
+                            message_id,
+                            crate::project_mailbox::ReceiptUpdate::Acknowledge,
+                            now,
+                        )
+                        .await
+                    );
+                    let Some((Some(read_ts), Some(ack_ts))) = receipt else {
                         rollback_tx(cx, &tracked).await;
                         return Outcome::Err(DbError::not_found(
                             "MessageRecipient",
                             format!("{agent_id}:{message_id}"),
                         ));
-                    }
+                    };
+                    (read_ts, ack_ts)
+                }
+                Outcome::Ok(rows) => {
                     let row = rows.first();
                     let read_ts = row.and_then(|r| r.get(0)).and_then(|value| match value {
                         Value::BigInt(n) => Some(*n),
@@ -13298,6 +14798,107 @@ fn is_tolerable_inbox_stats_rebuild_error(error: &DbError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Count one new message into an existing `inbox_stats` row.
+const ADD_NEW_MESSAGE_TO_INBOX_STATS_SQL: &str = "UPDATE inbox_stats SET \
+     total_count = total_count + 1, \
+     unread_count = unread_count + 1, \
+     ack_pending_count = ack_pending_count + ?2, \
+     last_message_ts = MAX(COALESCE(last_message_ts, 0), ?3) \
+     WHERE agent_id = ?1";
+
+/// Count a just-inserted message into its recipients' `inbox_stats` rows.
+///
+/// Sends used to recount every recipient's whole inbox here, O(inbox) per
+/// recipient under the message write serializer (br-qbhs0). Read, ack and
+/// repair paths still recount, so an existing row is exact before the send,
+/// and adding each inserted recipient row as one unread message keeps it
+/// exact, as the recount counts rows. Agents without a row yet, and
+/// recipients whose insert was a no-op, get the full recount instead. The
+/// row is looked up rather than inferred from the UPDATE's affected-row
+/// count, which older engines reported unreliably. A legacy insert trigger
+/// also requires a recount because it may already have counted the delivery.
+async fn add_new_message_to_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    delivered_agent_ids: &[i64],
+    recount_agent_ids: &[i64],
+    ack_required: bool,
+    created_ts: i64,
+) -> Outcome<(), DbError> {
+    let mut recount = recount_agent_ids.to_vec();
+    if delivered_agent_ids.is_empty() {
+        return rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await;
+    }
+
+    // A migration/import can restore the compatibility trigger after pool
+    // startup removed it. Check inside the same write transaction as the
+    // recipient inserts, so concurrent schema changes cannot invalidate the
+    // answer; caching it across sends would let the trigger and this path both
+    // count a delivery. Recount just the affected agents when the trigger owns
+    // inserts, also recovering rows that the trigger could only partly repair.
+    let insert_trigger = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' \
+             AND name = 'trg_inbox_stats_insert' \
+             AND tbl_name = 'message_recipients' LIMIT 1",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    if !insert_trigger.is_empty() {
+        recount.extend_from_slice(delivered_agent_ids);
+        return rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await;
+    }
+
+    for &agent_id in delivered_agent_ids {
+        let existing = match map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                "SELECT agent_id FROM inbox_stats WHERE agent_id = ?",
+                &[Value::BigInt(agent_id)],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        };
+        if existing.is_empty() {
+            recount.push(agent_id);
+            continue;
+        }
+        let params = [
+            Value::BigInt(agent_id),
+            Value::BigInt(i64::from(ack_required)),
+            Value::BigInt(created_ts),
+        ];
+        match map_sql_outcome(
+            traw_execute(cx, tracked, ADD_NEW_MESSAGE_TO_INBOX_STATS_SQL, &params).await,
+        ) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        }
+    }
+    rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await
 }
 
 async fn rebuild_agents_inbox_stats_in_tx(
@@ -13729,10 +15330,8 @@ pub async fn get_reservation_conflict_snapshot(
         };
         let tracked = tracked(&*conn);
 
-        // BEGIN IMMEDIATE is the established fresh-snapshot path for reservation
-        // reads (GH#85/#86). The transaction performs no table writes and ends
-        // through commit_read_tx, which deliberately skips the write-path WAL
-        // checkpoint. On query-only pools this degrades to a deferred BEGIN.
+        // One fresh committed snapshot covers identity, candidates and ledger
+        // without acquiring the writer lock or publishing/checkpointing WAL.
         try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
         let captured_ts = now_micros();
 
@@ -14094,6 +15693,15 @@ async fn create_file_reservations_impl(
             }
         }
 
+        // An exact replay above only reads the original result. New grants and
+        // reacquisitions extend coordination authority, so retirement or
+        // deregistration must be checked inside this write transaction.
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[agent_id], Some(project_id)).await
+        );
+
         let exclusive_filter = if exclusive {
             ""
         } else {
@@ -14179,7 +15787,10 @@ async fn create_file_reservations_impl(
                             "active reservation for project_id={project_id} agent_id={agent_id} path={path} has no id"
                         )));
                     };
-                    row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
+                    // Re-reserving asks for the lease to run at least `ttl`
+                    // from now: keep a later expiry, never stack the TTL on
+                    // what is left (repeat calls would extend without bound).
+                    row.expires_ts = row.expires_ts.max(now.saturating_add(lease_extension));
                     // Re-acquisition applies the new request's intent as well
                     // as its TTL. In particular, shared -> exclusive must not
                     // report a successful acquisition that still lets peers
@@ -14312,8 +15923,8 @@ async fn create_file_reservations_impl(
 
 /// Get active file reservations for a project.
 ///
-/// Uses `BEGIN IMMEDIATE` to acquire a fresh WAL snapshot, ensuring the
-/// caller always sees the latest committed reservation state.  Without an
+/// Uses an explicit deferred transaction to acquire a fresh committed WAL
+/// snapshot without competing for the writer lock. Without an
 /// explicit transaction the pooled connection may re-use a stale read
 /// snapshot which causes phantom conflicts after release (Bug #85) and
 /// missed conflicts before insert (Bug #86).
@@ -14345,8 +15956,7 @@ async fn get_active_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot so we never read stale reservation state.
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Observe candidates and the release ledger in one fresh committed snapshot.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     // GH#180: fetch candidate active rows with the cheap `released_ts` predicate
@@ -14420,8 +16030,7 @@ async fn get_active_reservations_once(
 
     candidates.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
 
-    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     Outcome::Ok(candidates)
 }
 
@@ -14464,8 +16073,7 @@ async fn list_released_unexpired_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot so we never read stale reservation state.
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Observe candidates and the release ledger in one fresh committed snapshot.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let candidate_sql = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, \
@@ -14542,8 +16150,7 @@ async fn list_released_unexpired_reservations_once(
         }
     };
 
-    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
 
     for row in &mut candidates {
         if row.released_ts.is_none_or(|ts| ts <= 0)
@@ -14580,6 +16187,26 @@ struct ReleaseReservationScope {
     project_id: i64,
     agent_id: i64,
     created_at_or_before: Option<i64>,
+    agent_last_active_at_or_before: Option<i64>,
+}
+
+/// Database evidence captured before a stale-reservation filesystem/git probe.
+///
+/// Cleanup must carry the observed lease and activity through to the release
+/// transaction. An ID alone cannot authorize revocation after a renewal,
+/// reacquisition, heartbeat, or mail action commits during the probe.
+#[derive(Debug, Clone)]
+pub struct StaleReservationCandidate {
+    pub reservation: FileReservationRow,
+    pub agent_last_active_ts: i64,
+    pub last_mail_activity_ts: Option<i64>,
+}
+
+struct StaleReservationReleaseGuard<'a> {
+    candidates: HashMap<i64, &'a StaleReservationCandidate>,
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
 }
 
 fn release_reservation_chunk_plan(
@@ -14708,8 +16335,7 @@ pub fn release_reservations<'a>(
 ///
 /// The final write transaction rechecks the owner and cutoff: candidate IDs
 /// selected before a concurrent replacement are never sufficient authority.
-/// `None` retains the ordinary direct-release behavior.
-#[allow(clippy::too_many_lines, clippy::must_use_candidate)]
+#[allow(clippy::must_use_candidate)]
 pub fn release_reservations_with_created_cutoff<'a>(
     cx: &'a Cx,
     pool: &'a DbPool,
@@ -14718,6 +16344,41 @@ pub fn release_reservations_with_created_cutoff<'a>(
     paths: Option<&'a [&'a str]>,
     reservation_ids: Option<&'a [i64]>,
     created_at_or_before: Option<i64>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
+> {
+    release_reservations_with_replay_cutoffs(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        paths,
+        reservation_ids,
+        created_at_or_before,
+        None,
+    )
+}
+
+/// Release reservations with creation and optional holder-activity cutoffs.
+///
+/// Broad durable intents carry an activity cutoff: a revived holder may have
+/// renewed old leases in place, without changing their creation times. Both
+/// cutoffs are rechecked inside the final write transaction on every retry.
+/// Direct and explicitly scoped releases pass no activity cutoff.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::must_use_candidate
+)]
+pub fn release_reservations_with_replay_cutoffs<'a>(
+    cx: &'a Cx,
+    pool: &'a DbPool,
+    project_id: i64,
+    agent_id: i64,
+    paths: Option<&'a [&'a str]>,
+    reservation_ids: Option<&'a [i64]>,
+    created_at_or_before: Option<i64>,
+    agent_last_active_at_or_before: Option<i64>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Outcome<Vec<FileReservationRow>, DbError>> + Send + 'a>,
 > {
@@ -14734,7 +16395,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                 ReleaseReservationChunkTarget::ReservationIds => {
                     if let Some(ids) = reservation_ids {
                         for chunk in ids.chunks(chunk_size) {
-                            let rows = match release_reservations_with_created_cutoff(
+                            let rows = match release_reservations_with_replay_cutoffs(
                                 cx,
                                 pool,
                                 project_id,
@@ -14742,6 +16403,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                                 paths,
                                 Some(chunk),
                                 created_at_or_before,
+                                agent_last_active_at_or_before,
                             )
                             .await
                             {
@@ -14757,7 +16419,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                 ReleaseReservationChunkTarget::Paths => {
                     if let Some(pats) = paths {
                         for chunk in pats.chunks(chunk_size) {
-                            let rows = match release_reservations_with_created_cutoff(
+                            let rows = match release_reservations_with_replay_cutoffs(
                                 cx,
                                 pool,
                                 project_id,
@@ -14765,6 +16427,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
                                 Some(chunk),
                                 reservation_ids,
                                 created_at_or_before,
+                                agent_last_active_at_or_before,
                             )
                             .await
                             {
@@ -14881,6 +16544,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
             project_id,
             agent_id,
             created_at_or_before,
+            agent_last_active_at_or_before,
         };
         let released_markers = match release_reservations_by_ids_with_constraints(
             cx,
@@ -14888,6 +16552,7 @@ pub fn release_reservations_with_created_cutoff<'a>(
             &target_ids,
             ReleaseReservationExpiryConstraint::Any,
             Some(scope),
+            None,
         )
         .await
         {
@@ -14913,18 +16578,20 @@ async fn release_reservations_by_ids_matching_expiry(
         .map_or(ReleaseReservationExpiryConstraint::Any, |cutoff| {
             ReleaseReservationExpiryConstraint::OnOrBefore(cutoff)
         });
-    release_reservations_by_ids_with_constraints(cx, pool, ids, expiry_constraint, None).await
+    release_reservations_by_ids_with_constraints(cx, pool, ids, expiry_constraint, None, None).await
 }
 
 /// Internal release primitive that supports exact-match and cutoff-based
 /// expiry guards, plus transaction-time ownership/creation checks for scoped
-/// releases and durable release replay.
+/// releases, durable release replay, and stale-cleanup evidence.
+#[allow(clippy::too_many_lines)]
 async fn release_reservations_by_ids_with_constraints(
     cx: &Cx,
     pool: &DbPool,
     ids: &[i64],
     expiry_constraint: ReleaseReservationExpiryConstraint,
     scope: Option<ReleaseReservationScope>,
+    stale_guard: Option<&StaleReservationReleaseGuard<'_>>,
 ) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
     if ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -14938,26 +16605,48 @@ async fn release_reservations_by_ids_with_constraints(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
+        // The release ledger is part of the schema (base schema and migration
+        // v14), and every active-reservation read already depends on it, so
+        // the release transaction runs no DDL of its own.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(
-                traw_execute(
-                    cx,
-                    &tracked,
-                    "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                        reservation_id INTEGER PRIMARY KEY,\
-                        released_ts INTEGER NOT NULL\
-                     )",
-                    &[],
+
+        if let Some(scope) = scope
+            && let Some(cutoff) = scope.agent_last_active_at_or_before
+        {
+            // A broad degraded closeout belongs to the session that queued it.
+            // Recheck durable activity after checkout and on every retry, in
+            // the same writer transaction as the release ledger updates. The
+            // tool/worker's earlier agent row cannot authorize later revocation.
+            let holder = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_query(
+                        cx,
+                        &tracked,
+                        "SELECT 1 FROM agents WHERE id = ? AND project_id = ? \
+                         AND last_active_ts <= ? LIMIT 1",
+                        &[
+                            Value::BigInt(scope.agent_id),
+                            Value::BigInt(scope.project_id),
+                            Value::BigInt(cutoff),
+                        ],
+                    )
+                    .await,
                 )
-                .await
-            )
-        );
+            );
+            if holder.is_empty() {
+                try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+                return Outcome::Ok(Vec::new());
+            }
+        }
 
         let mut release_marker = now_micros();
         let mut released = Vec::with_capacity(ids.len());
+        // Every check in one attempt shares the same transaction snapshot.
+        // Repeated paths for one holder need not rescan that holder's mail.
+        // This cache is recreated on every retry, never carried across commits.
+        let mut stale_activity_cache = HashMap::new();
 
         // Build the eligibility check: active reservation not already released.
         // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
@@ -14980,6 +16669,12 @@ async fn release_reservations_by_ids_with_constraints(
             if scope.created_at_or_before.is_some() {
                 check_sql.push_str(" AND created_ts <= ?");
             }
+        }
+        if stale_guard.is_some() {
+            check_sql.push_str(
+                " AND project_id = ? AND agent_id = ? AND path_pattern = ? \
+                 AND \"exclusive\" = ? AND reason = ? AND created_ts = ? AND expires_ts = ?",
+            );
         }
         check_sql.push_str(" LIMIT 1");
 
@@ -15010,6 +16705,26 @@ async fn release_reservations_by_ids_with_constraints(
                     check_params.push(Value::BigInt(cutoff));
                 }
             }
+            let stale_candidate = if let Some(guard) = stale_guard {
+                let Some(candidate) = guard.candidates.get(id).copied() else {
+                    // A stale release without its original evidence is never
+                    // an ordinary unconditional release.
+                    continue;
+                };
+                let observed = &candidate.reservation;
+                check_params.extend([
+                    Value::BigInt(observed.project_id),
+                    Value::BigInt(observed.agent_id),
+                    Value::Text(observed.path_pattern.clone()),
+                    Value::BigInt(observed.exclusive),
+                    Value::Text(observed.reason.clone()),
+                    Value::BigInt(observed.created_ts),
+                    Value::BigInt(observed.expires_ts),
+                ]);
+                Some((guard, candidate))
+            } else {
+                None
+            };
             let eligible_rows = try_in_tx!(
                 cx,
                 &tracked,
@@ -15017,6 +16732,28 @@ async fn release_reservations_by_ids_with_constraints(
             );
             if eligible_rows.is_empty() {
                 continue;
+            }
+            if let Some((guard, candidate)) = stale_candidate {
+                let activity_key = (
+                    candidate.reservation.agent_id,
+                    candidate.agent_last_active_ts,
+                    candidate.last_mail_activity_ts,
+                );
+                let activity_matches = if let Some(matches) = stale_activity_cache.get(&activity_key) {
+                    *matches
+                } else {
+                    let matches = try_in_tx!(
+                        cx,
+                        &tracked,
+                        stale_reservation_activity_still_matches(cx, &tracked, candidate, guard)
+                            .await
+                    );
+                    stale_activity_cache.insert(activity_key, matches);
+                    matches
+                };
+                if !activity_matches {
+                    continue;
+                }
             }
 
             // Step 2: Update the base reservation row first.
@@ -15046,6 +16783,147 @@ async fn release_reservations_by_ids_with_constraints(
         Outcome::Ok(released)
     })
     .await
+}
+
+/// Revalidate only database evidence while holding the release transaction.
+/// Filesystem and git probes belong outside the writer lock; their negative
+/// observations do not authorize ignoring later committed database activity.
+async fn stale_reservation_activity_still_matches(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    candidate: &StaleReservationCandidate,
+    guard: &StaleReservationReleaseGuard<'_>,
+) -> Outcome<bool, DbError> {
+    let agent_rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT project_id, last_active_ts, reaper_exempt FROM agents WHERE id = ?",
+            &[Value::BigInt(candidate.reservation.agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(agent) = agent_rows.first() else {
+        return Outcome::Ok(false);
+    };
+    let decode = || -> std::result::Result<(i64, i64, i64), DbError> {
+        Ok((
+            agent
+                .get_named("project_id")
+                .map_err(|e| map_sql_error(&e))?,
+            agent
+                .get_named("last_active_ts")
+                .map_err(|e| map_sql_error(&e))?,
+            agent
+                .get_named("reaper_exempt")
+                .map_err(|e| map_sql_error(&e))?,
+        ))
+    };
+    let (project_id, last_active_ts, reaper_exempt) = match decode() {
+        Ok(values) => values,
+        Err(error) => return Outcome::Err(error),
+    };
+    if project_id != candidate.reservation.project_id
+        || reaper_exempt != 0
+        || last_active_ts != candidate.agent_last_active_ts
+        || guard.observed_at.saturating_sub(last_active_ts) <= guard.inactivity_us
+    {
+        return Outcome::Ok(false);
+    }
+
+    // Reuse this connection: acquiring a second pooled connection here would
+    // deadlock a single-connection pool and would lose the transaction snapshot.
+    match get_agent_last_mail_activity_on_connection(
+        cx,
+        tracked,
+        candidate.reservation.agent_id,
+        project_id,
+    )
+    .await
+    {
+        Outcome::Ok(last_mail) => Outcome::Ok(
+            last_mail == candidate.last_mail_activity_ts
+                && last_mail.is_none_or(|ts| guard.observed_at.saturating_sub(ts) > guard.grace_us),
+        ),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Release stale candidates only while their observed database evidence holds.
+///
+/// Every candidate is checked again inside the authoritative release transaction:
+/// exact lease identity, expiry and intent; the same non-exempt holder and
+/// heartbeat; and unchanged send/read/ack activity. Inactivity is measured against
+/// the original observation time, including on retries. Changed evidence skips
+/// that candidate; unavailable evidence rolls back the entire batch. The returned
+/// IDs are exactly the leases whose base row and release ledger were committed.
+/// This does not make the earlier filesystem/git probes transactional.
+pub async fn release_stale_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    candidates: &[StaleReservationCandidate],
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+) -> Outcome<Vec<i64>, DbError> {
+    if inactivity_us < 0 || grace_us < 0 {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "stale reservation thresholds",
+            message: "inactivity and activity grace must be nonnegative".to_string(),
+        });
+    }
+    let mut guard = StaleReservationReleaseGuard {
+        candidates: HashMap::with_capacity(candidates.len()),
+        observed_at,
+        inactivity_us,
+        grace_us,
+    };
+    let mut ids = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let observed = &candidate.reservation;
+        let Some(id) = observed.id else {
+            return Outcome::Err(DbError::InvalidArgument {
+                field: "stale reservation candidate",
+                message: "reservation ID is missing".to_string(),
+            });
+        };
+        if observed.project_id != project_id
+            || observed.released_ts.is_some_and(|ts| ts > 0)
+            || observed.expires_ts <= observed_at
+            || guard.candidates.insert(id, candidate).is_some()
+        {
+            return Outcome::Err(DbError::InvalidArgument {
+                field: "stale reservation candidate",
+                message: format!(
+                    "reservation {id} is not a unique active lease in project {project_id}"
+                ),
+            });
+        }
+        ids.push(id);
+    }
+    match release_reservations_by_ids_with_constraints(
+        cx,
+        pool,
+        &ids,
+        ReleaseReservationExpiryConstraint::Any,
+        None,
+        Some(&guard),
+    )
+    .await
+    {
+        Outcome::Ok(markers) => Outcome::Ok(markers.into_iter().map(|marker| marker.id).collect()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 /// Renew file reservations
@@ -15078,6 +16956,12 @@ pub async fn renew_reservations(
     // only after admission, just like create_file_reservations.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
         let now = now_micros();
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[agent_id], Some(project_id)).await
+        );
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(
@@ -15229,6 +17113,387 @@ pub async fn list_file_reservations(
     .await
 }
 
+/// Complete single-message context from the server resource read pool.
+pub async fn message_context_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    id: i64,
+) -> Outcome<crate::message_context::MessageContextSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "message_context_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match crate::message_context::message_context_from_conn(&**conn, project, id, now_micros())
+        {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// Complete conversation context from the server resource read pool.
+pub async fn thread_context_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    thread: &str,
+    limit: usize,
+    since: Option<i64>,
+    include_bodies: bool,
+) -> Outcome<crate::message_context::ThreadContextSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "thread_context_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match crate::message_context::thread_context_from_conn(
+            &**conn,
+            project,
+            thread,
+            limit,
+            since,
+            include_bodies,
+            now_micros(),
+        ) {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// Maximum rows (and holder identities) in one complete reservation snapshot.
+pub const FILE_RESERVATION_SNAPSHOT_MAX_ROWS: usize = 10_000;
+/// Maximum raw string bytes and serialized JSON bytes for the snapshot resource.
+pub const FILE_RESERVATION_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum leases (and holder identities) materialized for a paged snapshot.
+pub const FILE_RESERVATION_PAGED_MAX_ROWS: usize = 100_000;
+/// Maximum raw string bytes materialized for a paged reservation snapshot.
+/// The resource must separately bound serialized pages and retained snapshots.
+pub const FILE_RESERVATION_PAGED_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct FileReservationSnapshotAgent {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+}
+
+/// Project authority, holder identities, and leases observed in one read scope.
+/// Retired identities remain available to resolve historical reservations.
+#[derive(Debug)]
+pub struct FileReservationSnapshot {
+    pub project: ProjectRow,
+    pub agents: Vec<FileReservationSnapshotAgent>,
+    pub reservations: Vec<FileReservationRow>,
+    pub captured_ts: i64,
+    pub active_only: bool,
+}
+
+/// Read the complete bounded reservation set through an already-admitted pool.
+pub async fn file_reservation_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    active_only: bool,
+) -> Outcome<FileReservationSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "file_reservation_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match file_reservation_snapshot_from_conn(&**conn, project, active_only, now_micros()) {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// Materialize a larger bounded reservation set through an admitted pool.
+///
+/// Every page must be served from this owned result: repeating reads with
+/// an offset would lose the snapshot guarantee when leases change between pages.
+pub async fn file_reservation_paged_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project: &ProjectRow,
+    active_only: bool,
+) -> Outcome<FileReservationSnapshot, DbError> {
+    run_read_with_mvcc_retry(cx, "file_reservation_paged_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match file_reservation_paged_snapshot_from_conn(&**conn, project, active_only, now_micros())
+        {
+            Ok(snapshot) => Outcome::Ok(snapshot),
+            Err(error) => Outcome::Err(error),
+        }
+    })
+    .await
+}
+
+/// A read savepoint keeps preflight bounds, identity, release state, and rows
+/// together even when another connection grants/releases leases concurrently.
+pub fn file_reservation_snapshot_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    file_reservation_snapshot_with_bounds(
+        conn,
+        expected_project,
+        active_only,
+        captured_ts,
+        FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
+        FILE_RESERVATION_SNAPSHOT_MAX_BYTES,
+    )
+}
+
+/// Capture a paged history in the same read scope used for a single snapshot.
+///
+/// The larger raw bounds do not authorize a larger wire response;
+/// callers must retain this immutable result and enforce per-page byte limits.
+pub fn file_reservation_paged_snapshot_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    file_reservation_snapshot_with_bounds(
+        conn,
+        expected_project,
+        active_only,
+        captured_ts,
+        FILE_RESERVATION_PAGED_MAX_ROWS,
+        FILE_RESERVATION_PAGED_MAX_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn file_reservation_snapshot_with_bounds(
+    conn: &impl crate::pool::SyncQuery,
+    expected_project: &ProjectRow,
+    active_only: bool,
+    captured_ts: i64,
+    max_rows: usize,
+    max_bytes: usize,
+) -> std::result::Result<FileReservationSnapshot, DbError> {
+    let row_limit = i64::try_from(max_rows)
+        .map_err(|_| DbError::Internal("invalid reservation snapshot row limit".to_string()))?;
+    let byte_limit = i64::try_from(max_bytes)
+        .map_err(|_| DbError::Internal("invalid reservation snapshot byte limit".to_string()))?;
+    let fetch_limit = row_limit
+        .checked_add(1)
+        .ok_or_else(|| DbError::Internal("invalid reservation snapshot row limit".to_string()))?;
+    let limit_error = || {
+        let bytes = if max_bytes.is_multiple_of(1024 * 1024) {
+            format!("{} MiB", max_bytes / (1024 * 1024))
+        } else {
+            format!("{max_bytes} bytes")
+        };
+        let guidance = if max_rows == FILE_RESERVATION_SNAPSHOT_MAX_ROWS
+            && max_bytes == FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            "narrow to active_only=true or use a bounded paged snapshot"
+        } else {
+            "narrow to active_only=true"
+        };
+        DbError::invalid(
+            "snapshot_limit",
+            format!(
+                "complete reservation snapshot exceeds the {max_rows}-row or {bytes} limit; {guidance}"
+            ),
+        )
+    };
+    crate::sync::with_read_snapshot(conn, || {
+        let project_id = expected_project.id.ok_or_else(|| {
+            DbError::invalid("project", "reservation snapshot requires a stored project")
+        })?;
+        let query = |sql: &str, params: &[Value]| {
+            conn.query_sync(sql, params)
+                .map_err(|error| map_sql_error(&error))
+        };
+        let project_params = [Value::BigInt(project_id)];
+        let predicate = if active_only {
+            format!(
+                " AND {} AND fr.expires_ts > ?",
+                active_reservation_predicate_for("fr")
+            )
+        } else {
+            String::new()
+        };
+        let mut reservation_params = vec![Value::BigInt(project_id)];
+        if active_only {
+            reservation_params.push(Value::BigInt(captured_ts));
+        }
+        // Preflight before materializing ANY project strings or lease bodies.
+        // COUNT alone does not bound a single pathological path/reason/name.
+        let reservation_bounds = query(
+            &format!(
+                "SELECT COUNT(*) AS row_count, COALESCE(SUM(\
+                COALESCE(length(CAST(fr.path_pattern AS BLOB)), 0) + COALESCE(length(CAST(fr.reason AS BLOB)), 0)), 0) AS raw_bytes \
+                FROM file_reservations fr WHERE fr.project_id = ?{predicate}"
+            ),
+            &reservation_params,
+        )?;
+        let agent_bounds = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(SUM(length(CAST(name AS BLOB))), 0) AS raw_bytes \
+             FROM agents WHERE project_id = ?",
+            &project_params,
+        )?;
+        let project_bounds = query(
+            "SELECT COUNT(*) AS row_count, COALESCE(SUM(COALESCE(length(CAST(slug AS BLOB)), 0) + \
+             COALESCE(length(CAST(human_key AS BLOB)), 0)), 0) AS raw_bytes FROM projects WHERE id = ?",
+            &project_params,
+        )?;
+        let mut raw_bytes = 0_i64;
+        let mut expected_counts = Vec::with_capacity(3);
+        for bounds in [&reservation_bounds, &agent_bounds, &project_bounds] {
+            let row = bounds.first().ok_or_else(|| {
+                DbError::Internal("missing reservation snapshot bounds".to_string())
+            })?;
+            let count = row
+                .get_named::<i64>("row_count")
+                .map_err(|error| map_sql_error(&error))?;
+            let bytes = row
+                .get_named::<i64>("raw_bytes")
+                .map_err(|error| map_sql_error(&error))?;
+            if count < 0 || bytes < 0 {
+                return Err(DbError::Internal(
+                    "invalid reservation snapshot bounds".to_string(),
+                ));
+            }
+            raw_bytes = raw_bytes.checked_add(bytes).ok_or_else(limit_error)?;
+            if count > row_limit || raw_bytes > byte_limit {
+                return Err(limit_error());
+            }
+            expected_counts.push(
+                usize::try_from(count)
+                    .map_err(|_| DbError::Internal("invalid snapshot count".to_string()))?,
+            );
+        }
+        let projects = query(
+            "SELECT id, slug, human_key, created_at FROM projects WHERE id = ?",
+            &project_params,
+        )?;
+        let project = projects
+            .first()
+            .ok_or_else(|| DbError::not_found("Project", project_id.to_string()))?;
+        let project = ProjectRow::from_row(project).map_err(|error| map_sql_error(&error))?;
+        if project.id != expected_project.id
+            || project.slug != expected_project.slug
+            || project.human_key != expected_project.human_key
+            || project.created_at != expected_project.created_at
+        {
+            return Err(DbError::invalid(
+                "project",
+                "project identity changed during reservation snapshot",
+            ));
+        }
+        let agents = query(
+            "SELECT id, project_id, name FROM agents WHERE project_id = ? ORDER BY id LIMIT ?",
+            &[Value::BigInt(project_id), Value::BigInt(fetch_limit)],
+        )?
+        .iter()
+        .map(|row| {
+            Ok(FileReservationSnapshotAgent {
+                id: row.get_named("id").map_err(|error| map_sql_error(&error))?,
+                project_id: row
+                    .get_named("project_id")
+                    .map_err(|error| map_sql_error(&error))?,
+                name: row
+                    .get_named("name")
+                    .map_err(|error| map_sql_error(&error))?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, DbError>>()?;
+        let released = if active_only {
+            "NULL"
+        } else {
+            // Match the historical resource's sidecar-first legacy timestamp conversion.
+            "COALESCE(rr.released_ts, CASE WHEN fr.released_ts IS NULL THEN NULL \
+             WHEN typeof(fr.released_ts) = 'text' THEN CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
+             CASE WHEN instr(fr.released_ts, '.') > 0 \
+                  THEN CAST(substr(REPLACE(fr.released_ts, 'Z', '') || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
+                  ELSE 0 END ELSE fr.released_ts END)"
+        };
+        let release_join = if active_only {
+            ""
+        } else {
+            " LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id"
+        };
+        reservation_params.push(Value::BigInt(fetch_limit));
+        let rows = query(
+            &format!(
+                "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+             fr.created_ts, fr.expires_ts, {released} AS released_ts \
+             FROM file_reservations fr{release_join} WHERE fr.project_id = ?{predicate} \
+             ORDER BY fr.created_ts, fr.id LIMIT ?"
+            ),
+            &reservation_params,
+        )?;
+        let reservations = rows
+            .iter()
+            .map(decode_file_reservation_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if reservations.len() != expected_counts[0]
+            || agents.len() != expected_counts[1]
+            || projects.len() != 1
+            || expected_counts[2] != 1
+        {
+            return Err(DbError::Internal(
+                "reservation snapshot row count changed or exceeded its bound".to_string(),
+            ));
+        }
+        // Keep the release anti-join out of a holder join: the pinned planner
+        // otherwise rescans the release ledger for every candidate (GH#180).
+        // The initial preflight already bounds all materialized strings; now
+        // bound repeated holder names before the resource clones them per row.
+        let holders: HashMap<_, _> = agents
+            .iter()
+            .map(|agent| (agent.id, agent.name.as_str()))
+            .collect();
+        for row in &reservations {
+            let name = holders
+                .get(&row.agent_id)
+                .filter(|_| row.project_id == project_id)
+                .ok_or_else(|| {
+                    DbError::invalid(
+                        "snapshot",
+                        "reservation holder is missing or belongs to another project",
+                    )
+                })?;
+            raw_bytes = raw_bytes
+                .checked_add(i64::try_from(name.len()).unwrap_or(i64::MAX))
+                .ok_or_else(limit_error)?;
+            if raw_bytes > byte_limit {
+                return Err(limit_error());
+            }
+        }
+        Ok(FileReservationSnapshot {
+            project,
+            agents,
+            reservations,
+            captured_ts,
+            active_only,
+        })
+    })
+}
+
 /// List one deterministically ordered page of file reservations.
 ///
 /// Resource handlers must use this instead of loading the historical table
@@ -15267,10 +17532,8 @@ async fn list_file_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot for active-only reads to avoid stale
-    // reservation state after a release (Bug #85) or concurrent grant.
-    // Falls back to a deferred BEGIN on query-only pools (GH#198 read
-    // surfaces), where BEGIN IMMEDIATE is a readonly-database error.
+    // Pin active rows and the release ledger to one fresh committed snapshot
+    // after a release (Bug #85) or concurrent grant, on either pool mode.
     if active_only {
         try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
     }
@@ -15493,7 +17756,7 @@ async fn list_file_reservations_once(
             };
             rows.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
         }
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     }
     result
 }
@@ -15527,8 +17790,7 @@ async fn list_unreleased_file_reservations_once(
 
     let tracked = tracked(&*conn);
 
-    // Force a fresh WAL snapshot (same rationale as get_active_reservations).
-    // On query-only pools this degrades to a deferred BEGIN.
+    // Refresh pooled observations without waiting for an unrelated writer.
     try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let sql = format!(
@@ -15642,7 +17904,7 @@ async fn list_unreleased_file_reservations_once(
         }
     };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
     result
 }
 
@@ -15679,6 +17941,16 @@ pub async fn request_contact(
 
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[from_agent_id], Some(from_project_id)).await
+        );
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[to_agent_id], Some(to_project_id)).await
+        );
 
         // FrankenConnection does not consistently support `ON CONFLICT ... DO UPDATE`.
         // Keep this path portable by doing insert-then-refresh on uniqueness conflict
@@ -15802,6 +18074,65 @@ pub async fn respond_contact(
     accept: bool,
     ttl_seconds: i64,
 ) -> Outcome<(usize, AgentLinkRow), DbError> {
+    respond_contact_with_mode(
+        cx,
+        pool,
+        from_project_id,
+        from_agent_id,
+        to_project_id,
+        to_agent_id,
+        accept,
+        ttl_seconds,
+        ContactResponseMode::Explicit,
+    )
+    .await
+}
+
+/// Automatically approve an existing request without lifting a recipient's
+/// block. The returned row is authoritative: a preserved block has zero
+/// updated rows and retains all of its original metadata.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_contact_unless_blocked(
+    cx: &Cx,
+    pool: &DbPool,
+    from_project_id: i64,
+    from_agent_id: i64,
+    to_project_id: i64,
+    to_agent_id: i64,
+    ttl_seconds: i64,
+) -> Outcome<(usize, AgentLinkRow), DbError> {
+    respond_contact_with_mode(
+        cx,
+        pool,
+        from_project_id,
+        from_agent_id,
+        to_project_id,
+        to_agent_id,
+        true,
+        ttl_seconds,
+        ContactResponseMode::Automatic,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ContactResponseMode {
+    Explicit,
+    Automatic,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn respond_contact_with_mode(
+    cx: &Cx,
+    pool: &DbPool,
+    from_project_id: i64,
+    from_agent_id: i64,
+    to_project_id: i64,
+    to_agent_id: i64,
+    accept: bool,
+    ttl_seconds: i64,
+    mode: ContactResponseMode,
+) -> Outcome<(usize, AgentLinkRow), DbError> {
     let now = now_micros();
     let status = if accept { "approved" } else { "blocked" };
     let expires = if ttl_seconds > 0 && accept {
@@ -15820,6 +18151,16 @@ pub async fn respond_contact(
 
         let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[from_agent_id], Some(from_project_id)).await
+        );
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[to_agent_id], Some(to_project_id)).await
+        );
 
         let existing_sql = format!(
             "{AGENT_LINK_SELECT_COLUMNS_SQL} \
@@ -15852,10 +18193,6 @@ pub async fn respond_contact(
                 return Outcome::Err(e);
             }
         };
-        row.status = status.to_string();
-        row.updated_ts = now;
-        row.expires_ts = expires;
-
         let Some(link_id) = row.id else {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::invalid(
@@ -15863,6 +18200,20 @@ pub async fn respond_contact(
                 "existing agent_link row has NULL id",
             ));
         };
+        // The macro's earlier request result cannot authorize this update:
+        // the recipient may have blocked the link while approval was queued.
+        // Recheck inside every transaction attempt, after endpoint validation.
+        // An explicit recipient decision retains its ability to lift a block.
+        if matches!(mode, ContactResponseMode::Automatic)
+            && row.status.eq_ignore_ascii_case("blocked")
+        {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok((0, row));
+        }
+        row.status = status.to_string();
+        row.updated_ts = now;
+        row.expires_ts = expires;
+
         let update_sql =
             "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? WHERE id = ?";
         let update_params = [
@@ -16460,6 +18811,7 @@ pub async fn force_release_reservation(
         &[reservation_id],
         expiry_constraint,
         None,
+        None,
     )
     .await
     {
@@ -16477,6 +18829,9 @@ pub async fn force_release_reservation(
 /// - Messages acknowledged by the agent (`ack_ts`)
 /// - Messages read by the agent (`read_ts`)
 ///
+/// Read/ack activity includes the agent's own shared-project mailbox receipts.
+/// An unread delivery by itself is not activity by the recipient.
+///
 /// Returns the maximum of all these timestamps, or `None` if no activity found.
 pub async fn get_agent_last_mail_activity(
     cx: &Cx,
@@ -16492,35 +18847,91 @@ pub async fn get_agent_last_mail_activity(
     };
 
     let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+    let last_mail = try_in_tx!(
+        cx,
+        &tracked,
+        get_agent_last_mail_activity_on_connection(cx, &tracked, agent_id, project_id).await
+    );
+    try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+    Outcome::Ok(last_mail)
+}
 
-    // Check messages sent, read, and acked in a single combined query to reduce round-trips
-    let sql = "
-        SELECT MAX(latest_ts) FROM (
-            SELECT MAX(created_ts) as latest_ts FROM messages WHERE sender_id = ? AND project_id = ?
+async fn get_agent_last_mail_activity_on_connection(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    project_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    // Both observations and the authoritative release check use the same
+    // definition of activity. Shared receipts are per-agent actions; another
+    // recipient's receipt or an unread project delivery must not keep a lease.
+    let direct_arms = "
+            SELECT MAX(created_ts) AS latest_ts FROM messages WHERE sender_id = ? AND project_id = ?
             UNION ALL
-            SELECT MAX(MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0))) as latest_ts
+            SELECT MAX(MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0))) AS latest_ts
             FROM message_recipients r
             JOIN messages m ON m.id = r.message_id
             WHERE r.agent_id = ? AND m.project_id = ?
-        )
     ";
+    let sql = format!(
+        "SELECT MAX(latest_ts) FROM ({direct_arms} \
+         UNION ALL \
+         SELECT MAX(MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0))) AS latest_ts \
+         FROM project_mailbox_receipts r \
+         JOIN project_mailbox_deliveries d ON d.message_id = r.message_id \
+         JOIN messages m ON m.id = d.message_id AND m.project_id = d.project_id \
+         WHERE r.agent_id = ? AND d.project_id = ?)"
+    );
     let params = [
         Value::BigInt(agent_id),
         Value::BigInt(project_id),
         Value::BigInt(agent_id),
         Value::BigInt(project_id),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
     ];
-    let max_ts = match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().and_then(|r| {
-            r.get(0).and_then(|v| match v {
-                Value::BigInt(n) if *n > 0 => Some(*n),
-                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                _ => None,
-            })
-        }),
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    let rows = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => {
+            // Only explicit pre-upgrade absence may omit shared activity.
+            // Retained receipts/deliveries/events or an unreadable schema
+            // invalidate that fallback, even for a different project.
+            if !error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("no such table:")
+            {
+                return Outcome::Err(error);
+            }
+            if let Err(error) = crate::project_mailbox::allow_absent_shared_schema(
+                tracked.inner,
+                &error.to_string(),
+            ) {
+                return Outcome::Err(error);
+            }
+            let legacy_sql = format!("SELECT MAX(latest_ts) FROM ({direct_arms})");
+            match map_sql_outcome(traw_query(cx, tracked, &legacy_sql, &params[..4]).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let max_ts = match rows.first().and_then(|row| row.get(0)) {
+        Some(Value::Null) => None,
+        Some(Value::BigInt(value)) => (*value > 0).then_some(*value),
+        Some(Value::Int(value)) => (*value > 0).then_some(i64::from(*value)),
+        // Unreadable evidence cannot mean "no activity": cleanup and
+        // force-release use this result to decide whether a lease is live.
+        other => {
+            return Outcome::Err(DbError::Internal(format!(
+                "invalid mail activity timestamp for agent {agent_id} in project {project_id}: {other:?}"
+            )));
+        }
     };
 
     Outcome::Ok(max_ts)
@@ -17059,9 +19470,11 @@ pub struct UnackedInboxRow {
 
 /// Fetch ack-required messages for a specific agent that have NOT been acknowledged.
 ///
-/// Returns messages ordered by `created_ts` ascending (oldest first), limited to
-/// `limit` rows. Each row includes the recipient `read_ts` so callers can report
-/// whether the message was at least read even if not acked.
+/// Direct and visible shared-project deliveries share one oldest-first window,
+/// ordered by creation time and message ID and limited to the requested count.
+/// A direct delivery takes precedence over the same message's project delivery,
+/// including its acknowledgement state. Each row carries the viewer's own read
+/// timestamp; this read never creates shared receipts or marks messages read.
 #[allow(clippy::too_many_lines)]
 pub async fn fetch_unacked_for_agent(
     cx: &Cx,
@@ -17083,117 +19496,89 @@ pub async fn fetch_unacked_for_agent(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+    let direct = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
-                  r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
+                  r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts, \
+                  s.display_name AS sender_display_name \
            FROM message_recipients r \
            JOIN messages m ON m.id = r.message_id \
            LEFT JOIN agents s ON s.id = m.sender_id \
            WHERE r.agent_id = ? AND m.project_id = ? \
-             AND m.ack_required = 1 AND r.ack_ts IS NULL \
-           ORDER BY m.created_ts ASC \
-           LIMIT ?"
+             AND m.ack_required = 1 AND r.ack_ts IS NULL"
     );
-
-    let params: Vec<Value> = vec![
+    let visibility = crate::project_mailbox::visible_to_viewer_sql!();
+    let shared = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+                m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+                'project' AS kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+                pr.read_ts, pr.ack_ts, s.display_name AS sender_display_name \
+         FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         JOIN agents viewer ON viewer.id = ? \
+         LEFT JOIN agents s ON s.id = m.sender_id \
+         LEFT JOIN project_mailbox_receipts pr \
+                ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+         WHERE d.project_id = ? AND {visibility} \
+           AND m.ack_required = 1 AND pr.ack_ts IS NULL"
+    );
+    // One statement observes both delivery kinds and their receipts together.
+    // As in the product inbox, render the validated integer limit: the pinned
+    // compound-select executor does not bind LIMIT parameters.
+    let sql =
+        format!("{direct} UNION ALL {shared} ORDER BY created_ts ASC, id ASC LIMIT {limit_i64}");
+    let params = [
         Value::BigInt(agent_id),
         Value::BigInt(project_id),
-        Value::BigInt(limit_i64),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
     ];
-
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_as(0) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let proj_id: i64 = match row.get_as(1) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_id: i64 = match row.get_as(2) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let thread_id: Option<String> = match row.get_as(3) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let topic: Option<String> = match row.get_as(4) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let subject: String = match row.get_as(5) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let body_md: String = match row.get_as(6) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let importance: String = match row.get_as(7) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let ack_required: i64 = match row.get_as(8) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let created_ts: i64 = match row.get_as(9) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let recipients_json: String = match row.get_as(10) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let attachments: String = match row.get_as(11) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let kind: String = match row.get_as(12) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_name: String = match row.get_as(13) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let read_ts: Option<i64> = match row.get_as(14) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-
-                out.push(UnackedInboxRow {
-                    message: MessageRow {
-                        id: Some(id),
-                        project_id: proj_id,
-                        sender_id,
-                        thread_id,
-                        topic,
-                        subject,
-                        body_md,
-                        importance,
-                        ack_required,
-                        created_ts,
-                        recipients_json,
-                        attachments,
-                    },
-                    kind,
-                    sender_name,
-                    read_ts,
-                });
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            // Only a genuinely pre-upgrade mailbox may fall back to direct
+            // mail. Retained shared receipts/events or a broken schema must
+            // never turn pending acknowledgements into an empty success.
+            if let Err(error) =
+                crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+            {
+                return Outcome::Err(error);
             }
-            Outcome::Ok(out)
+            let direct = format!("{direct} ORDER BY m.created_ts ASC, m.id ASC LIMIT ?");
+            let params = [
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(limit_i64),
+            ];
+            match map_sql_outcome(traw_query(cx, &tracked, &direct, &params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_inbox_row_indexed(&row) {
+            Ok(row) => out.push(UnackedInboxRow {
+                message: row.message,
+                kind: row.kind,
+                sender_name: row.sender_name,
+                read_ts: row.read_ts,
+            }),
+            Err(error) => return Outcome::Err(error),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Insert a raw agent row without name validation (for ops/system agents).
@@ -17340,22 +19725,19 @@ pub async fn insert_experience(
     let state = row.state;
     let subsystem = row.subsystem;
     let effect_kind = row.effect_kind;
-    let feature_vector_size = experience_feature_vector_size(&row);
-    let project_key = row.project_key.clone().unwrap_or_default();
-
     if let Err(error) = validate_experience_row_for_insert(&row) {
         tracing::warn!(
             requested_experience_id,
             state = %state,
             subsystem = %subsystem,
             effect_kind = %effect_kind,
-            feature_vector_size,
-            project_key,
             error = %error,
             "atc.db.insert_experience rejected invalid row"
         );
         return Outcome::Err(error);
     }
+
+    let feature_vector_size = experience_feature_vector_size(&row);
 
     let started = std::time::Instant::now();
     match append_atc_experience(cx, pool, &row).await {
@@ -17381,7 +19763,6 @@ pub async fn insert_experience(
                 subsystem = %subsystem,
                 effect_kind = %effect_kind,
                 feature_vector_size,
-                project_key,
                 error = %error,
                 "atc.db.insert_experience failed"
             );
@@ -17397,6 +19778,17 @@ pub async fn append_atc_experience(
     pool: &DbPool,
     row: &ExperienceRow,
 ) -> Outcome<ExperienceRow, DbError> {
+    // Production callers use this API directly, bypassing insert_experience.
+    // Validate before pool initialization, feature migration, cloning or JSON
+    // encoding in either backend. Valid duplicate inputs still reselect the
+    // first row without changing it.
+    if let Err(error) = validate_atc_content(
+        "append_atc_experience",
+        Some(row.state),
+        row.validate_content(),
+    ) {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -17582,6 +19974,7 @@ async fn transition_atc_experience_tx(
     ts_micros: i64,
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
+    dispatch_if_planned: bool,
 ) -> Outcome<(), DbError> {
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
 
@@ -17614,85 +20007,17 @@ async fn transition_atc_experience_tx(
         }
     };
 
-    if experience.state != new_state
-        && let Err(reason) = validate_transition(experience.state, new_state)
-    {
+    if let Err(error) = prepare_atc_experience_transition(
+        &mut experience,
+        new_state,
+        ts_micros,
+        non_execution_reason,
+        context_patch,
+        dispatch_if_planned,
+    ) {
         rollback_tx(cx, tracked).await;
-        return Outcome::Err(DbError::invalid(
-            "state",
-            format!(
-                "experience {experience_id} cannot transition from {} to {}: {reason}",
-                experience.state, new_state
-            ),
-        ));
+        return Outcome::Err(error);
     }
-
-    if non_execution_reason.is_some() && !new_state.is_non_execution() {
-        rollback_tx(cx, tracked).await;
-        return Outcome::Err(DbError::invalid(
-            "non_execution_reason",
-            format!(
-                "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
-            ),
-        ));
-    }
-    if new_state.is_non_execution()
-        && experience.state != new_state
-        && non_execution_reason.is_none()
-    {
-        rollback_tx(cx, tracked).await;
-        return Outcome::Err(DbError::invalid(
-            "non_execution_reason",
-            format!("non_execution_reason is required when transitioning to {new_state}"),
-        ));
-    }
-
-    if let Err(reason) = experience.transition_to(new_state) {
-        rollback_tx(cx, tracked).await;
-        return Outcome::Err(DbError::invalid(
-            "state",
-            format!("experience {experience_id} transition failed: {reason}"),
-        ));
-    }
-
-    match new_state {
-        ExperienceState::Planned => {}
-        ExperienceState::Dispatched => {
-            if experience.dispatched_ts_micros.is_none() {
-                experience.dispatched_ts_micros = Some(ts_micros);
-            }
-        }
-        ExperienceState::Executed
-        | ExperienceState::Failed
-        | ExperienceState::Throttled
-        | ExperienceState::Suppressed
-        | ExperienceState::Skipped => {
-            if experience.executed_ts_micros.is_none() {
-                experience.executed_ts_micros = Some(ts_micros);
-            }
-        }
-        ExperienceState::Open => {}
-        ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
-            if experience.resolved_ts_micros.is_none() {
-                experience.resolved_ts_micros = Some(ts_micros);
-            }
-        }
-    }
-
-    if new_state.is_non_execution() {
-        if let Some(reason) = non_execution_reason {
-            experience.non_execution_reason = Some(reason.clone());
-        }
-    } else {
-        experience.non_execution_reason = None;
-    }
-    experience.context = match merge_context_patch(experience.context.take(), context_patch) {
-        Ok(value) => value,
-        Err(error) => {
-            rollback_tx(cx, tracked).await;
-            return Outcome::Err(error);
-        }
-    };
 
     let non_exec_json =
         match encode_json_optional(&experience.non_execution_reason, "non_execution_json") {
@@ -17749,8 +20074,8 @@ async fn transition_atc_experience_tx(
 /// state machine: invalid transitions (e.g., `Resolved → Planned`) return
 /// an error.
 ///
-/// **Idempotent**: Same-state transitions succeed without mutation (the
-/// state machine treats `(S, S)` as a no-op).
+/// **Idempotent lifecycle**: Same-state transitions retain existing timestamps,
+/// while still validating and applying any supplied context/reason amendment.
 ///
 /// # Parameters
 ///
@@ -17771,6 +20096,78 @@ pub async fn transition_atc_experience(
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
 ) -> Outcome<(), DbError> {
+    transition_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        new_state,
+        ts_micros,
+        non_execution_reason,
+        context_patch,
+        false,
+    )
+    .await
+}
+
+/// Record execution metadata and its lifecycle steps atomically.
+///
+/// A planned experience first advances through Dispatched in memory; its
+/// execution state, timestamps, reason and merged context commit together.
+/// Invalid content leaves even the dispatch timestamp unchanged.
+pub async fn record_atc_execution_outcome(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    new_state: ExperienceState,
+    ts_micros: i64,
+    non_execution_reason: Option<&NonExecutionReason>,
+    context_patch: Option<&serde_json::Value>,
+) -> Outcome<(), DbError> {
+    if !matches!(
+        new_state,
+        ExperienceState::Executed
+            | ExperienceState::Failed
+            | ExperienceState::Throttled
+            | ExperienceState::Suppressed
+            | ExperienceState::Skipped
+    ) {
+        return Outcome::Err(DbError::invalid(
+            "state",
+            "expected an execution result state",
+        ));
+    }
+    transition_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        new_state,
+        ts_micros,
+        non_execution_reason,
+        context_patch,
+        true,
+    )
+    .await
+}
+
+async fn transition_atc_experience_inner(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    new_state: ExperienceState,
+    ts_micros: i64,
+    non_execution_reason: Option<&NonExecutionReason>,
+    context_patch: Option<&serde_json::Value>,
+    dispatch_if_planned: bool,
+) -> Outcome<(), DbError> {
+    // Reject before initializing a sidecar, cloning a reason, or merging JSON.
+    let content_check = non_execution_reason
+        .map_or(Ok(()), NonExecutionReason::validate_content)
+        .and_then(|()| context_patch.map_or(Ok(()), validate_atc_context));
+    if let Err(error) =
+        validate_atc_content("transition_atc_experience", Some(new_state), content_check)
+    {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -17785,6 +20182,7 @@ pub async fn transition_atc_experience(
             ts_micros,
             non_execution_reason,
             context_patch,
+            dispatch_if_planned,
         ) {
             Ok(()) => Outcome::Ok(()),
             Err(error) => Outcome::Err(error),
@@ -17819,6 +20217,7 @@ pub async fn transition_atc_experience(
                 ts_micros,
                 non_execution_reason,
                 context_patch,
+                dispatch_if_planned,
             )
             .await
         })
@@ -17851,6 +20250,7 @@ pub async fn transition_atc_experience(
                             ts_micros,
                             non_execution_reason,
                             context_patch,
+                            dispatch_if_planned,
                         )
                         .await
                     })
@@ -18009,11 +20409,99 @@ pub async fn fetch_message_sent_atc_experience(
     }
 }
 
+/// The durable effect of applying one message acknowledgement/read observation.
+///
+/// Callers must use this receipt, rather than a previously fetched row, when
+/// recording resolution metrics or reporting an acknowledgement upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtcMessageOutcomeUpdate {
+    /// The experience entered Resolved for the first time.
+    Resolved,
+    /// Acknowledgement replaced a resolved read observation.
+    AcknowledgedAfterRead,
+    /// Acknowledgement replaced a resolved overdue observation.
+    AcknowledgedAfterOverdue,
+    /// A replay or lower-priority observation left the row untouched.
+    Unchanged,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtcOutcomeResolutionPolicy {
+    OpenOnly,
+    Observed,
+    Message,
+}
+
+impl AtcOutcomeResolutionPolicy {
+    const fn api(self) -> &'static str {
+        match self {
+            Self::OpenOnly => "resolve_atc_experience",
+            Self::Observed => "resolve_atc_observed_outcome",
+            Self::Message => "resolve_atc_message_outcome",
+        }
+    }
+}
+
+/// Decide from the same transaction snapshot that will receive the outcome.
+/// Generic resolvers retain first-resolution-wins; only message feedback can
+/// upgrade read/overdue to acknowledged, and an acknowledged replay is a no-op.
+fn atc_outcome_resolution_update(
+    experience: &ExperienceRow,
+    outcome: &ExperienceOutcome,
+    policy: AtcOutcomeResolutionPolicy,
+) -> std::result::Result<AtcMessageOutcomeUpdate, DbError> {
+    validate_atc_content(
+        policy.api(),
+        Some(experience.state),
+        experience.validate_content_with_outcome(outcome),
+    )?;
+    if policy == AtcOutcomeResolutionPolicy::Message && experience.decision_class != "message_sent"
+    {
+        return Err(DbError::invalid(
+            "decision_class",
+            "message outcome requires a message_sent experience",
+        ));
+    }
+
+    match experience.state {
+        ExperienceState::Open => Ok(AtcMessageOutcomeUpdate::Resolved),
+        ExperienceState::Executed if policy != AtcOutcomeResolutionPolicy::OpenOnly => {
+            Ok(AtcMessageOutcomeUpdate::Resolved)
+        }
+        ExperienceState::Resolved => {
+            if policy == AtcOutcomeResolutionPolicy::Message
+                && outcome.label == "acknowledged"
+                && let Some(previous) = &experience.outcome
+            {
+                if previous.label.eq_ignore_ascii_case("read") {
+                    return Ok(AtcMessageOutcomeUpdate::AcknowledgedAfterRead);
+                }
+                if previous.label.eq_ignore_ascii_case("ack_overdue") {
+                    return Ok(AtcMessageOutcomeUpdate::AcknowledgedAfterOverdue);
+                }
+            }
+            Ok(AtcMessageOutcomeUpdate::Unchanged)
+        }
+        current_state => Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {} is {current_state}, must be open{} to resolve",
+                experience.experience_id,
+                if policy == AtcOutcomeResolutionPolicy::OpenOnly {
+                    ""
+                } else {
+                    " or executed"
+                },
+            ),
+        )),
+    }
+}
+
 /// Resolve an ATC experience with an observed outcome.
 ///
 /// Transitions the experience from `open` to `resolved` and stores the
-/// outcome data. Callers that still hold an `executed` row must first
-/// promote it to `open` via `transition_atc_experience`. This is the
+/// outcome data. Callers that still hold an `executed` row can use
+/// `resolve_atc_observed_outcome` to promote and resolve atomically. This is the
 /// terminal attribution step for message-driven experiences.
 ///
 /// **Idempotent**: Resolving an already-resolved experience succeeds
@@ -18024,6 +20512,88 @@ pub async fn resolve_atc_experience(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::OpenOnly,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Persist an observed outcome atomically, including Executed → Open when needed.
+///
+/// Rejected content cannot leave the lifecycle partially advanced.
+/// Open experiences resolve normally; valid already-resolved replays are no-ops.
+pub async fn resolve_atc_observed_outcome(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    outcome: &ExperienceOutcome,
+) -> Outcome<(), DbError> {
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::Observed,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Apply `read`, `acknowledged`, or `ack_overdue` to a `message_sent` experience.
+///
+/// The transaction both selects the current row and decides precedence:
+/// Executed/Open resolve, and acknowledged upgrades a resolved read/overdue.
+/// A later read, overdue observation, or duplicate acknowledgement cannot
+/// replace the first acknowledged payload or its timestamp. Other terminal
+/// outcomes retain their original result; non-resolvable states are refused.
+/// Content and aggregate bounds apply before precedence, including no-op
+/// candidates. Returned effects describe committed changes only.
+pub async fn resolve_atc_message_outcome(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    outcome: &ExperienceOutcome,
+) -> Outcome<AtcMessageOutcomeUpdate, DbError> {
+    resolve_atc_experience_inner(
+        cx,
+        pool,
+        experience_id,
+        outcome,
+        AtcOutcomeResolutionPolicy::Message,
+    )
+    .await
+}
+
+async fn resolve_atc_experience_inner(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    outcome: &ExperienceOutcome,
+    policy: AtcOutcomeResolutionPolicy,
+) -> Outcome<AtcMessageOutcomeUpdate, DbError> {
+    if let Err(error) = validate_atc_content(
+        policy.api(),
+        Some(ExperienceState::Resolved),
+        outcome.validate_content(),
+    ) {
+        return Outcome::Err(error);
+    }
+    if policy == AtcOutcomeResolutionPolicy::Message
+        && !matches!(
+            outcome.label.as_str(),
+            "read" | "acknowledged" | "ack_overdue"
+        )
+    {
+        return Outcome::Err(DbError::invalid(
+            "outcome",
+            "unsupported message outcome label",
+        ));
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -18031,8 +20601,8 @@ pub async fn resolve_atc_experience(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
-        return match resolve_atc_experience_file_backed(pool, experience_id, outcome) {
-            Ok(()) => Outcome::Ok(()),
+        return match resolve_atc_experience_file_backed(pool, experience_id, outcome, policy) {
+            Ok(update) => Outcome::Ok(update),
             Err(error) => Outcome::Err(error),
         };
     }
@@ -18051,74 +20621,64 @@ pub async fn resolve_atc_experience(
         Err(error) => return Outcome::Err(error),
     };
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    // Only update rows that are in `open` state. The state machine
-    // requires Executed → Open before Open → Resolved. The caller
-    // must ensure the Executed → Open transition happens first (e.g.,
-    // via the resolution sweep). A zero-row update is treated as a
-    // follow-up state read so stale callers cannot report false success
-    // for missing or non-open rows.
-    let sql = "UPDATE atc_experiences \
-               SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
-               WHERE experience_id = ? AND state = 'open'";
-
-    let params = vec![
-        Value::BigInt(outcome.observed_ts_micros),
-        Value::Text(outcome_json),
-        Value::BigInt(id),
-    ];
-
-    match traw_execute(cx, &tracked, sql, &params).await {
-        Outcome::Ok(rows_affected) => {
-            if rows_affected > 0 {
-                return Outcome::Ok(());
+    run_with_mvcc_retry(cx, policy.api(), || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &[Value::BigInt(id)]).await)
+        );
+        let experience = match rows.first().map(decode_atc_experience_row).transpose() {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
             }
-
-            match traw_query(
-                cx,
-                &tracked,
-                "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
-                &[Value::BigInt(id)],
-            )
-            .await
-            {
-                Outcome::Ok(rows) => {
-                    let state = match rows
-                        .first()
-                        .map(|row| {
-                            row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state"))
-                        })
-                        .transpose()
-                    {
-                        Ok(state) => state,
-                        Err(error) => return Outcome::Err(error),
-                    };
-                    match resolve_atc_experience_noop_result(state, experience_id) {
-                        Ok(()) => Outcome::Ok(()),
-                        Err(error) => Outcome::Err(error),
-                    }
-                }
-                Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
-                    "failed to inspect experience {experience_id} after resolve no-op: {error}"
-                ))),
-                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        };
+        let Some(experience) = experience else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
+        };
+        let update = match atc_outcome_resolution_update(&experience, outcome, policy) {
+            Ok(update) => update,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
             }
+        };
+        if update == AtcMessageOutcomeUpdate::Unchanged {
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            return Outcome::Ok(update);
         }
-        Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
-            "failed to resolve experience {experience_id}: {error}"
-        ))),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
+        // The aggregate budget is checked against the same snapshot that is
+        // updated, so concurrent context amendments cannot bypass it.
+        let sql = "UPDATE atc_experiences \
+                   SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
+                   WHERE experience_id = ? AND state = ?";
+        let params = [
+            Value::BigInt(outcome.observed_ts_micros),
+            Value::Text(outcome_json.clone()),
+            Value::BigInt(id),
+            Value::Text(experience.state.to_string()),
+        ];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(update)
+    })
+    .await
 }
 
 /// Overwrite the outcome payload for an already-resolved ATC experience.
@@ -18133,6 +20693,13 @@ pub async fn overwrite_resolved_atc_experience_outcome(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
+    if let Err(error) = validate_atc_content(
+        "overwrite_resolved_atc_experience_outcome",
+        Some(ExperienceState::Resolved),
+        outcome.validate_content(),
+    ) {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -18174,6 +20741,8 @@ pub async fn overwrite_resolved_atc_experience_outcome(
     let tracked = tracked(&*conn);
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
         let rows = try_in_tx!(
             cx,
             &tracked,
@@ -18181,7 +20750,7 @@ pub async fn overwrite_resolved_atc_experience_outcome(
                 traw_query(
                     cx,
                     &tracked,
-                    "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
+                    &select_sql,
                     &[Value::BigInt(id)],
                 )
                 .await,
@@ -18191,14 +20760,14 @@ pub async fn overwrite_resolved_atc_experience_outcome(
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
         };
-        let current_state: ExperienceState =
-            match row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state")) {
-                Ok(state) => state,
-                Err(error) => {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(error);
-                }
-            };
+        let experience = match decode_atc_experience_row(row) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        let current_state = experience.state;
         if current_state != ExperienceState::Resolved {
             rollback_tx(cx, &tracked).await;
             return Outcome::Err(DbError::invalid(
@@ -18207,6 +20776,14 @@ pub async fn overwrite_resolved_atc_experience_outcome(
                     "experience {experience_id} is {current_state}, must be resolved to overwrite outcome"
                 ),
             ));
+        }
+        if let Err(error) = validate_atc_content(
+            "overwrite_resolved_atc_experience_outcome",
+            Some(current_state),
+            experience.validate_content_with_outcome(outcome),
+        ) {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
         }
 
         try_in_tx!(
@@ -18252,6 +20829,15 @@ pub async fn resolve_experience(
     experience_id: u64,
     resolution: &ResolutionKind,
 ) -> Outcome<(), DbError> {
+    if let ResolutionKind::Resolved(outcome) = resolution
+        && let Err(error) = validate_atc_content(
+            "resolve_experience",
+            Some(ExperienceState::Resolved),
+            outcome.validate_content(),
+        )
+    {
+        return Outcome::Err(error);
+    }
     if pool.sqlite_path() != ":memory:" {
         match ensure_file_backed_atc_pool_initialized(cx, pool).await {
             Outcome::Ok(()) => {}
@@ -18274,100 +20860,82 @@ pub async fn resolve_experience(
         }
     };
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    let select_sql = "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
-    let rows = match traw_query(cx, &tracked, select_sql, &[Value::BigInt(id)]).await {
-        Outcome::Ok(r) => r,
-        Outcome::Err(error) => {
-            return Outcome::Err(DbError::Internal(format!(
-                "resolve_experience select failed: {error}"
-            )));
-        }
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let row = match rows.first() {
-        Some(r) => r,
-        None => {
-            return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
-        }
-    };
-
-    let current_state: ExperienceState =
-        match row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state")) {
-            Ok(s) => s,
-            Err(e) => return Outcome::Err(e),
+    run_with_mvcc_retry(cx, "resolve_experience", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-
-    let target = resolution.target_state();
-
-    if current_state == target {
-        return Outcome::Ok(());
-    }
-    if current_state.is_terminal() {
-        return Outcome::Err(DbError::invalid(
-            "state",
-            format!(
-                "experience {experience_id} already terminal as {current_state}, \
-                 cannot re-resolve as {target}"
-            ),
-        ));
-    }
-    if current_state != ExperienceState::Open {
-        return Outcome::Err(DbError::invalid(
-            "state",
-            format!("experience {experience_id} is {current_state}, must be open to resolve"),
-        ));
-    }
-
-    let (sql, params) = match resolution {
-        ResolutionKind::Resolved(outcome) => {
-            let outcome_json = match encode_json(outcome, "outcome_json") {
-                Ok(v) => v,
-                Err(e) => return Outcome::Err(e),
-            };
-            (
-                "UPDATE atc_experiences \
-                 SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
-                 WHERE experience_id = ?",
-                vec![
-                    Value::BigInt(outcome.observed_ts_micros),
-                    Value::Text(outcome_json),
-                    Value::BigInt(id),
-                ],
-            )
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &[Value::BigInt(id)]).await)
+        );
+        let Some(row) = rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
+        };
+        let needs_update = decode_atc_experience_row(row)
+            .and_then(|experience| validate_atc_resolution(&experience, resolution));
+        match needs_update {
+            Ok(true) => {}
+            Ok(false) => {
+                try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+                return Outcome::Ok(());
+            }
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
         }
-        ResolutionKind::Censored { ts_micros } => (
-            "UPDATE atc_experiences \
-             SET state = 'censored', resolved_ts = ? \
-             WHERE experience_id = ?",
-            vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
-        ),
-        ResolutionKind::Expired { ts_micros } => (
-            "UPDATE atc_experiences \
-             SET state = 'expired', resolved_ts = ? \
-             WHERE experience_id = ?",
-            vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
-        ),
-    };
 
-    match traw_execute(cx, &tracked, sql, &params).await {
-        Outcome::Ok(_) => Outcome::Ok(()),
-        Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
-            "failed to resolve experience {experience_id}: {error}"
-        ))),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
+        let (sql, params) = match resolution {
+            ResolutionKind::Resolved(outcome) => {
+                let outcome_json = match encode_json(outcome, "outcome_json") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(error);
+                    }
+                };
+                (
+                    "UPDATE atc_experiences \
+                     SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
+                     WHERE experience_id = ? AND state = 'open'",
+                    vec![
+                        Value::BigInt(outcome.observed_ts_micros),
+                        Value::Text(outcome_json),
+                        Value::BigInt(id),
+                    ],
+                )
+            }
+            ResolutionKind::Censored { ts_micros } => (
+                "UPDATE atc_experiences \
+                 SET state = 'censored', resolved_ts = ? \
+                 WHERE experience_id = ? AND state = 'open'",
+                vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
+            ),
+            ResolutionKind::Expired { ts_micros } => (
+                "UPDATE atc_experiences \
+                 SET state = 'expired', resolved_ts = ? \
+                 WHERE experience_id = ? AND state = 'open'",
+                vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
+            ),
+        };
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(())
+    })
+    .await
 }
 
 /// Update rollup statistics for an ATC experience stratum on resolution.
@@ -19028,6 +21596,420 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[test]
+    fn reservation_snapshot_is_complete_readonly_and_preserves_retired_holders() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-snapshot")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES (1, {project_id}, 'RetiredHolder', 'test', 'test', 1, 1, 2); BEGIN"
+            )).unwrap();
+            for id in 1..=300 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     VALUES ({id}, {project_id}, 1, 'src/{id}.rs', 1, 'snapshot', {id}, 1000)"
+                )).unwrap();
+            }
+            conn.execute_raw("INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 450); COMMIT; PRAGMA query_only=ON; BEGIN").unwrap();
+            let active = file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
+            assert_eq!(active.reservations.len(), 299);
+            assert_eq!(active.agents[0].name, "RetiredHolder");
+            assert!(active.reservations.iter().all(|row| row.id != Some(1)));
+            let history = file_reservation_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(history.reservations.len(), 300);
+            assert_eq!(history.reservations[0].released_ts, Some(450));
+            // The nested read savepoint releases only itself, preserving the
+            // caller's transaction and query-only setting.
+            conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            let mut rebound = project.clone();
+            rebound.created_at += 1;
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &rebound, false, 500),
+                Err(DbError::InvalidArgument { field: "project", .. })
+            ));
+            conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (99, 'foreign-snapshot', '/tmp/foreign-snapshot', 1); \
+                INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (99, 99, 'ForeignHolder', 'test', 'test', 1, 1); \
+                UPDATE file_reservations SET agent_id = 99 WHERE id = 2").unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot", .. })
+            ));
+            assert!(matches!(
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot", .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn reservation_snapshot_bounds_payloads_before_returning_rows() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot_bounds.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-snapshot-bounds")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, '', 1, 1000)"
+            )).unwrap();
+            conn.execute_sync("UPDATE file_reservations SET reason = ? WHERE id = 1",
+                &[Value::Text("x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1))]).unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", message })
+                    if message.contains("4 MiB")
+            ));
+            let paged = file_reservation_paged_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
+            assert_eq!(paged.reservations.len(), 1);
+            assert_eq!(paged.reservations[0].reason.len(), FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1);
+            conn.execute_raw("UPDATE file_reservations SET reason = ''; BEGIN").unwrap();
+            for _ in 0..14 {
+                conn.execute_raw(
+                    "INSERT INTO file_reservations (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts FROM file_reservations"
+                ).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", message })
+                    if message.contains("10000-row")
+            ));
+        });
+    }
+
+    #[test]
+    fn reservation_paged_snapshot_reads_more_than_ten_thousand_history_rows() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_large.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-large")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let empty =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert!(empty.reservations.is_empty());
+            assert!(empty.agents.is_empty());
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts, retired_at) \
+                 VALUES (1, {project_id}, 'RetiredHolder', 'test', 'test', 1, 1, 2); BEGIN; \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, '', 1, 1000, 400)"
+            )).unwrap();
+            for _ in 0..13 {
+                conn.execute_raw(
+                    "INSERT INTO file_reservations \
+                     (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                     SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+                     FROM file_reservations"
+                ).unwrap();
+            }
+            conn.execute_raw(
+                "INSERT INTO file_reservations \
+                 (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 SELECT project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
+                 FROM file_reservations ORDER BY id LIMIT 1808; \
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 450); COMMIT"
+            ).unwrap();
+            let at_limit =
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(at_limit.reservations.len(), FILE_RESERVATION_SNAPSHOT_MAX_ROWS);
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (10001, {project_id}, 1, 'src/active.rs', 1, 'active', 1, 1000); \
+                 PRAGMA query_only=ON; BEGIN"
+            )).unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_from_conn(&**conn, &project, false, 500),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            let active =
+                file_reservation_snapshot_from_conn(&**conn, &project, true, 500).unwrap();
+            assert_eq!(active.reservations.len(), 1);
+            assert_eq!(active.reservations[0].id, Some(10001));
+            let history =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(history.reservations.len(), 10_001);
+            assert_eq!(history.agents[0].name, "RetiredHolder");
+            assert_eq!(history.reservations[0].released_ts, Some(450));
+            assert_eq!(history.reservations[1].released_ts, Some(400));
+            assert_eq!(history.reservations[10_000].released_ts, None);
+            for (index, row) in history.reservations.iter().enumerate() {
+                assert_eq!(row.id, Some(i64::try_from(index + 1).unwrap()));
+            }
+            // Nested snapshots must not commit or disable the caller's
+            // read-only transaction, including after a bounds rejection.
+            conn.execute_raw("ROLLBACK; PRAGMA query_only=OFF").unwrap();
+            drop(conn);
+            let pooled = file_reservation_paged_snapshot(&cx, &pool, &project, false)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(pooled.reservations.len(), 10_001);
+        });
+    }
+
+    #[test]
+    fn reservation_snapshot_checks_exact_raw_bytes_and_holder_bounds() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_snapshot_exact_bounds.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-exact-bounds")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (1, {project_id}, 1, 'src/**', 1, 'é', 1, 1000)"
+            )).unwrap();
+            let raw_bytes = project.slug.len()
+                + project.human_key.len()
+                + "BlueLake".len() * 2
+                + "src/**".len()
+                + "é".len();
+            let exact = file_reservation_snapshot_with_bounds(
+                &**conn, &project, false, 500, 1, raw_bytes,
+            ).unwrap();
+            assert_eq!(exact.reservations.len(), 1);
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, raw_bytes - 1,
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            // A byte budget below the unique-string preflight is also rejected
+            // before rows are hydrated, independently of repeated holder names.
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, "é".len(),
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (2, {project_id}, 'GreenStone', 'test', 'test', 1, 1)"
+            )).unwrap();
+            assert!(matches!(
+                file_reservation_snapshot_with_bounds(
+                    &**conn, &project, false, 500, 1, FILE_RESERVATION_PAGED_MAX_BYTES,
+                ),
+                Err(DbError::InvalidArgument { field: "snapshot_limit", .. })
+            ));
+            let two_holders = file_reservation_snapshot_with_bounds(
+                &**conn, &project, false, 500, 2, FILE_RESERVATION_PAGED_MAX_BYTES,
+            ).unwrap();
+            assert_eq!(two_holders.agents.len(), 2);
+        });
+    }
+
+    #[test]
+    fn reservation_paged_snapshot_retains_capture_after_concurrent_writes() {
+        let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_writes.db");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-writes")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES \
+                 (1, {project_id}, 1, 'src/released.rs', 1, '', 10, 1000), \
+                 (2, {project_id}, 1, 'src/renewed.rs', 1, '', 10, 600), \
+                 (3, {project_id}, 1, 'src/earlier.rs', 1, '', 5, 1000); \
+                 PRAGMA query_only=ON"
+            )).unwrap();
+            let captured =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 500).unwrap();
+            assert_eq!(
+                captured.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![Some(3), Some(1), Some(2)]
+            );
+            let writer = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            writer.execute_raw(&format!(
+                "BEGIN IMMEDIATE; \
+                 INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 700); \
+                 UPDATE file_reservations SET expires_ts = 1500 WHERE id = 2; \
+                 INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES (4, {project_id}, 1, 'src/new.rs', 1, '', 1, 1500); \
+                 UPDATE agents SET name = 'GreenStone' WHERE id = 1; COMMIT"
+            )).unwrap();
+            // Later pages can keep borrowing this owned capture after the
+            // database savepoint has ended; no database cursor remains live.
+            assert_eq!(captured.reservations.len(), 3);
+            assert_eq!(captured.reservations[1].released_ts, None);
+            assert_eq!(captured.reservations[2].expires_ts, 600);
+            assert_eq!(captured.agents[0].name, "BlueLake");
+            assert_eq!(captured.captured_ts, 500);
+            let fresh =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, false, 800).unwrap();
+            assert_eq!(
+                fresh.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                vec![Some(4), Some(3), Some(1), Some(2)]
+            );
+            assert_eq!(fresh.reservations[2].released_ts, Some(700));
+            assert_eq!(fresh.reservations[3].expires_ts, 1500);
+            assert_eq!(fresh.agents[0].name, "GreenStone");
+            assert_eq!(fresh.captured_ts, 800);
+            let active =
+                file_reservation_paged_snapshot_from_conn(&**conn, &project, true, 800).unwrap();
+            assert_eq!(active.reservations.len(), 3);
+            assert!(active.reservations.iter().all(|row| row.id != Some(1)));
+            let readonly = conn.query_sync("PRAGMA query_only", &[]).unwrap();
+            assert_eq!(readonly[0].get_as::<i64>(0).unwrap(), 1);
+            conn.execute_raw("PRAGMA query_only=OFF").unwrap();
+        });
+    }
+
+    #[test]
+    fn reservation_paged_snapshot_keeps_one_view_across_interleaved_peer_commits() {
+        struct PeerCommit<'a> {
+            reader: &'a crate::DbConn,
+            writer: &'a crate::DbConn,
+            mutations: String,
+            after_holders: bool,
+            committed: std::cell::Cell<bool>,
+        }
+
+        impl crate::pool::SyncQuery for PeerCommit<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> std::result::Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                let trigger = if self.after_holders {
+                    sql.starts_with("SELECT id, project_id, name FROM agents")
+                } else {
+                    sql.starts_with("SELECT COUNT(*) AS row_count")
+                        && sql.contains("FROM file_reservations fr")
+                };
+                if trigger && !self.committed.replace(true) {
+                    self.writer.execute_raw(&self.mutations)?;
+                }
+                Ok(rows)
+            }
+
+            fn execute_raw(&self, sql: &str) -> std::result::Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+        }
+
+        for after_holders in [false, true] {
+            let (cx, pool, _dir) = setup_test_pool("reservation_paged_snapshot_peer_commit.db");
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let project = ensure_project(&cx, &pool, "/tmp/reservation-paged-peer-commit")
+                    .await
+                    .into_result()
+                    .unwrap();
+                let project_id = project.id.unwrap();
+                let reader = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                reader.execute_raw(&format!(
+                    "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                     VALUES (1, {project_id}, 'BlueLake', 'test', 'test', 1, 1); \
+                     INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES \
+                     (1, {project_id}, 1, 'src/released.rs', 1, '', 10, 1000), \
+                     (2, {project_id}, 1, 'src/renewed.rs', 1, '', 10, 600), \
+                     (3, {project_id}, 1, 'src/deleted.rs', 1, '', 5, 1000); \
+                     PRAGMA query_only=ON"
+                )).unwrap();
+                // Reuse an already-read connection so stale cached engine
+                // snapshots cannot make the subsequent fresh read pass.
+                let warm = file_reservation_paged_snapshot_from_conn(
+                    &**reader, &project, false, 400,
+                ).unwrap();
+                assert_eq!(warm.reservations.len(), 3);
+                let writer = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+                let racing = PeerCommit {
+                    reader: &reader,
+                    writer: &writer,
+                    mutations: format!(
+                        "BEGIN IMMEDIATE; \
+                         INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, 700); \
+                         UPDATE file_reservations SET expires_ts = 1500 WHERE id = 2; \
+                         DELETE FROM file_reservations WHERE id = 3; \
+                         INSERT INTO file_reservations \
+                         (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                         VALUES (4, {project_id}, 1, 'src/inserted.rs', 1, 'new', 1, 1500); \
+                         UPDATE agents SET name = 'GreenStone' WHERE id = 1; COMMIT"
+                    ),
+                    after_holders,
+                    committed: std::cell::Cell::new(false),
+                };
+                let captured = file_reservation_paged_snapshot_from_conn(
+                    &racing, &project, false, 500,
+                ).unwrap();
+                assert!(racing.committed.get(), "peer must commit during the capture");
+                // Counts remain three on both sides of the commit: checking
+                // totals alone cannot detect a mixed or shifted snapshot.
+                assert_eq!(
+                    captured.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![Some(3), Some(1), Some(2)]
+                );
+                assert_eq!(captured.agents[0].name, "BlueLake");
+                assert_eq!(captured.reservations[1].released_ts, None);
+                assert_eq!(captured.reservations[2].expires_ts, 600);
+                let fresh = file_reservation_paged_snapshot_from_conn(
+                    &**reader, &project, false, 800,
+                ).unwrap();
+                assert_eq!(
+                    fresh.reservations.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![Some(4), Some(1), Some(2)]
+                );
+                assert_eq!(fresh.agents[0].name, "GreenStone");
+                assert_eq!(fresh.reservations[0].reason, "new");
+                assert_eq!(fresh.reservations[1].released_ts, Some(700));
+                assert_eq!(fresh.reservations[2].expires_ts, 1500);
+                assert_eq!(
+                    reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0).unwrap(),
+                    1
+                );
+                reader.execute_raw("PRAGMA query_only=OFF").unwrap();
+            });
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -21398,6 +24380,498 @@ mod tests {
         });
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reaper_rechecks_candidates_after_activity_exemption_and_lifecycle_changes() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("reaper race runtime");
+        let (cx, pool, _dir) = setup_test_pool("reaper-candidate-races.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/reaper-candidate-races")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let projection = "SELECT id, project_id, name, program, model, task_description, \
+                              inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                              reaper_exempt, registration_token, retired_at FROM agents ORDER BY id";
+            let (candidates, before) = {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                for (id, name) in [
+                    (501_i64, "GreenStone"),
+                    (502, "BlueLake"),
+                    (503, "RedFox"),
+                    (504, "AmberBear"),
+                    (505, "SilverCloud"),
+                    (506, "GoldCove"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'codex-cli', 'test-model', 'keep this task', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("synthetic-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                let candidates = conn
+                    .query_sync(
+                        "SELECT id FROM agents WHERE last_active_ts < 200 \
+                         AND retired_at IS NULL AND reaper_exempt = 0 ORDER BY id",
+                        &[],
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get_as::<i64>(0).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(candidates, [501, 502, 503, 504, 505, 506]);
+
+                // These are real intervening database writes after discovery,
+                // not a prefiltered fixture. Every ID remains in the sweep.
+                conn.execute_raw("UPDATE agents SET last_active_ts = 201 WHERE id = 502")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET last_active_ts = 200 WHERE id = 503")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET reaper_exempt = 1 WHERE id = 504")
+                    .unwrap();
+                conn.execute_raw("UPDATE agents SET retired_at = 222 WHERE id = 505")
+                    .unwrap();
+                conn.execute_raw(
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (506, 222)",
+                )
+                .unwrap();
+                let before = conn
+                    .query_sync(projection, &[])
+                    .unwrap()
+                    .iter()
+                    .map(decode_agent_row_indexed)
+                    .collect::<Vec<_>>();
+                (candidates, before)
+            };
+
+            let mut retired = Vec::new();
+            for id in &candidates {
+                if let Some(agent) = retire_agent_if_stale(&cx, &pool, *id, 200, 300)
+                    .await
+                    .into_result()
+                    .unwrap()
+                {
+                    retired.push(agent.id.unwrap());
+                    assert_eq!(agent.retired_at, Some(300));
+                }
+            }
+            assert_eq!(retired, [501], "only a still-eligible candidate may retire");
+            for id in candidates {
+                assert!(
+                    retire_agent_if_stale(&cx, &pool, id, 200, 400)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_none(),
+                    "repeat sweeps must not count an existing retirement again"
+                );
+            }
+
+            let cached = get_agent_by_id(&cx, &pool, 501)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(cached.retired_at, Some(300));
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let after = conn.query_sync(projection, &[]).unwrap();
+            assert_eq!(after.len(), before.len());
+            for (mut expected, row) in before.into_iter().zip(&after) {
+                if expected.id == Some(501) {
+                    expected.retired_at = Some(300);
+                }
+                assert_eq!(
+                    serde_json::to_value(decode_agent_row_indexed(row)).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "tokens, activity, policies, identity and all skipped rows must be preserved"
+                );
+            }
+            assert_eq!(
+                conn.query_sync("SELECT deregistered_at FROM agent_deregistrations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                222
+            );
+            drop(conn);
+            assert!(matches!(
+                retire_agent_if_stale(&cx, &pool, 999, 200, 300).await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn cancelled_reaper_preserves_identity_and_leaves_the_pool_usable() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("cancelled reaper runtime");
+        let (cx, pool, _dir) = setup_test_pool("reaper-cancellation.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/reaper-cancellation")
+                .await
+                .into_result()
+                .unwrap();
+            let original = register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                "BlueLake",
+                "codex-cli",
+                "test-model",
+                Some("keep the original task"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = original.id.unwrap();
+            let cancelled = Cx::for_testing();
+            cancelled.cancel_with(asupersync::types::CancelKind::User, Some("cancel reaper"));
+            assert!(matches!(
+                retire_agent_if_stale(&cancelled, &pool, agent_id, i64::MAX, now_micros()).await,
+                Outcome::Cancelled(_)
+            ));
+            let unchanged = get_agent_by_id_fresh(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&unchanged).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+            assert!(
+                retire_agent_if_stale(&cx, &pool, agent_id, i64::MAX, now_micros())
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_some(),
+                "a cancelled sweep must not strand the one-slot pool or its transaction"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_reaper_exemption_preserves_identity_and_lifecycle() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator exemption runtime");
+        let (cx, pool, _dir) = setup_test_pool("operator-reaper-exemption.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-reaper-exemption")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                for (id, name) in [
+                    (601_i64, "GreenStone"),
+                    (602, "BlueLake"),
+                    (603, "RedFox"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'operator-test', 'preserved-model', 'preserved task', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project_id),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("preserved-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                conn.execute_raw("UPDATE agents SET retired_at = 120 WHERE id = 602")
+                    .unwrap();
+            }
+            deregister_agent(&cx, &pool, 603, 140)
+                .await
+                .into_result()
+                .unwrap();
+
+            for (name, expected_deregistered_at) in
+                [("GREENSTONE", None), ("bluelake", None), ("redfox", Some(140))]
+            {
+                let (original, deregistered_at) =
+                    get_agent_for_operator(&cx, &pool, project_id, name)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(deregistered_at, expected_deregistered_at);
+                let agent_id = original.id.unwrap();
+                let _ = get_agent_by_id(&cx, &pool, agent_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                let update = set_agent_reaper_exempt(&cx, &pool, project_id, name, true)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(!update.previous_exempt);
+                assert!(update.changed);
+                assert_eq!(update.deregistered_at, deregistered_at);
+                let mut expected = original.clone();
+                expected.reaper_exempt = 1;
+                assert_eq!(
+                    serde_json::to_value(&update.agent).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                    "changing exemption must preserve every other identity field"
+                );
+                let cached = get_agent_by_id(&cx, &pool, agent_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&cached).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+
+                let repeated = set_agent_reaper_exempt(&cx, &pool, project_id, name, true)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(repeated.previous_exempt);
+                assert!(!repeated.changed);
+                assert_eq!(repeated.deregistered_at, deregistered_at);
+                assert_eq!(
+                    serde_json::to_value(&repeated.agent).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+
+                let restored = set_agent_reaper_exempt(&cx, &pool, project_id, name, false)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert!(restored.previous_exempt);
+                assert!(restored.changed);
+                assert_eq!(restored.deregistered_at, deregistered_at);
+                let (fresh, fresh_deregistered_at) =
+                    get_agent_for_operator(&cx, &pool, project_id, name)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(fresh_deregistered_at, deregistered_at);
+                assert_eq!(
+                    serde_json::to_value(&restored.agent).unwrap(),
+                    serde_json::to_value(&original).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&fresh).unwrap(),
+                    serde_json::to_value(&original).unwrap(),
+                    "tokens, timestamps, policies, task and lifecycle must survive a round trip"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn operator_agent_lookup_is_uncached_and_works_in_a_query_only_pool() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator read-only runtime");
+        let (cx, pool, dir) = setup_test_pool("operator-query-only.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-query-only")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let original = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "test-model",
+                Some("keep this identity"),
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let agent_id = original.id.unwrap();
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE agents SET reaper_exempt = 1, last_active_ts = 100, retired_at = 120 \
+                     WHERE id = ?",
+                    &[Value::BigInt(agent_id)],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (?, 140)",
+                    &[Value::BigInt(agent_id)],
+                )
+                .unwrap();
+            }
+            let read_cfg = crate::pool::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    dir.path().join("operator-query-only.db").display()
+                ),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let read_pool = crate::create_query_only_pool(&read_cfg).expect("query-only pool");
+            {
+                let conn = acquire_conn(&cx, &read_pool).await.into_result().unwrap();
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    1,
+                    "the operator dry-run must work with database writes disabled"
+                );
+            }
+            let cache = crate::cache::read_cache();
+            let scope = cache_scope_for_pool(&read_pool);
+            cache.put_agent_scoped(&scope, &original);
+            let (actual, deregistered_at) =
+                get_agent_for_operator(&cx, &read_pool, project_id, "bluelake")
+                    .await
+                    .into_result()
+                    .unwrap();
+            let mut expected = original.clone();
+            expected.reaper_exempt = 1;
+            expected.last_active_ts = 100;
+            expected.retired_at = Some(120);
+            assert_eq!(deregistered_at, Some(140));
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(cache.get_agent_by_id_scoped(&scope, agent_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(original).unwrap(),
+                "operator previews must bypass and leave the read cache untouched"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operator_reaper_exemption_refuses_ambiguous_and_missing_identities() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("operator ambiguity runtime");
+        let (cx, pool, _dir) = setup_test_pool("operator-ambiguous.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&cx, &pool, "/tmp/operator-ambiguous")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let other_project_id = ensure_project(&cx, &pool, "/tmp/operator-unambiguous")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let projection = "SELECT id, project_id, name, program, model, task_description, \
+                              inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                              reaper_exempt, registration_token, retired_at FROM agents ORDER BY id";
+            let before = {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                // Legacy databases may predate the case-insensitive unique index.
+                conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                    .unwrap();
+                for (id, project, name) in [
+                    (701_i64, project_id, "GreenStone"),
+                    (702, project_id, "greenstone"),
+                    (703, other_project_id, "GreenStone"),
+                ] {
+                    conn.execute_sync(
+                        "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                         inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                         reaper_exempt, registration_token, retired_at) \
+                         VALUES (?, ?, ?, 'operator-test', 'test-model', 'keep identity', \
+                         50, 100, 'file', 'contacts_only', 0, ?, NULL)",
+                        &[
+                            Value::BigInt(id),
+                            Value::BigInt(project),
+                            Value::Text(name.to_string()),
+                            Value::Text(format!("original-token-{id}")),
+                        ],
+                    )
+                    .unwrap();
+                }
+                conn.query_sync(projection, &[])
+                    .unwrap()
+                    .iter()
+                    .map(decode_agent_row_indexed)
+                    .collect::<Vec<_>>()
+            };
+            for name in ["GreenStone", "greenstone", "GREENSTONE"] {
+                assert!(matches!(
+                    get_agent_for_operator(&cx, &pool, project_id, name).await,
+                    Outcome::Err(DbError::InvalidArgument { field: "agent_name", message })
+                        if message.contains("ambiguous")
+                ));
+                for exempt in [false, true] {
+                    assert!(matches!(
+                        set_agent_reaper_exempt(&cx, &pool, project_id, name, exempt).await,
+                        Outcome::Err(DbError::InvalidArgument { field: "agent_name", message })
+                            if message.contains("ambiguous")
+                    ));
+                }
+            }
+            assert!(matches!(
+                get_agent_for_operator(&cx, &pool, project_id, "MissingAgent").await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+            assert!(matches!(
+                set_agent_reaper_exempt(&cx, &pool, project_id, "MissingAgent", true).await,
+                Outcome::Err(DbError::NotFound { .. })
+            ));
+            let update =
+                set_agent_reaper_exempt(&cx, &pool, other_project_id, "greenstone", true)
+                    .await
+                    .into_result()
+                    .unwrap();
+            assert_eq!(update.agent.id, Some(703));
+            assert!(update.changed);
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            let after = conn.query_sync(projection, &[]).unwrap();
+            assert_eq!(after.len(), before.len(), "missing lookups must not register agents");
+            for (mut expected, row) in before.into_iter().zip(&after) {
+                if expected.id == Some(703) {
+                    expected.reaper_exempt = 1;
+                }
+                assert_eq!(
+                    serde_json::to_value(decode_agent_row_indexed(row)).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "ambiguous identities must remain untouched; resolution stays project-scoped"
+                );
+            }
+        });
+    }
+
     fn open_direct_repair_connection(db_path: &std::path::Path) -> crate::DbConn {
         crate::open_sqlite_file_with_recovery(
             db_path
@@ -21838,6 +25312,372 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn atc_content_validation_covers_direct_append_before_persistence() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (cx, file_pool, _dir) = setup_test_pool("atc_content_append.db");
+        let memory_pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("memory pool");
+
+        rt.block_on(async {
+            for pool in [&file_pool, &memory_pool] {
+                let valid = make_insert_experience_test_row(
+                    70_001,
+                    80_001,
+                    ExperienceState::Resolved,
+                    1_700_000_000_000_000,
+                );
+                let baseline = append_atc_experience(&cx, pool, &valid)
+                    .await
+                    .into_result()
+                    .expect("positive append");
+                let repeated = append_atc_experience(&cx, pool, &valid)
+                    .await
+                    .into_result()
+                    .expect("positive idempotent append");
+                assert_eq!(baseline, repeated);
+
+                // atc_engine's deadlock_cycle events deliberately have no
+                // Bayesian posterior. Append accepts this observation shape;
+                // the stricter learning insert contract remains unchanged.
+                let mut event = valid.clone();
+                event.decision_id += 1000;
+                event.effect_id += 1000;
+                event.posterior.clear();
+                event.decision_class = "deadlock_cycle".to_string();
+                event.effect_kind = EffectKind::Advisory;
+                assert!(
+                    insert_experience(&cx, pool, event.clone())
+                        .await
+                        .into_result()
+                        .is_err(),
+                    "learning insert retains its structural gate"
+                );
+                let observation = append_atc_experience(&cx, pool, &event)
+                    .await
+                    .into_result()
+                    .expect("event-only positive append");
+                assert_eq!(observation.posterior, Vec::<(String, f64)>::new());
+
+                for field in 0..6 {
+                    let mut invalid = valid.clone();
+                    invalid.decision_id += field + 1;
+                    invalid.effect_id += field + 1;
+                    match field {
+                        0 => invalid.evidence_summary = "ghp_synthetic_atc_canary".to_string(),
+                        1 => {
+                            invalid.context = Some(serde_json::json!({
+                                "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                            }));
+                        }
+                        2 => {
+                            invalid.outcome.as_mut().expect("outcome").label =
+                                "ghp_synthetic_atc_canary".to_string();
+                        }
+                        3 => {
+                            invalid.outcome.as_mut().expect("outcome").evidence =
+                                Some(serde_json::json!({
+                                    "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                                }));
+                        }
+                        4 => {
+                            invalid.context = Some(serde_json::json!({
+                                "metric": "x".repeat(16 * 1024)
+                            }));
+                        }
+                        _ => {
+                            let mut nested = serde_json::Value::Null;
+                            for _ in 0..17 {
+                                nested = serde_json::json!([nested]);
+                            }
+                            invalid.outcome.as_mut().expect("outcome").evidence = Some(nested);
+                        }
+                    }
+                    let error = append_atc_experience(&cx, pool, &invalid)
+                        .await
+                        .into_result()
+                        .expect_err("direct append must validate content");
+                    assert!(matches!(
+                        error,
+                        asupersync::OutcomeError::Err(DbError::InvalidArgument { .. })
+                    ));
+                    assert!(!format!("{error:?}").contains("synthetic_atc_canary"));
+                    let counts = if pool.sqlite_path() == ":memory:" {
+                        durability_probe_query(
+                            &cx,
+                            pool,
+                            "SELECT COUNT(*) FROM atc_experiences",
+                            &[],
+                        )
+                        .await
+                        .into_result()
+                        .expect("count memory rows")
+                    } else {
+                        let conn = open_canonical_atc_conn(pool, "reopen after invalid append")
+                            .expect("independent sidecar reopen");
+                        let counts = canonical_query_atc_rows(
+                            &conn,
+                            "SELECT COUNT(*) FROM atc_experiences",
+                            &[],
+                            "count rejected rows",
+                        )
+                        .expect("count sidecar rows");
+                        close_canonical_db_conn(conn, "reopen after invalid append");
+                        counts
+                    };
+                    assert_eq!(
+                        counts.first().and_then(row_first_i64),
+                        Some(2),
+                        "durable store must contain only the two accepted positive rows"
+                    );
+                }
+                let reopened = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(baseline.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen")
+                .expect("positive row retained");
+                assert_eq!(reopened, baseline);
+            }
+        });
+    }
+
+    #[test]
+    fn atc_content_validation_preserves_rows_after_rejected_updates() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let (cx, file_pool, _dir) = setup_test_pool("atc_content_updates.db");
+        let memory_pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("memory pool");
+
+        rt.block_on(async {
+            for pool in [&file_pool, &memory_pool] {
+                let row = make_insert_experience_test_row(
+                    70_100,
+                    80_100,
+                    ExperienceState::Open,
+                    1_700_000_000_000_000,
+                );
+                let mut before = append_atc_experience(&cx, pool, &row)
+                    .await
+                    .into_result()
+                    .expect("append positive row");
+                let first = serde_json::Value::Object(
+                    (0..9)
+                        .map(|index| {
+                            (
+                                format!("first_metric_{index}"),
+                                serde_json::Value::String("x".repeat(4096)),
+                            )
+                        })
+                        .collect(),
+                );
+                transition_atc_experience(
+                    &cx,
+                    pool,
+                    before.experience_id,
+                    ExperienceState::Open,
+                    0,
+                    None,
+                    Some(&first),
+                )
+                .await
+                .into_result()
+                .expect("bounded metric patch accepted");
+                before = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(before.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen patched row")
+                .expect("row");
+                let second = serde_json::Value::Object(
+                    (0..9)
+                        .map(|index| {
+                            (
+                                format!("second_metric_{index}"),
+                                serde_json::Value::String("x".repeat(4096)),
+                            )
+                        })
+                        .collect(),
+                );
+                // Each patch is individually valid, but storing both would
+                // cross the shared text budget. Verify transaction rollback.
+                assert!(
+                    transition_atc_experience(
+                        &cx,
+                        pool,
+                        before.experience_id,
+                        ExperienceState::Open,
+                        0,
+                        None,
+                        Some(&second)
+                    )
+                    .await
+                    .into_result()
+                    .is_err()
+                );
+                let after = fetch_durable_atc_experience_by_id(
+                    &cx,
+                    pool,
+                    i64::try_from(before.experience_id).expect("id"),
+                )
+                .await
+                .into_result()
+                .expect("reopen after oversized merge")
+                .expect("row");
+                assert_eq!(after, before);
+                let good = ExperienceOutcome {
+                    observed_ts_micros: 1_700_000_000_010_000,
+                    label: "acknowledged".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.0),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"latency_micros": 10_000})),
+                };
+                let mut rollups_before = fetch_atc_rollups(&cx, pool)
+                    .await
+                    .into_result()
+                    .expect("initial rollups");
+                for api in 0..4 {
+                    for field in 0..2 {
+                        let mut bad = good.clone();
+                        if field == 0 {
+                            bad.label = "ghp_synthetic_atc_canary".to_string();
+                        } else {
+                            bad.evidence = Some(serde_json::json!({
+                                "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                            }));
+                        }
+                        let patch = serde_json::json!({
+                            "nested": [{"credential": "ghp_synthetic_atc_canary"}]
+                        });
+                        let result = match api {
+                            0 => {
+                                transition_atc_experience(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    ExperienceState::Open,
+                                    0,
+                                    None,
+                                    Some(&patch),
+                                )
+                                .await
+                            }
+                            1 => {
+                                resolve_atc_experience(&cx, pool, before.experience_id, &bad).await
+                            }
+                            2 => {
+                                resolve_experience(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    &ResolutionKind::Resolved(bad),
+                                )
+                                .await
+                            }
+                            _ => {
+                                overwrite_resolved_atc_experience_outcome(
+                                    &cx,
+                                    pool,
+                                    before.experience_id,
+                                    &bad,
+                                )
+                                .await
+                            }
+                        };
+                        let error = result.into_result().expect_err("invalid update must fail");
+                        assert!(matches!(
+                            error,
+                            asupersync::OutcomeError::Err(DbError::InvalidArgument { .. })
+                        ));
+                        assert!(!format!("{error:?}").contains("synthetic_atc_canary"));
+                        let after = fetch_durable_atc_experience_by_id(
+                            &cx,
+                            pool,
+                            i64::try_from(before.experience_id).expect("id"),
+                        )
+                        .await
+                        .into_result()
+                        .expect("independent reopen")
+                        .expect("row retained");
+                        assert_eq!(after, before, "rejected update changed durable row");
+                        let rollups_after = fetch_atc_rollups(&cx, pool)
+                            .await
+                            .into_result()
+                            .expect("reopen rollups after rejected update");
+                        assert_eq!(rollups_after, rollups_before);
+                    }
+                    if api == 2 {
+                        resolve_atc_experience(&cx, pool, before.experience_id, &good)
+                            .await
+                            .into_result()
+                            .expect("valid outcome resolves");
+                        before = fetch_durable_atc_experience_by_id(
+                            &cx,
+                            pool,
+                            i64::try_from(before.experience_id).expect("id"),
+                        )
+                        .await
+                        .into_result()
+                        .expect("reopen positive resolution")
+                        .expect("resolved row");
+                        assert_eq!(before.state, ExperienceState::Resolved);
+                        assert_eq!(before.outcome.as_ref(), Some(&good));
+                        update_atc_experience_rollup(
+                            &cx,
+                            pool,
+                            "liveness:probe:0",
+                            "liveness",
+                            "probe",
+                            0,
+                            ExperienceState::Resolved,
+                            true,
+                            0.0,
+                            0.0,
+                            10_000,
+                            good.observed_ts_micros,
+                        )
+                        .await
+                        .into_result()
+                        .expect("real positive rollup");
+                        rollups_before = fetch_atc_rollups(&cx, pool)
+                            .await
+                            .into_result()
+                            .expect("reopen positive rollup");
+                        assert_eq!(rollups_before.len(), 1);
+                        assert_eq!(rollups_before[0].2, 1, "resolved_count");
+                    }
+                }
+                overwrite_resolved_atc_experience_outcome(&cx, pool, before.experience_id, &good)
+                    .await
+                    .into_result()
+                    .expect("valid acknowledgement amendment");
+            }
+        });
     }
 
     #[test]
@@ -24253,6 +28093,125 @@ mod tests {
         );
     }
 
+    /// br-v0ucm: while any concurrent transaction is active FrankenSQLite
+    /// refuses every checkpoint, so an over-limit WAL is only reset if new
+    /// transactions are held off until the in-flight one finishes.
+    #[test]
+    fn over_limit_wal_reset_waits_for_the_in_flight_transaction() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().expect("wal-reset tempdir");
+        let db_path = directory.path().join("wal-reset.sqlite3");
+        let wal_path = directory.path().join("wal-reset.sqlite3-wal");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = crate::DbConn::open_file(db_path_str.clone()).expect("open writer");
+        for statement in [
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA journal_size_limit = 1048576;",
+            "CREATE TABLE bodies(id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
+            "CREATE TABLE holder(id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
+        ] {
+            conn.execute_raw(statement)
+                .expect("prepare wal-reset database");
+        }
+
+        // Another connection keeps a concurrent write transaction open until
+        // told to commit. It writes a different table, so committing it later
+        // never conflicts with the writer's pages.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = db_path_str.clone();
+        let holder = std::thread::spawn(move || {
+            let holder = crate::DbConn::open_file(holder_path).expect("open holder");
+            holder
+                .execute_raw("BEGIN CONCURRENT;")
+                .expect("holder begins");
+            holder
+                .execute_raw("INSERT INTO holder(note) VALUES ('in flight');")
+                .expect("holder writes");
+            ready_tx.send(()).expect("announce holder");
+            release_rx.recv().expect("await release");
+            holder.execute_raw("COMMIT;").expect("holder commits");
+        });
+        ready_rx.recv().expect("holder transaction open");
+
+        let body = Value::Text("x".repeat(32 * 1024));
+        for _ in 0..64 {
+            conn.execute_sync(
+                "INSERT INTO bodies(body) VALUES (?)",
+                std::slice::from_ref(&body),
+            )
+            .expect("grow the WAL");
+        }
+        conn.execute_raw("PRAGMA busy_timeout = 0;")
+            .expect("fail-fast checkpoints");
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+            .expect("passive checkpoint");
+        let progress = wal_checkpoint_progress(&rows).expect("checkpoint tuple");
+        assert_eq!(
+            progress.busy, 1,
+            "the engine refuses checkpoints while a concurrent transaction is active: {progress:?}"
+        );
+        assert!(
+            wal_exceeds_journal_size_limit(&conn, progress.log),
+            "64 x 32 KiB bodies must exceed the 1 MiB journal_size_limit: {progress:?}"
+        );
+        assert!(
+            !wal_exceeds_journal_size_limit(&conn, 1),
+            "one frame is under the limit"
+        );
+
+        // A holder that outlives the drain budget: the reset gives up in
+        // bounded time, reopens the gate and backs off.
+        let cx = asupersync::Cx::for_testing();
+        let gate = crate::pool::WalResetGate::new();
+        let started = Instant::now();
+        assert!(
+            !reset_over_limit_wal(&cx, &conn, &gate),
+            "the WAL cannot be truncated under an open transaction"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the reset must stop at its drain budget, took {:?}",
+            started.elapsed()
+        );
+        assert!(!gate.is_closed(), "a failed reset reopens the gate");
+        assert!(
+            gate.try_close().is_none(),
+            "a failed reset defers the next attempt"
+        );
+
+        // The holder finishes while a reset waits: the reset truncates.
+        let gate = crate::pool::WalResetGate::new();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).expect("release holder");
+        });
+        assert!(
+            reset_over_limit_wal(&cx, &conn, &gate),
+            "the reset truncates once the in-flight transaction commits"
+        );
+        assert!(!gate.is_closed(), "a successful reset reopens the gate");
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+        let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        assert!(
+            wal_bytes < 64 * 1024,
+            "the WAL must be truncated, still {wal_bytes} bytes"
+        );
+        let rows = conn
+            .query_sync("SELECT count(*) AS count FROM holder", &[])
+            .expect("count holder rows");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "the held transaction committed"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn commit_tx_does_not_wait_for_external_reader_checkpoint() {
@@ -24832,6 +28791,98 @@ mod tests {
         });
     }
 
+    async fn atc_population_projection_after_update(
+        cx: &Cx,
+        pool: &DbPool,
+        sql: &str,
+        id: i64,
+        value: &str,
+    ) -> Vec<SqlRow> {
+        let conn = acquire_conn(cx, pool).await.into_result().unwrap();
+        let tracked = tracked(&*conn);
+        traw_execute(
+            cx,
+            &tracked,
+            sql,
+            &[Value::Text(value.to_string()), Value::BigInt(id)],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        traw_query(
+            cx,
+            &tracked,
+            ATC_POPULATION_SQL,
+            &atc_population_query_params(0, 2),
+        )
+        .await
+        .into_result()
+        .unwrap()
+    }
+
+    #[test]
+    fn atc_population_snapshot_bounds_bytes_without_truncating_or_omitting_rows() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("atc-population-metadata.db");
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/atc-metadata")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES (1, {project_id}, 'BlueLake', 'codex-cli', 'test', 1, 500), \
+                        (2, {project_id}, 'RedFox', 'codex-cli', 'test', 1, 300)"
+            )).unwrap();
+            drop(conn);
+            for (sql, id, column, max_bytes, original) in [
+                ("UPDATE projects SET human_key = ? WHERE id = ?", project_id,
+                    1, ATC_POPULATION_MAX_PROJECT_BYTES, "/tmp/atc-metadata"),
+                ("UPDATE agents SET name = ? WHERE id = ?", 1,
+                    2, ATC_POPULATION_MAX_NAME_BYTES, "BlueLake"),
+                ("UPDATE agents SET program = ? WHERE id = ?", 1,
+                    3, ATC_POPULATION_MAX_PROGRAM_BYTES, "codex-cli"),
+            ] {
+                let at_limit = "é".repeat(max_bytes / 2);
+                let projected = atc_population_projection_after_update(
+                    &cx, &pool, sql, id, &at_limit,
+                ).await;
+                assert_eq!(projected.len(), 2);
+                assert!(matches!(projected[0].get(column), Some(Value::Text(value)) if value == &at_limit));
+                let population = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                    .await.into_result().expect("exact byte boundary is valid");
+                assert_eq!(population.len(), 2);
+                assert!(population.iter().all(AtcPopulationAgentRow::metadata_within_limits));
+                let retained = match column {
+                    1 => &population[0].project_key,
+                    2 => &population[0].name,
+                    _ => &population[0].program,
+                };
+                assert_eq!(retained, &at_limit, "valid metadata must remain exact");
+
+                for oversized in [format!("{at_limit}x"), format!("x\0{}", "x".repeat(max_bytes))] {
+                    let projected = atc_population_projection_after_update(
+                        &cx, &pool, sql, id, &oversized,
+                    ).await;
+                    assert_eq!(projected.len(), 2, "oversized rows must not disappear");
+                    assert!(matches!(projected[0].get(column), Some(Value::Null)),
+                        "the driver must never receive the oversized text");
+                    let error = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                        .await.into_result().expect_err("incomplete population must fail closed");
+                    assert!(error.to_string().contains("coverage is incomplete"));
+                    assert!(error.to_string().len() < 200, "errors must not echo oversized values");
+                }
+                atc_population_projection_after_update(&cx, &pool, sql, id, original).await;
+            }
+            let recovered = list_atc_population_snapshot(&cx, &pool, 0, 2)
+                .await.into_result().unwrap();
+            assert_eq!(recovered.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+                vec!["BlueLake", "RedFox"]);
+        });
+    }
+
     #[test]
     fn prune_released_file_reservations_deletes_old_released_keeps_active_and_recent() {
         // GH#154 item 2: the retention sweep hard-DELETEs released/expired
@@ -25066,6 +29117,362 @@ mod tests {
                 1,
                 "another agent's unread state is untouched"
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bulk_mark_read_merges_shared_mail_with_one_limit_and_viewer_receipts() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("bulk_shared_read.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'shared', '/tmp/bulk-shared', 0),
+                        (2, 'foreign', '/tmp/bulk-foreign', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0),
+                        (3, 1, 'Peer', 'test', 'test', 0, 0),
+                        (4, 1, 'Late', 'test', 'test', 1000, 0),
+                        (5, 1, 'Retired', 'test', 'test', 0, 0),
+                        (6, 1, 'Blocked', 'test', 'test', 0, 0),
+                        (7, 2, 'Foreign', 'test', 'test', 0, 0);
+                 UPDATE agents SET retired_at = 42 WHERE id = 5;
+                 UPDATE agents SET contact_policy = 'block_all' WHERE id = 6;
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'oldest shared', '', 100, 1),
+                        (2, 1, 1, 'direct ack preserved', '', 200, 1),
+                        (3, 1, 1, 'direct precedence', '', 200, 1),
+                        (4, 1, 1, 'shared already read', '', 200, 1),
+                        (5, 1, 2, 'viewer authored', '', 200, 1),
+                        (6, 1, 1, 'fresh shared', '', 600, 1),
+                        (7, 2, 7, 'foreign project', '', 200, 1),
+                        (8, 1, 1, 'direct already read', '', 200, 1),
+                        (9, 1, 1, 'shared ack preserved', '', 300, 1),
+                        (11, 1, 1, 'fresh direct', '', 700, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (2, 2, 'to', NULL, 22), (3, 2, 'cc', NULL, 33),
+                        (8, 2, 'to', 88, 88), (11, 2, 'to', NULL, NULL);
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (1, 1, 'to', 100), (3, 1, 'to', 200), (4, 1, 'to', 200),
+                        (5, 1, 'to', 200), (6, 1, 'to', 600), (7, 2, 'to', 200),
+                        (8, 1, 'to', 200), (9, 1, 'to', 300);
+                 INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (1, 3, 111, 112), (3, 2, NULL, 333),
+                        (4, 2, 44, NULL), (9, 2, NULL, 99);",
+            )
+            .unwrap();
+            drop(conn);
+
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, None, 0)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                BulkMarkReadOutcome { marked: 0, more: false }
+            );
+            let first = mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 1)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(first, BulkMarkReadOutcome { marked: 1, more: true });
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn
+                .query_sync("SELECT message_id FROM project_mailbox_receipts WHERE agent_id = 2 AND read_ts IS NOT NULL ORDER BY message_id", &[])
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.get_named::<i64>("message_id").unwrap()).collect::<Vec<_>>(),
+                vec![1, 4],
+                "the oldest shared message wins the cap before newer direct mail"
+            );
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 2 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+            drop(conn);
+
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 2)
+                    .await.into_result().unwrap(),
+                BulkMarkReadOutcome { marked: 2, more: true }
+            );
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 1)
+                    .await.into_result().unwrap(),
+                BulkMarkReadOutcome { marked: 1, more: false },
+                "the inclusive age boundary clears shared mail without counting fresh mail"
+            );
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                2,
+                "the uncapped action drains the remaining direct and shared messages"
+            );
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                0,
+                "already-read direct/shared duplicates are never counted again"
+            );
+            for hidden_viewer in [4, 5, 6, 7] {
+                assert_eq!(
+                    mark_all_messages_read_in_project(&cx, &pool, 1, hidden_viewer)
+                        .await.into_result().unwrap(),
+                    0,
+                    "late, retired, blocked and foreign agents cannot claim shared receipts"
+                );
+            }
+            let stats = get_inbox_stats(&cx, &pool, 2)
+                .await.into_result().unwrap().unwrap();
+            assert_eq!(stats.unread_count, 0);
+            assert_eq!(stats.ack_pending_count, 1);
+            assert!(fetch_inbox_unread(&cx, &pool, 1, 2, false, None, 100)
+                .await.into_result().unwrap().is_empty());
+            assert_eq!(fetch_inbox_unread(&cx, &pool, 1, 3, false, None, 100)
+                .await.into_result().unwrap().len(), 6);
+
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync(
+                "SELECT message_id, ack_ts FROM message_recipients WHERE agent_id = 2 ORDER BY message_id",
+                &[],
+            ).unwrap();
+            let direct: Vec<_> = rows.iter().map(|row| (
+                row.get_named::<i64>("message_id").unwrap(),
+                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+            )).collect();
+            assert_eq!(direct, vec![(2, Some(22)), (3, Some(33)), (8, Some(88)), (11, None)]);
+            let rows = conn.query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 2 ORDER BY message_id",
+                &[],
+            ).unwrap();
+            let shared: Vec<_> = rows.iter().map(|row| (
+                row.get_named::<i64>("message_id").unwrap(),
+                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+            )).collect();
+            assert_eq!(shared.iter().map(|row| row.0).collect::<Vec<_>>(), vec![1, 3, 4, 6, 9]);
+            assert_eq!(shared[1], (3, None, Some(333)), "direct receipt remains authoritative");
+            assert_eq!(shared[2], (4, Some(44), None), "existing reads remain unchanged");
+            assert!(shared[0].1.is_some() && shared[3].1.is_some() && shared[4].1.is_some());
+            assert_eq!((shared[0].2, shared[3].2, shared[4].2), (None, None, Some(99)));
+            let rows = conn.query_sync(
+                "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = 1 AND agent_id = 3",
+                &[],
+            ).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), Some(111));
+            assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), Some(112));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bulk_mark_read_rolls_back_both_lanes_when_shared_receipts_are_not_stored() {
+        for (label, trigger, uncapped) in [
+            (
+                "suppressed_insert",
+                "CREATE TRIGGER sabotage_receipt BEFORE INSERT ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN SELECT RAISE(IGNORE); END;",
+                false,
+            ),
+            (
+                "suppressed_update",
+                "CREATE TRIGGER sabotage_receipt BEFORE UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN SELECT RAISE(IGNORE); END;",
+                true,
+            ),
+            (
+                "changed_ack",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 AND NEW.ack_ts IS NULL BEGIN
+                   UPDATE project_mailbox_receipts SET ack_ts = 777 WHERE message_id = 3 AND agent_id = 2;
+                 END;",
+                false,
+            ),
+            (
+                "later_shared_write_undoes_direct",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN
+                   UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1 AND agent_id = 2;
+                 END;",
+                true,
+            ),
+            (
+                "later_shared_write_undoes_shared",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN
+                   UPDATE project_mailbox_receipts SET read_ts = NULL WHERE message_id = 2 AND agent_id = 2;
+                 END;",
+                false,
+            ),
+        ] {
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let dir = tempfile::tempdir().expect("receipt fixture");
+            let db_path = dir.path().join(format!("bulk_{label}.db"));
+            let seed = crate::DbConn::open_file(db_path.display().to_string()).unwrap();
+            seed.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL).unwrap();
+            seed.execute_raw(&crate::schema::init_schema_sql_base()).unwrap();
+            rt.block_on(async {
+                let cx = Cx::current().expect("migration context");
+                crate::schema::migrate_to_latest_base(&cx, &seed)
+                    .await.into_result().unwrap();
+            });
+            seed.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'atomic', '/tmp/bulk-atomic', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct', '', 100, 1),
+                        (2, 1, 1, 'first shared', '', 200, 1),
+                        (3, 1, 1, 'last shared', '', 300, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (2, 1, 'to', 200), (3, 1, 'to', 300);",
+            )
+            .unwrap();
+            // Install the real trigger before pooled transactions begin.
+            seed.execute_raw(trigger).unwrap();
+            drop(seed);
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                {
+                    // Pool initialization repairs aggregate statistics. Plant
+                    // the rollback witness only after that real startup pass.
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_raw(
+                        "INSERT OR REPLACE INTO inbox_stats
+                         (agent_id, total_count, unread_count, ack_pending_count)
+                         VALUES (2, 99, 99, 99);",
+                    ).unwrap();
+                    let rows = conn.query_sync(
+                        "SELECT total_count, unread_count, ack_pending_count FROM inbox_stats WHERE agent_id = 2",
+                        &[],
+                    ).unwrap();
+                    assert_eq!(
+                        (
+                            rows[0].get_named::<i64>("total_count").unwrap(),
+                            rows[0].get_named::<i64>("unread_count").unwrap(),
+                            rows[0].get_named::<i64>("ack_pending_count").unwrap(),
+                        ),
+                        (99, 99, 99),
+                        "{label}: rollback witness follows pool initialization"
+                    );
+                }
+                let outcome = if uncapped {
+                    mark_all_messages_read_in_project(&cx, &pool, 1, 2).await.map(|_| ())
+                } else {
+                    mark_messages_read_bulk(&cx, &pool, 1, 2, None, 3).await.map(|_| ())
+                };
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::Internal(ref message))
+                        if message.contains("did not store")),
+                    "{label}: {outcome:?}"
+                );
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let rows = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2",
+                    &[],
+                ).unwrap();
+                assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "{label}: direct update rolls back");
+                assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                let rows = conn.query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 0, "{label}: all lazy shared receipts roll back");
+                let rows = conn.query_sync("SELECT total_count FROM inbox_stats WHERE agent_id = 2", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 99, "{label}: stats rebuild rolls back");
+                conn.execute_sync("BEGIN IMMEDIATE", &[]).expect("failure releases the transaction");
+                conn.execute_sync("ROLLBACK", &[]).unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn bulk_mark_read_requires_complete_shared_receipt_authority() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("bulk_shared_schema.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'authority', '/tmp/bulk-authority', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct', '', 100, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts;
+                 ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, None, 1).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "neither failed action commits direct receipts");
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;").unwrap();
+            conn.execute_raw(
+                "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+            ).unwrap();
+            drop(conn);
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                1,
+                "a genuinely absent shared schema still permits direct-only reads"
+            );
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1 AND agent_id = 2;").unwrap();
+            conn.execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[Value::BigInt(1), Value::BigInt(1), Value::BigInt(100)],
+            ).unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "retained project events rule out the legacy exception");
         });
     }
 
@@ -26500,6 +30907,443 @@ mod tests {
         });
     }
 
+    async fn seed_project_thread_fixture(cx: &Cx, pool: &DbPool) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("conversation fixture connection");
+        for sql in [
+            "INSERT INTO projects(id, slug, human_key, created_at) \
+             VALUES (1, 'threads-a', '/threads-a', 1), (2, 'threads-b', '/threads-b', 1)",
+            "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1), \
+                    (2, 1, 'RedStone', 'test', 'test', 1, 1), \
+                    (3, 2, 'GreenLake', 'test', 'test', 1, 1)",
+        ] {
+            conn.execute(cx, sql, &[])
+                .await
+                .into_result()
+                .expect("seed conversation identities");
+        }
+        let rows = [
+            (1, 1, None, "root", 10),
+            (2, 1, Some("1"), "root reply", 20),
+            (3, 1, Some("topic"), "topic first", 30),
+            (4, 1, Some("topic"), "topic latest", 50),
+            (5, 1, Some("topic"), "topic backdated", 40),
+            (6, 1, Some("6"), "self numeric", 15),
+            (7, 1, Some("0001"), "leading zeroes", 20),
+            (8, 1, Some("other"), "unrelated numeric seed", 60),
+            (9, 1, Some("8"), "numeric key", 61),
+            (10, 2, Some("topic"), "foreign topic", 100),
+            (11, 2, Some("1"), "foreign numeric key", 101),
+            (12, 1, Some(""), "empty root", 12),
+            (13, 1, Some("12"), "empty root reply", 13),
+            (14, 1, Some("   "), "space root", 14),
+            (15, 1, Some("14"), "space root reply", 15),
+            (16, 1, Some("\t"), "tab key", 16),
+            (17, 1, Some("\u{a0}"), "nbsp key", 17),
+            (18, 1, Some(" padded "), "padded key", 18),
+            (19, 1, Some("padded"), "unpadded key", 19),
+            (
+                20,
+                1,
+                Some("slash/plus+query?#%26'\"><"),
+                "reserved key",
+                20,
+            ),
+            (21, 1, Some("timestamp-tie"), "tied latest", 61),
+        ];
+        for (id, project_id, thread_id, subject, created_ts) in rows {
+            conn.execute(
+                cx,
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(project_id),
+                    Value::BigInt(if project_id == 1 { 1 } else { 3 }),
+                    thread_id.map_or(Value::Null, |key| Value::Text(key.into())),
+                    Value::Text(subject.into()),
+                    Value::Text("large-body ".repeat(4096)),
+                    Value::BigInt(created_ts),
+                ],
+            )
+            .await
+            .into_result()
+            .expect("seed conversation message");
+        }
+        conn.execute(
+            cx,
+            "INSERT INTO message_recipients(message_id, agent_id, kind) \
+             VALUES (4, 1, 'to'), (4, 2, 'cc')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("multiple deliveries must not multiply conversation counts");
+    }
+
+    #[test]
+    fn canonical_thread_id_preserves_exact_nonblank_identifiers() {
+        for blank in [None, Some(""), Some(" "), Some("    ")] {
+            assert_eq!(canonical_thread_id(42, blank), "42");
+        }
+        for key in [
+            "42", "0042", "+42", " topic ", "\t", "\u{a0}", "../x?y#z", "a%2Fb",
+        ] {
+            assert_eq!(canonical_thread_id(42, Some(key)), key);
+        }
+    }
+
+    async fn assert_project_thread_metadata_query<C: Connection>(cx: &Cx, conn: &C) {
+        conn.execute(
+            cx,
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             thread_id TEXT, created_ts INTEGER NOT NULL, subject TEXT, body_md TEXT)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let migration = crate::schema::schema_migrations()
+            .into_iter()
+            .find(|migration| {
+                migration.id == "v1_create_index_idx_messages_project_thread_activity"
+            })
+            .expect("covering index has an additive schema migration");
+        conn.execute(cx, &migration.up, &[])
+            .await
+            .into_result()
+            .unwrap();
+        conn.execute(
+            cx,
+            "INSERT INTO messages VALUES \
+             (1, 1, NULL, 9, 'root', 'body'), (2, 1, '1', 10, 'reply', 'body'), \
+             (3, 1, 'topic', 12, 'latest', 'body'), (4, 1, 'topic', 11, 'backdated', 'body'), \
+             (5, 2, 'topic', 99, 'foreign', 'body'), (6, 1, 'tie', 12, 'tie', 'body')",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        let sql = project_thread_page_sql(None);
+        let params = [Value::BigInt(1), Value::BigInt(6), Value::BigInt(11)];
+        let rows = conn.query(cx, &sql, &params).await.into_result().unwrap();
+        let summaries = rows
+            .iter()
+            .map(decode_project_thread_summary)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|row| (
+                    row.thread_id.as_str(),
+                    row.last_message_id,
+                    row.message_count
+                ))
+                .collect::<Vec<_>>(),
+            [("tie", 6, 1), ("topic", 3, 2), ("1", 2, 2)]
+        );
+        // FrankenSQLite 0.4.10 reports only the outer `SCAN ranked` for
+        // this CTE's EXPLAIN. Inspect the exact production metadata scan
+        // separately; the complete query's real results are checked above.
+        let scoped_sql = PROJECT_THREAD_RANKED_SQL
+            .strip_prefix("WITH scoped AS (")
+            .unwrap()
+            .split_once("), ranked AS (")
+            .unwrap()
+            .0;
+        let plan = conn
+            .query(
+                cx,
+                &format!("EXPLAIN QUERY PLAN {scoped_sql}"),
+                &params[..2],
+            )
+            .await
+            .into_result()
+            .unwrap();
+        let detail = plan
+            .iter()
+            .map(|row| row.get_as::<String>(3).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            detail.contains("idx_messages_project_thread_activity"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn project_thread_metadata_query_runs_on_both_engines_and_uses_covering_index() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = Cx::for_testing();
+            let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+            assert_project_thread_metadata_query(&cx, &canonical).await;
+            let runtime = crate::DbConn::open_memory().unwrap();
+            assert_project_thread_metadata_query(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn project_threads_have_exact_counts_latest_subjects_and_project_scope() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-summary.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let page = list_project_threads(&cx, &pool, 1, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(page.threads.len(), 14);
+            assert_eq!(page.snapshot_id, 21);
+            assert!(page.previous_cursor.is_none());
+            assert!(page.next_cursor.is_none());
+            assert_eq!(page.threads[0].thread_id, "timestamp-tie");
+            assert_eq!(page.threads[1].thread_id, "8");
+            let topic = page
+                .threads
+                .iter()
+                .find(|row| row.thread_id == "topic")
+                .unwrap();
+            assert_eq!(topic.subject, "topic latest");
+            assert_eq!(
+                topic.last_message_id, 4,
+                "a backdated insertion must not select the subject"
+            );
+            assert_eq!(
+                topic.message_count, 3,
+                "recipients must not multiply counts"
+            );
+            assert_eq!((topic.first_created_ts, topic.last_created_ts), (30, 50));
+            for (key, count) in [
+                ("1", 2),
+                ("12", 2),
+                ("14", 2),
+                ("0001", 1),
+                ("8", 1),
+                ("6", 1),
+            ] {
+                assert_eq!(
+                    page.threads
+                        .iter()
+                        .find(|row| row.thread_id == key)
+                        .unwrap()
+                        .message_count,
+                    count
+                );
+            }
+            for key in [
+                "\t",
+                "\u{a0}",
+                " padded ",
+                "padded",
+                "slash/plus+query?#%26'\"><",
+            ] {
+                assert!(page.threads.iter().any(|row| row.thread_id == key));
+            }
+            let foreign = list_project_threads(&cx, &pool, 2, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(foreign.threads.len(), 2);
+            assert!(
+                foreign
+                    .threads
+                    .iter()
+                    .all(|row| row.subject.starts_with("foreign"))
+            );
+            let empty = list_project_threads(&cx, &pool, 99, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(empty.threads, [] as [ProjectThreadSummary; 0]);
+            assert_eq!(empty.snapshot_id, 0);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn project_threads_cursor_pages_stay_stable_during_new_and_backdated_inserts() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-pagination.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let baseline = list_project_threads(&cx, &pool, 1, 200, None)
+                .await.into_result().unwrap();
+            let first = list_project_threads(&cx, &pool, 1, 3, None)
+                .await.into_result().unwrap();
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            conn.execute(
+                &cx,
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                 VALUES (1000, 1, 1, 'topic', 'concurrent reply', 'body', 999), \
+                        (1001, 1, 1, 'new-backdated', 'concurrent backdated', 'body', -100)",
+                &[],
+            ).await.into_result().unwrap();
+            drop(conn);
+
+            let second = list_project_threads(&cx, &pool, 1, 3, first.next_cursor.as_ref())
+                .await.into_result().unwrap();
+            let previous = list_project_threads(&cx, &pool, 1, 3, second.previous_cursor.as_ref())
+                .await.into_result().unwrap();
+            assert_eq!(previous.threads, first.threads);
+            assert!(previous.previous_cursor.is_none());
+            let mut all = first.threads.clone();
+            let mut next = first.next_cursor;
+            while let Some(cursor) = next {
+                let page = list_project_threads(&cx, &pool, 1, 3, Some(&cursor))
+                    .await.into_result().unwrap();
+                assert_eq!(page.snapshot_id, 21);
+                assert!(page.previous_cursor.is_some());
+                all.extend(page.threads);
+                next = page.next_cursor;
+            }
+            assert_eq!(all, baseline.threads, "no duplicate, missing or newly accepted threads");
+            let refreshed = list_project_threads(&cx, &pool, 1, 200, None)
+                .await.into_result().unwrap();
+            assert_eq!(refreshed.threads.len(), 15);
+            assert_eq!(refreshed.threads[0].subject, "concurrent reply");
+            assert_eq!(refreshed.threads[0].message_count, 4);
+            assert_eq!(refreshed.threads.last().unwrap().thread_id, "new-backdated");
+        });
+    }
+
+    #[test]
+    fn project_threads_bounded_pages_do_not_let_one_busy_thread_hide_older_threads() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("project-thread-bounds.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+            for id in 100..405 {
+                conn.execute(
+                    &cx,
+                    "INSERT INTO messages(id, project_id, sender_id, thread_id, subject, body_md, created_ts) \
+                     VALUES (?, 1, 1, ?, 'bounded', 'body', ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(if id < 200 { "busy".into() } else { format!("thread-{id}") }),
+                        Value::BigInt(if id < 200 { 10_000 } else { id }),
+                    ],
+                ).await.into_result().unwrap();
+            }
+            drop(conn);
+            let page = list_project_threads(&cx, &pool, 1, usize::MAX, None)
+                .await.into_result().unwrap();
+            assert_eq!(page.threads.len(), MAX_PROJECT_THREADS_PAGE_SIZE);
+            assert_eq!(page.threads[0].thread_id, "busy");
+            assert_eq!(page.threads[0].message_count, 100);
+            assert_eq!(page.threads[1].thread_id, "thread-404");
+            assert!(page.next_cursor.is_some());
+            let tail = list_project_threads(&cx, &pool, 1, usize::MAX, page.next_cursor.as_ref())
+                .await.into_result().unwrap();
+            assert_eq!(page.threads.len() + tail.threads.len(), 220);
+            assert!(tail.next_cursor.is_none());
+            let one = list_project_threads(&cx, &pool, 1, 0, None)
+                .await.into_result().unwrap();
+            assert_eq!(one.threads.len(), 1);
+            for (snapshot_id, anchor_message_id) in [(-1, 1), (10, 0), (10, 11)] {
+                let cursor = ProjectThreadCursor {
+                    snapshot_id, anchor_message_id, anchor_created_ts: 0, newer: false,
+                };
+                assert!(matches!(list_project_threads(&cx, &pool, 1, 3, Some(&cursor)).await, Outcome::Err(_)));
+            }
+        });
+    }
+
+    #[test]
+    fn canonical_thread_messages_match_browser_keys_without_numeric_seed_collisions() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (cx, pool, _dir) = setup_test_pool("canonical-thread-membership.db");
+        rt.block_on(async {
+            seed_project_thread_fixture(&cx, &pool).await;
+            let page = list_project_threads(&cx, &pool, 1, 200, None)
+                .await
+                .into_result()
+                .unwrap();
+            for summary in page.threads {
+                let messages =
+                    list_canonical_thread_messages(&cx, &pool, 1, &summary.thread_id, None)
+                        .await
+                        .into_result()
+                        .unwrap();
+                assert_eq!(
+                    i64::try_from(messages.len()).unwrap(),
+                    summary.message_count,
+                    "{}",
+                    summary.thread_id
+                );
+                assert!(messages.iter().all(|message| message.project_id == 1));
+                assert_eq!(messages.last().unwrap().id, summary.last_message_id);
+            }
+            for (key, expected) in [
+                ("1", vec![1, 2]),
+                ("8", vec![9]),
+                ("0001", vec![7]),
+                ("12", vec![12, 13]),
+                ("14", vec![14, 15]),
+            ] {
+                let messages = list_canonical_thread_messages(&cx, &pool, 1, key, None)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .map(|message| message.id)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+            let limited = list_canonical_thread_messages(&cx, &pool, 1, "topic", Some(2))
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                limited.iter().map(|message| message.id).collect::<Vec<_>>(),
+                [5, 4]
+            );
+            for key in ["", " ", "missing", "+1"] {
+                assert!(
+                    list_canonical_thread_messages(&cx, &pool, 1, key, None)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert!(
+                list_canonical_thread_messages(&cx, &pool, 2, "8", None)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+            // The MCP/resource seed lookup has an intentionally different API.
+            let seeded = list_thread_messages(&cx, &pool, 1, "8", None)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                seeded.iter().map(|message| message.id).collect::<Vec<_>>(),
+                [8, 9]
+            );
+        });
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn list_numeric_thread_roots_with_replies_returns_only_roots_with_children() {
@@ -26621,6 +31465,393 @@ mod tests {
 
             assert_eq!(roots, vec![root_with_reply_id]);
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_lifecycle_blocks_new_work_but_preserves_replay_release_and_history() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for permanent in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("reservation-lifecycle-{permanent}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/reservation-lifecycle")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let agent_id = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("agent")
+                .id
+                .unwrap();
+                let message = create_message_with_recipients(
+                    &cx, &pool, project_id, agent_id, "preserved history", "body", None,
+                    "normal", false, "[]", &[(agent_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("historical message");
+                let paths = ["src/held.rs", "src/release.rs"];
+                let claim = IdempotencyClaim {
+                    project_id,
+                    tool: "file_reservation_paths",
+                    key: "original-grant",
+                    fingerprint: "original-paths-ttl-mode-reason",
+                };
+                let original = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &paths, 3600, true, "original", claim,
+                )
+                .await
+                .into_result()
+                .expect("active grant");
+                let IdempotentOutcome::Fresh(original) = original else {
+                    panic!("first grant must be fresh");
+                };
+                let original_json = serde_json::to_value(&original).unwrap();
+                let ids: Vec<i64> = original.iter().map(|row| row.id.unwrap()).collect();
+                let expected_field = if permanent {
+                    deregister_agent(&cx, &pool, agent_id, now_micros())
+                        .await
+                        .into_result()
+                        .expect("deregister owner");
+                    "agent_deregistered"
+                } else {
+                    set_agent_retired_at(&cx, &pool, agent_id, Some(now_micros()))
+                        .await
+                        .into_result()
+                        .expect("retire owner");
+                    "agent_retired"
+                };
+
+                for path in ["src/new.rs", "src/held.rs"] {
+                    let error = create_file_reservations(
+                        &cx, &pool, project_id, agent_id, &[path], 7200, false, "changed intent",
+                    )
+                    .await
+                    .into_result()
+                    .expect_err("inactive owner cannot acquire or reacquire");
+                    assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
+                }
+                let error = renew_reservations(
+                    &cx, &pool, project_id, agent_id, 600, None, Some(&ids),
+                )
+                .await
+                .into_result()
+                .expect_err("inactive owner cannot extend leases");
+                assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
+                let new_claim = IdempotencyClaim {
+                    key: "new-grant",
+                    fingerprint: "new-path-ttl-mode-reason",
+                    ..claim
+                };
+                let error = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &["src/new.rs"], 3600, true, "new work", new_claim,
+                )
+                .await
+                .into_result()
+                .expect_err("a new idempotency key cannot bypass lifecycle admission");
+                assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
+
+                let stored = list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .expect("retained reservations");
+                assert_eq!(stored.len(), original.len(), "no new lease was inserted");
+                for row in &original {
+                    let retained = stored.iter().find(|stored| stored.id == row.id).unwrap();
+                    assert_eq!(serde_json::to_value(retained).unwrap(), serde_json::to_value(row).unwrap());
+                }
+
+                // An identical retry is historical readback, even after a lease
+                // is released. It must neither extend nor resurrect that lease.
+                for released in [false, true] {
+                    if released {
+                        let rows = release_reservations(
+                            &cx, &pool, project_id, agent_id, Some(&["src/release.rs"]), None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("inactive owner may release existing work");
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(rows[0].id, original[1].id);
+                    }
+                    let replay = create_file_reservations_idempotent(
+                        &cx, &pool, project_id, agent_id, &paths, 3600, true, "original", claim,
+                    )
+                    .await
+                    .into_result()
+                    .expect("historical grant remains replayable");
+                    let IdempotentOutcome::Replayed(replayed) = replay else {
+                        panic!("retry must replay the original grant");
+                    };
+                    assert_eq!(serde_json::to_value(replayed).unwrap(), original_json);
+                    let retained = get_reservations_by_ids(&cx, &pool, &ids)
+                        .await
+                        .into_result()
+                        .expect("current lease state");
+                    let release_row = retained.iter().find(|row| row.id == original[1].id).unwrap();
+                    assert_eq!(release_row.released_ts.is_some(), released);
+                    for row in &retained {
+                        let old = original.iter().find(|old| old.id == row.id).unwrap();
+                        assert_eq!(row.expires_ts, old.expires_ts);
+                    }
+                }
+
+                let conflict = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &paths, 7200, true, "changed",
+                    IdempotencyClaim { fingerprint: "different-request", ..claim },
+                )
+                .await
+                .into_result()
+                .expect("idempotency conflicts remain classified");
+                assert!(matches!(conflict, IdempotentOutcome::Conflict(_)));
+                let retained_message = get_message(&cx, &pool, message.id.unwrap())
+                    .await
+                    .into_result()
+                    .expect("lifecycle leaves history readable");
+                assert_eq!(retained_message.subject, "preserved history");
+
+                if !permanent {
+                    set_agent_retired_at(&cx, &pool, agent_id, None)
+                        .await
+                        .into_result()
+                        .expect("unretire owner");
+                    let renewed = renew_reservations(
+                        &cx, &pool, project_id, agent_id, 600, None, Some(&[ids[0]]),
+                    )
+                    .await
+                    .into_result()
+                    .expect("unretirement restores renewal");
+                    assert_eq!(renewed.len(), 1);
+                    assert!(renewed[0].expires_ts > original[0].expires_ts);
+                    let granted = create_file_reservations_idempotent(
+                        &cx, &pool, project_id, agent_id, &["src/new.rs"], 3600, true, "new work", new_claim,
+                    )
+                    .await
+                    .into_result()
+                    .expect("unretirement restores grants");
+                    let IdempotentOutcome::Fresh(granted) = granted else {
+                        panic!("refused grants must not consume their idempotency key");
+                    };
+                    assert_eq!(granted.len(), 1);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn reservation_grants_and_renewals_require_an_owner_in_the_requested_project() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("reservation-owner-project.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/reservation-owner")
+                .await
+                .into_result()
+                .expect("owner project")
+                .id
+                .unwrap();
+            let foreign_project_id = ensure_project(&cx, &pool, "/tmp/reservation-foreign")
+                .await
+                .into_result()
+                .expect("foreign project")
+                .id
+                .unwrap();
+            let agent_id = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("owner")
+            .id
+            .unwrap();
+            let original = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/held.rs"],
+                3600,
+                true,
+                "own project",
+            )
+            .await
+            .into_result()
+            .expect("valid grant");
+            let id = original[0].id.unwrap();
+            let error = create_file_reservations(
+                &cx,
+                &pool,
+                foreign_project_id,
+                agent_id,
+                &["src/foreign.rs"],
+                3600,
+                true,
+                "wrong project",
+            )
+            .await
+            .into_result()
+            .expect_err("foreign owner cannot grant");
+            assert!(matches!(
+                error,
+                asupersync::OutcomeError::Err(DbError::NotFound { .. })
+            ));
+            let error = renew_reservations(
+                &cx,
+                &pool,
+                foreign_project_id,
+                agent_id,
+                600,
+                None,
+                Some(&[id]),
+            )
+            .await
+            .into_result()
+            .expect_err("foreign owner cannot renew");
+            assert!(matches!(
+                error,
+                asupersync::OutcomeError::Err(DbError::NotFound { .. })
+            ));
+            let foreign_rows = list_file_reservations(&cx, &pool, foreign_project_id, false)
+                .await
+                .into_result()
+                .expect("foreign project remains empty");
+            assert!(foreign_rows.is_empty());
+            let retained = get_reservations_by_ids(&cx, &pool, &[id])
+                .await
+                .into_result()
+                .expect("valid lease remains unchanged");
+            assert_eq!(
+                serde_json::to_value(retained).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_lifecycle_is_rechecked_after_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for renewal in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("reservation-retirement-wait-{renewal}.db"));
+            let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent lifecycle pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/reservation-retirement-wait")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let agent_id = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("owner")
+                .id
+                .unwrap();
+                let original = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/held.rs"],
+                    3600,
+                    true,
+                    "original",
+                )
+                .await
+                .into_result()
+                .expect("original grant");
+                drop(
+                    lifecycle_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("initialize lifecycle pool"),
+                );
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("hold sole checkout");
+                let mut waiting = std::pin::pin!(async {
+                    if renewal {
+                        renew_reservations(&cx, &pool, project_id, agent_id, 600, None, None).await
+                    } else {
+                        create_file_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            agent_id,
+                            &["src/new.rs"],
+                            3600,
+                            true,
+                            "queued grant",
+                        )
+                        .await
+                    }
+                });
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                // A real lifecycle write commits through another pool while the
+                // reservation is waiting, after any tool-level identity lookup.
+                set_agent_retired_at(&cx, &lifecycle_pool, agent_id, Some(now_micros()))
+                    .await
+                    .into_result()
+                    .expect("retire while reservation waits");
+                drop(held);
+                let error =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("reservation admission watchdog")
+                        .into_result()
+                        .expect_err("retirement wins before reservation admission");
+                assert!(matches!(
+                    error,
+                    asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                        field: "agent_retired",
+                        ..
+                    })
+                ));
+                let stored = list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .expect("unchanged reservations");
+                assert_eq!(
+                    serde_json::to_value(stored).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            });
+        }
     }
 
     #[test]
@@ -26925,7 +32156,9 @@ mod tests {
                     project_id,
                     agent_id: holder_id,
                     created_at_or_before: Some(cutoff),
+                    agent_last_active_at_or_before: None,
                 }),
+                None,
             )
             .await
             .into_result()
@@ -26965,6 +32198,173 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn broad_release_rechecks_revival_after_waiting_for_final_write_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for revived in [false, true] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("broad-release-revival-{revived}.db"));
+            let revival_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent revival pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/broad-release-revival")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let holder = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("holder");
+                let agent_id = holder.id.unwrap();
+                let original = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/renewed.rs"],
+                    3600,
+                    true,
+                    "original session",
+                )
+                .await
+                .into_result()
+                .expect("original lease");
+                let ids = [original[0].id.unwrap()];
+                let cutoff = now_micros();
+                assert!(holder.last_active_ts <= cutoff);
+                assert!(original[0].created_ts <= cutoff);
+                drop(
+                    revival_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("initialize independent pool"),
+                );
+
+                // Candidate selection has already happened. Hold the only
+                // checkout so a durable heartbeat and renewal can commit
+                // after that observation but before the release transaction.
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("sole checkout");
+                let mut waiting = std::pin::pin!(release_reservations_by_ids_with_constraints(
+                    &cx,
+                    &pool,
+                    &ids,
+                    ReleaseReservationExpiryConstraint::Any,
+                    Some(ReleaseReservationScope {
+                        project_id,
+                        agent_id,
+                        created_at_or_before: Some(cutoff),
+                        agent_last_active_at_or_before: Some(cutoff),
+                    }),
+                    None,
+                ));
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                let renewed = if revived {
+                    assert!(
+                        touch_agent(&cx, &revival_pool, agent_id)
+                            .await
+                            .into_result()
+                            .expect("durable revival heartbeat")
+                    );
+                    let renewed = renew_reservations(
+                        &cx,
+                        &revival_pool,
+                        project_id,
+                        agent_id,
+                        600,
+                        None,
+                        Some(&ids),
+                    )
+                    .await
+                    .into_result()
+                    .expect("renew older lease while release waits");
+                    assert_eq!(renewed.len(), 1);
+                    assert_eq!(renewed[0].created_ts, original[0].created_ts);
+                    assert!(renewed[0].expires_ts > original[0].expires_ts);
+                    let conn = revival_pool.acquire(&cx).await.into_result().unwrap();
+                    let activity = conn
+                        .query_sync(
+                            "SELECT last_active_ts FROM agents WHERE id = ?",
+                            &[Value::BigInt(agent_id)],
+                        )
+                        .expect("persisted revival");
+                    assert!(activity[0].get_named::<i64>("last_active_ts").unwrap() > cutoff);
+                    renewed
+                } else {
+                    original.clone()
+                };
+                drop(held);
+                let released =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("release admission watchdog")
+                        .into_result()
+                        .expect("broad release replay");
+                assert_eq!(released.len(), usize::from(!revived));
+
+                let retained = get_reservations_by_ids(&cx, &pool, &ids)
+                    .await
+                    .into_result()
+                    .expect("read lease after release decision");
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let ledger = conn
+                    .query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                    .expect("release ledger");
+                assert_eq!(ledger.len(), usize::from(!revived));
+                drop(conn);
+                if revived {
+                    assert_eq!(
+                        serde_json::to_value(&retained).unwrap(),
+                        serde_json::to_value(&renewed).unwrap(),
+                        "refused broad replay leaves the renewed lease unchanged"
+                    );
+                    let narrow = release_reservations_with_created_cutoff(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        None,
+                        Some(&ids),
+                        Some(cutoff),
+                    )
+                    .await
+                    .into_result()
+                    .expect("explicit older intent still owns its exact lease scope");
+                    assert_eq!(narrow.len(), 1);
+                    assert_eq!(narrow[0].id, Some(ids[0]));
+                } else {
+                    assert_eq!(released[0].id, ids[0]);
+                    assert!(retained[0].released_ts.is_some());
+                }
+            });
+        }
     }
 
     #[test]
@@ -27089,6 +32489,162 @@ mod tests {
                     .into_result()
                     .expect("release exact id set");
             assert_eq!(released_ids, vec![second_id]);
+        });
+    }
+
+    #[test]
+    fn numeric_thread_seed_includes_the_seeds_named_thread() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("seed.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-seed-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let post_in = |thread: Option<&'static str>| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender_id,
+                        "s",
+                        "b",
+                        thread,
+                        "normal",
+                        false,
+                        "[]",
+                        &[(sender_id, "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("message")
+                    .id
+                    .expect("id")
+                }
+            };
+            let seed = post_in(Some("TKT-1")).await;
+            let sibling = post_in(Some("TKT-1")).await;
+            let _unrelated = post_in(Some("TKT-2")).await;
+
+            let thread = list_thread_messages(&cx, &pool, project_id, &seed.to_string(), None)
+                .await
+                .into_result()
+                .expect("thread");
+            let mut ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![seed, sibling], "the seed's thread, nothing else");
+        });
+    }
+
+    #[test]
+    fn re_reserving_a_held_path_runs_ttl_from_now_without_stacking() {
+        use asupersync::runtime::RuntimeBuilder;
+        const HOUR: i64 = 3_600_000_000;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("rereserve.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-rereserve-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+            let reserve = |ttl: i64| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_file_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        holder_id,
+                        &["src/a.rs"],
+                        ttl,
+                        true,
+                        "r",
+                    )
+                    .await
+                    .into_result()
+                    .expect("reserve")[0]
+                        .expires_ts
+                }
+            };
+            let first = reserve(3600).await;
+            // A shorter TTL does not cut the lease short, and does not add to it.
+            let short = reserve(60).await;
+            assert_eq!(short, first, "60 s on top of an hour left must not stack");
+            // A longer TTL runs from now (about first + 1 h), not from the
+            // current expiry (first + 2 h).
+            let long = reserve(7200).await;
+            assert!(long >= base + 2 * HOUR, "{long}");
+            assert!(
+                long < first + HOUR * 3 / 2,
+                "7200 s stacked on {first}: {long}"
+            );
         });
     }
 
@@ -27223,6 +32779,318 @@ mod tests {
             .expect("read released_ts");
             assert_eq!(rows.len(), 1);
             assert!(rows[0].get(0).and_then(value_as_i64).is_some());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_read_snapshots_remain_available_and_fresh_while_a_writer_is_active() {
+        const CHILD: &str = "AM_TEST_RESERVATION_READ_SNAPSHOT_CHILD";
+        type LeaseState = std::collections::BTreeMap<i64, i64>;
+        struct ExpectedReads {
+            active: LeaseState,
+            unreleased: LeaseState,
+            released: LeaseState,
+            last_mail: i64,
+        }
+
+        fn lease_state(rows: &[FileReservationRow]) -> LeaseState {
+            rows.iter()
+                .map(|row| (row.id.expect("reservation id"), row.expires_ts))
+                .collect()
+        }
+
+        // SHM contains legitimate reader coordination state; the primary and
+        // WAL are the durable bytes that an observation must not publish.
+        fn durable_family(path: &std::path::Path) -> [Option<Vec<u8>>; 2] {
+            ["", "-wal"].map(|suffix| {
+                let mut member = path.as_os_str().to_os_string();
+                member.push(suffix);
+                match std::fs::read(std::path::PathBuf::from(member)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("read durable SQLite family: {error}"),
+                }
+            })
+        }
+
+        async fn assert_reads(
+            cx: &Cx,
+            pool: &DbPool,
+            project_id: i64,
+            agent_id: i64,
+            expected: &ExpectedReads,
+        ) {
+            let active = get_active_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("active view must not acquire the writer lock");
+            assert_eq!(lease_state(&active), expected.active);
+            let unreleased = list_unreleased_file_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("cleanup listing must not acquire the writer lock");
+            assert_eq!(lease_state(&unreleased), expected.unreleased);
+            let released = list_released_unexpired_reservations(cx, pool, project_id)
+                .await
+                .into_result()
+                .expect("release archive view must not acquire the writer lock");
+            assert_eq!(lease_state(&released), expected.released);
+            assert!(released.iter().all(|row| row.released_ts.is_some()));
+            let listed = list_file_reservations(cx, pool, project_id, true)
+                .await
+                .into_result()
+                .expect("active resource listing");
+            assert_eq!(lease_state(&listed), expected.active);
+
+            // Exercise pagination's SQL-level ledger subtraction separately
+            // from the unpaginated candidate/ledger merge.
+            let mut pages = Vec::new();
+            for offset in 0..expected.active.len() {
+                let page = list_file_reservations_page(cx, pool, project_id, true, 1, offset)
+                    .await
+                    .into_result()
+                    .expect("active resource page");
+                assert_eq!(page.len(), 1);
+                pages.extend(page);
+            }
+            assert_eq!(pages.len(), expected.active.len());
+            assert_eq!(lease_state(&pages), expected.active);
+            let snapshot = get_reservation_conflict_snapshot(
+                cx,
+                pool,
+                "/reservation-read-snapshot",
+                "BlueLake",
+                100,
+            )
+            .await
+            .into_result()
+            .expect("authoritative guard snapshot");
+            assert_eq!(snapshot.project.id, Some(project_id));
+            assert_eq!(snapshot.caller_agent_id, agent_id);
+            assert!(!snapshot.overflow);
+            assert_eq!(
+                snapshot
+                    .reservations
+                    .iter()
+                    .map(|row| (row.id, row.expires_ts))
+                    .collect::<LeaseState>(),
+                expected.active,
+            );
+            assert_eq!(
+                get_agent_last_mail_activity(cx, pool, agent_id, project_id)
+                    .await
+                    .into_result()
+                    .expect("mail activity observation"),
+                Some(expected.last_mail),
+            );
+        }
+
+        // The retry budget is a process-wide LazyLock. Keep the negative
+        // control bounded without changing any other test's retry policy.
+        let thread = std::thread::current();
+        let name = thread.name().expect("named test");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, name)
+                .env("FSQLITE_CONCURRENT_RETRIES", "0")
+                .env("FSQLITE_CONCURRENT_MODE", "false")
+                .output()
+                .expect("run isolated reservation snapshot regression");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "reservation snapshot regression failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let (_cx, pool, dir) = setup_test_pool("reservation-read-snapshot.db");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/reservation-read-snapshot")
+                .await
+                .into_result()
+                .expect("project")
+                .id
+                .unwrap();
+            let agent_id = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("holder")
+            .id
+            .unwrap();
+            let leases = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/closed.rs", "src/released.rs", "src/renewed.rs", "src/expired.rs"],
+                3600,
+                true,
+                "snapshot fixture",
+            )
+            .await
+            .into_result()
+            .expect("initial leases");
+            let lease = |path| {
+                leases
+                    .iter()
+                    .find(|row| row.path_pattern == path)
+                    .expect("named lease")
+            };
+            let closed = lease("src/closed.rs");
+            let released = lease("src/released.rs");
+            let renewed = lease("src/renewed.rs");
+            let expired = lease("src/expired.rs");
+            release_reservations_by_ids(&cx, &pool, &[closed.id.unwrap()])
+                .await
+                .into_result()
+                .expect("pre-existing release");
+
+            let db_path = dir.path().join("reservation-read-snapshot.db");
+            let writer = crate::DbConn::open_file(db_path.to_str().unwrap())
+                .expect("independent native writer");
+            writer
+                .execute_raw("PRAGMA wal_autocheckpoint = 0")
+                .expect("retain committed WAL for the publication control");
+            writer
+                .execute_raw("PRAGMA busy_timeout = 0")
+                .expect("bounded writer admission");
+            writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+            writer
+                .execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
+                    &[Value::BigInt(expired.id.unwrap())],
+                )
+                .expect("expired but unreleased fixture");
+            writer
+                .execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (1, ?, ?, 'Before', 'Committed activity', 100)",
+                    &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+                )
+                .expect("committed mail activity");
+            writer.execute_raw("COMMIT").unwrap();
+
+            let read_pool = DbPool::new_query_only(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("query-only reader pool");
+            let before = ExpectedReads {
+                active: [
+                    (released.id.unwrap(), released.expires_ts),
+                    (renewed.id.unwrap(), renewed.expires_ts),
+                ]
+                .into(),
+                unreleased: [
+                    (released.id.unwrap(), released.expires_ts),
+                    (renewed.id.unwrap(), renewed.expires_ts),
+                    (expired.id.unwrap(), 1),
+                ]
+                .into(),
+                released: [(closed.id.unwrap(), closed.expires_ts)].into(),
+                last_mail: 100,
+            };
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &before).await;
+                let conn = reader.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync("PRAGMA busy_timeout = 0", &[])
+                    .expect("fail promptly if a reader attempts writer admission");
+            }
+
+            let new_id = leases.iter().filter_map(|row| row.id).max().unwrap() + 1;
+            let new_expiry = renewed.expires_ts + 120_000_000;
+            let release_ts = now_micros();
+            writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+            // A ledger-only release must disappear from every active view and
+            // appear in the released view only after this writer commits.
+            writer
+                .execute_sync(
+                    "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)",
+                    &[Value::BigInt(released.id.unwrap()), Value::BigInt(release_ts)],
+                )
+                .expect("uncommitted release");
+            writer
+                .execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[Value::BigInt(new_expiry), Value::BigInt(renewed.id.unwrap())],
+                )
+                .expect("uncommitted renewal");
+            writer
+                .execute_sync(
+                    "INSERT INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+                     VALUES (?, ?, ?, 'src/new.rs', 1, 'Concurrent grant', ?, ?)",
+                    &[
+                        Value::BigInt(new_id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(agent_id),
+                        Value::BigInt(release_ts),
+                        Value::BigInt(new_expiry),
+                    ],
+                )
+                .expect("uncommitted grant");
+            writer
+                .execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (2, ?, ?, 'After', 'Uncommitted activity', 200)",
+                    &[Value::BigInt(project_id), Value::BigInt(agent_id)],
+                )
+                .expect("uncommitted mail activity");
+            let held_family = durable_family(&db_path);
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &before).await;
+                assert_eq!(
+                    durable_family(&db_path),
+                    held_family,
+                    "reads must not publish the held writer's changes"
+                );
+            }
+
+            writer.execute_raw("COMMIT").expect("commit independent writer");
+            let committed_family = durable_family(&db_path);
+            assert!(
+                committed_family[1].as_ref().is_some_and(|wal| wal.len() > 32),
+                "the no-checkpoint control must retain actual committed WAL frames"
+            );
+            let after = ExpectedReads {
+                active: [(renewed.id.unwrap(), new_expiry), (new_id, new_expiry)].into(),
+                unreleased: [
+                    (renewed.id.unwrap(), new_expiry),
+                    (expired.id.unwrap(), 1),
+                    (new_id, new_expiry),
+                ]
+                .into(),
+                released: [
+                    (closed.id.unwrap(), closed.expires_ts),
+                    (released.id.unwrap(), released.expires_ts),
+                ]
+                .into(),
+                last_mail: 200,
+            };
+            for reader in [&pool, &read_pool] {
+                assert_reads(&cx, reader, project_id, agent_id, &after).await;
+                assert_eq!(
+                    durable_family(&db_path),
+                    committed_family,
+                    "fresh pooled reads must not checkpoint or rewrite committed WAL"
+                );
+            }
         });
     }
 
@@ -27868,6 +33736,557 @@ mod tests {
             assert_eq!(active[0].id, Some(reservation_id));
             assert!(active[0].released_ts.is_none());
         });
+    }
+
+    async fn stale_release_candidate_for_test(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        name: &str,
+    ) -> StaleReservationCandidate {
+        let agent = register_agent(cx, pool, project_id, name, "test", "test", None, None, None)
+            .await
+            .into_result()
+            .expect("stale holder");
+        let agent_id = agent.id.expect("holder id");
+        let path = format!("src/{name}.rs");
+        let reservation = create_file_reservations(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            &[path.as_str()],
+            3600,
+            true,
+            "stale observation",
+        )
+        .await
+        .into_result()
+        .expect("stale lease")
+        .pop()
+        .expect("lease row");
+        {
+            let conn = acquire_conn(cx, pool)
+                .await
+                .into_result()
+                .expect("fixture connection");
+            conn.execute_sync(
+                "UPDATE agents SET last_active_ts = 0 WHERE id = ?",
+                &[Value::BigInt(agent_id)],
+            )
+            .expect("inactive fixture holder");
+        }
+        let agent = get_agent_by_id_fresh(cx, pool, agent_id)
+            .await
+            .into_result()
+            .expect("observe current holder");
+        let last_mail_activity_ts = get_agent_last_mail_activity(cx, pool, agent_id, project_id)
+            .await
+            .into_result()
+            .expect("observe current mail");
+        StaleReservationCandidate {
+            reservation,
+            agent_last_active_ts: agent.last_active_ts,
+            last_mail_activity_ts,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stale_release_revalidates_lease_and_activity_in_write_transaction() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("stale-release-revalidation.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = ensure_project(&cx, &pool, "/tmp/stale-release-revalidation")
+                .await
+                .into_result()
+                .expect("project");
+            let project_id = project.id.expect("project id");
+            let mut candidates = Vec::new();
+            for name in [
+                "BlueLake",
+                "GreenLake",
+                "RedLake",
+                "GoldLake",
+                "SilverLake",
+                "AmberLake",
+                "PurpleLake",
+                "WhiteLake",
+                "BlackLake",
+                "OrangeLake",
+                "TealLake",
+                "PinkLake",
+                "AzureLake",
+                "CyanLake",
+            ] {
+                candidates
+                    .push(stale_release_candidate_for_test(&cx, &pool, project_id, name).await);
+            }
+            let ids: Vec<i64> = candidates
+                .iter()
+                .map(|candidate| candidate.reservation.id.unwrap())
+                .collect();
+            let agent_ids: Vec<i64> = candidates
+                .iter()
+                .map(|candidate| candidate.reservation.agent_id)
+                .collect();
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "MistyRiver",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("sender");
+            let incoming = create_message_with_recipients_topic(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap(),
+                "activity race",
+                "A delivery is not activity until its recipient acts.",
+                None,
+                None,
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(agent_ids[5], "to"), (agent_ids[6], "to")],
+                Some("to"),
+            )
+            .await
+            .into_result()
+            .expect("direct and shared delivery");
+            let message_id = incoming.id.unwrap();
+            for candidate in &mut candidates {
+                candidate.last_mail_activity_ts = get_agent_last_mail_activity(
+                    &cx,
+                    &pool,
+                    candidate.reservation.agent_id,
+                    project_id,
+                )
+                .await
+                .into_result()
+                .expect("capture mail before recipient actions");
+                assert_eq!(candidate.last_mail_activity_ts, None);
+            }
+            let observed_at = now_micros();
+
+            // These real writes happen after the cleanup observation and before
+            // release admission. No sleeps or mocked database outcomes are used.
+            let renewed = renew_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_ids[1],
+                7200,
+                None,
+                Some(&[ids[1]]),
+            )
+            .await
+            .into_result()
+            .expect("renew after scan");
+            assert!(renewed[0].expires_ts > candidates[1].reservation.expires_ts);
+            assert!(
+                touch_agent(&cx, &pool, agent_ids[2])
+                    .await
+                    .into_result()
+                    .unwrap()
+            );
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                agent_ids[4],
+                "still working",
+                "active",
+                None,
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("send after scan");
+            mark_message_read(&cx, &pool, agent_ids[5], message_id)
+                .await
+                .into_result()
+                .expect("direct read after scan");
+            acknowledge_message(&cx, &pool, agent_ids[6], message_id)
+                .await
+                .into_result()
+                .expect("direct ack after scan");
+            mark_message_read(&cx, &pool, agent_ids[7], message_id)
+                .await
+                .into_result()
+                .expect("shared read after scan");
+            acknowledge_message(&cx, &pool, agent_ids[8], message_id)
+                .await
+                .into_result()
+                .expect("shared ack after scan");
+            let reacquired = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_ids[9],
+                &[candidates[9].reservation.path_pattern.as_str()],
+                1,
+                false,
+                "new work with unchanged expiry",
+            )
+            .await
+            .into_result()
+            .expect("same-expiry reacquisition");
+            assert_eq!(
+                reacquired[0].expires_ts,
+                candidates[9].reservation.expires_ts
+            );
+            {
+                let conn = acquire_conn(&cx, &pool)
+                    .await
+                    .into_result()
+                    .expect("fixture writes");
+                conn.execute_sync(
+                    "UPDATE agents SET reaper_exempt = 1 WHERE id = ?",
+                    &[Value::BigInt(agent_ids[3])],
+                )
+                .expect("exempt after scan without changing heartbeat");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET created_ts = created_ts + 1 WHERE id = ?",
+                    &[Value::BigInt(ids[10])],
+                )
+                .expect("replace identity after scan");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET agent_id = ? WHERE id = ?",
+                    &[Value::BigInt(agent_ids[0]), Value::BigInt(ids[11])],
+                )
+                .expect("change holder after scan");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET path_pattern = 'src/replaced.rs' WHERE id = ?",
+                    &[Value::BigInt(ids[12])],
+                )
+                .expect("change path after scan");
+            }
+            let expected = vec![ids[0], ids[13]];
+            let released = release_stale_reservations(
+                &cx,
+                &pool,
+                project_id,
+                &candidates,
+                observed_at,
+                1_800_000_000,
+                900_000_000,
+            )
+            .await
+            .into_result()
+            .expect("guarded release");
+            assert_eq!(
+                released, expected,
+                "only unchanged eligible leases may be revoked"
+            );
+            let rows = get_reservations_by_ids(&cx, &pool, &ids)
+                .await
+                .into_result()
+                .expect("committed lease state");
+            assert_eq!(rows.len(), ids.len());
+            for row in rows {
+                assert_eq!(
+                    row.released_ts.is_some(),
+                    expected.contains(&row.id.unwrap())
+                );
+            }
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("ledger connection");
+            let ledger = conn
+                .query_sync(
+                    "SELECT reservation_id FROM file_reservation_releases ORDER BY reservation_id",
+                    &[],
+                )
+                .expect("release ledger");
+            let ledger_ids: Vec<i64> = ledger
+                .iter()
+                .map(|row| row.get_named("reservation_id").unwrap())
+                .collect();
+            assert_eq!(ledger_ids, expected);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stale_release_rolls_back_earlier_candidates_when_activity_is_unreadable() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("stale-release-rollback.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/stale-release-rollback")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let first = stale_release_candidate_for_test(&cx, &pool, project_id, "BlueLake").await;
+            let second =
+                stale_release_candidate_for_test(&cx, &pool, project_id, "GreenLake").await;
+            let ids = [
+                first.reservation.id.unwrap(),
+                second.reservation.id.unwrap(),
+            ];
+            let observed_at = now_micros();
+            let message = create_message(
+                &cx,
+                &pool,
+                project_id,
+                second.reservation.agent_id,
+                "unreadable activity",
+                "test",
+                None,
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("actual mail row");
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = 'unreadable' WHERE id = ?",
+                    &[Value::BigInt(message.id.unwrap())],
+                )
+                .expect("corrupt second holder's activity evidence");
+            }
+            let candidates = [first, second];
+            let error = release_stale_reservations(
+                &cx,
+                &pool,
+                project_id,
+                &candidates,
+                observed_at,
+                1_800_000_000,
+                900_000_000,
+            )
+            .await
+            .into_result()
+            .expect_err("unreadable evidence must abort the transaction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid mail activity timestamp"),
+                "{error}"
+            );
+            let rows = get_reservations_by_ids(&cx, &pool, &ids)
+                .await
+                .into_result()
+                .expect("rolled-back lease state");
+            assert!(rows.iter().all(|row| row.released_ts.is_none()));
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                assert!(
+                    conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                        .unwrap()
+                        .is_empty(),
+                    "the first candidate's ledger write must roll back too"
+                );
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = 0 WHERE id = ?",
+                    &[Value::BigInt(message.id.unwrap())],
+                )
+                .expect("restore no positive activity");
+            }
+            assert_eq!(
+                release_stale_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    &candidates,
+                    observed_at,
+                    1_800_000_000,
+                    900_000_000,
+                )
+                .await
+                .into_result()
+                .expect("later valid proof still releases"),
+                ids
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cancelled_release_transaction_rolls_back_before_returning_checkout_to_pool() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (healthy_cx, pool, _dir) = setup_test_pool("cancelled-release-rollback.db");
+        rt.block_on(async {
+            let project_id = ensure_project(&healthy_cx, &pool, "/tmp/cancelled-release-rollback")
+                .await.into_result().unwrap().id.unwrap();
+            let candidate = stale_release_candidate_for_test(
+                &healthy_cx, &pool, project_id, "BlueLake",
+            ).await;
+            let id = candidate.reservation.id.unwrap();
+            for cancel_after_mutation in [false, true] {
+                let request_cx = Cx::for_testing();
+                {
+                    let conn = acquire_conn(&healthy_cx, &pool).await.into_result().unwrap();
+                    let tracked = tracked(&*conn);
+                    if !cancel_after_mutation {
+                        request_cx.cancel_with(asupersync::types::CancelKind::User, Some("before begin"));
+                    }
+                    let outcome: Outcome<(), DbError> = async {
+                        try_in_tx!(
+                            &request_cx, &tracked, begin_immediate_tx(&request_cx, &tracked).await
+                        );
+                        // Exactly the base-row and ledger mutations performed
+                        // by the release primitive, on a real pooled database.
+                        let released_ts = now_micros();
+                        try_in_tx!(
+                            &request_cx,
+                            &tracked,
+                            map_sql_outcome(traw_execute(
+                                &request_cx,
+                                &tracked,
+                                "UPDATE file_reservations SET released_ts = ? WHERE id = ?",
+                                &[Value::BigInt(released_ts), Value::BigInt(id)],
+                            ).await)
+                        );
+                        try_in_tx!(
+                            &request_cx,
+                            &tracked,
+                            map_sql_outcome(traw_execute(
+                                &request_cx,
+                                &tracked,
+                                "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)",
+                                &[Value::BigInt(id), Value::BigInt(released_ts)],
+                            ).await)
+                        );
+                        request_cx.cancel_with(
+                            asupersync::types::CancelKind::User, Some("after release candidate write"),
+                        );
+                        // The real SQL adapter now rejects the next statement.
+                        // Exercise try_in_tx's cancellation cleanup, rather
+                        // than calling a replacement rollback in this fixture.
+                        try_in_tx!(
+                            &request_cx, &tracked,
+                            map_sql_outcome(traw_query(&request_cx, &tracked, "SELECT 1", &[]).await)
+                        );
+                        Outcome::Ok(())
+                    }.await;
+                    assert!(matches!(outcome, Outcome::Cancelled(_)));
+                    assert!(request_cx.is_cancel_requested(), "cleanup must not clear cancellation");
+                    assert!(tracked.retire_on_drop.is_some());
+                    assert!(!tracked.retire_on_drop.unwrap().load(Ordering::Acquire),
+                        "successful or already-idle rollback keeps a healthy checkout reusable");
+                }
+                // A single-slot pool must return a connection in autocommit,
+                // with no release bits left for a later caller to commit.
+                let conn = acquire_conn(&healthy_cx, &pool).await.into_result().unwrap();
+                conn.execute_raw("BEGIN IMMEDIATE")
+                    .expect("cancelled checkout must not retain an open transaction");
+                let rows = conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id = ?",
+                    &[Value::BigInt(id)],
+                ).unwrap();
+                assert!(rows[0].get_named::<Option<i64>>("released_ts").unwrap().is_none());
+                assert!(conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                    .unwrap().is_empty(), "cancelled release ledger must roll back");
+                conn.execute_raw("COMMIT").expect("next owner's transaction remains usable");
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn stale_release_requires_shared_activity_authority_except_for_legacy_absence() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for case in [
+            "legacy",
+            "receipts_missing",
+            "deliveries_missing",
+            "events_retained",
+            "unreadable",
+        ] {
+            let (_cx, pool, _dir) = setup_test_pool(&format!("stale-shared-{case}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/stale-shared-authority")
+                    .await.into_result().unwrap().id.unwrap();
+                let candidate = stale_release_candidate_for_test(&cx, &pool, project_id, "BlueLake").await;
+                let id = candidate.reservation.id.unwrap();
+                let agent_id = candidate.reservation.agent_id;
+                let observed_at = now_micros();
+                if case == "events_retained" {
+                    let foreign_project = ensure_project(&cx, &pool, "/tmp/stale-shared-foreign")
+                        .await.into_result().unwrap().id.unwrap();
+                    let foreign_sender = register_agent(
+                        &cx, &pool, foreign_project, "GreenLake", "test", "test", None, None, None,
+                    ).await.into_result().unwrap().id.unwrap();
+                    create_message_with_recipients_topic(
+                        &cx, &pool, foreign_project, foreign_sender,
+                        "retained authority", "shared event in another project", None, None, None,
+                        "normal", false, "[]", &[], Some("to"),
+                    ).await.into_result().expect("shared event authority");
+                }
+                {
+                    let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                    conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                    if matches!(case, "legacy" | "receipts_missing" | "events_retained") {
+                        conn.execute_raw(
+                            "ALTER TABLE project_mailbox_receipts RENAME TO saved_cleanup_receipts",
+                        ).expect("preserve receipt table under another name");
+                    }
+                    if matches!(case, "legacy" | "deliveries_missing" | "events_retained") {
+                        conn.execute_raw(
+                            "ALTER TABLE project_mailbox_deliveries RENAME TO saved_cleanup_deliveries",
+                        ).expect("preserve delivery table under another name");
+                    }
+                    if case == "legacy" {
+                        conn.execute_raw(
+                            "ALTER TABLE inbox_delivery_cursor_state RENAME TO saved_cleanup_cursor_state",
+                        ).expect("preserve cursor authority under another name for the legacy fixture");
+                    }
+                    if case == "unreadable" {
+                        conn.execute_raw(
+                            "ALTER TABLE project_mailbox_receipts RENAME COLUMN read_ts TO unreadable_read_ts",
+                        ).expect("make activity authority unreadable");
+                    }
+                    conn.execute_raw("COMMIT").unwrap();
+                }
+                let observed = get_agent_last_mail_activity(&cx, &pool, agent_id, project_id)
+                    .await.into_result();
+                let released = release_stale_reservations(
+                    &cx, &pool, project_id, &[candidate], observed_at, 1_800_000_000, 900_000_000,
+                ).await.into_result();
+                if case == "legacy" {
+                    assert_eq!(observed.unwrap(), None);
+                    assert_eq!(released.unwrap(), vec![id], "pre-upgrade direct mail remains usable");
+                } else {
+                    assert!(observed.is_err(), "{case}: observation must not hide missing authority");
+                    assert!(released.is_err(), "{case}: release must fail closed too");
+                    let rows = get_reservations_by_ids(&cx, &pool, &[id])
+                        .await.into_result().expect("preserved claim");
+                    assert!(rows[0].released_ts.is_none(), "{case}");
+                    let conn = acquire_conn(&cx, &pool).await.into_result().unwrap();
+                    assert!(conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                        .unwrap().is_empty(), "{case}: no false terminal evidence");
+                }
+            });
+        }
     }
 
     #[test]
@@ -28721,6 +35140,337 @@ mod tests {
                     "non-ack-required message should not create ack debt"
                 );
             }
+        });
+    }
+
+    /// br-qbhs0: a send counts itself into each recipient's `inbox_stats` row
+    /// instead of recounting the whole inbox. The row must equal the recount
+    /// through a missing row, an existing one, ack-required and plain mail, a
+    /// duplicated recipient entry, and a read and an ack in between.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_message_counts_itself_into_inbox_stats_exactly_like_a_recount() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        // (total, unread, ack_pending, last_message_ts) as stored, and as a
+        // recount of message_recipients computes it; zeros when there is none.
+        fn stored_and_recounted(path: &str, agent_id: i64) -> ([i64; 4], [i64; 4]) {
+            let conn = crate::DbConn::open_file(path.to_string()).expect("open verify connection");
+            let read = |sql: &str| {
+                let rows = conn
+                    .query_sync(sql, &[Value::BigInt(agent_id)])
+                    .expect("query inbox stats");
+                rows.first().map_or([0; 4], |row| {
+                    [
+                        row.get_named::<i64>("total").unwrap_or(0),
+                        row.get_named::<i64>("unread").unwrap_or(0),
+                        row.get_named::<i64>("ack_pending").unwrap_or(0),
+                        row.get_named::<i64>("last_ts").unwrap_or(0),
+                    ]
+                })
+            };
+            let stored = read(
+                "SELECT total_count AS total, unread_count AS unread, \
+                 ack_pending_count AS ack_pending, last_message_ts AS last_ts \
+                 FROM inbox_stats WHERE agent_id = ?",
+            );
+            let recounted = read(
+                "SELECT COUNT(*) AS total, \
+                 COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread, \
+                 COALESCE(SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 THEN 1 ELSE 0 END), 0) AS ack_pending, \
+                 COALESCE(MAX(m.created_ts), 0) AS last_ts \
+                 FROM message_recipients mr JOIN messages m ON m.id = mr.message_id \
+                 WHERE mr.agent_id = ?",
+            );
+            (stored, recounted)
+        }
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_stats_counted_on_send.db");
+        let path = pool.sqlite_path().to_string();
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for inbox_stats setup");
+            create_inbox_stats_table_for_test(&conn);
+            drop(conn);
+
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-counted-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedCastle", "PinkHarbor"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "e2e-test",
+                    "test-model",
+                    Some("inbox stats"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (sender, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+            let send = |subject: &'static str, ack: bool, recipients: Vec<(i64, &'static str)>| {
+                let (cx, pool) = (&cx, &pool);
+                async move {
+                    create_message_with_recipients(
+                        cx,
+                        pool,
+                        project_id,
+                        sender,
+                        subject,
+                        "body",
+                        Some("THREAD-INBOX-COUNTED"),
+                        "normal",
+                        ack,
+                        "[]",
+                        &recipients,
+                    )
+                    .await
+                    .into_result()
+                    .expect("create message")
+                    .id
+                    .expect("message id")
+                }
+            };
+            let assert_exact = |step: &str| {
+                for agent in [a, b, c] {
+                    let (stored, recounted) = stored_and_recounted(&path, agent);
+                    assert_eq!(
+                        stored, recounted,
+                        "{step}: agent {agent} inbox_stats must equal the recount"
+                    );
+                }
+            };
+
+            // No row yet: every recipient falls back to the recount.
+            let first = send("first", true, vec![(a, "to"), (b, "cc")]).await;
+            assert_exact("first send");
+            // Existing rows are counted in place; plain mail adds no ack debt,
+            // and a duplicated recipient entry counts once.
+            send("second", false, vec![(a, "to"), (a, "cc"), (c, "bcc")]).await;
+            assert_exact("second send");
+            mark_message_read(&cx, &pool, a, first)
+                .await
+                .into_result()
+                .expect("mark read");
+            acknowledge_message(&cx, &pool, b, first)
+                .await
+                .into_result()
+                .expect("acknowledge");
+            assert_exact("after read and ack");
+            let third = send("third", true, vec![(a, "to"), (b, "to")]).await;
+            assert_exact("third send");
+
+            let (stored_a, _) = stored_and_recounted(&path, a);
+            assert_eq!(
+                stored_a[..3],
+                [3, 2, 2],
+                "a: three messages, the first read, two still awaiting an ack"
+            );
+            let (stored_b, _) = stored_and_recounted(&path, b);
+            assert_eq!(stored_b[0], 2, "b received two messages");
+            assert_eq!(
+                stored_b[2], 1,
+                "b acknowledged the first; the third awaits an ack"
+            );
+            let third_ts: i64 = crate::DbConn::open_file(path.clone())
+                .expect("open verify connection")
+                .query_sync(
+                    "SELECT created_ts AS ts FROM messages WHERE id = ?",
+                    &[Value::BigInt(third)],
+                )
+                .expect("third message")[0]
+                .get_named::<i64>("ts")
+                .expect("created_ts");
+            assert_eq!(
+                stored_b[3], third_ts,
+                "last_message_ts follows the newest message"
+            );
+        });
+    }
+
+    /// A migration on an already-running mailbox can restore the standalone
+    /// import trigger. Sends must not count its delivery a second time, nor
+    /// trust a trigger-created row that omits an agent's older messages.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_message_recounts_when_migration_restores_inbox_insert_trigger() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        fn assert_stats(path: &str, agent_id: i64, expected: [i64; 3]) {
+            let conn = crate::DbConn::open_file(path.to_string()).expect("open verify connection");
+            let conn = crate::guard_db_conn(
+                conn,
+                "queries::tests live migration inbox stats verification",
+            );
+            let read = |sql: &str| {
+                let rows = conn
+                    .query_sync(sql, &[Value::BigInt(agent_id)])
+                    .expect("query inbox stats");
+                let row = rows.first().expect("inbox stats row");
+                [
+                    row.get_named::<i64>("total").expect("total"),
+                    row.get_named::<i64>("unread").expect("unread"),
+                    row.get_named::<i64>("ack_pending").expect("ack pending"),
+                    row.get_named::<i64>("last_ts").expect("last timestamp"),
+                ]
+            };
+            let stored = read(
+                "SELECT total_count AS total, unread_count AS unread, \
+                 ack_pending_count AS ack_pending, last_message_ts AS last_ts \
+                 FROM inbox_stats WHERE agent_id = ?",
+            );
+            let recounted = read(
+                "SELECT COUNT(*) AS total, \
+                 SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread, \
+                 SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 THEN 1 ELSE 0 END) AS ack_pending, \
+                 MAX(m.created_ts) AS last_ts \
+                 FROM message_recipients mr JOIN messages m ON m.id = mr.message_id \
+                 WHERE mr.agent_id = ?",
+            );
+            assert_eq!(
+                stored, recounted,
+                "agent {agent_id}: stored stats vs recount"
+            );
+            assert_eq!(stored[..3], expected, "agent {agent_id}: expected counters");
+        }
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_stats_migrate_live_pool.db");
+        let path = pool.sqlite_path().to_string();
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-inbox-migrate-live-{}", now_micros()),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedCastle", "PinkHarbor"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "e2e-test",
+                    "test-model",
+                    Some("inbox stats migration"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (sender, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+            let send = |subject: &'static str, ack: bool, recipients: Vec<(i64, &'static str)>| {
+                let (cx, pool) = (&cx, &pool);
+                async move {
+                    create_message_with_recipients(
+                        cx,
+                        pool,
+                        project_id,
+                        sender,
+                        subject,
+                        "body",
+                        Some("THREAD-INBOX-MIGRATE-LIVE"),
+                        "urgent",
+                        ack,
+                        "[]",
+                        &recipients,
+                    )
+                    .await
+                    .into_result()
+                    .expect("create message")
+                    .id
+                    .expect("message id")
+                }
+            };
+
+            let first = send("before migration", true, vec![(a, "to"), (b, "cc")]).await;
+            assert_stats(&path, a, [1, 1, 1]);
+            assert_stats(&path, b, [1, 1, 1]);
+
+            // Use the real migration entry point while retaining the initialized
+            // pool. Restarting it would drop the trigger and hide this regression.
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire migration connection");
+            crate::schema::migrate_to_latest_base(&cx, &**conn)
+                .await
+                .into_result()
+                .expect("migrate initialized mailbox");
+            let triggers = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                     AND name = 'trg_inbox_stats_insert'",
+                    &[],
+                )
+                .expect("query restored insert trigger");
+            assert_eq!(triggers.len(), 1, "migration must restore the trigger");
+            drop(conn);
+
+            send(
+                "after migration",
+                false,
+                vec![(a, "to"), (a, "cc"), (c, "bcc")],
+            )
+            .await;
+            assert_stats(&path, a, [2, 2, 1]);
+            assert_stats(&path, b, [1, 1, 1]);
+            assert_stats(&path, c, [1, 1, 0]);
+
+            mark_message_read(&cx, &pool, a, first)
+                .await
+                .into_result()
+                .expect("mark read");
+            acknowledge_message(&cx, &pool, b, first)
+                .await
+                .into_result()
+                .expect("acknowledge");
+            assert_stats(&path, a, [2, 1, 1]);
+            assert_stats(&path, b, [1, 0, 0]);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire stats repair connection");
+            conn.execute_sync(
+                "DELETE FROM inbox_stats WHERE agent_id = ?",
+                &[Value::BigInt(c)],
+            )
+            .expect("remove derived row to exercise trigger partial repair");
+            drop(conn);
+            send(
+                "after read and ack",
+                true,
+                vec![(a, "to"), (b, "to"), (c, "to")],
+            )
+            .await;
+            assert_stats(&path, a, [3, 2, 2]);
+            assert_stats(&path, b, [2, 1, 1]);
+            assert_stats(&path, c, [2, 2, 1]);
         });
     }
 
@@ -30231,6 +36981,7 @@ mod tests {
             .build()
             .expect("build runtime");
         SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow_mut().clear());
+        SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow_mut().clear());
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-serializer-scope")
@@ -30287,6 +37038,18 @@ mod tests {
         assert!(
             seen.iter().any(|locked| !locked),
             "every post-commit probe ran with the message serializer still held: {seen:?}"
+        );
+        // br-qbhs0: the writer's own post-commit sample also runs after the
+        // release; it was ~10% of the serializer's hold under swarm load.
+        let sampled = SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow().clone());
+        assert_eq!(
+            sampled.len(),
+            3,
+            "one writer sample per fresh send: {sampled:?}"
+        );
+        assert!(
+            sampled.iter().any(|locked| !locked),
+            "every writer sample ran with the message serializer still held: {sampled:?}"
         );
     }
 
@@ -30469,10 +37232,23 @@ mod tests {
                 min_connections: 1,
                 max_connections: writers,
                 run_migrations: true,
-                warmup_connections: 0,
+                warmup_connections: 1,
                 ..Default::default()
             };
             let pool = crate::create_pool(&cfg).expect("create pool");
+            // Ensure schema initialization completes before the writer threads
+            // race at the barrier so host load cannot trip the 10s init_gate
+            // before the first autocommit write is issued.
+            let warmup_rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("warmup runtime");
+            warmup_rt.block_on(async {
+                let cx = Cx::current().expect("warmup cx");
+                assert!(
+                    matches!(acquire_conn(&cx, &pool).await, Outcome::Ok(_)),
+                    "warmup acquire_conn failed"
+                );
+            });
             let per_writer = 8_usize;
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
             // Spawn every writer before joining any: they meet at the barrier.
@@ -30545,6 +37321,137 @@ mod tests {
                 .collect();
             assert_eq!(integrity, vec!["ok".to_string()], "{writers} writers");
         }
+    }
+
+    #[test]
+    fn autocommit_writer_storm_compares_mvcc_and_serialized_modes_and_records_retry_metrics() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let writers = 16_usize;
+        let per_writer = 6_usize;
+        for concurrent_mode_on in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mode_name = if concurrent_mode_on {
+                "mvcc_concurrent"
+            } else {
+                "serialized"
+            };
+            let db_path = dir.path().join(format!("autocommit_ab_{mode_name}.db"));
+            let cfg = crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: writers,
+                run_migrations: true,
+                warmup_connections: 1,
+                ..Default::default()
+            };
+            let pool = crate::create_pool(&cfg).expect("create pool");
+            let warmup_rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("warmup runtime");
+            warmup_rt.block_on(async {
+                let cx = Cx::current().expect("warmup cx");
+                assert!(
+                    matches!(acquire_conn(&cx, &pool).await, Outcome::Ok(_)),
+                    "warmup acquire_conn failed"
+                );
+            });
+
+            let before_metrics = mvcc_retry_metrics();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+            let mut handles = Vec::with_capacity(writers);
+            for writer in 0..writers {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("writer runtime");
+                    barrier.wait();
+                    let mut failures = Vec::new();
+                    for row in 0..per_writer {
+                        let slug = format!("ab-{mode_name}-{writer}-{row}");
+                        let outcome = rt.block_on(async {
+                            let cx = Cx::current().expect("runtime installs a context");
+                            run_with_mvcc_retry(&cx, "autocommit ab insert", || async {
+                                let conn = match acquire_conn(&cx, &pool).await {
+                                    Outcome::Ok(conn) => conn,
+                                    Outcome::Err(error) => return Outcome::Err(error),
+                                    Outcome::Cancelled(reason) => {
+                                        return Outcome::Cancelled(reason);
+                                    }
+                                    Outcome::Panicked(payload) => {
+                                        return Outcome::Panicked(payload);
+                                    }
+                                };
+                                let pragma = if concurrent_mode_on {
+                                    "PRAGMA fsqlite.concurrent_mode = ON"
+                                } else {
+                                    "PRAGMA fsqlite.concurrent_mode = OFF"
+                                };
+                                let _ = conn.execute_raw(pragma);
+                                match conn.execute_raw(&format!(
+                                    "INSERT INTO projects (slug, human_key, created_at) \
+                                         VALUES ('{slug}', '/tmp/{slug}', 0)"
+                                )) {
+                                    Ok(()) => Outcome::Ok(()),
+                                    Err(error) => Outcome::Err(map_sql_error(&error)),
+                                }
+                            })
+                            .await
+                        });
+                        if !matches!(outcome, Outcome::Ok(())) {
+                            failures.push(format!("{slug}: {outcome:?}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            let failures: Vec<String> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("writer thread"))
+                .collect();
+            let after_metrics = mvcc_retry_metrics();
+            assert!(
+                failures.is_empty(),
+                "mode={mode_name}: expected zero lost rows / RESOURCE_BUSY failures, got {failures:?}"
+            );
+            assert!(
+                after_metrics.retries_total >= before_metrics.retries_total
+                    && after_metrics.write_contention_retries_total
+                        >= before_metrics.write_contention_retries_total,
+                "mode={mode_name}: retry counters must be monotonic ({before_metrics:?} -> {after_metrics:?})"
+            );
+            drop(pool);
+
+            let verify = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+                .expect("independent C SQLite connection");
+            let count = verify
+                .query_sync("SELECT count(*) FROM projects", &[])
+                .expect("count projects")
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok());
+            assert_eq!(
+                count,
+                Some(i64::try_from(writers * per_writer).expect("row count fits")),
+                "mode={mode_name}: autocommit writers must lose no rows"
+            );
+            let integrity: Vec<String> = verify
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check")
+                .iter()
+                .filter_map(|row| row.get_as::<String>(0).ok())
+                .collect();
+            assert_eq!(integrity, vec!["ok".to_string()], "mode={mode_name}");
+        }
+
+        // Also verify the rolling per-minute counter directly when an MVCC conflict is retried.
+        let before = mvcc_retry_metrics();
+        MVCC_RETRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MVCC_RETRIES_LAST_MINUTE.record();
+        let after = mvcc_retry_metrics();
+        assert!(after.retries_total > before.retries_total);
+        assert!(after.retries_last_minute >= 1);
     }
 
     #[test]
@@ -31077,6 +37984,599 @@ mod tests {
                 .expect("request against a blocked link");
             assert_eq!(still_blocked.status, "blocked");
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn contact_mutations_require_active_endpoints_and_preserve_history() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for permanent in [false, true] {
+            for inactive_sender in [false, true] {
+                for initial_status in ["pending", "approved", "blocked"] {
+                    let (_cx, pool, _dir) = setup_test_pool(&format!(
+                        "contact-lifecycle-{permanent}-{inactive_sender}-{initial_status}.db"
+                    ));
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("runtime context");
+                        let from_project_id = ensure_project(&cx, &pool, "/tmp/contact-source")
+                            .await
+                            .into_result()
+                            .expect("source project")
+                            .id
+                            .unwrap();
+                        let to_project_id = ensure_project(&cx, &pool, "/tmp/contact-target")
+                            .await
+                            .into_result()
+                            .expect("target project")
+                            .id
+                            .unwrap();
+                        let from_agent_id = register_agent(
+                            &cx,
+                            &pool,
+                            from_project_id,
+                            "BlueLake",
+                            "test",
+                            "test",
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("requester")
+                        .id
+                        .unwrap();
+                        let to_agent_id = register_agent(
+                            &cx,
+                            &pool,
+                            to_project_id,
+                            "GreenStone",
+                            "test",
+                            "test",
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("recipient")
+                        .id
+                        .unwrap();
+                        let requested = request_contact(
+                            &cx,
+                            &pool,
+                            from_project_id,
+                            from_agent_id,
+                            to_project_id,
+                            to_agent_id,
+                            "original",
+                            3600,
+                        )
+                        .await
+                        .into_result()
+                        .expect("active cross-project request");
+                        let original = if initial_status == "pending" {
+                            requested
+                        } else {
+                            respond_contact(
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                initial_status == "approved",
+                                3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("active cross-project response")
+                            .1
+                        };
+
+                        // Each identity must belong to its stated endpoint project.
+                        for (wrong_from, wrong_to) in [
+                            (to_project_id, to_project_id),
+                            (from_project_id, from_project_id),
+                        ] {
+                            assert!(matches!(
+                                request_contact(
+                                    &cx,
+                                    &pool,
+                                    wrong_from,
+                                    from_agent_id,
+                                    wrong_to,
+                                    to_agent_id,
+                                    "wrong project",
+                                    7200,
+                                )
+                                .await,
+                                Outcome::Err(DbError::NotFound {
+                                    entity: "Agent",
+                                    ..
+                                })
+                            ));
+                            assert!(matches!(
+                                respond_contact(
+                                    &cx,
+                                    &pool,
+                                    wrong_from,
+                                    from_agent_id,
+                                    wrong_to,
+                                    to_agent_id,
+                                    true,
+                                    7200,
+                                )
+                                .await,
+                                Outcome::Err(DbError::NotFound {
+                                    entity: "Agent",
+                                    ..
+                                })
+                            ));
+                        }
+                        let inactive_id = if inactive_sender {
+                            from_agent_id
+                        } else {
+                            to_agent_id
+                        };
+                        let expected_field = if permanent {
+                            let deregistered =
+                                deregister_agent(&cx, &pool, inactive_id, now_micros())
+                                    .await
+                                    .into_result()
+                                    .expect("deregister participant");
+                            assert!(
+                                deregistered.retired_at.is_none(),
+                                "ledger-only lifecycle state"
+                            );
+                            "agent_deregistered"
+                        } else {
+                            set_agent_retired_at(&cx, &pool, inactive_id, Some(now_micros()))
+                                .await
+                                .into_result()
+                                .expect("retire participant");
+                            "agent_retired"
+                        };
+
+                        // Refuse both refresh of the existing direction and creation
+                        // of the previously absent reverse direction.
+                        for (a_project, a_agent, b_project, b_agent) in [
+                            (from_project_id, from_agent_id, to_project_id, to_agent_id),
+                            (to_project_id, to_agent_id, from_project_id, from_agent_id),
+                        ] {
+                            assert!(matches!(
+                                request_contact(
+                                    &cx, &pool, a_project, a_agent, b_project, b_agent,
+                                    "changed authorization", 7200,
+                                ).await,
+                                Outcome::Err(DbError::InvalidArgument { field, .. })
+                                    if field == expected_field
+                            ));
+                        }
+                        for accept in [false, true] {
+                            assert!(matches!(
+                                respond_contact(
+                                    &cx, &pool, from_project_id, from_agent_id,
+                                    to_project_id, to_agent_id, accept, 7200,
+                                ).await,
+                                Outcome::Err(DbError::InvalidArgument { field, .. })
+                                    if field == expected_field
+                            ));
+                        }
+                        assert!(matches!(
+                            approve_contact_unless_blocked(
+                                &cx, &pool, from_project_id, from_agent_id,
+                                to_project_id, to_agent_id, 7200,
+                            ).await,
+                            Outcome::Err(DbError::InvalidArgument { field, .. })
+                                if field == expected_field
+                        ));
+
+                        // Refused mutations must leave all link fields unchanged,
+                        // and retirement must not hide historical contact metadata.
+                        let source_history =
+                            list_contacts(&cx, &pool, from_project_id, from_agent_id)
+                                .await
+                                .into_result()
+                                .expect("requester history");
+                        let target_history = list_contacts(&cx, &pool, to_project_id, to_agent_id)
+                            .await
+                            .into_result()
+                            .expect("recipient history");
+                        assert!(source_history.1.is_empty());
+                        assert!(target_history.0.is_empty());
+                        assert_eq!(
+                            serde_json::to_value(&source_history.0).unwrap(),
+                            serde_json::json!([&original])
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&target_history.1).unwrap(),
+                            serde_json::json!([&original])
+                        );
+
+                        if !permanent {
+                            set_agent_retired_at(&cx, &pool, inactive_id, None)
+                                .await
+                                .into_result()
+                                .expect("explicitly unretire");
+                            request_contact(
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                "resumed",
+                                3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("unretired participant can request");
+                            respond_contact(
+                                &cx,
+                                &pool,
+                                from_project_id,
+                                from_agent_id,
+                                to_project_id,
+                                to_agent_id,
+                                true,
+                                3600,
+                            )
+                            .await
+                            .into_result()
+                            .expect("unretired participant can respond");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_contact_approval_preserves_a_block_committed_while_waiting() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for cross_project in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("contact-auto-block-{cross_project}.db"));
+            let recipient_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent recipient pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let from_project_id = ensure_project(&cx, &pool, "/tmp/contact-auto-source")
+                    .await
+                    .into_result()
+                    .expect("source project")
+                    .id
+                    .unwrap();
+                let to_project_id = if cross_project {
+                    ensure_project(&cx, &pool, "/tmp/contact-auto-target")
+                        .await
+                        .into_result()
+                        .expect("target project")
+                        .id
+                        .unwrap()
+                } else {
+                    from_project_id
+                };
+                let from_agent_id = register_agent(
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    "BlueLake",
+                    "test",
+                    "test",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("requester")
+                .id
+                .unwrap();
+                let to_agent_id = register_agent(
+                    &cx,
+                    &pool,
+                    to_project_id,
+                    "GreenStone",
+                    "test",
+                    "test",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("recipient")
+                .id
+                .unwrap();
+                let requested = request_contact(
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    "request observed before the block",
+                    3600,
+                )
+                .await
+                .into_result()
+                .expect("pending request");
+                assert_eq!(requested.status, "pending");
+                let reverse = request_contact(
+                    &cx,
+                    &pool,
+                    to_project_id,
+                    to_agent_id,
+                    from_project_id,
+                    from_agent_id,
+                    "independent reverse request",
+                    1800,
+                )
+                .await
+                .into_result()
+                .expect("reverse link");
+                drop(
+                    recipient_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("warm recipient"),
+                );
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("hold sole checkout");
+                let mut waiting = std::pin::pin!(approve_contact_unless_blocked(
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    7200,
+                ));
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                let (_, blocked) = respond_contact(
+                    &cx,
+                    &recipient_pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    false,
+                    7200,
+                )
+                .await
+                .into_result()
+                .expect("recipient blocks after the request snapshot");
+                assert_eq!(blocked.status, "blocked");
+                drop(held);
+                let (updated, observed) =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("automatic approval watchdog")
+                        .into_result()
+                        .expect("automatic approval returns the preserved block");
+                assert_eq!(updated, 0);
+                assert_eq!(
+                    serde_json::to_value(&observed).unwrap(),
+                    serde_json::to_value(&blocked).unwrap(),
+                    "automatic approval must not refresh any blocked row field"
+                );
+                let history = list_contacts(&cx, &pool, from_project_id, from_agent_id)
+                    .await
+                    .into_result()
+                    .expect("preserved directed history");
+                assert_eq!(
+                    serde_json::to_value(history.0).unwrap(),
+                    serde_json::json!([blocked])
+                );
+                assert_eq!(
+                    serde_json::to_value(history.1).unwrap(),
+                    serde_json::json!([reverse])
+                );
+
+                let (updated, approved) = respond_contact(
+                    &cx,
+                    &pool,
+                    from_project_id,
+                    from_agent_id,
+                    to_project_id,
+                    to_agent_id,
+                    true,
+                    3600,
+                )
+                .await
+                .into_result()
+                .expect("explicit recipient approval still lifts the block");
+                assert_eq!(updated, 1);
+                assert_eq!(approved.status, "approved");
+                assert_eq!(approved.id, requested.id);
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn contact_lifecycle_is_rechecked_after_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for responding in [false, true] {
+            for inactive_sender in [false, true] {
+                let (_cx, pool, _dir) = setup_test_pool(&format!(
+                    "contact-retirement-wait-{responding}-{inactive_sender}.db"
+                ));
+                let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                    storage_root: Some(pool.storage_root().to_path_buf()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("independent lifecycle pool");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    let project_id = ensure_project(&cx, &pool, "/tmp/contact-retirement-wait")
+                        .await
+                        .into_result()
+                        .expect("project")
+                        .id
+                        .unwrap();
+                    let from_agent_id = register_agent(
+                        &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("requester")
+                    .id
+                    .unwrap();
+                    let to_agent_id = register_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        "GreenStone",
+                        "test",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .into_result()
+                    .expect("recipient")
+                    .id
+                    .unwrap();
+                    let original = request_contact(
+                        &cx,
+                        &pool,
+                        project_id,
+                        from_agent_id,
+                        project_id,
+                        to_agent_id,
+                        "original",
+                        3600,
+                    )
+                    .await
+                    .into_result()
+                    .expect("original request");
+                    let (inactive_id, inactive_name) = if inactive_sender {
+                        (from_agent_id, "BlueLake")
+                    } else {
+                        (to_agent_id, "GreenStone")
+                    };
+                    let resolved = get_agent(&cx, &pool, project_id, inactive_name)
+                        .await
+                        .into_result()
+                        .expect("tool-level lookup");
+                    assert!(resolved.retired_at.is_none());
+                    drop(
+                        lifecycle_pool
+                            .acquire(&cx)
+                            .await
+                            .into_result()
+                            .expect("initialize lifecycle pool"),
+                    );
+                    let held = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("hold sole checkout");
+                    let mut waiting = std::pin::pin!(async {
+                        if responding {
+                            respond_contact(
+                                &cx,
+                                &pool,
+                                project_id,
+                                from_agent_id,
+                                project_id,
+                                to_agent_id,
+                                true,
+                                7200,
+                            )
+                            .await
+                            .into_result()
+                            .map(|(_, row)| row)
+                        } else {
+                            request_contact(
+                                &cx,
+                                &pool,
+                                project_id,
+                                from_agent_id,
+                                project_id,
+                                to_agent_id,
+                                "queued refresh",
+                                7200,
+                            )
+                            .await
+                            .into_result()
+                        }
+                    });
+                    {
+                        let mut context = Context::from_waker(Waker::noop());
+                        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                    }
+                    // Retire through a separate real pool after identity lookup
+                    // and while the contact mutation is waiting for admission.
+                    set_agent_retired_at(&cx, &lifecycle_pool, inactive_id, Some(now_micros()))
+                        .await
+                        .into_result()
+                        .expect("retire while contact mutation waits");
+                    drop(held);
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        std::time::Duration::from_secs(5),
+                        waiting,
+                    )
+                    .await
+                    .expect("contact admission watchdog")
+                    .expect_err("retirement wins before contact admission");
+                    assert!(matches!(
+                        error,
+                        asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                            field: "agent_retired",
+                            ..
+                        })
+                    ));
+                    let (outgoing, incoming) = list_contacts(&cx, &pool, project_id, from_agent_id)
+                        .await
+                        .into_result()
+                        .expect("unchanged contact history");
+                    assert!(incoming.is_empty());
+                    assert_eq!(
+                        serde_json::to_value(outgoing).unwrap(),
+                        serde_json::json!([original])
+                    );
+                });
+            }
+        }
     }
 
     #[test]
@@ -32786,7 +40286,19 @@ mod tests {
                 )
                 .expect("stabilize message timestamp");
             }
+            conn.execute_sync(
+                "UPDATE agents SET display_name = 'Reviewer' WHERE id = ?",
+                &[Value::BigInt(sender_b.id.expect("sender b id"))],
+            )
+            .expect("set current product sender label");
             drop(conn);
+
+            let labels = list_agent_display_names(&cx, &pool, project_b_id)
+                .await
+                .into_result()
+                .expect("read product project labels");
+            assert_eq!(labels["greencastle"].as_deref(), Some("Reviewer"));
+            assert_eq!(labels["bluelake"], None);
 
             let tracker = Arc::new(crate::QueryTracker::new());
             tracker.enable(None);
@@ -32816,6 +40328,12 @@ mod tests {
             assert_eq!(metadata_rows.len(), 2);
             assert_eq!(metadata_rows[0].message.subject, "newer urgent");
             assert_eq!(metadata_rows[1].message.subject, "older normal");
+            assert_eq!(metadata_rows[0].sender_name, "GreenCastle");
+            assert_eq!(
+                metadata_rows[0].sender_display_name.as_deref(),
+                Some("Reviewer")
+            );
+            assert_eq!(metadata_rows[1].sender_display_name, None);
             assert!(
                 metadata_rows
                     .iter()
@@ -32867,6 +40385,10 @@ mod tests {
             assert_eq!(urgent_rows.len(), 1);
             assert_eq!(urgent_rows[0].message.subject, "newer urgent");
             assert_eq!(urgent_rows[0].message.body_md, "newer body hydrated");
+            assert_eq!(
+                urgent_rows[0].sender_display_name.as_deref(),
+                Some("Reviewer")
+            );
         });
     }
 
@@ -32978,6 +40500,7 @@ mod tests {
                 false,
                 "[]",
                 &[],
+                None,
             )
             .await
             .into_result()
@@ -33490,6 +41013,194 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fetch_unacked_merges_shared_obligations_with_viewer_receipts_and_oldest_limit() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_shared.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'shared', '/tmp/unacked-shared', 0),
+                        (2, 'other', '/tmp/unacked-other', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0),
+                        (3, 1, 'Peer', 'test', 'test', 0, 0),
+                        (4, 1, 'Late', 'test', 'test', 900, 0),
+                        (5, 1, 'Retired', 'test', 'test', 0, 0),
+                        (6, 1, 'Blocked', 'test', 'test', 0, 0),
+                        (7, 2, 'Foreign', 'test', 'test', 0, 0);
+                 UPDATE agents SET retired_at = 42 WHERE id = 5;
+                 UPDATE agents SET contact_policy = 'block_all' WHERE id = 6;
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+                 VALUES (1, 1, 1, 'shared urgent', '', 100, 'urgent', 1),
+                        (2, 1, 1, 'direct precedence', '', 200, 'high', 1),
+                        (3, 1, 1, 'direct already acked', '', 50, 'normal', 1),
+                        (4, 1, 1, 'no ack required', '', 300, 'normal', 0),
+                        (5, 1, 2, 'viewer authored', '', 60, 'normal', 1),
+                        (6, 1, 1, 'direct timestamp tie', '', 100, 'normal', 1),
+                        (7, 2, 7, 'other project', '', 70, 'normal', 1),
+                        (8, 1, 1, 'acked but unread', '', 90, 'normal', 1),
+                        (9, 1, 1, 'read but unacked', '', 150, 'normal', 1);
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (1, 1, 'to', 100), (2, 1, 'to', 200), (3, 1, 'to', 50),
+                        (4, 1, 'to', 300), (5, 1, 'to', 60), (7, 2, 'to', 70),
+                        (8, 1, 'to', 90), (9, 1, 'to', 150);
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (2, 2, 'cc', 210, NULL), (3, 2, 'to', 90, 90),
+                        (6, 2, 'to', NULL, NULL);
+                 INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (1, 3, 110, 111), (2, 2, 220, 230),
+                        (8, 2, NULL, 91), (9, 2, 160, NULL);",
+            )
+            .unwrap();
+            drop(conn);
+
+            let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 100)
+                .await
+                .into_result()
+                .unwrap();
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| (row.message.id.unwrap(), row.kind.as_str(), row.read_ts))
+                .collect();
+            assert_eq!(
+                actual,
+                vec![
+                    (1, "project", None),
+                    (6, "to", None),
+                    (9, "project", Some(160)),
+                    (2, "cc", Some(210)),
+                ]
+            );
+            let limited = fetch_unacked_for_agent(&cx, &pool, 1, 2, 2)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                limited.iter().map(|row| row.message.id).collect::<Vec<_>>(),
+                vec![Some(1), Some(6)]
+            );
+            assert!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 0)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+            for viewer in [4, 5, 6, 7] {
+                assert!(
+                    fetch_unacked_for_agent(&cx, &pool, 1, viewer, 100)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let receipts = conn
+                .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+                .unwrap();
+            assert_eq!(receipts[0].get_named::<i64>("n").unwrap(), 4);
+            let activity = conn
+                .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+                .unwrap();
+            assert_eq!(activity[0].get_named::<i64>("n").unwrap(), 0);
+            drop(conn);
+
+            acknowledge_message(&cx, &pool, 2, 9)
+                .await
+                .into_result()
+                .unwrap();
+            let viewer_rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 100)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(viewer_rows.iter().all(|row| row.message.id != Some(9)));
+            let peer_rows = fetch_unacked_for_agent(&cx, &pool, 1, 3, 100)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(peer_rows.iter().any(|row| row.message.id == Some(9)));
+        });
+    }
+
+    #[test]
+    fn fetch_unacked_falls_back_only_for_a_genuinely_absent_shared_schema() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_shared_schema.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'legacy', '/tmp/unacked-legacy', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct obligation', '', 10, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts;
+                 ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;")
+                .unwrap();
+            conn.execute_raw(
+                "ALTER TABLE inbox_delivery_cursor_state RENAME TO retained_cursor_state",
+            )
+            .unwrap();
+            drop(conn);
+            let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 10)
+                .await
+                .into_result()
+                .expect("genuinely old schema retains direct obligations");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].message.id, Some(1));
+
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[Value::BigInt(1), Value::BigInt(1), Value::BigInt(10)],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+        });
+    }
+
+    #[test]
     fn fetch_unacked_for_agent_keeps_orphaned_sender_rows_visible() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -33663,6 +41374,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
             assert_eq!(rows[0].message.subject, "Inbox survives sender drift");
+            assert_eq!(rows[0].sender_display_name, None);
         });
     }
 
@@ -33730,6 +41442,7 @@ mod tests {
                 false,
                 "[]",
                 &[(recipient_id, "to")],
+                None,
             )
             .await
             .into_result()

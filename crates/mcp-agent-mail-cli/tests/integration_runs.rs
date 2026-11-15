@@ -176,7 +176,7 @@ fn run_am_binary(
     args: &[&str],
     stdin: Option<&[u8]>,
 ) -> Output {
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(binary); // ubs:ignore — integration callers select the Cargo-built am or an explicitly prepared private test candidate, never a request value
     cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
@@ -197,10 +197,10 @@ fn run_am_binary(
         }
         child
             .wait_with_output()
-            .unwrap_or_else(|error| panic!("wait for {} output: {error}", binary.display()))
+            .unwrap_or_else(|error| panic!("wait for {} output: {error}", binary.display())) // ubs:ignore — test helper must fail on candidate process I/O failure
     } else {
         cmd.output()
-            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display()))
+            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display())) // ubs:ignore — test helper must fail if the candidate cannot be spawned
     }
 }
 
@@ -259,7 +259,7 @@ fn run_am_with_timeout(
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => panic!("timed am wait failed: {error}"),
+            Err(error) => panic!("timed am wait failed: {error}"), // ubs:ignore — integration fixture must fail on process wait errors
         }
     }
 
@@ -401,7 +401,7 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => panic!("stdio wait failed: {error}"),
+            Err(error) => panic!("stdio wait failed: {error}"), // ubs:ignore — integration fixture must fail on process wait errors
         }
     }
 
@@ -440,7 +440,7 @@ fn json_check<'a>(value: &'a Value, id: &str) -> &'a Value {
         .expect("checks array")
         .iter()
         .find(|check| check["id"].as_str() == Some(id))
-        .unwrap_or_else(|| panic!("missing check {id}"))
+        .unwrap_or_else(|| panic!("missing check {id}")) // ubs:ignore — missing doctor check is a failed integration assertion
 }
 
 fn init_cli_schema(db_path: &Path) {
@@ -465,7 +465,7 @@ struct TreeEntry {
 
 fn file_snapshot(path: &Path) -> (u64, u64) {
     let bytes =
-        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())); // ubs:ignore — test file witness must fail if it cannot be read
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     (bytes.len() as u64, hasher.finish())
@@ -474,7 +474,7 @@ fn file_snapshot(path: &Path) -> (u64, u64) {
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
     fn visit(root: &Path, current: &Path, out: &mut BTreeMap<PathBuf, TreeEntry>) {
         let mut entries: Vec<_> = std::fs::read_dir(current)
-            .unwrap_or_else(|error| panic!("read_dir {}: {error}", current.display()))
+            .unwrap_or_else(|error| panic!("read_dir {}: {error}", current.display())) // ubs:ignore — test tree witness must fail on enumeration errors
             .map(|entry| entry.expect("read dir entry"))
             .collect();
         entries.sort_by_key(|entry| entry.path());
@@ -486,7 +486,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                 .expect("entry below snapshot root")
                 .to_path_buf();
             let metadata = std::fs::symlink_metadata(&path)
-                .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()));
+                .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display())); // ubs:ignore — test file witness must fail on metadata errors
             let file_type = metadata.file_type();
             let mode = file_mode(&metadata);
             let modified = metadata.modified().ok();
@@ -525,7 +525,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                         len: None,
                         content_hash: None,
                         symlink_target: Some(std::fs::read_link(&path).unwrap_or_else(|error| {
-                            panic!("read_link {}: {error}", path.display())
+                            panic!("read_link {}: {error}", path.display()) // ubs:ignore — test symlink witness must fail on read errors
                         })),
                         mode,
                         modified,
@@ -568,11 +568,11 @@ fn set_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut perms = std::fs::metadata(path)
-        .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()))
+        .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display())) // ubs:ignore — private test shim must have readable metadata
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms)
-        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display())); // ubs:ignore — private test shim must be executable or the test must fail
 }
 
 #[cfg(not(unix))]
@@ -584,7 +584,7 @@ fn write_version_shim(path: &Path, binary: &str) {
         env!("CARGO_PKG_VERSION")
     );
     std::fs::write(path, contents)
-        .unwrap_or_else(|error| panic!("write shim {}: {error}", path.display()));
+        .unwrap_or_else(|error| panic!("write shim {}: {error}", path.display())); // ubs:ignore — private test shim creation failure must fail the test
     set_executable(path);
 }
 
@@ -692,7 +692,13 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     conn.close_sync().unwrap();
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
 
-    assert_idle_stdio_reconciles(&env, "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md", 1);
+    assert_idle_stdio_reconciles(
+        &env,
+        &[(
+            "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md".to_string(),
+            1,
+        )],
+    );
 }
 
 #[test]
@@ -842,10 +848,337 @@ fn serve_stdio_recovers_accepted_send_after_archive_failure_and_restart() {
         "{}__idle-recovery__{message_id}.md",
         created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
     );
-    assert_idle_stdio_reconciles(&env, &filename, message_id);
+    assert_idle_stdio_reconciles(&env, &[(filename, message_id)]);
 }
 
-fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) {
+struct ArchivePressureServer {
+    child: Option<std::process::Child>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    next_id: i64,
+}
+
+impl ArchivePressureServer {
+    fn start(env: &TestEnv) -> Self {
+        let stdout_path = env.tmp.path().join("archive-pressure.stdout");
+        let stderr_path = env.tmp.path().join("archive-pressure.stderr");
+        let child = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false")
+            .env("RETENTION_REPORT_ENABLED", "false")
+            .env("QUOTA_ENABLED", "false")
+            .env("AM_WBQ_CHANNEL_CAPACITY", "256")
+            .env("AM_WBQ_DRAIN_BATCH_CAP", "16")
+            .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+            .env("AM_ARCHIVE_BACKLOG_CAP", "1")
+            .env("RUST_LOG", "warn")
+            .current_dir(env.hostile_repo())
+            .arg("serve-stdio")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .expect("start private archive-pressure server");
+        let mut server = Self {
+            child: Some(child),
+            stdout_path,
+            stderr_path,
+            next_id: 2,
+        };
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            initialize_request()
+        )
+        .unwrap();
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        )
+        .unwrap();
+        server
+    }
+
+    fn request_batch(&mut self, requests: Vec<(&str, Value)>) -> Vec<Value> {
+        let ids: Vec<_> = requests
+            .into_iter()
+            .map(|(name, arguments)| {
+                let id = self.next_id;
+                self.next_id += 1;
+                writeln!(
+                    self.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+                    "{}",
+                    tool_call(id, name, arguments)
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let stdout = std::fs::read_to_string(&self.stdout_path).unwrap_or_default();
+            let responses: BTreeMap<_, _> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|response| response["id"].as_i64().map(|id| (id, response)))
+                .collect();
+            if ids.iter().all(|id| responses.contains_key(id)) {
+                return ids
+                    .iter()
+                    .map(|id| {
+                        let response = &responses[id];
+                        assert!(response.get("error").is_none(), "{response}");
+                        assert_ne!(response["result"]["isError"], true, "{response}");
+                        serde_json::from_str(
+                            response["result"]["content"][0]["text"].as_str().unwrap(),
+                        )
+                        .expect("tool payload")
+                    })
+                    .collect();
+            }
+            assert!(
+                Instant::now() < deadline
+                    && self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "pressure request did not complete; stderr={}",
+                std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn request(&mut self, name: &str, arguments: Value) -> Value {
+        self.request_batch(vec![(name, arguments)])
+            .pop()
+            .expect("one tool result")
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ArchivePressureServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[test]
+fn serve_stdio_recovers_journal_failure_and_full_backlog_after_restart() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        env.hostile_repo.to_str().unwrap(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    conn.execute_raw("UPDATE agents SET contact_policy = 'open'")
+        .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    let config = mcp_agent_mail_core::Config {
+        storage_root: env.storage_root.clone(),
+        ..mcp_agent_mail_core::Config::default()
+    };
+    let archive = mcp_agent_mail_storage::ensure_archive(&config, "idle-recovery").unwrap();
+    let unrelated = archive.root.join("operator-note.txt");
+    std::fs::write(&unrelated, b"retain unrelated operator content").unwrap();
+    // Hold the actual private archive flock, not a mocked write failure. The
+    // server remains able to accept DB writes while both archive drains wait.
+    let archive_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&archive.lock_path)
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&archive_lock).unwrap();
+    let blocked_journal = env.storage_root.join(".archive_backlog");
+    std::fs::write(&blocked_journal, b"retain journal obstruction").unwrap();
+    let mut server = ArchivePressureServer::start(&env);
+
+    let message_arguments = json!({
+        "project_key": env.hostile_repo.display().to_string(),
+        "sender_name": "BlueLake", "to": ["GreenStone"],
+        "subject": "idle recovery", "body_md": "Retain this accepted message.",
+        "topic": "pressure-recovery", "thread_id": "pressure-recovery"
+    });
+    // First occupy the drain with a real accepted message bundle. The held
+    // project flock prevents its archive write from completing.
+    let first = server.request("send_message", message_arguments.clone());
+    assert_eq!(first["count"], 1, "{first}");
+    let mut accepted_ids = vec![first["deliveries"][0]["payload"]["id"].as_i64().unwrap()];
+
+    // Enqueue only the observed free capacity. Profiles fill the WBQ without
+    // creating mail rows or consuming the one-entry fallback backlog. The
+    // stdio dispatcher admits at most 64 pending requests, so pipeline the
+    // profiles in batches well below that bound.
+    const PROFILE_BATCH: u64 = 32;
+    let mut health = server.request("health_check", json!({}));
+    assert_eq!(health["queues"]["wbq"]["capacity"], 256, "{health}");
+    for _ in 0..16 {
+        let depth = health["queues"]["wbq"]["depth"].as_u64().unwrap();
+        if depth == 256 {
+            break;
+        }
+        let profiles = (depth..(depth + PROFILE_BATCH).min(256))
+            .map(|_| {
+                (
+                    "register_agent",
+                    json!({
+                        "project_key": env.hostile_repo.display().to_string(),
+                        "name": "BlueLake", "program": "test", "model": "test",
+                        "task_description": "private queue pressure"
+                    }),
+                )
+            })
+            .collect();
+        server.request_batch(profiles);
+        health = server.request("health_check", json!({}));
+    }
+    assert_eq!(health["queues"]["wbq"]["depth"], 256, "{health}");
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_ephemeral_total"], 0,
+        "{health}"
+    );
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_dropped_total"], 0,
+        "{health}"
+    );
+
+    // Six more accepted messages exceed the production four-repair batch
+    // bound. Only the first fits the ephemeral backlog; the other five must
+    // be recovered from the DB after the process and its queues are gone.
+    for index in 0..6 {
+        let response = server.request("send_message", message_arguments.clone());
+        assert_eq!(response["count"], 1, "{response}");
+        accepted_ids.push(response["deliveries"][0]["payload"]["id"].as_i64().unwrap());
+        health = server.request("health_check", json!({}));
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_ephemeral_total"], 1,
+            "{health}"
+        );
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_dropped_total"], index,
+            "{health}"
+        );
+    }
+    server
+        .stop()
+        .expect("reap pressure server before restoring archive access");
+    let stderr = std::fs::read_to_string(&server.stderr_path).unwrap();
+    assert!(stderr.contains("message archive write project=idle-recovery; WBQ unavailable and archive journal write failed"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "message archive write project=idle-recovery; WBQ unavailable and retry backlog full"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_journal).unwrap(),
+        b"retain journal obstruction"
+    );
+    std::fs::rename(
+        &blocked_journal,
+        env.tmp.path().join("pressure-journal.saved"),
+    )
+    .unwrap();
+    drop(archive_lock);
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync(
+            "SELECT id, created_ts, body_md, topic, thread_id FROM messages ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        7,
+        "every accepted message must survive process death"
+    );
+    let mut expected = Vec::new();
+    let mut newest = 0;
+    for (row, accepted_id) in rows.iter().zip(&accepted_ids) {
+        let message_id = row.get_named::<i64>("id").unwrap();
+        assert_eq!(message_id, *accepted_id);
+        assert_eq!(
+            row.get_named::<String>("body_md").unwrap(),
+            "Retain this accepted message."
+        );
+        assert_eq!(
+            row.get_named::<String>("topic").unwrap(),
+            "pressure-recovery"
+        );
+        assert_eq!(
+            row.get_named::<String>("thread_id").unwrap(),
+            "pressure-recovery"
+        );
+        let created_ts = row.get_named::<i64>("created_ts").unwrap();
+        newest = newest.max(created_ts);
+        let created = chrono::DateTime::from_timestamp_micros(created_ts).unwrap();
+        expected.push((
+            format!(
+                "{}__idle-recovery__{message_id}.md",
+                created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
+            ),
+            message_id,
+        ));
+    }
+    conn.close_sync().unwrap();
+    for (filename, _) in &expected {
+        for location in [
+            "messages",
+            "agents/BlueLake/outbox",
+            "agents/GreenStone/inbox",
+        ] {
+            assert!(
+                !archive.root.join(location).join(filename).exists(),
+                "the pressure phase must leave every accepted archive copy missing"
+            );
+        }
+    }
+    let wait_us = newest
+        .saturating_add(31_000_000)
+        .saturating_sub(mcp_agent_mail_db::now_micros());
+    if wait_us > 0 {
+        thread::sleep(Duration::from_micros(u64::try_from(wait_us).unwrap()));
+    }
+    assert_idle_stdio_reconciles(&env, &expected);
+    for (filename, message_id) in &expected {
+        let path = archive.root.join("messages").join(filename);
+        let (metadata, body) = mcp_agent_mail_storage::read_message_file(&path).unwrap();
+        assert_eq!(metadata["id"], *message_id);
+        assert_eq!(metadata["topic"], "pressure-recovery");
+        assert_eq!(metadata["thread_id"], "pressure-recovery");
+        assert_eq!(metadata["to"], json!(["GreenStone"]));
+        assert_eq!(body, "Retain this accepted message.");
+        let canonical_bytes = std::fs::read(&path).unwrap();
+        for mailbox in ["agents/BlueLake/outbox", "agents/GreenStone/inbox"] {
+            assert_eq!(
+                std::fs::read(archive.root.join(mailbox).join(filename)).unwrap(),
+                canonical_bytes
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(unrelated).unwrap(),
+        b"retain unrelated operator content"
+    );
+}
+
+fn assert_idle_stdio_reconciles(env: &TestEnv, expected: &[(String, i64)]) {
     let stdout_path = env.tmp.path().join("stdio.stdout");
     let stderr_path = env.tmp.path().join("stdio.stderr");
     let mut child = Command::new(am_bin())
@@ -872,12 +1205,20 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
     );
     let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     let project = env.storage_root.join("projects/idle-recovery");
-    let paths = [
-        format!("messages/{filename}"),
-        format!("agents/BlueLake/outbox/{filename}"),
-        format!("agents/GreenStone/inbox/{filename}"),
-    ];
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let paths: Vec<_> = expected
+        .iter()
+        .flat_map(|(filename, _)| {
+            [
+                format!("messages/{filename}"),
+                format!("agents/BlueLake/outbox/{filename}"),
+                format!("agents/GreenStone/inbox/{filename}"),
+            ]
+        })
+        .collect();
+    // More than four messages need a second production maintenance tick:
+    // ten-second startup delay plus the unchanged sixty-second cadence.
+    let timeout_secs = if expected.len() > 4 { 105 } else { 45 };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut committed = false;
     while sent.is_ok() && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
@@ -894,6 +1235,8 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
                         out.status.success()
                             && String::from_utf8_lossy(&out.stdout)
                                 .contains("Retain this accepted message.")
+                            && std::fs::read(project.join(path))
+                                .is_ok_and(|bytes| bytes == out.stdout)
                     })
             });
             if committed {
@@ -921,15 +1264,17 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
         "idle stdio did not commit all archive copies: {stderr}"
     );
     let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
-    let rows = conn
-        .query_sync(
-            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
-            &[SqlValue::BigInt(message_id)],
-        )
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
-    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    for (_, message_id) in expected {
+        let rows = conn
+            .query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                &[SqlValue::BigInt(*message_id)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+        assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    }
     conn.close_sync().unwrap();
 }
 
@@ -1099,6 +1444,9 @@ fn robot_overview_cold_processes_preserve_project_counts_after_mutations() {
 fn seed_startup_recovery_archive_only(env: &TestEnv) {
     let project_path = env.tmp.path().join("reconstructed-project");
     std::fs::create_dir_all(&project_path).expect("create reconstruct project path");
+    let project_path = project_path
+        .canonicalize()
+        .expect("canonical reconstruct project path");
     let project_human_key = project_path.display().to_string();
     let project_slug = mcp_agent_mail_db::queries::generate_slug(&project_human_key);
     let project_dir = env.storage_root.join("projects").join(&project_slug);
@@ -1271,6 +1619,7 @@ fn assert_success(
     }
     write_artifact(case, args, &out);
     panic!(
+        // ubs:ignore — integration helper fails after writing diagnostics for an unsuccessful candidate command
         "expected success for {case} args={args:?}, got status={:?}\nstdout:\n{}\nstderr:\n{}",
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
@@ -1309,7 +1658,7 @@ fn robot_search_index_state<'a>(value: &'a Value, context: &str) -> &'a str {
         .or_else(|| value.get("data").and_then(|data| data.get("search_index")))
         .and_then(|search_index| search_index.get("state"))
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("missing robot search_index.state in {context}: {value}"))
+        .unwrap_or_else(|| panic!("missing robot search_index.state in {context}: {value}")) // ubs:ignore — test response assertion must reject missing state
 }
 
 fn robot_total_results(value: &Value, context: &str) -> u64 {
@@ -1317,7 +1666,7 @@ fn robot_total_results(value: &Value, context: &str) -> u64 {
         .get("total_results")
         .or_else(|| value.get("data").and_then(|data| data.get("total_results")))
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("missing robot total_results in {context}: {value}"))
+        .unwrap_or_else(|| panic!("missing robot total_results in {context}: {value}")) // ubs:ignore — test response assertion must reject missing result count
 }
 
 fn doctor_non_ok_checks(value: &Value) -> Value {
@@ -1639,6 +1988,7 @@ fn collect_installed_parity_outputs(binary: &Path, env: &TestEnv) -> Value {
         );
         let parsed: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
             panic!(
+                // ubs:ignore — parity integration helper must fail if a candidate emits invalid JSON
                 "{} parity command emitted invalid JSON for {}: {error}\nstdout:\n{}",
                 surface.id,
                 binary.display(),
@@ -2742,26 +3092,9 @@ fn guard_install_status_uninstall_smoke() {
 #[test]
 fn guard_check_conflict_exits_1_when_not_advisory() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    // Active exclusive reservation held by someone else.
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -2783,25 +3116,9 @@ fn guard_check_conflict_exits_1_when_not_advisory() {
 #[test]
 fn guard_check_advisory_does_not_exit_1() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--advisory", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -2817,6 +3134,133 @@ fn guard_check_advisory_does_not_exit_1() {
         "expected conflict marker in stderr, got:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Without an agent identity the guard cannot tell whose reservations are
+/// foreign: warn mode (which never blocks) says nothing was checked and
+/// exits 0, while enforcing mode still refuses.
+#[test]
+fn guard_check_without_identity_warns_in_warn_mode_and_fails_when_enforcing() {
+    for (mode, warned) in [("warn", true), ("block", false)] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        let mut child_env: Vec<_> = guard_blocking_env(&env)
+            .into_iter()
+            .chain(env.hermetic_env())
+            .filter(|(var, _)| var != "AGENT_NAME")
+            .collect();
+        child_env.push(("AGENT_MAIL_GUARD_MODE".to_string(), mode.to_string()));
+        let mut child = Command::new(am_bin())
+            .env_clear()
+            .envs(child_env)
+            .current_dir(env.tmp.path())
+            .args(["guard", "check", "--repo", &repo_str])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn guard without inherited identity");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("guard stdin")
+                .write_all(b"foo.txt\n")
+                .expect("write guard paths");
+        }
+        let out = child.wait_with_output().expect("wait for guard");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.success(),
+            warned,
+            "{mode}: status {} stderr:\n{stderr}",
+            out.status
+        );
+        assert_eq!(
+            stderr.contains("no agent identity"),
+            warned,
+            "{mode}: stderr:\n{stderr}"
+        );
+    }
+}
+
+/// An archive root holding one active exclusive reservation on `foo.txt` by
+/// another agent.
+fn guard_repo_with_foreign_reservation(env: &TestEnv) -> String {
+    let repo = env.tmp.path().join("archive_root");
+    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
+    let reservation = serde_json::json!({
+        "path_pattern": "foo.txt",
+        "agent_name": "OtherAgent",
+        "exclusive": true,
+        "expires_ts": "2999-01-01T00:00:00Z",
+        "released_ts": serde_json::Value::Null,
+    });
+    std::fs::write(
+        repo.join("file_reservations").join("res.json"),
+        serde_json::to_string_pretty(&reservation).unwrap(),
+    )
+    .expect("write reservation");
+    repo.to_string_lossy().to_string()
+}
+
+/// The guard switches pinned to "enforce", so a value exported in the shell
+/// running the tests (the hook's own refusal suggests
+/// AGENT_MAIL_GUARD_MODE=warn) cannot flip these results.
+fn guard_blocking_env(env: &TestEnv) -> Vec<(String, String)> {
+    let mut child_env = env.base_env();
+    for (var, value) in [
+        ("AGENT_MAIL_BYPASS", "0"),
+        ("AGENT_MAIL_GUARD_MODE", "block"),
+        ("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true"),
+    ] {
+        child_env.push((var.to_string(), value.to_string()));
+    }
+    child_env
+}
+
+/// `am guard check` honors the installed hook's switches; without one, the
+/// same conflict exits 1 (guard_check_conflict_exits_1_when_not_advisory).
+#[test]
+fn guard_check_honors_bypass_warn_mode_and_disabled_enforcement() {
+    for (var, value, expect_conflict_listed, marker) in [
+        ("AGENT_MAIL_BYPASS", "1", false, "AGENT_MAIL_BYPASS is set"),
+        ("AGENT_MAIL_GUARD_MODE", "warn", true, "not blocking"),
+        (
+            "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+            "false",
+            false,
+            "enforcement is disabled",
+        ),
+    ] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        // The pinned values first; the switch under test overrides one.
+        let mut child_env = guard_blocking_env(&env);
+        child_env.push((var.to_string(), value.to_string()));
+        let out = run_am(
+            &child_env,
+            Some(env.tmp.path()),
+            &["guard", "check", "--repo", &repo_str],
+            Some(b"foo.txt\n"),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{var}={value}: expected exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("CONFLICT: pattern"),
+            expect_conflict_listed,
+            "{var}={value}: conflict listing\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(marker) || stderr.contains(marker),
+            "{var}={value}: expected '{marker}'\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -3052,6 +3496,10 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
         stdout
     );
     assert!(
+        stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected executable plan status in stdout:\n{stdout}"
+    );
+    assert!(
         source_archive_file.exists(),
         "dry-run should not move source artifacts"
     );
@@ -3064,6 +3512,55 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
     assert!(
         !target_archive_file.exists(),
         "dry-run should not create target artifacts"
+    );
+}
+
+#[test]
+fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
+    let env = TestEnv::new();
+    let project_dir = env.tmp.path().join("create-proj");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    let project_key = project_dir.display().to_string();
+    let create = |extra: &[&str]| {
+        let mut args = vec![
+            "agents",
+            "create",
+            "-p",
+            project_key.as_str(),
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        run_am(&env.base_env(), Some(env.tmp.path()), &args, None)
+    };
+
+    // No daemon answers (HTTP_PORT=1), so this is the local path; it must
+    // apply the tool's validation rather than write the row directly.
+    let bad = create(&["--attachments-policy", "bogus"]);
+    assert!(
+        !bad.status.success(),
+        "an invalid attachments policy must be refused offline too\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let out = create(&["-n", "BlueLake"]);
+    assert!(
+        out.status.success(),
+        "expected success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["name"], "BlueLake", "{value}");
+    assert!(
+        value["registration_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "an offline-created agent gets a sender token: {value}"
     );
 }
 
@@ -3207,19 +3704,27 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
         &["projects", "adopt", &source_key, &target_key, "--apply"],
         None,
     );
-    if !out.status.success() {
+    // GH#366: a refused --apply must not exit 0, or a script would read the
+    // refusal as a completed move.
+    if out.status.code() != Some(1) {
         write_artifact(
             "projects_adopt_apply_cross_repo_refusal",
             &["projects", "adopt", &source_key, &target_key, "--apply"],
             &out,
         );
         panic!(
-            "expected success with refusal semantics\nstdout:\n{}\nstderr:\n{}",
+            "expected exit 1 for a refused adopt, got {:?}\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
 
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected refused plan status in stdout:\n{stdout}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
@@ -3241,6 +3746,165 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
     assert!(
         !target_archive_file.exists(),
         "cross-repo refusal should not create target artifacts"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_non_git_keys_in_dry_run_and_apply() {
+    // GH#366: two registered keys that are plain directories, not checkouts.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let source_dir = tmp_root.join("plain_source");
+    let target_dir = tmp_root.join("plain_target");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "plain-source", &source_key);
+    insert_project(&conn, 2, "plain-target", &target_key);
+    drop(conn);
+
+    // Keep Git discovery inside the temp root, so a checkout that happens to
+    // enclose the test's temp directory cannot make the keys look related.
+    let mut env_vars = env.base_env();
+    env_vars.push((
+        "GIT_CEILING_DIRECTORIES".to_string(),
+        tmp_root.display().to_string(),
+    ));
+    for args in [
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+        ],
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+            "--apply",
+        ],
+    ] {
+        let out = run_am(&env_vars, Some(&tmp_root), &args, None);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "args={args:?}: a refused plan must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("- Same repo (git-common-dir): no"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("- Plan status: refused; nothing was changed")
+                && !stdout.contains("Plan status: executable"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("A project key outside a Git repository cannot be re-keyed"),
+            "args={args:?}: stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !env.storage_root
+            .join("projects")
+            .join("plain-target")
+            .join("aliases.json")
+            .exists(),
+        "a refused adopt must not write aliases.json"
+    );
+}
+
+#[test]
+fn projects_adopt_accepts_keys_at_different_depths_of_one_checkout() {
+    // `git rev-parse --git-common-dir` is relative to the directory it ran in,
+    // so keys at different depths print different relative paths.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let repo_root = tmp_root.join("checkout");
+    init_git_repo(&repo_root);
+    let nested = repo_root.join("crates").join("app");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    let source_key = repo_root.display().to_string();
+    let target_key = nested.display().to_string();
+    insert_project(&conn, 1, "checkout-root", &source_key);
+    insert_project(&conn, 2, "checkout-nested", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two directories of one checkout must merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): yes")
+            && stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected an executable same-repo plan:\n{stdout}"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_separate_repositories_nested_in_a_parent_repository() {
+    // Keys one level below two different repositories print the same `../.git`.
+    // Resolved against the repository root, both landed on the parent's `.git`
+    // and an unrelated pair looked like one repository.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let parent = tmp_root.join("parent");
+    init_git_repo(&parent);
+    let first_repo = parent.join("first");
+    let second_repo = parent.join("second");
+    init_git_repo(&first_repo);
+    init_git_repo(&second_repo);
+    let source_dir = first_repo.join("src");
+    let target_dir = second_repo.join("src");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "first-src", &source_key);
+    insert_project(&conn, 2, "second-src", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "separate repositories must not merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): no")
+            && stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected a refused plan:\n{stdout}"
     );
 }
 
@@ -3348,6 +4012,12 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
         stderr
     );
     assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("- Plan status: refused; nothing was changed"),
+        "expected the refused status line:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
         source_archive_file.exists(),
         "conflict should preserve source artifacts"
     );
@@ -3360,6 +4030,43 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
     assert!(
         !target_archive_file.exists(),
         "conflict should not move artifacts to target"
+    );
+}
+
+#[test]
+fn projects_adopt_dry_run_refuses_duplicate_agent_name_conflict() {
+    // --apply refuses this pair, so the dry run must not call it executable.
+    let env = TestEnv::new();
+    let (_source_slug, _target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
+    insert_agent(&conn, 202, 2, "greencastle", "test", "test");
+    drop(conn);
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key],
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dry run of a conflicting pair must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed")
+            && !stdout.contains("- Plan status: executable"),
+        "expected a refused plan:\n{stdout}"
+    );
+    assert!(
+        stderr
+            .to_ascii_lowercase()
+            .contains("agent name conflicts in target project"),
+        "expected the conflict reason in stderr:\n{stderr}"
     );
 }
 
@@ -4956,6 +5663,2219 @@ fn file_reservations_soon_returns_expiring() {
     );
 }
 
+// GH#368: the supported server-read mode must use the real MCP resource without
+// opening a new local database connection. All state and child servers here are
+// private fixtures; these tests never discover or restart an operator's mailbox.
+const RESERVATION_READ_TEST_TOKEN: &str = "gh368-private-reservation-read-token"; // ubs:ignore — synthetic credential used only by this private real-server regression fixture
+
+fn reservation_read_fixture() -> (TestEnv, String, String) {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let slug = mcp_agent_mail_core::slugify(&project);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_project(&conn, 1, &slug, &project);
+    insert_agent(&conn, 1, 1, "RusticGlen", "test", "test");
+    insert_agent(&conn, 2, 1, "BlueLake", "test", "test");
+    let future = 4_102_444_800_000_000_i64;
+    for (id, agent, path, exclusive, expiry) in [
+        (1, 1, "src/**", true, future),
+        (2, 2, "src/lib.rs", true, future + 60_000_000),
+        (3, 2, "docs/**", false, future + 120_000_000),
+        (4, 1, "expired/**", true, 1_704_067_300_000_000),
+        (5, 1, "legacy-released/**", true, future),
+        (6, 1, "ledger-released/**", true, future),
+    ] {
+        insert_file_reservation(&conn, id, 1, agent, path, exclusive, expiry);
+        conn.execute_sync(
+            "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+            &[
+                SqlValue::BigInt(1_704_067_200_000_000 + id),
+                SqlValue::BigInt(id),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts = 1704067400000000 WHERE id = 5; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         VALUES (6, 1704067400000000);",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    (env, project, slug)
+}
+
+fn reservation_read_env(env: &TestEnv, port: u16, database_url: &str) -> Vec<(String, String)> {
+    let mut vars = env.isolated_env();
+    vars.extend([
+        ("AM_INTERFACE_MODE".into(), "cli".into()),
+        ("DATABASE_URL".into(), database_url.into()),
+        ("HTTP_PORT".into(), port.to_string()),
+        (
+            "HTTP_BEARER_TOKEN".into(),
+            RESERVATION_READ_TEST_TOKEN.into(),
+        ),
+        (
+            "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED".into(),
+            "false".into(),
+        ),
+        ("AM_ATC_ENABLED".into(), "false".into()),
+        ("FILE_RESERVATIONS_CLEANUP_ENABLED".into(), "false".into()),
+        (
+            "AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED".into(),
+            "false".into(),
+        ),
+        ("RUST_LOG".into(), "error".into()),
+        ("NO_COLOR".into(), "1".into()),
+    ]);
+    vars
+}
+
+fn reservation_read_success(out: &Output) -> &str {
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::str::from_utf8(&out.stdout).expect("UTF-8 CLI output")
+}
+
+fn reservation_read_failed_closed(out: &Output) {
+    assert!(
+        !out.status.success(),
+        "read unexpectedly succeeded: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "failed read emitted authoritative-looking data: {out:?}"
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "failed read needs an actionable error"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(RESERVATION_READ_TEST_TOKEN),
+        "bearer token must not appear in diagnostics"
+    );
+}
+
+fn reservation_read_stable_json(mut value: Value) -> Value {
+    // Compare all durable output fields. Check, then remove only wall-clock
+    // relative values; the two commands run at different instants.
+    fn strip_clock(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("granted_ts") {
+                    for key in ["remaining_seconds", "granted_age_seconds"] {
+                        assert!(
+                            map.get(key).is_some_and(Value::is_i64),
+                            "missing {key}: {map:?}"
+                        );
+                        map.remove(key);
+                    }
+                    map.remove("remaining");
+                    map.remove("granted_at");
+                }
+                for child in map.values_mut() {
+                    strip_clock(child);
+                }
+            }
+            Value::Array(rows) => rows.iter_mut().for_each(strip_clock),
+            _ => {}
+        }
+    }
+    let object = value.as_object_mut().unwrap();
+    object.remove("_meta");
+    object.remove("_alerts");
+    object.remove("reservation_read_attestation");
+    strip_clock(&mut value);
+    value
+}
+
+fn reservation_read_stable_text(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("reservation_read_attestation:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct ReservationReadServer(std::process::Child);
+
+impl Drop for ReservationReadServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn reservation_read_start_server(env: &TestEnv, port: u16) -> ReservationReadServer {
+    let log_path = env.tmp.path().join("gh368-private-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let child = Command::new(am_bin())
+        .env_clear()
+        .envs(reservation_read_env(env, port, &env.database_url()))
+        .current_dir(env.hostile_repo())
+        .args([
+            "serve-http",
+            "--no-tui",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("start private MCP server");
+    let mut server = ReservationReadServer(child);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            return server;
+        }
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "private server did not bind: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn reservation_reads_direct_and_real_server_preserve_output_without_local_admission() {
+    let (env, project, slug) = reservation_read_fixture();
+    let active_uri = format!("resource://file_reservations/{slug}?active_only=true");
+    let history_uri =
+        format!("resource://file_reservations/{slug}?active_only=false&limit=2&offset=1");
+    let cases = [
+        vec!["reservations", "--project", &project, "--all", "--json"],
+        vec![
+            "robot",
+            "reservations",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+        vec![
+            "robot",
+            "navigate",
+            &active_uri,
+            "--project",
+            &project,
+            "--json",
+        ],
+        vec![
+            "robot",
+            "navigate",
+            &history_uri,
+            "--project",
+            &project,
+            "--json",
+        ],
+        vec!["file_reservations", "active", &project],
+        vec!["file_reservations", "active", &project, "--limit", "1"],
+        vec!["file_reservations", "list", &project],
+        vec!["file_reservations", "list", &project, "--all"],
+        vec!["file_reservations", "soon", &project],
+        vec!["file_reservations", "conflicts", &project, "src/lib.rs"],
+    ];
+    let direct_env = reservation_read_env(&env, 1, &env.database_url());
+    let before_db = file_snapshot(&env.db_path);
+    let direct: Vec<_> = cases
+        .iter()
+        .map(|args| {
+            let out = run_am_hermetic(&direct_env, Some(env.hostile_repo()), args);
+            reservation_read_success(&out);
+            out
+        })
+        .collect();
+    let data: Value = serde_json::from_slice(&direct[0].stdout).unwrap();
+    let paths: Vec<_> = data["all_active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/**", "src/lib.rs", "docs/**"]);
+    assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        file_snapshot(&env.db_path),
+        before_db,
+        "direct reads changed mailbox bytes"
+    );
+
+    let port = unused_loopback_port();
+    let mut server = reservation_read_start_server(&env, port);
+    // Deliberately unusable local storage: --server has to reach the real MCP
+    // resource, not a canonical-SQLite bypass or an accidentally working open.
+    let unavailable_db = env.tmp.path().join("unopenable.sqlite3");
+    std::fs::write(&unavailable_db, b"GH368: this is not a SQLite database\n").unwrap();
+    let unavailable_url = format!("sqlite:///{}", unavailable_db.display());
+    let server_env = reservation_read_env(&env, port, &unavailable_url);
+    let before_unavailable = file_snapshot(&unavailable_db);
+    for (args, direct) in cases.iter().zip(&direct) {
+        let mut server_args = args.clone();
+        server_args.push("--server");
+        let remote = run_am_hermetic(&server_env, Some(env.hostile_repo()), &server_args);
+        let remote_text = reservation_read_success(&remote);
+        if args.contains(&"--json") {
+            let local: Value = serde_json::from_slice(&direct.stdout).unwrap();
+            let remote: Value = serde_json::from_str(remote_text).unwrap();
+            assert_eq!(remote["_meta"]["project"], slug);
+            assert_eq!(
+                reservation_read_stable_json(remote),
+                reservation_read_stable_json(local),
+                "{args:?}"
+            );
+        } else {
+            assert_eq!(
+                reservation_read_stable_text(remote_text),
+                reservation_read_stable_text(std::str::from_utf8(&direct.stdout).unwrap()),
+                "{args:?}"
+            );
+        }
+    }
+    assert_eq!(file_snapshot(&unavailable_db), before_unavailable);
+    for suffix in ["-wal", "-shm", ".fsqlite-shm", ".fsqlite-wal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", unavailable_db.display())).exists());
+    }
+
+    // A failed direct read remains a failure: the CLI never silently changes
+    // authority, repairs the local database, or reports an empty reservation set.
+    let direct_failure = run_am_hermetic(&server_env, Some(env.hostile_repo()), &cases[0]);
+    reservation_read_failed_closed(&direct_failure);
+    assert_eq!(file_snapshot(&unavailable_db), before_unavailable);
+    for token in ["", "wrong-token"] {
+        // Keep a readable local database here: authentication rejection must
+        // not be hidden by a successful fallback to that database.
+        let mut unauthorized_env = reservation_read_env(&env, port, &env.database_url());
+        unauthorized_env.push(("HTTP_BEARER_TOKEN".into(), token.into()));
+        let unauthorized = run_am_hermetic(
+            &unauthorized_env,
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        reservation_read_failed_closed(&unauthorized);
+    }
+    let unknown = run_am_hermetic(
+        &server_env,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            "gh368-nonexistent-project",
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    reservation_read_failed_closed(&unknown);
+    assert!(
+        server.0.try_wait().unwrap().is_none(),
+        "read probes stopped the owned server"
+    );
+    drop(server);
+    let offline_env = reservation_read_env(&env, port, &env.database_url());
+    let offline = run_am_hermetic(
+        &offline_env,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    reservation_read_failed_closed(&offline);
+}
+
+fn reservation_history_fixture(count: i64, reason: &str) -> (TestEnv, String, String) {
+    use std::fmt::Write as _;
+
+    let (env, project, slug) = reservation_read_fixture();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_agent(&conn, 3, 1, "RetiredVale", "test", "test");
+    conn.execute_raw("UPDATE agents SET retired_at=1704067500000000 WHERE id=3; BEGIN")
+        .unwrap();
+    // Batched inserts keep this real persisted >10,000-row fixture affordable.
+    for start in (7..=count).step_by(250) {
+        let end = count.min(start + 249);
+        let mut sql = String::from(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES ",
+        );
+        let mut params = Vec::new();
+        for id in start..=end {
+            if id != start {
+                sql.push(',');
+            }
+            write!(
+                sql,
+                "({id}, 1, 3, 'history/{id:05}.rs', 1, ?, {}, 4102444800000000)",
+                1_704_067_200_000_000_i64 + id
+            )
+            .unwrap();
+            params.push(SqlValue::Text(reason.to_string()));
+        }
+        conn.execute_sync(&sql, &params).unwrap();
+    }
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts=1704067400000000 WHERE id>=7 AND id%2=0; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, 1704067400000000 FROM file_reservations WHERE id>=7 AND id%2=1; COMMIT",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    (env, project, slug)
+}
+
+fn reservation_read_http_rpc(port: u16, bearer: Option<&str>, request: &Value) -> (u16, Value) {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut socket =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(45)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = request.to_string();
+    write!(
+        socket,
+        "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .unwrap();
+    if let Some(bearer) = bearer {
+        write!(socket, "Authorization: Bearer {bearer}\r\n").unwrap();
+    }
+    write!(socket, "\r\n{body}").unwrap();
+    let mut response = Vec::new();
+    socket
+        .take(12 * 1024 * 1024)
+        .read_to_end(&mut response)
+        .unwrap();
+    let split = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..split]).unwrap();
+    let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = &response[split + 4..];
+    let payload = serde_json::from_slice(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
+    (status, payload)
+}
+
+fn reservation_read_http_resource(port: u16, uri: &str) -> Value {
+    let request = json!({
+        "jsonrpc": "2.0", "id": "gh377-history", "method": "resources/read",
+        "params": {"uri": uri},
+    });
+    let (status, reply) =
+        reservation_read_http_rpc(port, Some(RESERVATION_READ_TEST_TOKEN), &request);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["id"], request["id"]);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let contents = reply["result"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["uri"], uri);
+    let text = contents[0]["text"].as_str().unwrap();
+    assert!(text.len() <= mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES);
+    serde_json::from_str(text).unwrap()
+}
+
+fn reservation_read_assert_snapshot_limit(port: u16, slug: &str) {
+    let (status, reply) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-limit", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot=true&active_only=false&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.get("result").is_none(),
+        "bounded snapshot unexpectedly fit"
+    );
+    assert!(
+        reply["error"]
+            .to_string()
+            .contains("FILE_RESERVATION_SNAPSHOT_TOO_LARGE"),
+        "snapshot capacity refusal must retain a machine-readable reason: {reply}"
+    );
+}
+
+fn reservation_read_history_pages(port: u16, slug: &str, first: &Value) -> Vec<Value> {
+    let token = first["snapshot_token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["consistency"], "materialized_snapshot");
+    assert_eq!(first["supports_release"], true);
+    assert_eq!(first["active_only"], false);
+    let total = usize::try_from(first["total_count"].as_u64().unwrap()).unwrap();
+    let mut rows = Vec::with_capacity(total);
+    let mut page = first.clone();
+    loop {
+        for field in [
+            "schema_version",
+            "consistency",
+            "snapshot_token",
+            "supports_release",
+            "project",
+            "agents",
+            "active_only",
+            "captured_ts",
+            "total_count",
+        ] {
+            assert_eq!(page[field], first[field], "page authority changed: {field}");
+        }
+        assert_eq!(page["offset"], rows.len());
+        let batch = page["reservations"].as_array().unwrap();
+        assert_eq!(page["count"], batch.len());
+        assert!(batch.len() <= 250);
+        rows.extend(batch.iter().cloned());
+        assert!(rows.len() <= total);
+        if page["next_offset"].is_null() {
+            assert_eq!(rows.len(), total, "terminal page lost reservations");
+            return rows;
+        }
+        assert!(!batch.is_empty(), "nonterminal page must advance");
+        assert_eq!(page["next_offset"], rows.len());
+        page = reservation_read_http_resource(
+            port,
+            &format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={}&active_only=false&format=json",
+                rows.len()
+            ),
+        );
+    }
+}
+
+fn reservation_read_native_ids(out: &Output) -> Vec<i64> {
+    reservation_read_success(out)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+#[test]
+fn reservation_history_real_server_reads_over_snapshot_row_limit_without_local_admission() {
+    let (env, project, slug) = reservation_history_fixture(10_001, "retained-history");
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let unavailable = env.tmp.path().join("gh377-unusable-client.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"History must come from the authenticated server.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let vars = reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    let history_started = Instant::now();
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+    let history_text = reservation_read_success(&history);
+    for (id, holder) in [
+        (7, "RetiredVale"),
+        (250, "RetiredVale"),
+        (10_001, "RetiredVale"),
+    ] {
+        let id_text = id.to_string();
+        let line = history_text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id_text.as_str()))
+            .unwrap();
+        assert!(
+            line.contains(holder),
+            "retired holder omitted from history: {line}"
+        );
+        assert!(line.contains(&format!("history/{id:05}.rs")));
+    }
+    let active = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--server"],
+    );
+    assert_eq!(reservation_read_native_ids(&active), [1, 2, 3]);
+    assert_eq!(file_snapshot(&unavailable), before);
+    for suffix in ["-wal", "-shm", ".fsqlite-shm", ".fsqlite-wal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", unavailable.display())).exists());
+    }
+
+    // The normal command must select the same authenticated daemon when the
+    // configured local mailbox matches, including when its history needs pages.
+    let automatic = run_am_hermetic(
+        &reservation_read_env(&env, port, &env.database_url()),
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&automatic),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+    // These are history reads three through five against the same daemon.
+    // Every completed CLI read must release its token: retaining all captures
+    // until TTL would exhaust the four-slot cache on the fifth invocation.
+    for read_number in 3..=5 {
+        let repeated = run_am_hermetic(
+            &vars,
+            Some(env.hostile_repo()),
+            &["file_reservations", "list", &project, "--all", "--server"],
+        );
+        assert_eq!(
+            reservation_read_native_ids(&repeated),
+            (1..=10_001).collect::<Vec<_>>(),
+            "completed history read {read_number} must not exhaust snapshot slots"
+        );
+    }
+    assert!(
+        history_started.elapsed() < Duration::from_secs(300),
+        "five history reads must complete inside the cache TTL to distinguish release from expiry"
+    );
+    assert_eq!(file_snapshot(&unavailable), before);
+}
+
+#[test]
+fn reservation_history_real_server_byte_pages_remain_immutable_between_requests() {
+    let reason = "x".repeat(20_000);
+    let (env, project, slug) = reservation_history_fixture(301, &reason);
+    let writer = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    // Put the two leases that will change after page zero near the end of the
+    // captured order, beyond both the byte boundary and the usual row boundary.
+    writer.execute_raw(
+        "BEGIN; UPDATE file_reservations SET agent_id=1, released_ts=NULL WHERE id IN (300,301); \
+         DELETE FROM file_reservation_releases WHERE reservation_id IN (300,301); COMMIT",
+    ).unwrap();
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let vars = reservation_read_env(&env, port, &env.database_url());
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=301).collect::<Vec<_>>()
+    );
+    assert!(history.stdout.len() > 4 * 1024 * 1024);
+    assert!(reservation_read_success(&history).contains(&reason));
+
+    let initial_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&active_only=false&format=json"
+    );
+    let first = reservation_read_http_resource(port, &initial_uri);
+    assert_eq!(first["total_count"], 301);
+    let offset = first["next_offset"].as_u64().unwrap();
+    assert!(
+        offset > 0 && offset < 250,
+        "byte-bound page must be short but nonterminal"
+    );
+    let token = first["snapshot_token"].as_str().unwrap();
+    let next_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={offset}&active_only=false&format=json"
+    );
+    let release_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=false&format=json"
+    );
+
+    // Same total count, different membership and lease state: a count check or
+    // independent offset reads would silently mix these two database versions.
+    writer.execute_raw(
+        "BEGIN IMMEDIATE; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (300,1800000000000000); \
+         UPDATE file_reservations SET expires_ts=4102444860000000 WHERE id=301; \
+         DELETE FROM file_reservations WHERE id=250; \
+         INSERT INTO file_reservations \
+         (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+         VALUES (302,1,1,'inserted-between-pages.rs',1,'concurrent grant',1704067200000302,4102444800000000); \
+         COMMIT",
+    ).unwrap();
+
+    for bearer in [None, Some("wrong-history-token")] {
+        for uri in [&next_uri, &release_uri] {
+            let (status, response) = reservation_read_http_rpc(
+                port,
+                bearer,
+                &json!({
+                    "jsonrpc": "2.0", "id": "gh377-denied", "method": "resources/read",
+                    "params": {"uri": uri},
+                }),
+            );
+            assert!(matches!(status, 401 | 403), "{status}: {response}");
+            assert!(
+                response.get("result").is_none(),
+                "snapshot token bypassed authentication"
+            );
+        }
+    }
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-wrong-release-scope", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=true&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_SCOPE_MISMATCH"
+    );
+
+    // Unauthorized or mismatched releases must leave the capture usable.
+    let captured = reservation_read_history_pages(port, &slug, &first);
+    let ids = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&captured), (1..=301).collect::<Vec<_>>());
+    assert!(captured[299]["released_ts"].is_null());
+    assert_eq!(captured[300]["expires_ts"], "2100-01-01T00:00:00.000000Z");
+    let repeated = reservation_read_http_resource(
+        port,
+        &format!(
+            "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset=0&active_only=false&format=json"
+        ),
+    );
+    assert_eq!(
+        repeated, first,
+        "retrying an immutable page changed its contents"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": true})
+    );
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-released-snapshot", "method": "resources/read",
+            "params": {"uri": next_uri},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_EXPIRED"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": false}),
+        "releasing an already released token must be idempotent"
+    );
+
+    let fresh = reservation_read_http_resource(port, &initial_uri);
+    assert_ne!(fresh["snapshot_token"], first["snapshot_token"]);
+    let current = reservation_read_history_pages(port, &slug, &fresh);
+    assert_eq!(
+        ids(&current),
+        (1..=302).filter(|id| *id != 250).collect::<Vec<_>>()
+    );
+    let released = current.iter().find(|row| row["id"] == 300).unwrap();
+    assert_eq!(
+        released["released_ts"],
+        mcp_agent_mail_db::micros_to_iso(1_800_000_000_000_000)
+    );
+    let renewed = current.iter().find(|row| row["id"] == 301).unwrap();
+    assert_eq!(renewed["expires_ts"], "2100-01-01T00:01:00.000000Z");
+    assert_eq!(
+        current.last().unwrap()["path_pattern"],
+        "inserted-between-pages.rs"
+    );
+    writer.close_sync().unwrap();
+}
+
+/// Scripted transport faults complement the real-server test above. The peer
+/// only accepts authenticated resources/read requests, never tools/call.
+struct ReservationReadPeer {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ReservationReadPeer {
+    fn start(mut reply: impl FnMut(&Value) -> Value + Send + 'static) -> Self {
+        Self::start_with_status(move |request| (200, reply(request)))
+    }
+
+    fn start_with_status(mut reply: impl FnMut(&Value) -> (u16, Value) + Send + 'static) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_requests = requests.clone();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !worker_stop.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() < deadline
+            {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept private peer request: {error}"), // ubs:ignore — private test server must fail on unexpected accept errors
+                };
+                // macOS hands the listener's non-blocking mode to the accepted
+                // socket; the read timeout needs a blocking one.
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /mcp/ HTTP/1.1"), "{line}");
+                let mut content_len = None;
+                let mut authorized = false;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.split_once(':').expect("HTTP header");
+                    if key.eq_ignore_ascii_case("content-length") {
+                        content_len = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                    if key.eq_ignore_ascii_case("authorization") {
+                        authorized =
+                            value.trim() == format!("Bearer {RESERVATION_READ_TEST_TOKEN}");
+                    }
+                }
+                assert!(authorized, "resource reader omitted its bearer token");
+                let size = content_len.expect("content-length");
+                assert!(size < 64 * 1024, "unbounded test request");
+                let mut body = vec![0; size];
+                reader.read_exact(&mut body).unwrap();
+                drop(reader);
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "resources/read");
+                worker_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (status, payload) = reply(&request);
+                let body = payload.to_string();
+                write!(socket, "HTTP/1.1 {status} Test response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        Self {
+            port,
+            stop,
+            requests,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ReservationReadPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !thread::panicking() {
+                result.expect("scripted resource peer");
+            }
+        }
+    }
+}
+
+fn reservation_read_resource_reply(request: &Value, payload: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": request["id"],
+        "result": {"contents": [{"uri": request["params"]["uri"], "mimeType": "application/json", "text": payload.to_string()}]}
+    })
+}
+
+fn reservation_read_snapshot(project: &str, slug: &str, rows: Vec<Value>) -> Value {
+    json!({
+        "schema_version": 1, "complete": true,
+        "project": {"id": 1, "slug": slug, "human_key": project, "created_at": "2024-01-01T00:00:00Z"},
+        "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}],
+        "active_only": true, "captured_ts": "2024-02-01T00:00:00Z",
+        "count": rows.len(), "reservations": rows,
+    })
+}
+
+fn reservation_read_legacy_rows(count: usize) -> Vec<Value> {
+    (1..=count)
+        .map(|id| {
+            // v0.3.39 returns holder names, not project_id/agent_id. A retired
+            // holder can retain a lease despite being absent from the directory.
+            json!({
+                "id": id,
+                "agent": if id == 27 { "RetiredVale" } else { "RusticGlen" },
+                "path_pattern": format!("src/legacy-{id}/**"),
+                "exclusive": id % 2 != 0,
+                "reason": format!("legacy lease {id}"),
+                "created_ts": format!("2024-01-01T00:{:02}:{:02}Z", id / 60, id % 60),
+                "expires_ts": "2100-01-01T00:00:00Z",
+                "released_ts": null,
+            })
+        })
+        .collect()
+}
+
+fn conversation_read_message(id: i64, include_body: bool) -> Value {
+    json!({
+        "id": id, "project_id": 1, "sender_id": 1,
+        "from": "RusticGlen", "from_program": "codex", "from_model": "test-model",
+        "to": ["BlueLake"], "subject": format!("Context message {id}"), "topic": "delivery",
+        "body_md": include_body.then(|| format!("Full conversation body {id}")),
+        "attachments_json": "[]", "thread_id": "TKT-42", "importance": "high",
+        "ack_required": true, "recipient_count": 2,
+        "acked_count": if id == 43 { 2 } else { 1 },
+        "created_ts": 1_704_067_200_000_000_i64 + id * 1_000_000,
+    })
+}
+
+fn conversation_read_snapshot(project: &str, thread: bool, bodies: bool) -> Value {
+    let identity = json!({"id": 1, "slug": "conversation-project", "human_key": project,
+        "created_at": 1_704_067_200_000_000_i64});
+    if thread {
+        json!({
+            "schema_version": 1, "complete": true, "project": identity,
+            "captured_ts": 1_704_067_300_000_000_i64, "thread_id": "TKT-42",
+            "subject": "Context message 41", "since_ts": null, "limit": 2,
+            "include_bodies": bodies, "message_count": 3, "omitted_older": 1,
+            "participants": ["RusticGlen", "BlueLake"],
+            "messages": [conversation_read_message(42, bodies), conversation_read_message(43, bodies)],
+        })
+    } else {
+        json!({
+            "schema_version": 1, "complete": true, "project": identity,
+            "captured_ts": 1_704_067_300_000_000_i64,
+            "message": conversation_read_message(42, true), "thread_id": "TKT-42",
+            "position": 2, "total_in_thread": 3,
+            "previous": {"id": 41, "from": "BlueLake", "subject": "Earlier reply"},
+            "next": {"id": 43, "from": "RusticGlen", "subject": "Later reply"},
+        })
+    }
+}
+
+#[test]
+fn conversation_server_reads_render_complete_context_without_local_database_admission() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "conversation-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z", "agents": []})
+        } else {
+            assert!(
+                uri.contains("project=conversation-project&context=true"),
+                "{uri}"
+            );
+            let thread = uri.starts_with("resource://thread/TKT-42?");
+            if thread {
+                assert!(uri.contains("&limit=2&include_bodies="), "{uri}");
+            } else {
+                assert_eq!(
+                    uri,
+                    "resource://message/42?project=conversation-project&context=true&format=json"
+                );
+            }
+            conversation_read_snapshot(
+                &expected_project,
+                thread,
+                !uri.contains("include_bodies=false"),
+            )
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let unavailable = env.tmp.path().join("unusable-local.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"This local file must never be opened as a database.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let vars = reservation_read_env(
+        &env,
+        peer.port,
+        &format!("sqlite:///{}", unavailable.display()),
+    );
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "message",
+            "42",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(result["_meta"]["project"], "conversation-project");
+    let data = &result;
+    assert_eq!(data["id"], 42);
+    assert_eq!(data["position"], 2);
+    assert_eq!(data["total_in_thread"], 3);
+    assert_eq!(data["from_program"], "codex");
+    assert_eq!(data["from_model"], "test-model");
+    assert_eq!(data["body"], "Full conversation body 42");
+    assert_eq!(data["ack_status"], "partial (1/2)");
+    assert_eq!(data["previous"], "#41 BlueLake: Earlier reply");
+    assert_eq!(data["next"], "#43 RusticGlen: Later reply");
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "thread",
+            "TKT-42",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let data = &result;
+    assert_eq!(data["message_count"], 3);
+    assert_eq!(data["omitted_older"], 1);
+    assert_eq!(data["messages"][0]["position"], 2);
+    assert_eq!(data["messages"][1]["position"], 3);
+    assert_eq!(data["messages"][0]["body"], "Full conversation body 42");
+    assert_eq!(data["messages"][1]["ack"], "done");
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "thread",
+            "TKT-42",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--format",
+            "toon",
+            "--server",
+        ],
+    );
+    let text = reservation_read_success(&out);
+    assert!(text.contains("Context message 42"));
+    assert!(!text.contains("Full conversation body"));
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 9);
+    assert_eq!(file_snapshot(&unavailable), before);
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+}
+
+#[test]
+fn conversation_server_reads_fail_closed_on_incomplete_or_changed_context() {
+    for (thread, failure) in [
+        (false, "legacy-response"),
+        (true, "legacy-response"),
+        (false, "incomplete"),
+        (true, "incomplete"),
+        (false, "foreign-project"),
+        (true, "wrong-window"),
+        (false, "missing-neighbor"),
+        (false, "wrong-message"),
+        (true, "wrong-thread"),
+        (false, "changed-project"),
+        (true, "changed-project"),
+        (false, "wrong-uri"),
+        (true, "wrong-id"),
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                return reservation_read_resource_reply(
+                    request,
+                    json!({
+                        "id": 1, "slug": "conversation-project", "human_key": expected_project,
+                        "created_at": if failure == "changed-project" && project_reads > 1 {
+                            "2025-01-01T00:00:00Z"
+                        } else { "2024-01-01T00:00:00Z" }, "agents": [],
+                    }),
+                );
+            }
+            let mut snapshot = conversation_read_snapshot(&expected_project, thread, true);
+            match failure {
+                "legacy-response" => {
+                    snapshot = json!({"id": 42, "body_md": "partial legacy resource"})
+                }
+                "incomplete" => snapshot["complete"] = json!(false),
+                "foreign-project" => snapshot["message"]["project_id"] = json!(2),
+                "wrong-window" => {
+                    snapshot["messages"].as_array_mut().unwrap().pop();
+                }
+                "missing-neighbor" => snapshot["previous"] = Value::Null,
+                "wrong-message" => snapshot["message"]["id"] = json!(43),
+                "wrong-thread" => snapshot["thread_id"] = json!("other-thread"),
+                _ => {}
+            }
+            let mut reply = reservation_read_resource_reply(request, snapshot);
+            match failure {
+                "wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] = json!("resource://message/43")
+                }
+                "wrong-id" => reply["id"] = json!("unrelated-request"),
+                _ => {}
+            }
+            reply
+        });
+        let mut args = vec![
+            "robot",
+            if thread { "thread" } else { "message" },
+            if thread { "TKT-42" } else { "42" },
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ];
+        if thread {
+            args.extend(["--limit", "2"]);
+        }
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &args,
+        );
+        eprintln!("conversation context failure scenario: thread={thread}, {failure}");
+        reservation_read_failed_closed(&out);
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            if failure == "changed-project" { 3 } else { 2 },
+            "must reach the intended context validation boundary: {failure}"
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn conversation_server_reads_use_real_resources_for_receipts_and_numeric_threads() {
+    let (env, project, slug) = reservation_read_fixture();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    for id in 41..=43 {
+        insert_message(
+            &conn,
+            id,
+            1,
+            1,
+            &format!("Real conversation {id}"),
+            &format!("Real body {id}"),
+        );
+        conn.execute_sync(
+            "UPDATE messages SET ack_required=1, created_ts=?, thread_id=? WHERE id=?",
+            &[
+                SqlValue::BigInt(1_704_067_200_000_000 + id * 1_000_000),
+                if id == 41 {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text("41".into())
+                },
+                SqlValue::BigInt(id),
+            ],
+        )
+        .unwrap();
+        insert_recipient(&conn, id, 1);
+        insert_recipient(&conn, id, 2);
+    }
+    conn.execute_raw(
+        "UPDATE message_recipients SET ack_ts=1704067300000000 \
+         WHERE (message_id=42 AND agent_id=2) OR message_id=43;",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    let port = unused_loopback_port();
+    let server = reservation_read_start_server(&env, port);
+    let unavailable = env.tmp.path().join("conversation-client-unusable.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"The client must use MCP, not this local file.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let client_archive = env.tmp.path().join("conversation-client-archive");
+    std::fs::create_dir_all(&client_archive).unwrap();
+    let mut vars =
+        reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    vars.push(("STORAGE_ROOT".into(), client_archive.display().to_string()));
+
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "message",
+            "42",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(result["_meta"]["project"], slug);
+    let data = &result;
+    assert_eq!(data["thread"], "41");
+    assert_eq!(data["position"], 2);
+    assert_eq!(data["total_in_thread"], 3);
+    assert_eq!(data["body"], "Real body 42");
+    assert_eq!(data["ack_status"], "partial (1/2)");
+    assert_eq!(data["previous"], "#41 RusticGlen: Real conversation 41");
+    assert_eq!(data["next"], "#43 RusticGlen: Real conversation 43");
+    assert_eq!(data["from_program"], "test");
+
+    for prefix in [vec!["robot", "thread"], vec!["thread"]] {
+        let mut args = prefix;
+        args.extend([
+            "41",
+            "--limit",
+            "2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ]);
+        let out = run_am_hermetic(&vars, Some(env.hostile_repo()), &args);
+        let result: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+        let data = &result;
+        assert_eq!(data["thread_id"], "41");
+        assert_eq!(data["subject"], "Real conversation 41");
+        assert_eq!(data["message_count"], 3);
+        assert_eq!(data["omitted_older"], 1);
+        assert_eq!(data["messages"][0]["position"], 2);
+        assert_eq!(data["messages"][0]["ack"], "partial (1/2)");
+        assert_eq!(data["messages"][0]["body"], "Real body 42");
+        assert_eq!(data["messages"][1]["position"], 3);
+        assert_eq!(data["messages"][1]["ack"], "done");
+    }
+    drop(server);
+    assert_eq!(file_snapshot(&unavailable), before);
+    assert!(snapshot_tree(&client_archive).is_empty());
+}
+
+#[test]
+fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
+    for failure in [
+        "project-mismatch",
+        "changed-project",
+        "wrong-id",
+        "wrong-uri",
+        "invalid-json",
+        "missing-released",
+        "invalid-exclusive",
+        "invalid-timestamp",
+        "malformed-legacy-array",
+        "incomplete-snapshot",
+        "wrong-count",
+        "foreign-project",
+        "unknown-holder",
+        "snapshot-identity",
+        "wrong-active-filter",
+        "rpc-error",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                let mut descriptor = json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]});
+                if failure == "project-mismatch" {
+                    descriptor["human_key"] = json!("/unrelated/project");
+                } else if failure == "changed-project" && project_reads > 1 {
+                    descriptor["created_at"] = json!("2025-01-01T00:00:00Z");
+                }
+                return reservation_read_resource_reply(request, descriptor);
+            }
+            assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
+            assert!(uri.contains("snapshot=true"));
+            let mut row = json!({"id": 1, "project_id": 1, "agent_id": 1, "agent": "RusticGlen", "path_pattern": "src/**", "exclusive": true, "reason": "gh368", "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null});
+            match failure {
+                "missing-released" => {
+                    row.as_object_mut().unwrap().remove("released_ts");
+                }
+                "invalid-exclusive" => row["exclusive"] = json!("true"),
+                "invalid-timestamp" => row["expires_ts"] = json!("not-a-time"),
+                "foreign-project" => row["project_id"] = json!(2),
+                "unknown-holder" => row["agent_id"] = json!(2),
+                _ => {}
+            }
+            let mut snapshot =
+                reservation_read_snapshot(&expected_project, "gh368-project", vec![row]);
+            match failure {
+                "malformed-legacy-array" => {
+                    snapshot = snapshot["reservations"].clone();
+                    snapshot[0].as_object_mut().unwrap().remove("reason");
+                }
+                "incomplete-snapshot" => snapshot["complete"] = json!(false),
+                "wrong-count" => snapshot["count"] = json!(2),
+                "snapshot-identity" => {
+                    snapshot["project"]["created_at"] = json!("2025-01-01T00:00:00Z")
+                }
+                "wrong-active-filter" => snapshot["active_only"] = json!(false),
+                _ => {}
+            }
+            let mut reply = reservation_read_resource_reply(request, snapshot);
+            match failure {
+                "wrong-id" => reply["id"] = json!("another-request"),
+                "wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] =
+                        json!("resource://file_reservations/another-project")
+                }
+                "invalid-json" => reply["result"]["contents"][0]["text"] = json!("[{truncated"),
+                "rpc-error" => {
+                    reply = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "database is busy (recovery in progress)"}})
+                }
+                _ => {}
+            }
+            reply
+        });
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        eprintln!("GH368 negative scenario: {failure}");
+        reservation_read_failed_closed(&out);
+        let expected_reads = match failure {
+            "project-mismatch" => 1,
+            "changed-project" => 3,
+            _ => 2,
+        };
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            expected_reads,
+            "{failure} must fail at the intended resource boundary, not earlier CLI setup"
+        );
+        assert!(
+            !env.db_path.exists(),
+            "server read created a local database"
+        );
+        assert!(
+            snapshot_tree(&env.storage_root).is_empty(),
+            "server read changed the local archive"
+        );
+    }
+}
+
+#[test]
+fn reservation_server_reads_negotiate_legacy_pages_without_local_database_admission() {
+    // R3 protocol/fault fixture: the real CLI and HTTP transport run, but the
+    // peer substitutes the v0.3.39 resource contract. Compensating real-server
+    // coverage is reservation_reads_direct_and_real_server_preserve_output_without_local_admission.
+    // Complete native CLI/old-server qualification remains tracked by br-gh368.
+    for count in [0, 27, 249] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            let payload = if uri.starts_with("resource://project/") {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+            } else {
+                let rows = reservation_read_legacy_rows(count);
+                if uri.contains("snapshot=true") {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                    );
+                    // v0.3.39 ignores snapshot=true and applies its default
+                    // twenty-row page. It is not a completeness witness.
+                    json!(rows.into_iter().take(20).collect::<Vec<_>>())
+                } else {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json"
+                    );
+                    json!(rows)
+                }
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let unavailable = env.tmp.path().join("legacy-client-unusable.sqlite3");
+        std::fs::write(
+            &unavailable,
+            b"The legacy server owns the reservation data.\n",
+        )
+        .unwrap();
+        let before = file_snapshot(&unavailable);
+        let vars = reservation_read_env(
+            &env,
+            peer.port,
+            &format!("sqlite:///{}", unavailable.display()),
+        );
+        let out = run_am_hermetic(
+            &vars,
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+        let rows = data["all_active"].as_array().unwrap();
+        assert_eq!(rows.len(), count, "the twenty-row probe must be discarded");
+        let paths: std::collections::HashSet<_> = rows
+            .iter()
+            .map(|row| row["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            (1..=count)
+                .map(|id| format!("src/legacy-{id}/**"))
+                .collect()
+        );
+        assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+        assert_eq!(
+            data["reservation_read_attestation"]["database_matches_server"],
+            Value::Null
+        );
+
+        if count == 27 {
+            assert!(rows.iter().any(|row| row["agent"] == "RetiredVale"));
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &["file_reservations", "active", &project, "--server"],
+            );
+            let text = reservation_read_success(&out);
+            assert!(text.contains("src/legacy-27/**"));
+            assert!(text.contains("RetiredVale"));
+
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &[
+                    "robot",
+                    "navigate",
+                    "resource://file_reservations/gh368-project?active_only=true&limit=2&offset=1",
+                    "--project",
+                    &project,
+                    "--json",
+                    "--server",
+                ],
+            );
+            let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+            let page = data["data"]["reservations"].as_array().unwrap();
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[0]["path"], "src/legacy-26/**");
+            assert_eq!(page[1]["path"], "src/legacy-25/**");
+
+            // A name in a legacy lease is not a substitute for the server's
+            // registered-agent authority when the caller explicitly scopes it.
+            let out = run_am_hermetic(
+                &vars,
+                Some(env.hostile_repo()),
+                &[
+                    "reservations",
+                    "--project",
+                    &project,
+                    "--agent",
+                    "RetiredVale",
+                    "--json",
+                    "--server",
+                ],
+            );
+            reservation_read_failed_closed(&out);
+        }
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            if count == 27 { 16 } else { 4 },
+            "each read must verify the project around one separate bounded legacy request"
+        );
+        assert_eq!(file_snapshot(&unavailable), before);
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn reservation_server_legacy_history_preserves_released_and_expired_rows() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z",
+                "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(
+                uri == "resource://file_reservations/gh368-project?snapshot=true&active_only=false&format=json"
+                    || uri
+                        == "resource://file_reservations/gh368-project?active_only=false&limit=250&offset=0&format=json",
+                "history must keep active_only=false through negotiation: {uri}"
+            );
+            let mut rows = reservation_read_legacy_rows(3);
+            rows[1]["released_ts"] = json!("2024-02-01T00:00:00Z");
+            rows[2]["expires_ts"] = json!("2024-02-01T00:00:00Z");
+            json!(rows)
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let vars = reservation_read_env(&env, peer.port, &env.database_url());
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    let text = reservation_read_success(&out);
+    for id in 1..=3 {
+        assert!(text.contains(&format!("src/legacy-{id}/**")));
+    }
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "navigate",
+            "resource://file_reservations/gh368-project?active_only=false&limit=2",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let page = data["data"]["reservations"].as_array().unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0]["path"], "src/legacy-3/**");
+    assert_eq!(page[0]["released"], false);
+    assert_eq!(page[1]["path"], "src/legacy-2/**");
+    assert_eq!(page[1]["released"], true);
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 8);
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+}
+
+#[test]
+fn reservation_server_legacy_auth_refusal_never_uses_readable_local_mailbox() {
+    let (env, project, slug) = reservation_read_fixture();
+    let args = ["reservations", "--project", &project, "--all", "--json"];
+    let direct = run_am_hermetic(
+        &reservation_read_env(&env, 1, &env.database_url()),
+        Some(env.hostile_repo()),
+        &args,
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&direct)).unwrap();
+    assert_eq!(data["all_active"].as_array().unwrap().len(), 3);
+    let before = file_snapshot(&env.db_path);
+    for status in [401, 403] {
+        let expected_project = project.clone();
+        let expected_slug = slug.clone();
+        let peer = ReservationReadPeer::start_with_status(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                return (
+                    200,
+                    reservation_read_resource_reply(
+                        request,
+                        json!({"id": 1, "slug": expected_slug, "human_key": expected_project,
+                            "created_at": "2024-01-01T00:00:00Z",
+                            "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]}),
+                    ),
+                );
+            }
+            if uri.contains("snapshot=true") {
+                assert_eq!(
+                    uri,
+                    format!(
+                        "resource://file_reservations/{expected_slug}?snapshot=true&active_only=true&format=json"
+                    )
+                );
+                return (
+                    200,
+                    reservation_read_resource_reply(
+                        request,
+                        json!(reservation_read_legacy_rows(1)),
+                    ),
+                );
+            }
+            assert_eq!(
+                uri,
+                format!(
+                    "resource://file_reservations/{expected_slug}?active_only=true&limit=250&offset=0&format=json"
+                )
+            );
+            (status, json!({"message": RESERVATION_READ_TEST_TOKEN}))
+        });
+        let mut server_args = args.to_vec();
+        server_args.push("--server");
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &server_args,
+        );
+        reservation_read_failed_closed(&out);
+        assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(file_snapshot(&env.db_path), before);
+    }
+}
+
+#[test]
+fn reservation_server_legacy_negotiation_fails_closed_without_retries_or_pagination() {
+    for failure in [
+        "malformed-probe",
+        "oversized-probe",
+        "malformed-page",
+        "duplicate-page",
+        "released-page",
+        "full-page",
+        "oversized-page",
+        "page-object",
+        "page-wrong-id",
+        "page-wrong-uri",
+        "page-rpc-error",
+        "page-unauthorized",
+        "page-forbidden",
+        "page-redirect",
+        "changed-project",
+        "changed-roster",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start_with_status(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                let mut descriptor = json!({"id": 1, "slug": "gh368-project",
+                    "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z",
+                    "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]});
+                if project_reads > 1 {
+                    if failure == "changed-project" {
+                        descriptor["created_at"] = json!("2025-01-01T00:00:00Z");
+                    } else if failure == "changed-roster" {
+                        descriptor["agents"][0]["id"] = json!(2);
+                    }
+                }
+                return (200, reservation_read_resource_reply(request, descriptor));
+            }
+            if uri.contains("snapshot=true") {
+                assert_eq!(
+                    uri,
+                    "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                );
+                let mut rows = reservation_read_legacy_rows(if failure == "oversized-probe" {
+                    251
+                } else {
+                    20
+                });
+                if failure == "malformed-probe" {
+                    rows[0].as_object_mut().unwrap().remove("released_ts");
+                }
+                return (200, reservation_read_resource_reply(request, json!(rows)));
+            }
+            assert_eq!(
+                uri,
+                "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json",
+                "negotiation must never request another page or a different resource"
+            );
+            let count = match failure {
+                "full-page" => 250,
+                "oversized-page" => 251,
+                _ => 27,
+            };
+            let mut rows = reservation_read_legacy_rows(count);
+            match failure {
+                "malformed-page" => rows[0]["exclusive"] = json!("true"),
+                "duplicate-page" => rows.push(rows[0].clone()),
+                "released-page" => rows[0]["released_ts"] = json!("2024-02-01T00:00:00Z"),
+                _ => {}
+            }
+            let payload = if failure == "page-object" {
+                reservation_read_snapshot(&expected_project, "gh368-project", rows)
+            } else {
+                json!(rows)
+            };
+            let mut reply = reservation_read_resource_reply(request, payload);
+            match failure {
+                "page-wrong-id" => reply["id"] = json!("unrelated-request"),
+                "page-wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] =
+                        json!("resource://file_reservations/another-project")
+                }
+                "page-rpc-error" => {
+                    reply = json!({"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32603, "message": RESERVATION_READ_TEST_TOKEN}});
+                }
+                "page-unauthorized" | "page-forbidden" | "page-redirect" => {
+                    let status = match failure {
+                        "page-unauthorized" => 401,
+                        "page-forbidden" => 403,
+                        _ => 307,
+                    };
+                    return (status, json!({"message": RESERVATION_READ_TEST_TOKEN}));
+                }
+                _ => {}
+            }
+            (200, reply)
+        });
+        let mut commands = vec![vec![
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ]];
+        if failure == "full-page" {
+            commands.push(vec![
+                "file_reservations",
+                "active",
+                &project,
+                "--limit",
+                "1",
+                "--server",
+            ]);
+            commands.push(vec![
+                "robot",
+                "navigate",
+                "resource://file_reservations/gh368-project?active_only=true&limit=1",
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ]);
+        }
+        for args in &commands {
+            let out = run_am_hermetic(
+                &reservation_read_env(&env, peer.port, &env.database_url()),
+                Some(env.hostile_repo()),
+                args,
+            );
+            eprintln!("GH368 legacy failure scenario: {failure}, {args:?}");
+            reservation_read_failed_closed(&out);
+        }
+        let expected_reads = match failure {
+            "malformed-probe" | "oversized-probe" => 2,
+            "changed-project" | "changed-roster" => 4,
+            _ => 3,
+        };
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            expected_reads * commands.len(),
+            "{failure} must stop at its failing boundary without retries or OFFSET pages"
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn reservation_server_reads_preserve_active_leases_when_client_clock_is_ahead() {
+    // R3 protocol fixture: the compiled CLI and HTTP transport are real. Both
+    // server protocols say these leases are active at their authority's clock.
+    // Local wall time may affect displays, but must not remove those leases.
+    let expires = "2024-02-02T00:00:00Z";
+    assert!(
+        mcp_agent_mail_db::now_micros() > mcp_agent_mail_db::iso_to_micros(expires).unwrap(),
+        "fixture must exercise a client clock ahead of the server"
+    );
+    for legacy in [false, true] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            let agents = json!([
+                {"id": 1, "name": "RusticGlen", "project_id": 1},
+                {"id": 2, "name": "BlueLake", "project_id": 1}
+            ]);
+            let payload = if uri.starts_with("resource://project/") {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                    "created_at": "2024-01-01T00:00:00Z", "agents": agents})
+            } else {
+                let mut rows = reservation_read_legacy_rows(2);
+                rows[0]["path_pattern"] = json!("src/**");
+                rows[1]["path_pattern"] = json!("src/lib.rs");
+                rows[1]["agent"] = json!("BlueLake");
+                for row in &mut rows {
+                    row["exclusive"] = json!(true);
+                    row["expires_ts"] = json!(expires);
+                }
+                if legacy {
+                    assert!(
+                        uri == "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                            || uri
+                                == "resource://file_reservations/gh368-project?active_only=true&limit=250&offset=0&format=json"
+                    );
+                    json!(rows)
+                } else {
+                    assert_eq!(
+                        uri,
+                        "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+                    );
+                    for (index, row) in rows.iter_mut().enumerate() {
+                        row["project_id"] = json!(1);
+                        row["agent_id"] = json!(index + 1);
+                    }
+                    let mut snapshot =
+                        reservation_read_snapshot(&expected_project, "gh368-project", rows);
+                    snapshot["agents"] = agents;
+                    snapshot
+                }
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let vars = reservation_read_env(&env, peer.port, &env.database_url());
+        let uri = "resource://file_reservations/gh368-project?active_only=true&limit=2";
+        let cases = [
+            vec![
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+            vec![
+                "robot",
+                "navigate",
+                uri,
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ],
+            vec!["file_reservations", "active", &project, "--server"],
+            vec!["file_reservations", "list", &project, "--server"],
+            vec!["file_reservations", "soon", &project, "--server"],
+            vec![
+                "file_reservations",
+                "conflicts",
+                &project,
+                "src/lib.rs",
+                "--server",
+            ],
+        ];
+        for args in &cases {
+            let out = run_am_hermetic(&vars, Some(env.hostile_repo()), args);
+            let text = reservation_read_success(&out);
+            if args.contains(&"--json") {
+                let data: Value = serde_json::from_str(text).unwrap();
+                let navigate = args.get(1) == Some(&"navigate");
+                let rows = if navigate {
+                    &data["data"]["reservations"]
+                } else {
+                    assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+                    assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+                    &data["all_active"]
+                };
+                let actual: std::collections::HashSet<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["path"].as_str().unwrap(),
+                            row["agent"].as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    std::collections::HashSet::from([
+                        ("src/**", "RusticGlen"),
+                        ("src/lib.rs", "BlueLake")
+                    ]),
+                    "legacy={legacy}, args={args:?}"
+                );
+            } else {
+                for expected in ["src/**", "src/lib.rs", "RusticGlen", "BlueLake"] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            cases.len() * if legacy { 4 } else { 3 }
+        );
+        assert!(!env.db_path.exists());
+        assert!(snapshot_tree(&env.storage_root).is_empty());
+    }
+}
+
+#[test]
+fn reservation_server_reads_accept_verified_empty_results_and_preserve_navigation_pages() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let mut reservation_reads = 0;
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
+            assert!(
+                uri.contains("snapshot=true&active_only=true&format=json")
+                    && !uri.contains("limit=")
+                    && !uri.contains("offset="),
+                "expected a complete snapshot before applying local navigation: {uri}"
+            );
+            reservation_reads += 1;
+            let rows = if reservation_reads == 1 {
+                Vec::new()
+            } else {
+                // The MCP resource returns ascending creation order. Native
+                // navigate uses descending creation order, then applies its
+                // page. Passing limit/offset straight through selects the
+                // wrong leases even if the JSON shape remains the same.
+                (1..=9)
+                    .map(|id| {
+                        json!({
+                            "id": id, "project_id": 1, "agent_id": 1,
+                            "agent": "RusticGlen", "path_pattern": format!("page-{id}/**"),
+                            "exclusive": id % 2 == 0, "reason": "gh368",
+                            "created_ts": format!("2024-01-{id:02}T00:00:00Z"),
+                            "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            reservation_read_snapshot(&expected_project, "gh368-project", rows)
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let vars = reservation_read_env(&env, peer.port, &env.database_url());
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(data["all_active"], json!([]));
+    assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "navigate",
+            "resource://file_reservations/gh368-project?active_only=true&limit=2&offset=7",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let rows = data["data"]["reservations"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "an explicitly requested full page is valid");
+    assert_eq!(rows[0]["path"], "page-2/**");
+    assert_eq!(rows[1]["path"], "page-1/**");
+    assert_eq!(rows[0]["exclusive"], true);
+    assert_eq!(rows[1]["exclusive"], false);
+    assert!(
+        rows.iter()
+            .all(|row| row["expires_ts"].is_i64() && row["released"] == false)
+    );
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 6);
+}
+
+#[test]
+fn reservation_server_reads_return_more_than_one_resource_page() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project,
+                "created_at": "2024-01-01T00:00:00Z",
+                "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert_eq!(
+                uri,
+                "resource://file_reservations/gh368-project?snapshot=true&active_only=true&format=json"
+            );
+            let rows = (1..=301).map(|id| json!({
+                "id": id, "project_id": 1, "agent_id": 1, "agent": "RusticGlen",
+                "path_pattern": format!("src/lease-{id}/**"), "exclusive": true, "reason": "complete snapshot",
+                "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null,
+            })).collect();
+            reservation_read_snapshot(&expected_project, "gh368-project", rows)
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let out = run_am_hermetic(
+        &reservation_read_env(&env, peer.port, &env.database_url()),
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let rows = data["all_active"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        301,
+        "complete results must cross the old 250-row cap"
+    );
+    let paths: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|row| row["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        (1..=301).map(|id| format!("src/lease-{id}/**")).collect()
+    );
+    assert_eq!(
+        peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "one complete reservation read must suffice, regardless of row count"
+    );
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+}
+
+#[test]
+fn reservation_server_navigation_rejects_conflicting_project_selectors() {
+    for uri in [
+        "resource://file_reservations/different-project?active_only=true",
+        "resource://file_reservations/gh368-project?active_only=true&project=different-project",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let payload = if request["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("resource://project/")
+            {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+            } else {
+                json!([])
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &[
+                "robot",
+                "navigate",
+                uri,
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ],
+        );
+        reservation_read_failed_closed(&out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("project"));
+        assert!(!env.db_path.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reservation_server_reads_escape_project_paths_and_use_explicit_client_token() {
+    let env = TestEnv::new();
+    let project_path = env.hostile_repo.join("query +%#?é");
+    std::fs::create_dir_all(&project_path).unwrap();
+    let project = project_path.canonicalize().unwrap().display().to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            for encoded in ["%2F", "%20", "%2B", "%25", "%23", "%3F", "%C3%A9"] {
+                assert!(
+                    uri.contains(encoded),
+                    "project component lost {encoded}: {uri}"
+                );
+            }
+            assert!(uri.ends_with("?format=json"));
+            assert_eq!(
+                uri.matches('?').count(),
+                1,
+                "project data became URI query syntax"
+            );
+            json!({"id": 1, "slug": "gh368-escaped-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(uri.starts_with("resource://file_reservations/gh368-escaped-project?"));
+            reservation_read_snapshot(&expected_project, "gh368-escaped-project", Vec::new())
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let mut vars = reservation_read_env(&env, peer.port, &env.database_url());
+    vars.push(("HTTP_BEARER_TOKEN".into(), "unused-server-setting".into()));
+    vars.push((
+        "AGENT_MAIL_TOKEN".into(),
+        RESERVATION_READ_TEST_TOKEN.into(),
+    ));
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(data["all_active"], json!([]));
+    assert_eq!(data["_meta"]["project"], "gh368-escaped-project");
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert!(!env.db_path.exists());
+}
+
 // ---- Acks ----
 
 #[test]
@@ -5036,6 +7956,89 @@ fn list_acks_with_seeded_project() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn beads_show_renders_real_issue_and_preserves_json_response() {
+    let env = TestEnv::new();
+    let project_dir = std::fs::canonicalize(env.tmp.path()).expect("canonical project path");
+    let beads_dir = project_dir.join(".beads");
+    let mut child_env = env.isolated_env();
+    child_env.extend([
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").expect("test PATH"),
+        ),
+        ("AM_BR_BIN".to_string(), "br".to_string()),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    let run_br = |args: &[&str]| {
+        let out = Command::new("br")
+            .current_dir(env.tmp.path())
+            .envs(child_env.iter().map(|(key, value)| (key, value)))
+            .env("BEADS_DIR", &beads_dir)
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("BD_DATABASE")
+            .args([
+                "--json",
+                "--quiet",
+                "--no-daemon",
+                "--allow-stale",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ])
+            .args(args)
+            .output()
+            .expect("run real br");
+        assert!(
+            out.status.success(),
+            "br {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run_br(&["init", "--prefix", "show"]);
+    let created = run_br(&[
+        "create",
+        "Visible Beads title",
+        "--description",
+        "Visible Beads description",
+        "--priority",
+        "1",
+    ]);
+    let issue: Value = serde_json::from_slice(&created.stdout).expect("created issue JSON");
+    let id = issue["id"].as_str().expect("created issue ID");
+    let expected = run_br(&["show", id]);
+    let project = project_dir.to_str().expect("UTF-8 project path");
+    for format in ["table", "json"] {
+        let args = ["beads", "show", id, "--path", project, "--format", format];
+        let out = run_am(&child_env, Some(env.tmp.path()), &args, None);
+        if !out.status.success() {
+            write_artifact("beads_show_real_issue", &args, &out);
+        }
+        assert!(out.status.success(), "am beads show failed: {out:?}");
+        if format == "json" {
+            let actual: Value = serde_json::from_slice(&out.stdout).expect("am show JSON");
+            let expected: Value = serde_json::from_slice(&expected.stdout).expect("br show JSON");
+            assert_eq!(
+                actual, expected,
+                "JSON must retain the complete br response"
+            );
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for required in [
+                id,
+                "Visible Beads title",
+                "Visible Beads description",
+                "P1",
+                "open",
+            ] {
+                assert!(text.contains(required), "missing {required:?} in {text:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -5356,6 +8359,95 @@ fn clear_and_reset_with_force_and_no_archive_succeeds() {
     assert!(
         !env.db_path.exists(),
         "expected database to be removed after reset"
+    );
+}
+
+/// A running server holds the mailbox activity locks for its whole life. The
+/// reset must stop it rather than fail "Resource is temporarily busy", then
+/// wipe the mailbox it served.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_and_reset_stops_a_running_server_holding_the_mailbox() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log)
+        .spawn()
+        .expect("start HTTP server");
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut serving = false;
+    while Instant::now() < deadline && matches!(server.try_wait(), Ok(None)) {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+            && env.db_path.exists()
+        {
+            serving = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !serving {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!(
+            "server never started serving:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+    }
+
+    let out = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["clear-and-reset-everything", "--force", "--no-archive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clear-and-reset-everything");
+
+    // Reap the server whatever the outcome, so a failure cannot leak it.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let mut server_exited = false;
+    while Instant::now() < exit_deadline {
+        if matches!(server.try_wait(), Ok(Some(_))) {
+            server_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !server_exited {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reset must stop the running server instead of failing busy\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Stopping Agent Mail process pid {}", server.id())),
+        "reset should name the server it stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        server_exited,
+        "the server holding the mailbox should have been stopped"
+    );
+    assert!(
+        !env.db_path.exists(),
+        "database should be removed after the reset\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -5747,6 +8839,7 @@ fn check_reconstruct_preview_reservations(ambiguous_source: bool, check_reseed: 
     let preview = run(&preview_env, "--dry-run");
     let preview_json: Value = serde_json::from_slice(&preview.stdout).unwrap_or_else(|error| {
         panic!(
+            // ubs:ignore — reconstruct integration helper must reject a non-JSON dry-run response
             "preview stdout must be a single JSON value ({error}):\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&preview.stdout),
             String::from_utf8_lossy(&preview.stderr)
@@ -6277,6 +9370,123 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
     check_serve_http_client_config_setup(true);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn robot_health_preserves_real_daemon_memory_pressure() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let log_path = env.tmp.path().join("health-pressure-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("HTTP_PORT", port.to_string())
+            // Exercise the real serving process's RSS sampler without putting
+            // the host under pressure. The CLI keeps its ordinary thresholds.
+            .env("MEMORY_WARNING_MB", "1")
+            .env("MEMORY_CRITICAL_MB", "2")
+            .env("MEMORY_FATAL_MB", "0")
+            .current_dir(env.hostile_repo())
+            .args([
+                "serve-http",
+                "--no-tui",
+                "--no-auth",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("start real health server"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "health server failed to start: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+        .current_dir(env.hostile_repo())
+        .args(["robot", "health", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nserver:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let health: Value = serde_json::from_slice(&output.stdout).expect("robot health JSON");
+    assert_eq!(health["overall"], "unhealthy", "{health}");
+    assert_eq!(health["health_level"], "red", "{health}");
+    assert_eq!(health["capacity_health_level"], "red", "{health}");
+    let probes = health["probes"].as_array().unwrap();
+    let server_probe = probes
+        .iter()
+        .find(|probe| probe["name"] == "server_health")
+        .unwrap();
+    assert_eq!(server_probe["status"], "fail", "{server_probe}");
+    assert!(
+        server_probe["detail"]
+            .as_str()
+            .unwrap()
+            .contains("pressure=red")
+    );
+    let pressure = probes
+        .iter()
+        .find(|probe| probe["name"] == "backpressure")
+        .unwrap();
+    assert_eq!(pressure["status"], "red", "{pressure}");
+    assert!(
+        pressure["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(pressure["detail"].as_str().unwrap().contains("memory"));
+    let circuits = probes
+        .iter()
+        .find(|probe| probe["name"] == "circuit_breakers")
+        .unwrap();
+    assert!(
+        circuits["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(
+        health["_alerts"].as_array().unwrap().iter().any(|alert| {
+            alert["severity"] == "error"
+                && alert["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("pressure=red"))
+        }),
+        "{health}"
+    );
+}
+
 fn check_serve_http_client_config_setup(setup: bool) {
     let env = TestEnv::new();
     let project = env.hostile_repo();
@@ -6373,6 +9583,31 @@ fn check_serve_http_client_config_setup(setup: bool) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // Liveness answers as soon as the listener serves, but `--setup` repairs
+    // client configs only after the server's own readiness self-probe, so
+    // stopping on the first 200 raced the repair. With setup, wait (bounded)
+    // for every client config to name this server; without it, give a wrong
+    // startup rewrite the same chance to land before asserting it did not.
+    if healthy {
+        if setup {
+            let expected = format!("http://127.0.0.1:{port}/mcp/");
+            let clients: Vec<_> = config_paths
+                .iter()
+                .filter(|path| **path != env.user_config_env_path())
+                .collect();
+            let settle_deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < settle_deadline
+                && matches!(child.try_wait(), Ok(None))
+                && !clients.iter().all(|path| {
+                    std::fs::read_to_string(path).is_ok_and(|content| content.contains(&expected))
+                })
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
     // Reap this test's own server before assertions, including startup failures.
     let _ = child.kill();
     let _ = child.wait();
@@ -6437,7 +9672,10 @@ fn legacy_am_serve_reports_migration_preflight() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn cli_discovers_nondefault_mailbox_daemon_port() {
+fn cli_serves_integrity_checked_tailwind_without_exposing_mailbox_pages() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
     struct OwnedServer(std::process::Child);
     impl Drop for OwnedServer {
         fn drop(&mut self) {
@@ -6446,6 +9684,119 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
         }
     }
     let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let token = mcp_agent_mail_core::setup::generate_token().expect("secure test bearer token");
+    let log_path = env.tmp.path().join("asset-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("HTTP_BEARER_TOKEN", &token)
+            .env("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+            .env("AM_ATC_ENABLED", "false")
+            .env("TMPDIR", env.tmp.path())
+            .current_dir(&env.hostile_repo)
+            .args([
+                "serve-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--no-tui",
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "asset daemon did not bind");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let request = |method: &str, path: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let split = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            response[split + 4..].to_vec(),
+        )
+    };
+    let path = "/mail/static/tailwind-3.4.17.min.js";
+    let (headers, script) = request("GET", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/javascript")
+    );
+    assert_eq!(script.len(), 407_279);
+    let integrity = format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&script))
+    );
+    assert_eq!(
+        integrity,
+        "sha256-F26JRmGqnNyaXLpscgBEy797i9gNHJoUKnwksbbFDRU="
+    );
+    let (headers, _) = request("GET", "/mail");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+    let (headers, html) = request("GET", &format!("/mail?token={token}"));
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "{headers}\n{}",
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let html = String::from_utf8(html).unwrap().replace("&#x2f;", "/");
+    assert!(html.contains(&format!("src=\"{path}\"")));
+    assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+    assert!(!html.contains("https://cdn.tailwindcss.com"));
+    let (headers, body) = request("HEAD", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-length: 407279")
+    );
+    assert!(body.is_empty());
+    let (headers, _) = request("GET", "/mail/static/vendor_manifest.json");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_discovers_nondefault_mailbox_daemon_port() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut env = TestEnv::new();
+    // Percent-encoding makes this URI exceed the request-ID limit without
+    // inflating its ASCII archive slug or exceeding a filesystem component.
+    env.hostile_repo = env.hostile_repo.join("é".repeat(100));
+    std::fs::create_dir_all(&env.hostile_repo).unwrap();
     let project = env.hostile_repo.to_str().unwrap();
     let port = unused_loopback_port();
     let log_path = env.tmp.path().join("discovered-daemon.log");
@@ -6612,6 +9963,85 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
 }
 
+/// br-eos8u: a client that sees a live server own a non-default mailbox, but
+/// cannot tie a listener to it, stops with an error. Its own TMPDIR hides the
+/// daemon's listener hints, so the only endpoint left is the default one, which
+/// could belong to another mailbox's server.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_refuses_a_mailbox_server_it_cannot_confirm() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let project = env.hostile_repo.to_str().unwrap();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("unconfirmed-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let client_tmp = env.tmp.path().join("client-tmp");
+    std::fs::create_dir_all(&client_tmp).unwrap();
+    let command = |tmpdir: &std::path::Path| {
+        let mut cmd = Command::new(am_bin());
+        cmd.env_clear()
+            .envs(env.isolated_env())
+            .env_remove("HTTP_HOST")
+            .env_remove("HTTP_PORT")
+            .env("TMPDIR", tmpdir)
+            .env("HTTP_BEARER_TOKEN", "unconfirmed-server-token")
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&env.hostile_repo);
+        cmd
+    };
+    let mut server_command = command(env.tmp.path());
+    server_command
+        .args([
+            "serve-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--no-tui",
+            "--no-auth",
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut server = OwnedServer(server_command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let agents_list = ["agents", "list", "--project", project, "--json"];
+    let out = command(&client_tmp).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("could not be confirmed"), "{stderr}");
+    assert!(stderr.contains("nothing was sent to"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("owner PID {}", server.0.id())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("HTTP_PORT"), "{stderr}");
+    assert!(!stderr.contains("unconfirmed-server-token"), "{stderr}");
+    // The daemon's own TMPDIR reaches the same listener, so only the guess was
+    // refused. The daemon has no such project, and the refusal is its answer.
+    let out = command(env.tmp.path()).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("list_agents via server failed"), "{stderr}");
+    assert!(stderr.contains("NOT_FOUND"), "{stderr}");
+    assert!(!stderr.contains("could not be confirmed"), "{stderr}");
+}
+
 #[test]
 fn serve_http_help_exits_zero() {
     let env = TestEnv::new();
@@ -6767,5 +10197,134 @@ fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
     assert!(
         daemon_reload < restart,
         "reload must precede restart: {calls}"
+    );
+}
+
+/// Hermetic env for one `am` run against a private HOME and mailbox. The
+/// listener port is one nothing listens on, so mutations take the local path
+/// instead of reaching a live daemon.
+fn user_env_guard_env(root: &Path, port: u16) -> Vec<(String, String)> {
+    let home = root.join("home");
+    let storage = root.join("storage");
+    [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.join(".config").display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME",
+            home.join(".local/share").display().to_string(),
+        ),
+        ("XDG_CACHE_HOME", home.join(".cache").display().to_string()),
+        ("STORAGE_ROOT", storage.display().to_string()),
+        (
+            "DATABASE_URL",
+            format!("sqlite:///{}/storage.sqlite3", storage.display()),
+        ),
+        ("AM_INTERFACE_MODE", "cli".to_string()),
+        ("AM_ATC_ENABLED", "false".to_string()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1".to_string()),
+        ("HTTP_HOST", "127.0.0.1".to_string()),
+        ("HTTP_PORT", port.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
+/// br-ww5js: through the real `execute` path, an unsafe (symlinked) user
+/// `config.env` makes config-consuming mutations fail closed before they open
+/// any mailbox state and without echoing the credential, while an exempt
+/// reflection verb still runs. The control arm, with a regular private
+/// `config.env`, shows the same registration does create the mailbox, so the
+/// missing storage in the unsafe arm is the guard's doing.
+#[cfg(unix)]
+#[test]
+fn unsafe_user_config_env_blocks_mutations_before_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let port = unused_loopback_port();
+    let unsafe_root = tmp.path().join("unsafe");
+    let control_root = tmp.path().join("control");
+    for root in [&unsafe_root, &control_root] {
+        std::fs::create_dir_all(root.join("home/.config/mcp-agent-mail")).expect("config dir");
+        std::fs::create_dir_all(root.join("project")).expect("project dir");
+    }
+    let elsewhere = tmp.path().join("elsewhere.env");
+    std::fs::write(&elsewhere, "HTTP_BEARER_TOKEN=elsewhere-secret\n").expect("target env");
+    std::os::unix::fs::symlink(
+        &elsewhere,
+        unsafe_root.join("home/.config/mcp-agent-mail/config.env"),
+    )
+    .expect("symlinked config.env");
+    let control_env = control_root.join("home/.config/mcp-agent-mail/config.env");
+    std::fs::write(&control_env, "HTTP_BEARER_TOKEN=control-secret\n").expect("control env");
+    std::fs::set_permissions(
+        &control_env,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod control env");
+
+    let project = unsafe_root.join("project");
+    let project_key = project.to_str().expect("utf-8 project path");
+    let env = user_env_guard_env(&unsafe_root, port);
+    // Temp paths contain no whitespace, so each command splits into its argv.
+    for command in [
+        format!("agents register --project {project_key} --program x --model y"),
+        format!(
+            "mail send --project {project_key} --from BlueLake --to RedStone --subject s --body b"
+        ),
+        format!("file_reservations reserve {project_key} BlueLake src/**"),
+        "doctor fix --yes".to_string(),
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let out = run_am_hermetic(&env, Some(&project), &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail closed: {stdout}");
+        assert!(
+            stderr.contains("refusing unsafe user configuration authority"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !format!("{stdout}{stderr}").contains("elsewhere-secret"),
+            "{args:?} disclosed the credential"
+        );
+        assert!(
+            !unsafe_root.join("storage").exists(),
+            "{args:?} created mailbox state despite the unsafe authority"
+        );
+    }
+    let reflection = run_am_hermetic(
+        &env,
+        Some(&project),
+        &["doctor", "capabilities", "--format", "json"],
+    );
+    assert!(
+        reflection.status.success(),
+        "exempt reflection must still run"
+    );
+    assert!(!unsafe_root.join("storage").exists());
+
+    let control_project = control_root.join("project");
+    let control_command = format!(
+        "agents register --project {} --program x --model y",
+        control_project.display()
+    );
+    let control_args: Vec<&str> = control_command.split_whitespace().collect();
+    let control = run_am_hermetic(
+        &user_env_guard_env(&control_root, port),
+        Some(&control_project),
+        &control_args,
+    );
+    assert!(
+        control.status.success(),
+        "control registration: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        control_root.join("storage").exists(),
+        "control must create the mailbox"
     );
 }

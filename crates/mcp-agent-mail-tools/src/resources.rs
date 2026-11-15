@@ -18,8 +18,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
@@ -362,7 +362,9 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
     pool_config.run_migrations = false;
     pool_config.warmup_connections = 0;
 
-    mcp_agent_mail_db::create_query_only_pool(&pool_config)
+    // Shared across resource reads: a per-read pool leaked one live-mailbox
+    // descriptor per read wherever the engine cannot reuse it (GH#333).
+    mcp_agent_mail_db::get_or_create_live_query_only_pool(&pool_config)
         .map(ResourceReadPool::live)
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
@@ -613,6 +615,8 @@ fn tool_filter_allows(config: &Config, tool_name: &str) -> bool {
     tool_cluster(tool_name).is_none_or(|cluster| config.should_expose_tool(tool_name, cluster))
 }
 
+/// Every caller reads mail as this agent. Apply the same session identity
+/// restriction here so alternate mailbox views cannot bypass inbox admission.
 async fn resolve_resource_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -651,8 +655,21 @@ async fn resolve_resource_agent(
         ));
     };
 
-    match mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), pool, agent_id).await {
-        Outcome::Ok(agent) => Ok(agent),
+    // Release the name lookup before acquiring the fresh row, including for
+    // one-slot pools. Cached identity may predate a rename or reused row ID.
+    drop(conn);
+    match mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), pool, agent_id).await {
+        Outcome::Ok(agent) => {
+            if agent.project_id != project_id || !agent.name.eq_ignore_ascii_case(&agent_name_norm)
+            {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "Agent identity changed during resource resolution",
+                ));
+            }
+            crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
+            Ok(agent)
+        }
         Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => Err(McpError::internal_error(format!(
@@ -704,6 +721,12 @@ async fn resolve_existing_resource_project(
     let Some(row) = rows.first() else {
         return Err(resource_project_not_found_error());
     };
+    decode_resource_project_row(row)
+}
+
+fn decode_resource_project_row(
+    row: &mcp_agent_mail_db::sqlmodel::Row,
+) -> McpResult<mcp_agent_mail_db::ProjectRow> {
     let slug = row
         .get_named::<String>("slug")
         .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
@@ -720,6 +743,88 @@ async fn resolve_existing_resource_project(
         human_key,
         created_at,
     })
+}
+
+/// Resolve a working directory without the Git identity discovery used when
+/// registering projects. Resource reads must not create worktree markers.
+fn resource_project_ancestor_paths(project_key: &str) -> McpResult<Vec<String>> {
+    if project_key.len() > 32_768
+        || project_key.contains('\0')
+        || !Path::new(project_key).is_absolute()
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution requires an absolute path of at most 32768 bytes",
+        ));
+    }
+    let path = mcp_agent_mail_core::resolve_project_path(project_key);
+    // Canonicalization can fail for missing paths. Do not let an unresolved
+    // `..` make an unrelated directory look like an ancestor, and do not
+    // normalize it lexically across a potentially symlinked component.
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution cannot resolve parent traversal in this path",
+        ));
+    }
+    let ancestors = path
+        .ancestors()
+        .take(257)
+        .map(|ancestor| ancestor.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if ancestors.len() > 256 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ancestor project resolution supports at most 256 path components",
+        ));
+    }
+    Ok(ancestors)
+}
+
+async fn resolve_nearest_resource_project(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    ancestor_paths: &[String],
+) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+    // One fresh query observes all candidate ancestors together. A cached
+    // project lookup, slug match, or capped project list cannot establish which
+    // registered human key is currently nearest to the working directory.
+    let placeholders = vec!["?"; ancestor_paths.len()].join(", ");
+    let sql = format!(
+        "SELECT id, slug, human_key, created_at FROM projects \
+         WHERE human_key IN ({placeholders}) \
+         ORDER BY length(human_key) DESC, id LIMIT 2"
+    );
+    let params = ancestor_paths
+        .iter()
+        .cloned()
+        .map(mcp_agent_mail_db::sqlmodel::Value::Text)
+        .collect::<Vec<_>>();
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
+    let rows = conn.query_sync(&sql, &params).map_err(|err| {
+        let message = err.to_string();
+        if is_missing_projects_table_error(&message) {
+            resource_project_not_found_error()
+        } else {
+            resource_sync_db_error_to_mcp_error(message)
+        }
+    })?;
+    let Some(row) = rows.first() else {
+        return Err(resource_project_not_found_error());
+    };
+    let project = decode_resource_project_row(row)?;
+    if let Some(other) = rows.get(1)
+        && decode_resource_project_row(other)?.human_key == project.human_key
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Nearest project human key is ambiguous",
+        ));
+    }
+    Ok(project)
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -752,6 +857,13 @@ fn ts_f64_to_rfc3339(t: f64) -> Option<String> {
 pub struct EnvironmentSnapshot {
     pub environment: String,
     pub database_url: String,
+    pub storage_root: String,
+    #[serde(default)]
+    pub project_path_resolution: String,
+    #[serde(default)]
+    pub inbox_priority_snapshot: String,
+    #[serde(default)]
+    pub search_recipient_kind: String,
     pub http: HttpSnapshot,
 }
 
@@ -783,6 +895,10 @@ pub fn config_environment(_ctx: &McpContext) -> McpResult<String> {
     let snapshot = EnvironmentSnapshot {
         environment: config.app_environment.to_string(),
         database_url: redact_database_url(&config.database_url),
+        storage_root: config.storage_root.to_string_lossy().into_owned(),
+        project_path_resolution: "nearest_ancestor_v1".to_string(),
+        inbox_priority_snapshot: "priority_v1".to_string(),
+        search_recipient_kind: "delivery_v1".to_string(),
         http: HttpSnapshot {
             host: config.http_host.clone(),
             port: config.http_port,
@@ -897,27 +1013,13 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
         mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
 
-    // Get unread counts for all agents in one query
+    // Direct and eligible shared deliveries must agree with each agent's inbox.
     let conn = acquire_resource_conn(ctx.cx(), &pool).await?;
-    let sql = "SELECT r.agent_id, COUNT(*) as unread \
-               FROM message_recipients r \
-               JOIN messages m ON m.id = r.message_id \
-               WHERE m.project_id = ? AND r.read_ts IS NULL \
-               GROUP BY r.agent_id";
-    let params = [mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)];
-    let start = mcp_agent_mail_db::query_timer();
-    let unread_rows = conn.query_sync(sql, &params);
-    mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
-    let unread_rows =
-        unread_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
-
-    let mut unread_counts: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::with_capacity(agents.len());
-    for row in unread_rows {
-        let agent_id: i64 = row.get_named("agent_id").unwrap_or(0);
-        let count: i64 = row.get_named("unread").unwrap_or(0);
-        unread_counts.insert(agent_id, count);
-    }
+    let unread_counts = mcp_agent_mail_db::project_mailbox::project_inbox_unread_counts_from_conn(
+        &*conn, project_id,
+    )
+    .map_err(db_error_to_mcp_error)?;
+    drop(conn);
 
     let mut active_agents = Vec::new();
     let mut retired_agents = Vec::new();
@@ -2605,23 +2707,201 @@ pub struct ProjectDetailResponse {
     pub human_key: String,
     pub created_at: Option<String>,
     pub agents: Vec<ProjectAgentEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ProjectPathResolution>,
+}
+
+/// Evidence that a project was selected for an implicit working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectPathResolution {
+    pub kind: String,
+    pub requested_path: String,
+}
+
+const PROJECT_DETAILS_RESOURCE_URI: &str = "resource://project/{slug}";
+const PROJECT_DETAILS_RESOURCE_DESCRIPTION: &str = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```";
+
+/// One project route for both ordinary reads and query-aware resolution.
+///
+/// Read the original URI so encoded delimiters remain path data until the
+/// query is separated. Registering a second query template overlaps this route.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectDetailsResource;
+
+impl fastmcp_server::ResourceHandler for ProjectDetailsResource {
+    fn definition(&self) -> fastmcp_protocol::Resource {
+        fastmcp_protocol::Resource {
+            uri: PROJECT_DETAILS_RESOURCE_URI.to_string(),
+            name: "project_details".to_string(),
+            description: Some(PROJECT_DETAILS_RESOURCE_DESCRIPTION.to_string()),
+            mime_type: Some("text/plain".to_string()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+        let definition = self.definition();
+        Some(fastmcp_protocol::ResourceTemplate {
+            uri_template: definition.uri,
+            name: definition.name,
+            description: definition.description,
+            mime_type: definition.mime_type,
+            icon: definition.icon,
+            version: definition.version,
+            tags: definition.tags,
+        })
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+        Err(McpError::invalid_params(
+            "project resource requires a concrete URI",
+        ))
+    }
+
+    fn read_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<Vec<fastmcp_protocol::ResourceContent>>,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri).await {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+
+    fn read_final_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<
+            fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalReadResourceResult>,
+        >,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri)
+                .await
+                .and_then(fastmcp_server::promote_legacy_resource_contents)
+            {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+
+    fn read_final_outcome_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> fastmcp_server::BoxFuture<
+        'a,
+        fastmcp_core::McpOutcome<
+            fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>,
+        >,
+    > {
+        Box::pin(async move {
+            match project_resource_contents(ctx, uri)
+                .await
+                .and_then(fastmcp_server::promote_legacy_resource_contents)
+                .map(fastmcp_server::FinalMethodOutcome::Complete)
+            {
+                Ok(contents) => fastmcp_core::Outcome::Ok(contents),
+                Err(error) => fastmcp_core::Outcome::Err(error),
+            }
+        })
+    }
+}
+
+async fn project_resource_contents(
+    ctx: &McpContext,
+    uri: &str,
+) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+    let target = uri
+        .strip_prefix("resource://project/")
+        .ok_or_else(|| McpError::invalid_params("invalid project resource URI"))?;
+    let text = project_details(ctx, target.to_string()).await?;
+    Ok(vec![fastmcp_protocol::ResourceContent {
+        uri: uri.to_string(),
+        mime_type: Some("text/plain".to_string()),
+        text: Some(text),
+        blob: None,
+    }])
 }
 
 /// Get project details.
-#[resource(
-    uri = "resource://project/{slug}",
-    description = "Fetch a project and its agents by project slug or human key.\n\nWhen to use\n-----------\n- Populate an \"LDAP-like\" directory for agents in tooling UIs.\n- Determine available agent identities and their metadata before addressing mail.\n\nParameters\n----------\nslug : str\n    Project slug (or human key; both resolve to the same target).\n\nReturns\n-------\ndict\n    Project descriptor including { agents: [...] } with agent profiles.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r3\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://project/backend-abc123\"}}\n```"
-)]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
-    let (slug, _query) = split_param_and_query(&slug);
+    let (slug, query) = split_param_and_query(&slug);
+    project_details_impl(ctx, slug, query).await
+}
+
+/// Resolve a project with query options while preserving the decoded path.
+pub async fn project_details_query(
+    ctx: &McpContext,
+    slug: String,
+    query: String,
+) -> McpResult<String> {
+    // The router splits URI components before percent-decoding them. Parsing
+    // the decoded slug again would truncate literal '?' and decode '%' twice.
+    project_details_impl(ctx, slug, parse_query(&query)).await
+}
+
+async fn project_details_impl(
+    ctx: &McpContext,
+    slug: String,
+    query: HashMap<String, String>,
+) -> McpResult<String> {
+    let include_retired = match query.get("include_retired").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "include_retired must be true or false",
+            ));
+        }
+    };
+    let ancestor_paths = match query.get("resolve").map(String::as_str) {
+        None | Some("exact") => None,
+        Some("ancestors") => Some(resource_project_ancestor_paths(&slug)?),
+        Some(_) => {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "resolve must be exact or ancestors",
+            ));
+        }
+    };
     let pool = get_resource_db_pool(ctx.cx()).await?;
 
-    let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
+    let (project, resolution) = if let Some(paths) = ancestor_paths {
+        let project = resolve_nearest_resource_project(ctx, &pool, &paths).await?;
+        let resolution = ProjectPathResolution {
+            kind: "nearest_ancestor".to_string(),
+            requested_path: paths[0].clone(),
+        };
+        (project, Some(resolution))
+    } else {
+        (
+            resolve_existing_resource_project(ctx, &pool, &slug).await?,
+            None,
+        )
+    };
 
     let project_id = project.id.unwrap_or(0);
 
-    // This resource advertises available recipients, so use the same canonical
-    // lifecycle snapshot as the agent directory and omit retired identities.
+    // Preserve canonical identity and deregistration rules in both modes.
+    // Default discovery advertises active recipients; history readers can
+    // explicitly request retired identities without changing their lifecycle.
     let agents = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_agent_roster(ctx.cx(), &pool, project_id).await,
     )?;
@@ -2631,9 +2911,10 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
         slug: project.slug,
         human_key: project.human_key,
         created_at: Some(micros_to_iso(project.created_at)),
+        resolution,
         agents: agents
             .into_iter()
-            .filter(|agent| agent.retired_at.is_none())
+            .filter(|agent| include_retired || agent.retired_at.is_none())
             .map(|a| ProjectAgentEntry {
                 id: a.id.unwrap_or(0),
                 name: a.name,
@@ -2754,6 +3035,10 @@ pub struct MessageDetails {
 }
 
 /// Get full message details.
+///
+/// Opt-in `context=true` returns the versioned,
+/// bounded read snapshot used by `am robot message --server`, including
+/// acknowledgement counts, sender metadata and neighbouring thread messages.
 #[resource(
     uri = "resource://message/{message_id}",
     description = "Read a single message by id within a project.\n\nWhen to use\n-----------\n- Fetch the canonical body/metadata for rendering in a client after list/search.\n- Retrieve attachments and full details for a given message id.\n\nParameters\n----------\nmessage_id : str\n    Numeric id as a string.\nproject : str\n    Project slug or human key (required for disambiguation).\n\nCommon mistakes\n---------------\n- Omitting `project` when a message id might exist in multiple projects.\n\nReturns\n-------\ndict\n    Full message payload including body and sender name.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r5\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://message/1234?project=/abs/path/backend\"}}\n```"
@@ -2775,6 +3060,17 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+
+    if query
+        .get("context")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        let snapshot = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::message_context_snapshot(ctx.cx(), &pool, &project, msg_id)
+                .await,
+        )?;
+        return context_snapshot_json(&snapshot);
+    }
 
     // Get message from DB
     let msg = db_outcome_to_mcp_result(
@@ -2859,7 +3155,26 @@ pub struct ThreadDetails {
     pub messages: Vec<ThreadMessageEntry>,
 }
 
+/// Context replies refuse an incomplete or unbounded wire representation.
+fn context_snapshot_json(snapshot: &impl Serialize) -> McpResult<String> {
+    let json = serde_json::to_string(snapshot).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::message_context::MAX_CONTEXT_BYTES {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "complete message context exceeds the 4 MiB response limit; request fewer thread messages or omit bodies",
+        ));
+    }
+    Ok(json)
+}
+
 /// Get thread messages.
+///
+/// Opt-in `context=true` returns a complete, bounded
+/// conversation snapshot with newest-window semantics, full-thread participants
+/// and receipt counts. It accepts `since_ts` and a displayed limit of 0..=1000;
+/// normal resource reads keep their existing oldest-first shape and limits.
 #[resource(
     uri = "resource://thread/{thread_id}",
     description = "List messages for a thread within a project.\n\nWhen to use\n-----------\n- Present a conversation view for a given ticket/thread key.\n- Export a thread for summarization or reporting.\n\nParameters\n----------\nthread_id : str\n    Either a string thread key or a numeric message id to seed the thread.\nproject : str\n    Project slug or human key (required).\ninclude_bodies : bool\n    Include message bodies if true (default false).\nlimit : int\n    Max number of messages to return (default 10,000).\n\nReturns\n-------\ndict\n    { project, thread_id, limit, truncated, messages: [{...}] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/TKT-123?project=/abs/path/backend&include_bodies=true\"}}\n```\n\nNumeric seed example (message id as thread seed):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r6b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/1234?project=/abs/path/backend\"}}\n```"
@@ -2894,6 +3209,40 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
+
+    if query
+        .get("context")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        let limit = query.get("limit").map_or(Ok(200), |value| {
+            value.parse::<usize>().map_err(|_| {
+                McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "context limit must be an integer from 0 through 1000",
+                )
+            })
+        })?;
+        if limit > mcp_agent_mail_db::message_context::MAX_CONTEXT_MESSAGES {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "context limit must be an integer from 0 through 1000",
+            ));
+        }
+        let since = parse_resource_since_ts(&query)?;
+        let snapshot = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::thread_context_snapshot(
+                ctx.cx(),
+                &pool,
+                &project,
+                &thread_id_str,
+                limit,
+                since,
+                include_bodies,
+            )
+            .await,
+        )?;
+        return context_snapshot_json(&snapshot);
+    }
 
     // Get thread messages
     let mut rows = db_outcome_to_mcp_result(
@@ -2988,6 +3337,10 @@ pub struct InboxResourceMessage {
     pub from: String,
     pub created_ts: Option<String>,
     pub kind: String,
+    /// `"project"` when the message reached this inbox through the project's
+    /// shared mailbox (GH#282), exactly as `fetch_inbox` reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -3003,14 +3356,217 @@ pub struct InboxResourceResponse {
     pub project: String,
 }
 
+fn priority_inbox_bool(query: &HashMap<String, String>, key: &str) -> McpResult<bool> {
+    match query.get(key).map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!("priority inbox {key} must be true or false"),
+        )),
+    }
+}
+
+fn priority_inbox_options(
+    query: &HashMap<String, String>,
+) -> McpResult<mcp_agent_mail_db::sync::InboxPriorityOptions> {
+    use mcp_agent_mail_db::sync::{InboxPriorityOptions, MAX_PRIORITY_INBOX_ROWS};
+
+    for key in query.keys() {
+        if !matches!(
+            key.as_str(),
+            "context"
+                | "project"
+                | "urgent"
+                | "ack_overdue"
+                | "unread"
+                | "all"
+                | "limit"
+                | "include_bodies"
+                | "format"
+        ) {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("unsupported priority inbox parameter: {key}"),
+            ));
+        }
+    }
+    if query.get("format").is_some_and(|format| format != "json") {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "priority inbox format must be json",
+        ));
+    }
+    let limit = query
+        .get("limit")
+        .map_or(Some(RESOURCE_LIMIT_DEFAULT), |value| {
+            value.parse::<usize>().ok()
+        });
+    let limit = limit
+        .filter(|limit| (1..=MAX_PRIORITY_INBOX_ROWS).contains(limit))
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                "priority inbox limit must be between 1 and 1000",
+            )
+        })?;
+    Ok(InboxPriorityOptions {
+        urgent: priority_inbox_bool(query, "urgent")?,
+        ack_overdue: priority_inbox_bool(query, "ack_overdue")?,
+        unread: priority_inbox_bool(query, "unread")?,
+        all: priority_inbox_bool(query, "all")?,
+        limit,
+        include_bodies: priority_inbox_bool(query, "include_bodies")?,
+    })
+}
+
+/// The priority response deliberately contains only the identity witness and
+/// selected inbox rows. Registration tokens, other recipients and attachments
+/// are not part of this read contract.
+fn priority_inbox_snapshot_json(
+    snapshot: mcp_agent_mail_db::sync::InboxPrioritySnapshot,
+    options: mcp_agent_mail_db::sync::InboxPriorityOptions,
+) -> McpResult<String> {
+    let mut messages = Vec::with_capacity(snapshot.rows.len());
+    for row in snapshot.rows {
+        let message = row.message;
+        let recipients = crate::tool_util::parse_recipients_lists(&message.recipients_json);
+        if message.id.is_none_or(|id| id <= 0)
+            || message.project_id != snapshot.project.id.unwrap_or(0)
+            || message.sender_id <= 0
+            || row.sender_name.trim().is_empty()
+            || !matches!(
+                message.importance.as_str(),
+                "low" | "normal" | "high" | "urgent"
+            )
+            || !matches!(message.ack_required, 0 | 1)
+            || !matches!(row.kind.as_str(), "to" | "cc" | "bcc" | "project")
+        {
+            return Err(McpError::internal_error(
+                "priority inbox contains invalid message identity or delivery metadata",
+            ));
+        }
+        let mut value = serde_json::json!({
+            "id": message.id,
+            "project_id": message.project_id,
+            "sender_id": message.sender_id,
+            "from": row.sender_name,
+            "sender_display_name": row.sender_display_name,
+            "to_display_names": crate::messaging::primary_recipient_display_names(&recipients.to, &snapshot.display_names),
+            "subject": message.subject,
+            "thread_id": message.thread_id,
+            "topic": message.topic,
+            "importance": message.importance,
+            "ack_required": message.ack_required != 0,
+            "created_ts": micros_to_iso(message.created_ts),
+            "read_ts": row.read_ts.map(micros_to_iso),
+            "ack_ts": row.ack_ts.map(micros_to_iso),
+            "kind": row.kind,
+            "via": crate::messaging::inbox_via(&row.kind),
+        });
+        if options.include_bodies {
+            value["body_md"] = Value::String(message.body_md);
+        }
+        messages.push(value);
+    }
+    let value = serde_json::json!({
+        "schema_version": 1,
+        // Complete requested priority top-N, not a claim that the mailbox
+        // contains no further messages.
+        "complete": true,
+        "project": {
+            "id": snapshot.project.id,
+            "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key,
+            "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agent": {
+            "id": snapshot.agent.id,
+            "project_id": snapshot.agent.project_id,
+            "name": snapshot.agent.name,
+            "display_name": snapshot.agent.display_name,
+            "inception_ts": micros_to_iso(snapshot.agent.inception_ts),
+        },
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "ack_overdue_before": micros_to_iso(snapshot.ack_overdue_before),
+        "urgent": options.urgent,
+        "ack_overdue": options.ack_overdue,
+        "unread": options.unread,
+        "all": options.all,
+        "limit": options.limit,
+        "include_bodies": options.include_bodies,
+        "count": messages.len(),
+        "messages": messages,
+    });
+    let json = serde_json::to_string(&value).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::sync::MAX_PRIORITY_INBOX_BYTES {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "priority inbox snapshot exceeds the 4 MiB JSON limit; reduce limit or omit bodies",
+        ));
+    }
+    Ok(json)
+}
+
+async fn priority_inbox_resource(
+    ctx: &McpContext,
+    agent_name: &str,
+    query: &HashMap<String, String>,
+) -> McpResult<String> {
+    let options = priority_inbox_options(query)?;
+    let project_key = query
+        .get("project")
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                "project query parameter is required",
+            )
+        })?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
+    let project = resolve_existing_resource_project(ctx, &pool, project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_resource_agent(ctx, &pool, project_id, agent_name).await?;
+    let conn = acquire_resource_conn(ctx.cx(), &pool).await?;
+    let snapshot = mcp_agent_mail_db::sync::priority_inbox_snapshot_from_conn(
+        &*conn,
+        project_id,
+        agent.id.unwrap_or(0),
+        options,
+    )
+    .map_err(db_error_to_mcp_error)?;
+    drop(conn);
+    if snapshot.project.id != project.id
+        || snapshot.project.slug != project.slug
+        || snapshot.project.human_key != project.human_key
+        || snapshot.project.created_at != project.created_at
+        || snapshot.agent.id != agent.id
+        || snapshot.agent.project_id != agent.project_id
+        || snapshot.agent.name != agent.name
+        || snapshot.agent.inception_ts != agent.inception_ts
+    {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Project or agent identity changed during priority inbox resolution",
+        ));
+    }
+    crate::session_identity::authorize_actor(ctx, &snapshot.agent, false, "read mail")?;
+    priority_inbox_snapshot_json(snapshot, options)
+}
+
 /// Get inbox messages for an agent.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://inbox/{agent}",
-    description = "Read an agent's inbox for a project.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nsince_ts : Optional[str]\n    ISO-8601 timestamp string; only messages newer than this are returned.\nurgent_only : bool\n    If true, limits to importance in {high, urgent}.\ninclude_bodies : bool\n    Include message bodies in results (default false).\nlimit : int\n    Maximum number of messages to return (default 20).\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [...] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true\"}}\n```\nIncremental fetch example (using since_ts):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z\"}}\n```"
+    description = "Read an agent's inbox for a project.\n\nParameters\n----------\nagent : str\n    Agent name.\nproject : str\n    Project slug or human key (required).\nsince_ts : Optional[str]\n    ISO-8601 timestamp string; only messages newer than this are returned.\nurgent_only : bool\n    If true, limits to importance in {high, urgent}.\ninclude_bodies : bool\n    Include message bodies in results (default false).\nlimit : int\n    Maximum number of messages to return (default 20).\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [...] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&limit=10&urgent_only=true\"}}\n```\nIncremental fetch example (using since_ts):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r7b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BlueLake?project=/abs/path/backend&since_ts=2025-10-23T15:00:00Z\"}}\n```\n\nPriority snapshot (context=true)\n--------------------------------\nWhen config/environment advertises inbox_priority_snapshot=priority_v1, context=true returns schema_version=1 and a complete requested priority top-N from one read-only database snapshot. It includes project and agent identity epochs, captured_ts, the 30-minute ack_overdue_before cutoff, and exact nullable read_ts and ack_ts receipt states. It does not mark messages read, acknowledge them, update activity, or clear notification signals.\nFilter flags accept only true or false, with precedence urgent, ack_overdue, all, unread; when none applies, include unread or unacknowledged ack-required messages. Rows prioritize unread urgent/high, overdue acknowledgements, unread ack-required, other unread, other unacknowledged ack-required, then other read messages; each bucket is newest-first by created_ts and id.\nUse limit=1..1000 (default 20), include_bodies=true to include body_md, and format=json. since_ts and urgent_only are not supported in context mode. Registration tokens, other recipients, and attachments are excluded."
 )]
 pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
+    if priority_inbox_bool(&query, "context")? {
+        return priority_inbox_resource(ctx, &agent_name, &query).await;
+    }
 
     let project_key = query.get("project").cloned().unwrap_or_default();
     let include_bodies = query
@@ -3087,6 +3643,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 from: row.sender_name.clone(),
                 created_ts: Some(micros_to_iso(msg.created_ts)),
                 kind: row.kind.clone(),
+                via: crate::messaging::inbox_via(&row.kind),
                 attachments: parse_attachment_metadata(&msg.attachments),
                 body_md: if include_bodies {
                     Some(msg.body_md.clone())
@@ -3437,9 +3994,21 @@ async fn load_outbox_messages(
     mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
     let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
 
-    // Cap at 200 to limit the N+1 recipient queries per message.
-    // Each message triggers one recipient query, so 200 messages = 201 queries.
+    // Cap at 200 to bound per-message direct-recipient lookups;
+    // shared addresses are fetched once below.
     let capped_rows: Vec<_> = rows.into_iter().take(200).collect();
+    let message_ids: Vec<i64> = capped_rows
+        .iter()
+        .map(|row| row.get_as(0).map_err(|error| error.to_string()))
+        .collect::<Result<_, _>>()
+        .map_err(resource_sync_db_error_to_mcp_error)?;
+    let mut project_recipients =
+        mcp_agent_mail_db::project_mailbox::project_mailbox_recipients_from_conn(
+            &*conn,
+            options.project_id,
+            &message_ids,
+        )
+        .map_err(db_error_to_mcp_error)?;
     let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(capped_rows.len());
     for row in capped_rows {
         let id: i64 = row.get_as(0).unwrap_or(0);
@@ -3453,7 +4022,14 @@ async fn load_outbox_messages(
         mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
         let recip_rows =
             recip_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
-        let (to_list, cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
+        let (mut to_list, mut cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
+        if let Some((address, kind)) = project_recipients.remove(&id) {
+            if kind == "cc" {
+                cc_list.push(address);
+            } else {
+                to_list.push(address);
+            }
+        }
         messages.push(outbox_message_from_row(
             &options, &row, to_list, cc_list, bcc_list,
         ));
@@ -5273,21 +5849,61 @@ fn reservation_row_is_active_at(
 /// Get file reservations for a project.
 ///
 /// Historical listings are paged with `limit` (default 20, max 250) and a
-/// zero-based `offset`; callers advance the offset by the page limit.
+/// zero-based `offset`; independent ordinary pages are not a snapshot.
+/// `snapshot_pages=true` instead materializes one bounded database snapshot,
+/// then serves immutable pages through authenticated requests for five minutes.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
-    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), only returns file_reservations with no `released_ts`.\n\nReturns\n-------\nlist[dict]\n    Each file_reservation with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=true\"}}\n```\n\nAlso see all historical (including released) file_reservations:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4b\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?active_only=false\"}}\n```"
+    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nsnapshot_pages : bool\n    If true, captures one immutable database snapshot of at most 100000 reservations or holder identities and 64 MiB, including repeated page metadata. Pages contain at most 250 rows and 4 MiB JSON. All pages are prepared before the first is returned. Does not accept snapshot or limit. One oversized row or holder roster is rejected.\nsnapshot_token, offset : str, int\n    Continue snapshot_pages=true with its opaque token and exact next_offset. Keep active_only and project unchanged. Every request is authenticated. Tokens expire five minutes after publication without renewal; server restart or mailbox replacement invalidates them. Unknown/expired tokens and invalid page boundaries are errors; restart from page zero rather than combining reads.\nsnapshot_release : bool\n    If true, releases cached pages after a completed or abandoned read; reservation rows are unchanged. Requires snapshot_pages=true and snapshot_token, and forbids offset, limit and snapshot. Only literal true or false is accepted. Every release is authenticated and an existing token must match the mailbox, project and active_only scope. Unknown, expired or already released tokens acknowledge released=false.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout either snapshot mode: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\nWith snapshot_pages=true: { schema_version: 1, consistency: materialized_snapshot, supports_release: true, snapshot_token, project, agents, active_only, captured_ts, total_count, offset, count, next_offset, reservations }. Ordering is ascending (created_ts, id). next_offset is null only on the final page, including an empty history. A partial page can have a continuation. Individual pages never claim complete=true; verify all pages and total_count before treating their union as the complete captured database snapshot. captured_ts marks capture start; it is not an exact historical query timestamp. Concurrent grants, releases, renewals and deletions do not change a captured snapshot.\nWith snapshot_release=true: { schema_version: 1, snapshot_token, released }. Pages remain repeatable until explicit release or expiry. Only request release when the first validated page advertises supports_release=true; older servers may omit that capability.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nFor large histories, start with snapshot_pages=true&active_only=false&format=json, then repeat that request with snapshot_token and the returned next_offset. After completion, release the token with snapshot_pages=true&active_only=false&snapshot_token=<token>&snapshot_release=true. Ordinary historical pages remain available with active_only=false&limit=250&offset=0, without snapshot guarantees."
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);
     let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
+    let snapshot_pages = query
+        .get("snapshot_pages")
+        .is_some_and(|value| parse_bool_param(value));
+    if (query.contains_key("snapshot_token") || query.contains_key("snapshot_release"))
+        && !snapshot_pages
+    {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "snapshot_token and snapshot_release require snapshot_pages=true",
+        ));
+    }
 
     let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
     let project_id = project.id.unwrap_or(0);
+
+    if snapshot_pages {
+        return paged_file_reservations(ctx, &pool, &project, active_only, &query).await;
+    }
+
+    if query
+        .get("snapshot")
+        .is_some_and(|value| parse_bool_param(value))
+    {
+        if query.contains_key("limit") || query.contains_key("offset") {
+            return Err(McpError::new(
+                McpErrorCode::InvalidParams,
+                "complete reservation snapshots do not accept limit or offset",
+            ));
+        }
+        let snapshot = reservation_snapshot_result(
+            mcp_agent_mail_db::queries::file_reservation_snapshot(
+                ctx.cx(),
+                &pool,
+                &project,
+                active_only,
+            )
+            .await,
+            false,
+        )?;
+        return reservation_snapshot_json(snapshot);
+    }
 
     let config = &Config::get();
     let now_micros = mcp_agent_mail_db::now_micros();
@@ -5473,6 +6089,657 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+const RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS: usize = 4;
+const RESERVATION_SNAPSHOT_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const RESERVATION_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// A token is scoped to the admitted engine generation, not just the database
+/// path. Live read wrappers have different read-cache generations, so using
+/// `sqlite_identity_key` here would invalidate a token on the next request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservationSnapshotScope {
+    engine_identity: String,
+    storage_root: PathBuf,
+    project_id: i64,
+    project_slug: String,
+    project_human_key: String,
+    project_created_at: i64,
+    active_only: bool,
+}
+
+impl ReservationSnapshotScope {
+    fn new(
+        pool: &mcp_agent_mail_db::DbPool,
+        project: &mcp_agent_mail_db::ProjectRow,
+        active_only: bool,
+    ) -> McpResult<Self> {
+        Ok(Self {
+            engine_identity: pool.engine_identity_key(),
+            storage_root: pool.storage_root().to_path_buf(),
+            project_id: project.id.ok_or_else(|| {
+                McpError::internal_error("reservation snapshot has no stored project identity")
+            })?,
+            project_slug: project.slug.clone(),
+            project_human_key: project.human_key.clone(),
+            project_created_at: project.created_at,
+            active_only,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ReservationSnapshotPage {
+    offset: usize,
+    json: String,
+}
+
+struct CachedReservationSnapshot {
+    scope: ReservationSnapshotScope,
+    created_at: Instant,
+    pages: Vec<ReservationSnapshotPage>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ReservationSnapshotCache {
+    entries: HashMap<String, CachedReservationSnapshot>,
+    builders: usize,
+    bytes: usize,
+}
+
+static RESERVATION_SNAPSHOT_CACHE: LazyLock<Mutex<ReservationSnapshotCache>> =
+    LazyLock::new(|| Mutex::new(ReservationSnapshotCache::default()));
+
+impl ReservationSnapshotCache {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.created_at) < RESERVATION_SNAPSHOT_CACHE_TTL
+        });
+        self.bytes = self.entries.values().map(|entry| entry.bytes).sum();
+    }
+
+    fn reserve(&mut self, now: Instant) -> McpResult<()> {
+        self.prune(now);
+        // Reserve the maximum serialized snapshot budget before doing any DB
+        // work. Concurrent builders count against both limits; abandoned or
+        // cancelled builders release their reservation through the RAII permit.
+        let reserved = (self.builders + 1)
+            .saturating_mul(mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES);
+        if self.entries.len() + self.builders >= RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS
+            || self.bytes.saturating_add(reserved) > RESERVATION_SNAPSHOT_CACHE_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_BUSY",
+                "reservation snapshot cache is at capacity; release unused snapshots or retry after an existing snapshot expires",
+            ));
+        }
+        self.builders += 1;
+        Ok(())
+    }
+
+    fn read(
+        &mut self,
+        token: &str,
+        scope: &ReservationSnapshotScope,
+        offset: usize,
+        now: Instant,
+    ) -> McpResult<String> {
+        self.prune(now);
+        let snapshot = self.entries.get(token).ok_or_else(|| {
+            paged_reservation_error(
+                "PAGED_SNAPSHOT_EXPIRED",
+                "reservation snapshot token is unknown or expired; restart the read from its first page",
+            )
+        })?;
+        if &snapshot.scope != scope {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_SCOPE_MISMATCH",
+                "reservation snapshot mailbox, project identity or active_only scope changed; restart the read",
+            ));
+        }
+        let page = snapshot
+            .pages
+            .binary_search_by_key(&offset, |page| page.offset)
+            .ok()
+            .and_then(|index| snapshot.pages.get(index))
+            .ok_or_else(|| {
+                paged_reservation_error(
+                    "PAGED_SNAPSHOT_INVALID_OFFSET",
+                    "reservation snapshot offset is not a returned page boundary",
+                )
+            })?;
+        // Reading a page does not refresh the TTL or consume the token. A
+        // retry observes exactly the same bytes, including the terminal page.
+        Ok(page.json.clone())
+    }
+
+    fn release(
+        &mut self,
+        token: &str,
+        scope: &ReservationSnapshotScope,
+        now: Instant,
+    ) -> McpResult<bool> {
+        self.prune(now);
+        let Some(snapshot) = self.entries.get(token) else {
+            // A lost acknowledgement can be retried safely. Releasing an
+            // unknown or expired token must not allocate a cache entry.
+            return Ok(false);
+        };
+        if &snapshot.scope != scope {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_SCOPE_MISMATCH",
+                "reservation snapshot mailbox, project identity or active_only scope does not match; snapshot was not released",
+            ));
+        }
+        if let Some(snapshot) = self.entries.remove(token) {
+            self.bytes = self.bytes.saturating_sub(snapshot.bytes);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+struct ReservationSnapshotBuild<'a> {
+    cache: &'a Mutex<ReservationSnapshotCache>,
+    reserved: bool,
+}
+
+impl<'a> ReservationSnapshotBuild<'a> {
+    fn reserve(cache: &'a Mutex<ReservationSnapshotCache>, now: Instant) -> McpResult<Self> {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve(now)?;
+        Ok(Self {
+            cache,
+            reserved: true,
+        })
+    }
+
+    fn publish(
+        mut self,
+        token: String,
+        scope: ReservationSnapshotScope,
+        pages: Vec<ReservationSnapshotPage>,
+        now: Instant,
+    ) -> McpResult<String> {
+        let bytes = pages.iter().map(|page| page.json.len()).sum::<usize>();
+        if pages.is_empty() || bytes > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_TOO_LARGE",
+                "reservation history exceeds the 64 MiB serialized snapshot limit",
+            ));
+        }
+        let first = pages[0].json.clone();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.prune(now);
+        if cache.entries.contains_key(&token) {
+            return Err(McpError::internal_error(
+                "reservation snapshot token collision; retry the read",
+            ));
+        }
+        cache.bytes += bytes;
+        cache.entries.insert(
+            token,
+            CachedReservationSnapshot {
+                scope,
+                created_at: now,
+                pages,
+                bytes,
+            },
+        );
+        cache.builders = cache.builders.saturating_sub(1);
+        self.reserved = false;
+        drop(cache);
+        Ok(first)
+    }
+}
+
+impl Drop for ReservationSnapshotBuild<'_> {
+    fn drop(&mut self) {
+        if self.reserved {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.builders = cache.builders.saturating_sub(1);
+        }
+    }
+}
+
+fn paged_reservation_error(error_type: &str, message: &str) -> McpError {
+    crate::tool_util::legacy_mcp_error(
+        McpErrorCode::InvalidParams,
+        error_type,
+        message,
+        matches!(error_type, "PAGED_SNAPSHOT_BUSY" | "PAGED_SNAPSHOT_EXPIRED"),
+        Value::Null,
+    )
+}
+
+fn reservation_snapshot_limit_error(message: String) -> McpError {
+    crate::tool_util::legacy_mcp_error(
+        McpErrorCode::InvalidParams,
+        "FILE_RESERVATION_SNAPSHOT_TOO_LARGE",
+        message,
+        true,
+        serde_json::json!({ "snapshot_pages": true }),
+    )
+}
+
+fn reservation_snapshot_result(
+    outcome: Outcome<mcp_agent_mail_db::queries::FileReservationSnapshot, DbError>,
+    paged: bool,
+) -> McpResult<mcp_agent_mail_db::queries::FileReservationSnapshot> {
+    match outcome {
+        Outcome::Err(DbError::InvalidArgument {
+            field: "snapshot_limit",
+            message,
+        }) => Err(if paged {
+            paged_reservation_error("PAGED_SNAPSHOT_TOO_LARGE", &message)
+        } else {
+            reservation_snapshot_limit_error(message)
+        }),
+        other => db_outcome_to_mcp_result(other),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReservationSnapshotRequest<'a> {
+    Start,
+    Page { token: &'a str, offset: usize },
+    Release { token: &'a str },
+}
+
+fn parse_reservation_snapshot_request(
+    query: &HashMap<String, String>,
+) -> McpResult<ReservationSnapshotRequest<'_>> {
+    if query.contains_key("snapshot") || query.contains_key("limit") {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "snapshot_pages does not accept snapshot or limit; follow the returned next_offset",
+        ));
+    }
+    let release = match query.get("snapshot_release").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_INVALID_REQUEST",
+                "snapshot_release must be true or false",
+            ));
+        }
+    };
+    if release && query.contains_key("offset") {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "reservation snapshot release does not accept offset",
+        ));
+    }
+    if let Some(token) = query.get("snapshot_token") {
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_INVALID_REQUEST",
+                "reservation snapshot_token must contain 64 lowercase hexadecimal characters",
+            ));
+        }
+        if release {
+            return Ok(ReservationSnapshotRequest::Release { token });
+        }
+        let offset = query
+            .get("offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|offset| *offset <= mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS)
+            .ok_or_else(|| {
+                paged_reservation_error(
+                    "PAGED_SNAPSHOT_INVALID_OFFSET",
+                    "reservation snapshot continuation requires a valid returned offset",
+                )
+            })?;
+        return Ok(ReservationSnapshotRequest::Page { token, offset });
+    }
+    if release || query.contains_key("offset") {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_INVALID_REQUEST",
+            "reservation snapshot offset or release requires a snapshot_token",
+        ));
+    }
+    Ok(ReservationSnapshotRequest::Start)
+}
+
+async fn paged_file_reservations(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project: &mcp_agent_mail_db::ProjectRow,
+    active_only: bool,
+    query: &HashMap<String, String>,
+) -> McpResult<String> {
+    let request = parse_reservation_snapshot_request(query)?;
+    let scope = ReservationSnapshotScope::new(pool, project, active_only)?;
+    match request {
+        ReservationSnapshotRequest::Page { token, offset } => {
+            return RESERVATION_SNAPSHOT_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read(token, &scope, offset, Instant::now());
+        }
+        ReservationSnapshotRequest::Release { token } => {
+            let released = RESERVATION_SNAPSHOT_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release(token, &scope, Instant::now())?;
+            return serde_json::to_string(&serde_json::json!({
+                "schema_version": 1,
+                "snapshot_token": token,
+                "released": released,
+            }))
+            .map_err(|error| McpError::internal_error(format!("JSON error: {error}")));
+        }
+        ReservationSnapshotRequest::Start => {}
+    }
+
+    let build = ReservationSnapshotBuild::reserve(&RESERVATION_SNAPSHOT_CACHE, Instant::now())?;
+    let token = mcp_agent_mail_core::setup::generate_token().map_err(|_| {
+        McpError::internal_error("could not generate a secure reservation snapshot token")
+    })?;
+    let snapshot = reservation_snapshot_result(
+        mcp_agent_mail_db::queries::file_reservation_paged_snapshot(
+            ctx.cx(),
+            pool,
+            project,
+            active_only,
+        )
+        .await,
+        true,
+    )?;
+    let pages = reservation_snapshot_pages(snapshot, &token)?;
+    if ctx.cx().is_cancel_requested() {
+        return Err(McpError::request_cancelled());
+    }
+    build.publish(token, scope, pages, Instant::now())
+}
+
+#[derive(Serialize)]
+struct ReservationSnapshotWireRow<'a> {
+    id: Option<i64>,
+    project_id: i64,
+    agent_id: i64,
+    agent: &'a str,
+    path_pattern: &'a str,
+    exclusive: bool,
+    reason: &'a str,
+    created_ts: String,
+    expires_ts: String,
+    released_ts: Option<String>,
+}
+
+/// Bound JSON escaping while it is serialized. A raw string that fits the DB
+/// budget can expand sixfold on the wire; rejecting only after `to_string`
+/// would allocate that expansion before enforcing the response budget.
+struct ReservationJsonBuffer {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+impl std::io::Write for ReservationJsonBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len())
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            self.overflow = true;
+            return Err(std::io::Error::other(
+                "reservation JSON response limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_reservation_json(value: &impl Serialize) -> McpResult<String> {
+    let mut buffer = ReservationJsonBuffer {
+        bytes: Vec::new(),
+        overflow: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        return Err(if buffer.overflow {
+            paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation or the holder identities exceed the 4 MiB page limit",
+            )
+        } else {
+            McpError::internal_error(format!("reservation snapshot JSON error: {error}"))
+        });
+    }
+    String::from_utf8(buffer.bytes)
+        .map_err(|_| McpError::internal_error("reservation snapshot JSON is not UTF-8"))
+}
+
+struct ReservationPageBuilder {
+    metadata: String,
+    total_count: usize,
+    offset: usize,
+    count: usize,
+    rows: String,
+    pages: Vec<ReservationSnapshotPage>,
+    bytes: usize,
+}
+
+impl ReservationPageBuilder {
+    fn frame(&self, count: usize) -> String {
+        let next = self.offset + count;
+        let next_offset = if next < self.total_count {
+            next.to_string()
+        } else {
+            "null".to_string()
+        };
+        format!(
+            ",\"offset\":{},\"count\":{count},\"next_offset\":{next_offset},\"reservations\":[",
+            self.offset,
+        )
+    }
+
+    fn page_bytes(&self, count: usize, rows_bytes: usize) -> usize {
+        self.metadata.len() + self.frame(count).len() + rows_bytes + 2
+    }
+
+    fn finish_page(&mut self) -> McpResult<()> {
+        let bytes = self.page_bytes(self.count, self.rows.len());
+        if bytes > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation or the holder identities exceed the 4 MiB page limit",
+            ));
+        }
+        if self.bytes.saturating_add(bytes)
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_TOO_LARGE",
+                "reservation history and repeated holder identities exceed the 64 MiB serialized snapshot limit",
+            ));
+        }
+        let mut json = String::with_capacity(bytes);
+        json.push_str(&self.metadata);
+        json.push_str(&self.frame(self.count));
+        json.push_str(&self.rows);
+        json.push_str("]}");
+        self.pages.push(ReservationSnapshotPage {
+            offset: self.offset,
+            json,
+        });
+        self.bytes += bytes;
+        self.offset += self.count;
+        self.count = 0;
+        self.rows.clear();
+        Ok(())
+    }
+
+    fn push(&mut self, row: &str) -> McpResult<()> {
+        if self.count == FILE_RESERVATION_RESOURCE_LIMIT_MAX {
+            self.finish_page()?;
+        }
+        let candidate_bytes = self.rows.len() + usize::from(self.count > 0) + row.len();
+        if self.count > 0
+            && self.page_bytes(self.count + 1, candidate_bytes)
+                > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            self.finish_page()?;
+        }
+        if self.page_bytes(self.count + 1, self.rows.len() + row.len())
+            > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        {
+            return Err(paged_reservation_error(
+                "PAGED_SNAPSHOT_ITEM_TOO_LARGE",
+                "one reservation with its holder identities exceeds the 4 MiB page limit",
+            ));
+        }
+        if self.count > 0 {
+            self.rows.push(',');
+        }
+        self.rows.push_str(row);
+        self.count += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> McpResult<Vec<ReservationSnapshotPage>> {
+        if self.count > 0 || self.total_count == 0 {
+            self.finish_page()?;
+        }
+        Ok(self.pages)
+    }
+}
+
+/// Capture once, then publish only after every fixed page has been rendered
+/// within both the per-response and aggregate budgets. Pages omit activity
+/// enrichment and all carry the same immutable project and holder authority.
+fn reservation_snapshot_pages(
+    snapshot: mcp_agent_mail_db::queries::FileReservationSnapshot,
+    token: &str,
+) -> McpResult<Vec<ReservationSnapshotPage>> {
+    if snapshot.reservations.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS
+        || snapshot.agents.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_PAGED_MAX_ROWS
+    {
+        return Err(paged_reservation_error(
+            "PAGED_SNAPSHOT_TOO_LARGE",
+            "reservation history exceeds the 100000-row or holder identity limit",
+        ));
+    }
+    let holders: HashMap<_, _> = snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent.name.as_str()))
+        .collect();
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "consistency": "materialized_snapshot",
+        "supports_release": true,
+        "snapshot_token": token,
+        "project": {
+            "id": snapshot.project.id, "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key, "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agents": snapshot.agents.iter().map(|agent| serde_json::json!({
+            "id": agent.id, "project_id": agent.project_id, "name": agent.name,
+        })).collect::<Vec<_>>(),
+        "active_only": snapshot.active_only,
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "total_count": snapshot.reservations.len(),
+    });
+    let mut metadata = bounded_reservation_json(&metadata)?;
+    // The object has already been encoded by serde; only fixed field names,
+    // integer counters and separately encoded rows are appended below.
+    metadata.pop();
+    let mut builder = ReservationPageBuilder {
+        metadata,
+        total_count: snapshot.reservations.len(),
+        offset: 0,
+        count: 0,
+        rows: String::new(),
+        pages: Vec::new(),
+        bytes: 0,
+    };
+    for row in snapshot.reservations {
+        let name = holders.get(&row.agent_id).ok_or_else(|| {
+            McpError::internal_error("reservation snapshot has no authoritative holder")
+        })?;
+        let encoded = bounded_reservation_json(&ReservationSnapshotWireRow {
+            id: row.id,
+            project_id: row.project_id,
+            agent_id: row.agent_id,
+            agent: name,
+            path_pattern: &row.path_pattern,
+            exclusive: row.exclusive != 0,
+            reason: &row.reason,
+            created_ts: micros_to_iso(row.created_ts),
+            expires_ts: micros_to_iso(row.expires_ts),
+            released_ts: row.released_ts.map(micros_to_iso),
+        })?;
+        builder.push(&encoded)?;
+    }
+    builder.finish()
+}
+
+/// Snapshot mode intentionally omits filesystem/git activity enrichment: its
+/// authority is the database read scope, and its bounded wire contract is
+/// consumed by CLI clients that need the complete reservation set.
+fn reservation_snapshot_json(
+    snapshot: mcp_agent_mail_db::queries::FileReservationSnapshot,
+) -> McpResult<String> {
+    let agents: HashMap<_, _> = snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent.name.as_str()))
+        .collect();
+    let reservations: Vec<_> = snapshot.reservations.iter().map(|row| {
+        let name = agents.get(&row.agent_id).ok_or_else(|| McpError::new(
+            McpErrorCode::InternalError, "reservation snapshot has no authoritative holder"))?;
+        Ok(serde_json::json!({
+            "id": row.id, "project_id": row.project_id, "agent_id": row.agent_id,
+            "agent": name, "path_pattern": row.path_pattern, "exclusive": row.exclusive != 0,
+            "reason": row.reason, "created_ts": micros_to_iso(row.created_ts),
+            "expires_ts": micros_to_iso(row.expires_ts), "released_ts": row.released_ts.map(micros_to_iso),
+        }))
+    }).collect::<McpResult<Vec<_>>>()?;
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "complete": true,
+        "project": {
+            "id": snapshot.project.id, "slug": snapshot.project.slug,
+            "human_key": snapshot.project.human_key, "created_at": micros_to_iso(snapshot.project.created_at),
+        },
+        "agents": snapshot.agents.iter().map(|agent| serde_json::json!({
+            "id": agent.id, "project_id": agent.project_id, "name": agent.name,
+        })).collect::<Vec<_>>(),
+        "active_only": snapshot.active_only,
+        "captured_ts": micros_to_iso(snapshot.captured_ts),
+        "count": reservations.len(),
+        "reservations": reservations,
+    });
+    let json = serde_json::to_string(&value).map_err(|error| {
+        McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}"))
+    })?;
+    if json.len() > mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+        return Err(reservation_snapshot_limit_error(
+            "complete reservation snapshot exceeds the 4 MiB JSON limit; use snapshot_pages=true or narrow to active_only=true".to_string(),
+        ));
+    }
+    Ok(json)
+}
+
 #[cfg(test)]
 mod resource_shape_tests {
     use super::*;
@@ -5487,6 +6754,616 @@ mod resource_shape_tests {
 
     static RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static RESOURCE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn reservation_snapshot_fixture(count: usize) -> queries::FileReservationSnapshot {
+        queries::FileReservationSnapshot {
+            project: ProjectRow {
+                id: Some(7),
+                slug: "snapshot-project".to_string(),
+                human_key: "/tmp/snapshot-project".to_string(),
+                created_at: 1_000_000,
+            },
+            agents: vec![
+                queries::FileReservationSnapshotAgent {
+                    id: 11,
+                    project_id: 7,
+                    name: "CurrentAgent".to_string(),
+                },
+                // Historical holders remain authoritative even when they
+                // are no longer advertised by the active agent directory.
+                queries::FileReservationSnapshotAgent {
+                    id: 12,
+                    project_id: 7,
+                    name: "RetiredHolder".to_string(),
+                },
+            ],
+            reservations: (0..count)
+                .map(|index| mcp_agent_mail_db::FileReservationRow {
+                    id: Some(i64::try_from(index + 1).unwrap()),
+                    project_id: 7,
+                    agent_id: 12,
+                    path_pattern: format!("src/file-{index}.rs"),
+                    exclusive: 1,
+                    reason: "historical ownership".to_string(),
+                    created_ts: 2_000_000,
+                    expires_ts: 4_000_000,
+                    released_ts: Some(3_000_000),
+                })
+                .collect(),
+            captured_ts: 5_000_000,
+            active_only: false,
+        }
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_encodes_all_rows_and_historical_holders() {
+        let json = reservation_snapshot_json(reservation_snapshot_fixture(257)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["active_only"], false);
+        assert_eq!(value["count"], 257);
+        assert_eq!(value["project"]["id"], 7);
+        assert_eq!(value["project"]["created_at"], micros_to_iso(1_000_000));
+        assert_eq!(value["captured_ts"], micros_to_iso(5_000_000));
+        assert_eq!(value["agents"].as_array().unwrap().len(), 2);
+        let rows = value["reservations"].as_array().unwrap();
+        assert_eq!(rows.len(), 257);
+        assert_eq!(rows[256]["id"], 257);
+        assert!(rows.iter().all(|row| {
+            row["agent_id"] == 12
+                && row["agent"] == "RetiredHolder"
+                && row["project_id"] == 7
+                && row["released_ts"] == micros_to_iso(3_000_000)
+        }));
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_refuses_missing_holder_authority() {
+        let mut snapshot = reservation_snapshot_fixture(1);
+        snapshot.agents.retain(|agent| agent.id != 12);
+        let error = reservation_snapshot_json(snapshot)
+            .expect_err("a complete snapshot cannot silently omit or invent a holder");
+        assert!(error.to_string().contains("no authoritative holder"));
+    }
+
+    #[test]
+    fn complete_reservation_snapshot_limits_serialized_escape_expansion() {
+        let mut snapshot = reservation_snapshot_fixture(1);
+        // Each control byte becomes a six-byte JSON escape. The raw database
+        // strings fit under 4 MiB, while their complete wire encoding does not.
+        snapshot.reservations[0].reason =
+            "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 6 + 1);
+        assert!(
+            snapshot.reservations[0].reason.len() < queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        );
+        let error = reservation_snapshot_json(snapshot)
+            .expect_err("JSON escaping must not bypass the response byte budget");
+        assert!(error.to_string().contains("4 MiB JSON limit"));
+        assert_eq!(
+            crate::tool_util::tool_error_code(&error),
+            Some("FILE_RESERVATION_SNAPSHOT_TOO_LARGE")
+        );
+    }
+
+    fn paged_snapshot_scope() -> ReservationSnapshotScope {
+        ReservationSnapshotScope {
+            engine_identity: "fixture-mailbox@1".to_string(),
+            storage_root: PathBuf::from("/fixture-archive"),
+            project_id: 7,
+            project_slug: "snapshot-project".to_string(),
+            project_human_key: "/tmp/snapshot-project".to_string(),
+            project_created_at: 1_000_000,
+            active_only: false,
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_preserves_order_and_complete_history_at_boundaries() {
+        let token = "a".repeat(64);
+        for count in [0, 1, 249, 250, 251, 500, 10_000, 10_001] {
+            let pages = reservation_snapshot_pages(reservation_snapshot_fixture(count), &token)
+                .expect("bounded history must be page-able");
+            assert_eq!(pages.len(), count.div_ceil(250).max(1));
+            let mut observed = 0;
+            for page in pages {
+                assert!(page.json.len() <= queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES);
+                let value: Value = serde_json::from_str(&page.json).unwrap();
+                assert_eq!(value["schema_version"], 1);
+                assert_eq!(value["consistency"], "materialized_snapshot");
+                assert_eq!(value["supports_release"], true);
+                assert!(value.get("complete").is_none());
+                assert_eq!(value["snapshot_token"], token);
+                assert_eq!(value["active_only"], false);
+                assert_eq!(value["captured_ts"], micros_to_iso(5_000_000));
+                assert_eq!(value["project"]["id"], 7);
+                assert_eq!(value["agents"][1]["name"], "RetiredHolder");
+                assert_eq!(value["total_count"], count);
+                assert_eq!(value["offset"], observed);
+                assert_eq!(page.offset, observed);
+                let rows = value["reservations"].as_array().unwrap();
+                assert!(rows.len() <= 250);
+                assert_eq!(value["count"], rows.len());
+                for row in rows {
+                    observed += 1;
+                    assert_eq!(row["id"], observed);
+                    assert_eq!(row["agent"], "RetiredHolder");
+                    assert_eq!(row["released_ts"], micros_to_iso(3_000_000));
+                }
+                if observed < count {
+                    assert_eq!(value["next_offset"], observed);
+                } else {
+                    assert!(value["next_offset"].is_null());
+                }
+            }
+            assert_eq!(observed, count);
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_splits_by_encoded_bytes_and_rejects_oversized_items() {
+        let token = "b".repeat(64);
+        let mut snapshot = reservation_snapshot_fixture(2);
+        for row in &mut snapshot.reservations {
+            // Two individually valid rows exceed a response budget after
+            // escaping, even though their raw database strings fit easily.
+            row.reason = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 12);
+        }
+        let pages = reservation_snapshot_pages(snapshot, &token).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages
+                .iter()
+                .all(|page| { page.json.len() <= queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES })
+        );
+        let first: Value = serde_json::from_str(&pages[0].json).unwrap();
+        let second: Value = serde_json::from_str(&pages[1].json).unwrap();
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(second["offset"], 1);
+        assert!(second["next_offset"].is_null());
+        assert!(
+            pages.iter().map(|page| page.json.len()).sum::<usize>()
+                > queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES
+        );
+
+        for oversized_roster in [false, true] {
+            let mut snapshot = reservation_snapshot_fixture(1);
+            let text = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 6 + 1);
+            if oversized_roster {
+                snapshot.agents[0].name = text;
+            } else {
+                snapshot.reservations[0].reason = text;
+            }
+            let error = reservation_snapshot_pages(snapshot, &token).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_ITEM_TOO_LARGE")
+            );
+        }
+    }
+
+    #[test]
+    fn paged_reservation_snapshot_bounds_repeated_metadata_before_publication() {
+        let mut snapshot = reservation_snapshot_fixture(8_250);
+        // The unused current-agent name appears once in the DB snapshot but
+        // in every wire page. The aggregate limit must count that repetition.
+        snapshot.agents[0].name = "\0".repeat(queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES / 12);
+        let error = reservation_snapshot_pages(snapshot, &"c".repeat(64)).unwrap_err();
+        assert_eq!(
+            crate::tool_util::tool_error_code(&error),
+            Some("PAGED_SNAPSHOT_TOO_LARGE")
+        );
+    }
+
+    #[test]
+    fn paged_reservation_cache_pins_scope_boundaries_bytes_and_expiration() {
+        let now = Instant::now();
+        let token = "d".repeat(64);
+        let scope = paged_snapshot_scope();
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let pages = reservation_snapshot_pages(reservation_snapshot_fixture(251), &token).unwrap();
+        let bytes = pages.iter().map(|page| page.json.len()).sum::<usize>();
+        let first = ReservationSnapshotBuild::reserve(&cache, now)
+            .unwrap()
+            .publish(token.clone(), scope.clone(), pages, now)
+            .unwrap();
+        let mut cache = cache.lock().unwrap();
+        assert_eq!(cache.builders, 0);
+        assert_eq!(cache.bytes, bytes);
+        assert_eq!(cache.read(&token, &scope, 0, now).unwrap(), first);
+        let last = cache.read(&token, &scope, 250, now).unwrap();
+        assert_eq!(cache.read(&token, &scope, 250, now).unwrap(), last);
+        for offset in [1, 249, 251, usize::MAX] {
+            let error = cache.read(&token, &scope, offset, now).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_INVALID_OFFSET")
+            );
+        }
+        let mut other_scopes = vec![scope.clone(); 5];
+        other_scopes[0].engine_identity.push_str("-replaced");
+        other_scopes[1].storage_root = PathBuf::from("/different-archive");
+        other_scopes[2].project_created_at += 1;
+        other_scopes[3].active_only = true;
+        other_scopes[4].project_id += 1;
+        for other in other_scopes {
+            let error = cache.read(&token, &other, 0, now).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_SCOPE_MISMATCH")
+            );
+        }
+        assert!(cache.read(&"e".repeat(64), &scope, 0, now).is_err());
+        let before_expiry = (now + RESERVATION_SNAPSHOT_CACHE_TTL)
+            .checked_sub(Duration::from_nanos(1))
+            .expect("snapshot TTL exceeds one nanosecond");
+        assert_eq!(cache.read(&token, &scope, 0, before_expiry).unwrap(), first);
+        let expired = cache
+            .read(&token, &scope, 250, now + RESERVATION_SNAPSHOT_CACHE_TTL)
+            .unwrap_err();
+        assert_eq!(
+            crate::tool_util::tool_error_code(&expired),
+            Some("PAGED_SNAPSHOT_EXPIRED")
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn paged_reservation_cache_bounds_concurrent_builders_and_releases_abandoned_work() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let barrier = std::sync::Barrier::new(4);
+        let accepted = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let permit = ReservationSnapshotBuild::reserve(&cache, now);
+                        barrier.wait();
+                        permit.is_ok()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count()
+        });
+        assert_eq!(
+            accepted, 2,
+            "two 64 MiB builders exhaust the 128 MiB budget"
+        );
+        assert_eq!(cache.lock().unwrap().builders, 0);
+
+        let first = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        let second = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        let token = "f".repeat(64);
+        first
+            .publish(
+                token.clone(),
+                paged_snapshot_scope(),
+                reservation_snapshot_pages(reservation_snapshot_fixture(1), &token).unwrap(),
+                now,
+            )
+            .unwrap();
+        assert!(ReservationSnapshotBuild::reserve(&cache, now).is_err());
+        drop(second);
+        let replacement = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        drop(replacement);
+        assert_eq!(cache.lock().unwrap().builders, 0);
+    }
+
+    #[test]
+    fn paged_reservation_cache_refuses_new_work_without_evicting_live_tokens() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let scope = paged_snapshot_scope();
+        for index in 0..RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS {
+            let token = format!("{index:064x}");
+            ReservationSnapshotBuild::reserve(&cache, now)
+                .unwrap()
+                .publish(
+                    token.clone(),
+                    scope.clone(),
+                    reservation_snapshot_pages(reservation_snapshot_fixture(0), &token).unwrap(),
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(ReservationSnapshotBuild::reserve(&cache, now).is_err());
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .read(&"0".repeat(64), &scope, 0, now)
+                .is_ok()
+        );
+        let available =
+            ReservationSnapshotBuild::reserve(&cache, now + RESERVATION_SNAPSHOT_CACHE_TTL)
+                .expect("expired slots and bytes are reclaimed before admission");
+        drop(available);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn paged_reservation_release_request_is_explicit_and_strict() {
+        let token = "a".repeat(64);
+        let release = HashMap::from([
+            ("snapshot_token".to_string(), token.clone()),
+            ("snapshot_release".to_string(), "true".to_string()),
+        ]);
+        assert_eq!(
+            parse_reservation_snapshot_request(&release).unwrap(),
+            ReservationSnapshotRequest::Release { token: &token }
+        );
+        assert_eq!(
+            parse_reservation_snapshot_request(&HashMap::new()).unwrap(),
+            ReservationSnapshotRequest::Start
+        );
+        let mut read = release.clone();
+        read.insert("snapshot_release".to_string(), "false".to_string());
+        read.insert("offset".to_string(), "250".to_string());
+        assert_eq!(
+            parse_reservation_snapshot_request(&read).unwrap(),
+            ReservationSnapshotRequest::Page {
+                token: &token,
+                offset: 250,
+            }
+        );
+        for key in ["offset", "limit", "snapshot"] {
+            let mut invalid = release.clone();
+            invalid.insert(key.to_string(), "0".to_string());
+            assert!(
+                parse_reservation_snapshot_request(&invalid).is_err(),
+                "{key}"
+            );
+        }
+        for value in ["", "1", "0", "yes", "True", "FALSE", " true ", "invalid"] {
+            let mut invalid = release.clone();
+            invalid.insert("snapshot_release".to_string(), value.to_string());
+            let error = parse_reservation_snapshot_request(&invalid).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_INVALID_REQUEST"),
+                "{value}"
+            );
+        }
+        for token in [
+            String::new(),
+            "a".repeat(63),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            let mut invalid = release.clone();
+            invalid.insert("snapshot_token".to_string(), token);
+            assert!(parse_reservation_snapshot_request(&invalid).is_err());
+        }
+        let mut missing_token = release;
+        missing_token.remove("snapshot_token");
+        assert!(parse_reservation_snapshot_request(&missing_token).is_err());
+    }
+
+    #[test]
+    fn paged_reservation_release_reuses_capacity_for_repeated_completed_reads() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let scope = paged_snapshot_scope();
+        let active_token = "b".repeat(64);
+        let active_first = ReservationSnapshotBuild::reserve(&cache, now)
+            .unwrap()
+            .publish(
+                active_token.clone(),
+                scope.clone(),
+                reservation_snapshot_pages(reservation_snapshot_fixture(251), &active_token)
+                    .unwrap(),
+                now,
+            )
+            .unwrap();
+        let active_bytes = cache.lock().unwrap().bytes;
+        for index in 0..RESERVATION_SNAPSHOT_CACHE_MAX_SLOTS * 3 {
+            let token = format!("{index:064x}");
+            let first = ReservationSnapshotBuild::reserve(&cache, now)
+                .expect("completed readers must not exhaust the four snapshot slots")
+                .publish(
+                    token.clone(),
+                    scope.clone(),
+                    reservation_snapshot_pages(reservation_snapshot_fixture(501), &token).unwrap(),
+                    now,
+                )
+                .unwrap();
+            let mut cache = cache.lock().unwrap();
+            assert_eq!(cache.read(&token, &scope, 0, now).unwrap(), first);
+            let last = cache.read(&token, &scope, 500, now).unwrap();
+            assert_eq!(cache.read(&token, &scope, 500, now).unwrap(), last);
+            assert!(cache.release(&token, &scope, now).unwrap());
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.bytes, active_bytes);
+            assert_eq!(cache.builders, 0);
+            assert_eq!(
+                cache.read(&active_token, &scope, 0, now).unwrap(),
+                active_first
+            );
+        }
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .release(&active_token, &scope, now)
+                .unwrap()
+        );
+        assert_eq!(cache.lock().unwrap().bytes, 0);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn paged_reservation_release_preserves_scope_and_is_idempotent_after_expiry() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let scope = paged_snapshot_scope();
+        let token = "c".repeat(64);
+        let first = ReservationSnapshotBuild::reserve(&cache, now)
+            .unwrap()
+            .publish(
+                token.clone(),
+                scope.clone(),
+                reservation_snapshot_pages(reservation_snapshot_fixture(251), &token).unwrap(),
+                now,
+            )
+            .unwrap();
+        let mut cache = cache.lock().unwrap();
+        let bytes = cache.bytes;
+        let mut other_scopes = vec![scope.clone(); 5];
+        other_scopes[0].engine_identity.push_str("-replaced");
+        other_scopes[1].storage_root = PathBuf::from("/different-archive");
+        other_scopes[2].project_created_at += 1;
+        other_scopes[3].active_only = true;
+        other_scopes[4].project_id += 1;
+        for other in other_scopes {
+            let error = cache.release(&token, &other, now).unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&error),
+                Some("PAGED_SNAPSHOT_SCOPE_MISMATCH")
+            );
+            assert_eq!(cache.bytes, bytes);
+            assert_eq!(cache.read(&token, &scope, 0, now).unwrap(), first);
+        }
+        assert!(!cache.release(&"d".repeat(64), &scope, now).unwrap());
+        assert_eq!(cache.bytes, bytes);
+        // Unknown-token cleanup does not refresh any live token's deadline.
+        let expired_at = now + RESERVATION_SNAPSHOT_CACHE_TTL;
+        assert!(!cache.release(&token, &scope, expired_at).unwrap());
+        assert!(!cache.release(&token, &scope, expired_at).unwrap());
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn paged_reservation_release_recovers_byte_admission_without_losing_builders() {
+        let cache = Mutex::new(ReservationSnapshotCache::default());
+        let now = Instant::now();
+        let scope = paged_snapshot_scope();
+        let token = "e".repeat(64);
+        let first = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        let second = ReservationSnapshotBuild::reserve(&cache, now).unwrap();
+        first
+            .publish(
+                token.clone(),
+                scope.clone(),
+                reservation_snapshot_pages(reservation_snapshot_fixture(1), &token).unwrap(),
+                now,
+            )
+            .unwrap();
+        assert!(ReservationSnapshotBuild::reserve(&cache, now).is_err());
+        assert!(cache.lock().unwrap().release(&token, &scope, now).unwrap());
+        assert!(!cache.lock().unwrap().release(&token, &scope, now).unwrap());
+        let replacement = ReservationSnapshotBuild::reserve(&cache, now)
+            .expect("release recovers the byte budget before TTL expiry");
+        assert_eq!(cache.lock().unwrap().builders, 2);
+        assert_eq!(cache.lock().unwrap().bytes, 0);
+        drop(second);
+        drop(replacement);
+        assert_eq!(cache.lock().unwrap().builders, 0);
+    }
+
+    #[test]
+    fn reservation_snapshot_errors_distinguish_capacity_from_other_rejections() {
+        for paged in [false, true] {
+            let capacity = reservation_snapshot_result(
+                Outcome::Err(DbError::invalid(
+                    "snapshot_limit",
+                    "reservation snapshot too large",
+                )),
+                paged,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&capacity),
+                Some(if paged {
+                    "PAGED_SNAPSHOT_TOO_LARGE"
+                } else {
+                    "FILE_RESERVATION_SNAPSHOT_TOO_LARGE"
+                })
+            );
+            let identity = reservation_snapshot_result(
+                Outcome::Err(DbError::invalid(
+                    "snapshot",
+                    "reservation holder is missing",
+                )),
+                paged,
+            )
+            .unwrap_err();
+            assert_eq!(
+                crate::tool_util::tool_error_code(&identity),
+                Some("INVALID_ARGUMENT")
+            );
+            assert!(
+                identity
+                    .to_string()
+                    .contains("reservation holder is missing")
+            );
+        }
+    }
+
+    #[test]
+    fn priority_inbox_snapshot_limits_serialized_escape_expansion() {
+        use mcp_agent_mail_db::sync::{
+            InboxPriorityOptions, InboxPrioritySnapshot, MAX_PRIORITY_INBOX_BYTES,
+        };
+
+        // The database byte budget counts source text; control bytes expand
+        // to six bytes each when the response is encoded as JSON.
+        let body_md = "\0".repeat(MAX_PRIORITY_INBOX_BYTES / 6 + 1);
+        assert!(body_md.len() < MAX_PRIORITY_INBOX_BYTES);
+        let snapshot = InboxPrioritySnapshot {
+            project: ProjectRow {
+                id: Some(7),
+                slug: "priority-snapshot".to_string(),
+                human_key: "/priority-snapshot".to_string(),
+                created_at: 1_000_000,
+            },
+            agent: mcp_agent_mail_db::AgentRow {
+                id: Some(11),
+                project_id: 7,
+                name: "BlueLake".to_string(),
+                inception_ts: 2_000_000,
+                ..Default::default()
+            },
+            captured_ts: 2_000_000_000,
+            ack_overdue_before: 200_000_000,
+            display_names: std::collections::BTreeMap::new(),
+            rows: vec![queries::InboxRow {
+                message: MessageRow {
+                    id: Some(13),
+                    project_id: 7,
+                    sender_id: 12,
+                    subject: "Escaped body".to_string(),
+                    body_md,
+                    importance: "normal".to_string(),
+                    created_ts: 3_000_000,
+                    ..Default::default()
+                },
+                kind: "to".to_string(),
+                sender_name: "RedPeak".to_string(),
+                sender_display_name: None,
+                read_ts: None,
+                ack_ts: None,
+            }],
+        };
+        let options = InboxPriorityOptions {
+            urgent: false,
+            ack_overdue: false,
+            unread: false,
+            all: false,
+            limit: 1,
+            include_bodies: true,
+        };
+        let error = priority_inbox_snapshot_json(snapshot, options)
+            .expect_err("JSON escaping must not bypass the response byte budget");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(error.to_string().contains("4 MiB JSON limit"));
+    }
 
     fn unique_suffix() -> u64 {
         let micros = SystemTime::now()
@@ -5818,6 +7695,1080 @@ mod resource_shape_tests {
         get_db_pool().expect("db pool").clone()
     }
 
+    fn agent_mail_resource_router() -> fastmcp_server::Router {
+        let mut router = fastmcp_server::Router::new();
+        router.add_resource(InboxResource);
+        router.add_resource(MailboxResource);
+        router.add_resource(MailboxWithCommitsResource);
+        router.add_resource(OutboxResource);
+        router.add_resource(ViewsUrgentUnreadResource);
+        router.add_resource(ViewsAckRequiredResource);
+        router.add_resource(ViewsAcksStaleResource);
+        router.add_resource(ViewsAckOverdueResource);
+        router
+    }
+
+    async fn inbox_read_only_witness(cx: &Cx, pool: &DbPool, agent_id: i64) -> Value {
+        let conn = acquire_resource_conn(cx, pool)
+            .await
+            .expect("witness reader");
+        let params = [mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)];
+        let mut receipts = Vec::new();
+        for table in ["message_recipients", "project_mailbox_receipts"] {
+            let rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT message_id, read_ts, ack_ts FROM {table} WHERE agent_id = ? ORDER BY message_id"
+                    ),
+                    &params,
+                )
+                .expect("receipt witness");
+            receipts.push(
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<i64>("message_id").unwrap(),
+                            row.get_named::<Option<i64>>("read_ts").unwrap(),
+                            row.get_named::<Option<i64>>("ack_ts").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let agents = conn
+            .query_sync(
+                "SELECT last_active_ts, retired_at FROM agents WHERE id = ?",
+                &params,
+            )
+            .expect("agent activity witness");
+        assert_eq!(agents.len(), 1);
+        serde_json::json!({
+            "direct": receipts[0],
+            "shared": receipts[1],
+            "last_active_ts": agents[0].get_named::<i64>("last_active_ts").unwrap(),
+            "retired_at": agents[0].get_named::<Option<i64>>("retired_at").unwrap(),
+        })
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shared_delivery_roster_and_outbox_resources_preserve_receipts_and_bcc() {
+        with_serialized_resources_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/shared resource parity").await;
+                    let project_id = project.id.unwrap();
+                    let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let reader = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                    let hidden = register_agent(&cx, &pool, project_id, "DarkLake").await;
+                    let sender_id = sender.id.unwrap();
+                    let reader_id = reader.id.unwrap();
+                    let hidden_id = hidden.id.unwrap();
+                    let mut ids = Vec::new();
+                    for (subject, shared_kind, importance, recipients) in [
+                        ("Project to", "to", "normal", vec![]),
+                        (
+                            "Mixed cc",
+                            "cc",
+                            "urgent",
+                            vec![(reader_id, "to"), (hidden_id, "bcc")],
+                        ),
+                        ("Recent shared", "to", "normal", vec![]),
+                    ] {
+                        let message = queries::create_message_with_recipients_topic(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender_id,
+                            subject,
+                            "body",
+                            Some("resource-parity"),
+                            None,
+                            None,
+                            importance,
+                            true,
+                            "[]",
+                            &recipients,
+                            Some(shared_kind),
+                        )
+                        .await
+                        .into_result()
+                        .expect("shared delivery fixture");
+                        ids.push(message.id.unwrap());
+                    }
+                    for id in &ids[..2] {
+                        queries::mark_message_read(&cx, &pool, reader_id, *id)
+                            .await
+                            .into_result()
+                            .expect("reader's own receipt");
+                    }
+                    let before = inbox_read_only_witness(&cx, &pool, reader_id).await;
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, sender_id, &sender.name);
+                    let mut router = fastmcp_server::Router::new();
+                    router.add_resource(AgentsListResource);
+                    router.add_resource(OutboxResource);
+                    let roster_response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://agents/{}", project.slug),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("mounted agent roster with one connection");
+                    let roster_response = serde_json::to_value(roster_response).unwrap();
+                    let agent_roster =
+                        parse_json(roster_response["contents"][0]["text"].as_str().unwrap());
+                    for (name, unread) in [
+                        ("BlueLake", 0),
+                        ("RedPeak", 1),
+                        ("GreenCastle", 3),
+                        ("DarkLake", 3),
+                    ] {
+                        let entry = agent_roster["agents"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|entry| entry["name"] == name)
+                            .expect("registered agent");
+                        assert_eq!(entry["unread_count"], unread, "{name}");
+                    }
+                    let outbox_response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://outbox/BlueLake?project={}", project.slug),
+                                meta: None,
+                            },
+                            state,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("mounted outbox with one connection");
+                    let outbox_response = serde_json::to_value(outbox_response).unwrap();
+                    let outbox_text = outbox_response["contents"][0]["text"].as_str().unwrap();
+                    let outbox = parse_json(outbox_text);
+                    let messages = outbox["messages"].as_array().unwrap();
+                    assert_eq!(messages.len(), 3);
+                    let address = format!("project:{}", project.slug);
+                    let to = messages
+                        .iter()
+                        .find(|message| message["id"] == ids[0])
+                        .unwrap();
+                    assert_eq!(to["to"], serde_json::json!([address]));
+                    assert_eq!(to["cc"], serde_json::json!([]));
+                    let cc = messages
+                        .iter()
+                        .find(|message| message["id"] == ids[1])
+                        .unwrap();
+                    assert_eq!(cc["to"], serde_json::json!(["RedPeak"]));
+                    assert_eq!(cc["cc"], serde_json::json!([address]));
+                    assert!(
+                        messages
+                            .iter()
+                            .all(|message| message["bcc"] == serde_json::json!([]))
+                    );
+                    assert!(!outbox_text.contains("DarkLake"));
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, reader_id).await, before);
+                    let conn = acquire_resource_conn(&cx, &pool).await.unwrap();
+                    let direct = conn
+                        .query_sync("SELECT COUNT(*) AS n FROM message_recipients", &[])
+                        .unwrap();
+                    assert_eq!(
+                        direct[0].get_named::<i64>("n").unwrap(),
+                        2,
+                        "shared mail never fans out"
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn priority_inbox_router_preserves_receipts_activity_and_notifications() {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let signals = tempfile::tempdir().expect("private notification signals");
+        with_serialized_resources_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
+                ("NOTIFICATIONS_ENABLED", "true"),
+                (
+                    "NOTIFICATIONS_SIGNALS_DIR",
+                    signals.path().to_str().expect("UTF-8 signals path"),
+                ),
+            ],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/priority inbox resource").await;
+                    let project_id = project.id.expect("project id");
+                    let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    let agent_id = agent.id.expect("agent id");
+                    let sender_id = sender.id.expect("sender id");
+                    let now = mcp_agent_mail_db::now_micros();
+                    let inception_ts = now - 180 * 60 * 1_000_000;
+                    let fixtures = [
+                        (
+                            "Old urgent",
+                            "urgent private body",
+                            "urgent",
+                            true,
+                            false,
+                            120,
+                        ),
+                        (
+                            "Shared overdue",
+                            "shared private body",
+                            "normal",
+                            true,
+                            true,
+                            60,
+                        ),
+                        (
+                            "New ordinary",
+                            "ordinary private body",
+                            "normal",
+                            false,
+                            false,
+                            1,
+                        ),
+                    ];
+                    let mut ids = Vec::new();
+                    let mut timestamps = Vec::new();
+                    for (subject, body, importance, ack_required, shared, age_minutes) in fixtures {
+                        let recipients = if shared {
+                            vec![]
+                        } else {
+                            vec![(agent_id, "to")]
+                        };
+                        let message = match queries::create_message_with_recipients_topic(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender_id,
+                            subject,
+                            body,
+                            Some("priority-resource"),
+                            Some("priority-topic"),
+                            None,
+                            importance,
+                            ack_required,
+                            "[]",
+                            &recipients,
+                            shared.then_some("to"),
+                        )
+                        .await
+                        {
+                            Outcome::Ok(message) => message,
+                            other => panic!("priority message fixture failed: {other:?}"),
+                        };
+                        ids.push(message.id.expect("message id"));
+                        timestamps.push(now - age_minutes * 60 * 1_000_000);
+                    }
+                    let writer = acquire_resource_conn(&cx, &pool)
+                        .await
+                        .expect("fixture writer");
+                    for (&id, &created_ts) in ids.iter().zip(&timestamps) {
+                        writer.execute_sync(
+                            "UPDATE messages SET created_ts = ?, recipients_json = ?, attachments = ? WHERE id = ?",
+                            &[
+                                SqlValue::BigInt(created_ts),
+                                SqlValue::Text(r#"{"bcc":["private-recipient-sentinel"]}"#.to_string()),
+                                SqlValue::Text(r#"[{"name":"private-attachment-sentinel"}]"#.to_string()),
+                                SqlValue::BigInt(id),
+                            ],
+                        ).expect("age messages and seed excluded metadata");
+                    }
+                    let shared_read_ts = now - 59 * 60 * 1_000_000;
+                    writer.execute_sync(
+                        "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, ?, NULL)",
+                        &[
+                            SqlValue::BigInt(ids[1]),
+                            SqlValue::BigInt(agent_id),
+                            SqlValue::BigInt(shared_read_ts),
+                        ],
+                    ).expect("seed existing shared receipt");
+                    writer.execute_sync(
+                        "UPDATE agents SET inception_ts = ?, last_active_ts = ?, registration_token = ? WHERE id = ?",
+                        &[
+                            SqlValue::BigInt(inception_ts),
+                            SqlValue::BigInt(now - 90 * 60 * 1_000_000),
+                            SqlValue::Text("private-registration-token-sentinel".to_string()),
+                            SqlValue::BigInt(agent_id),
+                        ],
+                    ).expect("seed pre-delivery inception, stale activity, and private token");
+                    drop(writer);
+
+                    let signal_path = Config::from_env()
+                        .notifications_signals_dir
+                        .join("projects")
+                        .join(&project.slug)
+                        .join("agents")
+                        .join("BlueLake.signal");
+                    std::fs::create_dir_all(signal_path.parent().unwrap())
+                        .expect("signal directory");
+                    let signal_bytes =
+                        b"{\"project\":\"priority\",\"agent\":\"BlueLake\",\"pending\":3}\n";
+                    std::fs::write(&signal_path, signal_bytes).expect("notification witness");
+                    let before = inbox_read_only_witness(&cx, &pool, agent_id).await;
+                    assert_eq!(before["direct"].as_array().unwrap().len(), 2);
+                    assert_eq!(before["shared"].as_array().unwrap().len(), 1);
+                    let mut encoded_project = String::new();
+                    for byte in project.human_key.bytes() {
+                        use std::fmt::Write as _;
+
+                        write!(&mut encoded_project, "%{byte:02X}")
+                            .expect("write escaped project byte");
+                    }
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
+                    let router = agent_mail_resource_router();
+                    for include_bodies in [false, true] {
+                        let response = router.handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://inbox/bluelake?project={encoded_project}&context=true&urgent=false&ack_overdue=false&unread=true&all=true&limit=3&include_bodies={include_bodies}&format=json"),
+                                meta: None,
+                            },
+                            state.clone(), None, None,
+                        ).await.expect("one-slot priority resource");
+                        let response = serde_json::to_value(response).unwrap();
+                        let text = response["contents"][0]["text"].as_str().unwrap();
+                        let value = parse_json(text);
+                        assert_eq!(value["schema_version"], 1);
+                        assert_eq!(value["complete"], true);
+                        assert_eq!(value["project"]["id"], project_id);
+                        assert_eq!(value["project"]["slug"], project.slug);
+                        assert_eq!(value["project"]["human_key"], project.human_key);
+                        assert_eq!(
+                            value["project"]["created_at"],
+                            micros_to_iso(project.created_at)
+                        );
+                        assert_eq!(value["agent"]["id"], agent_id);
+                        assert_eq!(value["agent"]["project_id"], project_id);
+                        assert_eq!(value["agent"]["name"], "BlueLake");
+                        assert_eq!(value["agent"]["inception_ts"], micros_to_iso(inception_ts));
+                        let captured =
+                            iso_to_micros(value["captured_ts"].as_str().unwrap()).unwrap();
+                        let cutoff =
+                            iso_to_micros(value["ack_overdue_before"].as_str().unwrap()).unwrap();
+                        assert!(captured >= now);
+                        assert_eq!(captured - cutoff, 30 * 60 * 1_000_000);
+                        for flag in ["urgent", "ack_overdue"] {
+                            assert_eq!(value[flag], false);
+                        }
+                        for flag in ["unread", "all"] {
+                            assert_eq!(value[flag], true);
+                        }
+                        assert_eq!(value["limit"], 3);
+                        assert_eq!(value["include_bodies"], include_bodies);
+                        assert_eq!(value["count"], 3);
+                        let rows = value["messages"].as_array().unwrap();
+                        assert_eq!(rows.len(), 3);
+                        for (index, row) in rows.iter().enumerate() {
+                            assert_eq!(row["id"], ids[index], "priority must precede recency");
+                            assert_eq!(row["project_id"], project_id);
+                            assert_eq!(row["sender_id"], sender_id);
+                            assert_eq!(row["from"], "RedPeak");
+                            assert_eq!(row["created_ts"], micros_to_iso(timestamps[index]));
+                            assert_eq!(row["thread_id"], "priority-resource");
+                            assert_eq!(row["topic"], "priority-topic");
+                            assert_eq!(row.get("ack_ts"), Some(&Value::Null));
+                            if index == 1 {
+                                assert_eq!(row["kind"], "project");
+                                assert_eq!(row["via"], "project");
+                                assert_eq!(row["read_ts"], micros_to_iso(shared_read_ts));
+                            } else {
+                                assert_eq!(row["kind"], "to");
+                                assert_eq!(row.get("via"), Some(&Value::Null));
+                                assert_eq!(row.get("read_ts"), Some(&Value::Null));
+                            }
+                            if include_bodies {
+                                assert_eq!(row["body_md"], fixtures[index].1);
+                            } else {
+                                assert!(row.get("body_md").is_none());
+                                assert!(!text.contains(fixtures[index].1));
+                            }
+                            for field in [
+                                "to",
+                                "cc",
+                                "bcc",
+                                "recipients",
+                                "recipients_json",
+                                "attachments",
+                            ] {
+                                assert!(row.get(field).is_none(), "excluded field {field}");
+                            }
+                        }
+                        for private in [
+                            "registration_token",
+                            "private-registration-token-sentinel",
+                            "private-recipient-sentinel",
+                            "private-attachment-sentinel",
+                        ] {
+                            assert!(!text.contains(private));
+                        }
+                        assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                        assert_eq!(
+                            std::fs::read(&signal_path).unwrap(),
+                            signal_bytes.as_slice()
+                        );
+                    }
+                    let error = router.handle_resources_read(
+                        &ctx,
+                        &fastmcp_protocol::ReadResourceParams {
+                            uri: format!("resource://inbox/redpeak?project={encoded_project}&context=true&include_bodies=true&format=json"),
+                            meta: None,
+                        },
+                        state, None, None,
+                    ).await.expect_err("context mode must not bypass the bound identity");
+                    assert_eq!(
+                        crate::tool_error_code(&error),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                    assert!(!error.to_string().contains("private body"));
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                    assert_eq!(
+                        std::fs::read(&signal_path).unwrap(),
+                        signal_bytes.as_slice()
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn priority_inbox_router_rejects_invalid_context_queries_before_legacy_dispatch() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let router = agent_mail_resource_router();
+                let state = fastmcp_core::SessionState::new();
+                let ctx = McpContext::with_state(cx, 1, state.clone());
+                for query in [
+                    "context=true&limit=0",
+                    "context=true&limit=1001",
+                    "context=true&limit=invalid",
+                    "context=true&urgent=1",
+                    "context=true&ack_overdue=yes",
+                    "context=true&unread=TRUE",
+                    "context=true&all=1",
+                    "context=true&include_bodies=invalid",
+                    "context=invalid",
+                    "context=true&since_ts=2026-10-28T00:00:00Z",
+                    "context=true&urgent_only=true",
+                    "context=true&format=toon",
+                ] {
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!(
+                                    "resource://inbox/BlueLake?project=unregistered&{query}"
+                                ),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("invalid context request cannot become a legacy read");
+                    assert_eq!(error.code, McpErrorCode::InvalidParams, "{query}: {error}");
+                    assert!(
+                        !error.to_string().contains("Project not found"),
+                        "{query}: options must fail before mailbox resolution"
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retired_inbox_history_requires_explicit_roster_opt_in_without_reactivation() {
+        with_serialized_resources_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("DATABASE_POOL_TIMEOUT", "1"),
+            ],
+            || {
+                run_async(|cx| async move {
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, "/retired-priority-history").await;
+                    let project_id = project.id.unwrap();
+                    let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let sender = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    let agent_id = agent.id.unwrap();
+                    let direct = create_message(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        agent_id,
+                        "Retired direct history",
+                        "Retired private body",
+                        "retired-history",
+                        false,
+                    )
+                    .await;
+                    let shared = match queries::create_message_with_recipients_topic(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap(),
+                        "Active shared delivery",
+                        "Active shared body",
+                        Some("retired-history"),
+                        None,
+                        None,
+                        "normal",
+                        false,
+                        "[]",
+                        &[],
+                        Some("to"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(message) => message,
+                        other => panic!("shared history fixture failed: {other:?}"),
+                    };
+                    let retired_at = mcp_agent_mail_db::now_micros();
+                    match queries::set_agent_retired_at(&cx, &pool, agent_id, Some(retired_at))
+                        .await
+                    {
+                        Outcome::Ok(retired) => assert_eq!(retired.retired_at, Some(retired_at)),
+                        other => panic!("retirement fixture failed: {other:?}"),
+                    }
+                    let before = inbox_read_only_witness(&cx, &pool, agent_id).await;
+                    assert_eq!(before["retired_at"], retired_at);
+                    let state = fastmcp_core::SessionState::new();
+                    let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                    crate::session_identity::bind(&ctx, project_id, agent_id, &agent.name);
+                    let mut router = agent_mail_resource_router();
+                    router.add_resource(ProjectDetailsResource);
+                    for (query, included) in [
+                        ("", false),
+                        ("?include_retired=false&format=json", false),
+                        ("?include_retired=true&format=json", true),
+                    ] {
+                        let response = router
+                            .handle_resources_read(
+                                &ctx,
+                                &fastmcp_protocol::ReadResourceParams {
+                                    uri: format!("resource://project/{}{query}", project.slug),
+                                    meta: None,
+                                },
+                                state.clone(),
+                                None,
+                                None,
+                            )
+                            .await
+                            .expect("project descriptor");
+                        let response = serde_json::to_value(response).unwrap();
+                        let value = parse_json(response["contents"][0]["text"].as_str().unwrap());
+                        let rows = value["agents"].as_array().unwrap();
+                        let retired = rows.iter().find(|row| row["name"] == "BlueLake");
+                        assert_eq!(retired.is_some(), included);
+                        if let Some(retired) = retired {
+                            assert_eq!(retired["id"], agent_id);
+                            assert_eq!(retired["project_id"], project_id);
+                            assert_eq!(retired["inception_ts"], micros_to_iso(agent.inception_ts));
+                            assert!(retired.get("registration_token").is_none());
+                        }
+                        assert!(rows.iter().any(|row| row["name"] == "RedPeak"));
+                    }
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!(
+                                    "resource://project/{}?include_retired=1&format=json",
+                                    project.slug
+                                ),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("history opt-in requires an explicit boolean");
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    let response = router.handle_resources_read(
+                        &ctx,
+                        &fastmcp_protocol::ReadResourceParams {
+                            uri: format!("resource://inbox/bluelake?project={}&context=true&all=true&include_bodies=true&format=json", project.slug),
+                            meta: None,
+                        },
+                        state, None, None,
+                    ).await.expect("retired direct history remains readable");
+                    let response = serde_json::to_value(response).unwrap();
+                    let value = parse_json(response["contents"][0]["text"].as_str().unwrap());
+                    assert_eq!(value["agent"]["name"], "BlueLake");
+                    assert_eq!(value["count"], 1);
+                    assert_eq!(value["messages"][0]["id"], direct.id.unwrap());
+                    assert_ne!(value["messages"][0]["id"], shared.id.unwrap());
+                    assert_eq!(value["messages"][0]["body_md"], "Retired private body");
+                    assert_eq!(value["messages"][0]["kind"], "to");
+                    assert_eq!(inbox_read_only_witness(&cx, &pool, agent_id).await, before);
+                });
+            },
+        );
+    }
+
+    const AGENT_MAIL_RESOURCE_PATHS: [&str; 8] = [
+        "inbox",
+        "mailbox",
+        "mailbox-with-commits",
+        "outbox",
+        "views/urgent-unread",
+        "views/ack-required",
+        "views/acks-stale",
+        "views/ack-overdue",
+    ];
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_agent_mail_resource_enforces_session_identity_on_one_slot_pool() {
+        for enabled in [false, true] {
+            with_serialized_resources_env(
+                &[
+                    (
+                        "MESSAGING_SESSION_IDENTITY",
+                        if enabled { "true" } else { "false" },
+                    ),
+                    ("DATABASE_POOL_SIZE", "1"),
+                    ("DATABASE_MAX_OVERFLOW", "0"),
+                    ("DATABASE_POOL_TIMEOUT", "1"),
+                ],
+                || {
+                    run_async(|cx| async move {
+                        let pool = seed_pool();
+                        let project =
+                            ensure_project(&cx, &pool, "/resource-session-identity").await;
+                        let project_id = project.id.expect("project id");
+                        let own = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                        let other = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                        for (sender, recipient) in [(&own, &other), (&other, &own)] {
+                            create_message(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender.id.expect("sender id"),
+                                recipient.id.expect("recipient id"),
+                                "Private identity witness",
+                                "Private mail body",
+                                "identity-views",
+                                true,
+                            )
+                            .await;
+                        }
+                        let writer = acquire_resource_conn(&cx, &pool).await.expect("writer");
+                        writer.execute_sync(
+                            "UPDATE messages SET created_ts = created_ts - 120000000 WHERE project_id = ?",
+                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)],
+                        ).expect("age ack-required messages");
+                        drop(writer);
+
+                        let state = fastmcp_core::SessionState::new();
+                        let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                        crate::session_identity::bind(&ctx, project_id, own.id.unwrap(), &own.name);
+                        let unbound = fastmcp_core::SessionState::new();
+                        let unbound_ctx = McpContext::with_state(cx, 2, unbound.clone());
+                        let router = agent_mail_resource_router();
+                        for path in AGENT_MAIL_RESOURCE_PATHS {
+                            for (agent, restricted) in [("bluelake", false), ("redpeak", enabled)] {
+                                let result = router.handle_resources_read(
+                                    &ctx,
+                                    &fastmcp_protocol::ReadResourceParams {
+                                        uri: format!("resource://{path}/{agent}?project={}&ttl_seconds=1&ttl_minutes=1&include_bodies=true", project.slug),
+                                        meta: None,
+                                    },
+                                    state.clone(), None, None,
+                                ).await;
+                                if restricted {
+                                    let error =
+                                        result.expect_err("borrowed identity must be refused");
+                                    assert_eq!(
+                                        crate::tool_error_code(&error),
+                                        Some("SESSION_IDENTITY_MISMATCH"),
+                                        "{path}: {error}"
+                                    );
+                                    assert!(!error.to_string().contains("Private mail body"));
+                                } else {
+                                    let payload = serde_json::to_value(
+                                        result.expect("authorized resource read"),
+                                    )
+                                    .unwrap();
+                                    let value = parse_json(
+                                        payload["contents"][0]["text"].as_str().unwrap(),
+                                    );
+                                    assert!(
+                                        value["count"].as_u64().is_some_and(|count| count > 0),
+                                        "{path}: authorized data must remain available: {value}"
+                                    );
+                                }
+                            }
+                            let result = router.handle_resources_read(
+                                &unbound_ctx,
+                                &fastmcp_protocol::ReadResourceParams {
+                                    uri: format!("resource://{path}/RedPeak?project={}&ttl_seconds=1&ttl_minutes=1", project.slug),
+                                    meta: None,
+                                },
+                                unbound.clone(), None, None,
+                            ).await.expect("unbound trusted-local behavior stays available");
+                            let payload = serde_json::to_value(result).unwrap();
+                            let value =
+                                parse_json(payload["contents"][0]["text"].as_str().unwrap());
+                            assert!(
+                                value["count"].as_u64().is_some_and(|count| count > 0),
+                                "{path}: {value}"
+                            );
+                        }
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_mail_resources_cannot_authorize_a_renamed_row_from_the_read_cache() {
+        with_serialized_resources_env(&[("MESSAGING_SESSION_IDENTITY", "true")], || {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project = ensure_project(&cx, &pool, "/resource-renamed-identity").await;
+                let project_id = project.id.unwrap();
+                let own = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let own_id = own.id.unwrap();
+                let read_pool = get_resource_db_pool(&cx).await.unwrap();
+                let cached = queries::get_agent_by_id(&cx, &read_pool, own_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(cached.name, "BlueLake");
+                let state = fastmcp_core::SessionState::new();
+                let ctx = McpContext::with_state(cx.clone(), 1, state.clone());
+                crate::session_identity::bind(&ctx, project_id, own_id, &own.name);
+                let writer = acquire_resource_conn(&cx, &pool).await.unwrap();
+                writer
+                    .execute_sync(
+                        "UPDATE agents SET name = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::Text("RedPeak".to_string()),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(own_id),
+                        ],
+                    )
+                    .expect("rename without invalidating the stale cache");
+                drop(writer);
+                let cached = queries::get_agent_by_id(&cx, &read_pool, own_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    cached.name, "BlueLake",
+                    "the negative must exercise a genuinely stale cache entry"
+                );
+                let router = agent_mail_resource_router();
+                for path in AGENT_MAIL_RESOURCE_PATHS {
+                    let error = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: format!("resource://{path}/RedPeak?project={}", project.slug),
+                                meta: None,
+                            },
+                            state.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("old cached identity cannot authorize the renamed agent");
+                    assert_eq!(
+                        crate::tool_error_code(&error),
+                        Some("SESSION_IDENTITY_MISMATCH"),
+                        "{path}: {error}"
+                    );
+                }
+            });
+        });
+    }
+
+    async fn insert_resource_project(cx: &Cx, pool: &DbPool, id: i64, slug: &str, human_key: &str) {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let conn = acquire_resource_conn(cx, pool)
+            .await
+            .expect("seed connection");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(id),
+                SqlValue::Text(slug.to_string()),
+                SqlValue::Text(human_key.to_string()),
+                SqlValue::BigInt(1_700_000_000_000_000),
+            ],
+        )
+        .expect("insert project without resolving identity or writing Git markers");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ancestor_project_resolution_uses_live_nearest_human_keys_without_writes() {
+        with_serialized_resources_env(&[("WORKTREES_ENABLED", "true")], || {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let repo = git2::Repository::init(dir.path()).expect("initialize test repository");
+                let git_config = std::fs::read(repo.path().join("config")).expect("Git config");
+                let root = mcp_agent_mail_core::resolve_project_path(
+                    dir.path().to_str().expect("UTF-8 test path"),
+                );
+                let nested = root.join("nested-extra");
+                let requested = nested.join("src");
+                std::fs::create_dir_all(&requested).expect("working directory");
+                let root_key = root.to_string_lossy().into_owned();
+                let nested_key = nested.to_string_lossy().into_owned();
+                let requested_key = requested.to_string_lossy().into_owned();
+                insert_resource_project(&cx, &pool, 101, "parent", &root_key).await;
+                insert_resource_project(
+                    &cx,
+                    &pool,
+                    102,
+                    "prefix-sibling",
+                    &root.join("nested").to_string_lossy(),
+                )
+                .await;
+                insert_resource_project(
+                    &cx,
+                    &pool,
+                    103,
+                    &requested_key,
+                    &root.join("elsewhere").to_string_lossy(),
+                )
+                .await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let query = "resolve=ancestors&format=json".to_string();
+                let parent = parse_json(
+                    &project_details_query(&ctx, requested_key.clone(), query.clone())
+                        .await
+                        .expect("parent project"),
+                );
+                assert_eq!(parent["id"], 101);
+                assert_eq!(parent["resolution"]["requested_path"], requested_key);
+                assert_eq!(parent["resolution"]["kind"], "nearest_ancestor");
+
+                insert_resource_project(&cx, &pool, 104, "nested", &nested_key).await;
+                let nearest = parse_json(
+                    &project_details_query(&ctx, requested_key.clone(), query.clone())
+                        .await
+                        .expect("new nearest project"),
+                );
+                assert_eq!(
+                    nearest["id"], 104,
+                    "a prior result must not hide a new ancestor"
+                );
+
+                let writer = acquire_resource_conn(&cx, &pool).await.expect("writer");
+                writer
+                    .execute_sync(
+                        "UPDATE projects SET human_key = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::Text(
+                                root.join("moved").to_string_lossy().into_owned(),
+                            ),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(104),
+                        ],
+                    )
+                    .expect("move registered project");
+                drop(writer);
+                let refreshed = parse_json(
+                    &project_details_query(&ctx, requested_key, query)
+                        .await
+                        .expect("fresh ancestor after move"),
+                );
+                assert_eq!(refreshed["id"], 101);
+
+                let read_pool = get_resource_db_pool(&cx).await.expect("resource pool");
+                let reader = acquire_resource_conn(&cx, &read_pool)
+                    .await
+                    .expect("resource reader");
+                assert!(
+                    reader
+                        .execute_sync("UPDATE projects SET slug = slug WHERE id = 101", &[])
+                        .is_err(),
+                    "project resolution must use the query-only lane"
+                );
+                let rows = reader
+                    .query_sync("SELECT COUNT(*) AS n FROM projects", &[])
+                    .expect("project count");
+                assert_eq!(
+                    rows[0].get_named::<i64>("n").expect("count"),
+                    4,
+                    "implicit resolution must not register the working directory"
+                );
+                assert!(!root.join(".agent-mail-project-id").exists());
+                assert!(!repo.path().join("agent-mail").join("project-id").exists());
+                assert_eq!(
+                    std::fs::read(repo.path().join("config")).expect("unchanged Git config"),
+                    git_config
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn ancestor_project_resolution_rejects_missing_and_ambiguous_matches() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let root = mcp_agent_mail_core::resolve_project_path(
+                    dir.path().to_str().expect("UTF-8 path"),
+                );
+                let root_key = root.to_string_lossy().into_owned();
+                let request = root.join("child").to_string_lossy().into_owned();
+                let ctx = McpContext::new(cx.clone(), 1);
+                let query = "resolve=ancestors".to_string();
+                let missing = project_details_query(&ctx, request.clone(), query.clone())
+                    .await
+                    .expect_err("no match");
+                assert_eq!(missing.code, McpErrorCode::InvalidParams);
+                assert!(missing.to_string().contains("Project not found"));
+                insert_resource_project(&cx, &pool, 201, "first", &root_key).await;
+                insert_resource_project(&cx, &pool, 202, "legacy-duplicate", &root_key).await;
+                let ambiguous = project_details_query(&ctx, request, query)
+                    .await
+                    .expect_err("duplicate nearest human key");
+                assert_eq!(ambiguous.code, McpErrorCode::InvalidParams);
+                assert!(ambiguous.to_string().contains("ambiguous"));
+                let exact = parse_json(
+                    &project_details(&ctx, "first?format=json".to_string())
+                        .await
+                        .expect("exact slug remains usable"),
+                );
+                assert_eq!(exact["id"], 201);
+                assert!(
+                    exact.get("resolution").is_none(),
+                    "exact response shape is unchanged"
+                );
+            });
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_query_router_preserves_encoded_path_delimiters() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let dir = tempfile::tempdir().expect("project directory");
+                let root = dir.path().join("project ? %2F # + café");
+                std::fs::create_dir_all(&root).expect("special-character project path");
+                let root =
+                    mcp_agent_mail_core::resolve_project_path(root.to_str().expect("UTF-8 path"));
+                let key = root.to_string_lossy().into_owned();
+                insert_resource_project(&cx, &pool, 301, "special-path", &key).await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let capability = parse_json(&config_environment(&ctx).expect("config capability"));
+                assert_eq!(capability["project_path_resolution"], "nearest_ancestor_v1");
+                let router = fastmcp_server::Server::new("project-resource-routing", "test")
+                    .resource(ProjectDetailsResource)
+                    .try_build()
+                    .expect("one project route must pass final template admission")
+                    .into_router();
+                let mut encoded = String::new();
+                for byte in key.bytes() {
+                    use std::fmt::Write as _;
+
+                    write!(&mut encoded, "%{byte:02X}").expect("write escaped project byte");
+                }
+                for mode in ["exact", "ancestors"] {
+                    let uri = format!("resource://project/{encoded}?resolve={mode}&format=json");
+                    let response = router
+                        .handle_resources_read(
+                            &ctx,
+                            &fastmcp_protocol::ReadResourceParams {
+                                uri: uri.clone(),
+                                meta: None,
+                            },
+                            fastmcp_core::SessionState::new(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("query-aware resource routing");
+                    let payload = serde_json::to_value(response).expect("resource response");
+                    assert_eq!(payload["contents"][0]["uri"], uri);
+                    let project = parse_json(
+                        payload["contents"][0]["text"]
+                            .as_str()
+                            .expect("JSON resource text"),
+                    );
+                    assert_eq!(project["id"], 301);
+                    assert_eq!(project["human_key"], key);
+                    if mode == "ancestors" {
+                        assert_eq!(project["resolution"]["requested_path"], key);
+                    } else {
+                        assert!(project.get("resolution").is_none());
+                    }
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn ancestor_project_resolution_rejects_invalid_requests_before_opening_database() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let ctx = McpContext::new(cx, 1);
+                let dir = tempfile::tempdir().expect("project directory");
+                let absolute = dir.path().to_string_lossy().into_owned();
+                let oversized = format!("{absolute}/{}", "a".repeat(32_768));
+                let deep = format!("{absolute}/{}", "a/".repeat(257));
+                let parent_traversal = format!("{absolute}/missing/../child");
+                for (path, query) in [
+                    (absolute.clone(), "resolve=unsupported"),
+                    ("relative/project".to_string(), "resolve=ancestors"),
+                    (oversized, "resolve=ancestors"),
+                    (deep, "resolve=ancestors"),
+                    (parent_traversal, "resolve=ancestors"),
+                    (format!("{absolute}/bad\0path"), "resolve=ancestors"),
+                ] {
+                    let err = project_details_query(&ctx, path, query.to_string())
+                        .await
+                        .expect_err("invalid request");
+                    assert_eq!(err.code, McpErrorCode::InvalidParams);
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("ancestor project resolution")
+                            || message.contains("resolve must"),
+                        "must fail path validation before database open: {err}"
+                    );
+                }
+            });
+        });
+    }
+
     struct PopulatedMailboxFixture {
         ctx: McpContext,
         project_ref: String,
@@ -6042,6 +8993,41 @@ mod resource_shape_tests {
                     !thread_value.to_string().contains(&hidden.name),
                     "thread resource leaked hidden recipient name"
                 );
+
+                let message_context = parse_json(
+                    &message_details(
+                        &ctx,
+                        format!(
+                            "{}?project={project_ref}&context=true",
+                            message.id.unwrap_or(0)
+                        ),
+                    )
+                    .await
+                    .expect("complete message context"),
+                );
+                assert_eq!(message_context["schema_version"], 1);
+                assert_eq!(message_context["complete"], true);
+                assert_eq!(message_context["project"]["id"], project_id);
+                assert_eq!(message_context["position"], 1);
+                assert_eq!(message_context["total_in_thread"], 1);
+                assert_eq!(message_context["message"]["recipient_count"], 2);
+                assert_eq!(message_context["message"]["acked_count"], 0);
+                assert_eq!(message_context["message"]["body_md"], "Hidden body.");
+                assert!(!message_context.to_string().contains(&hidden.name));
+
+                let thread_context = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&context=true&limit=1&include_bodies=true"),
+                    ).await.expect("complete thread context"),
+                );
+                assert_eq!(thread_context["schema_version"], 1);
+                assert_eq!(thread_context["complete"], true);
+                assert_eq!(thread_context["message_count"], 1);
+                assert_eq!(thread_context["omitted_older"], 0);
+                assert_eq!(thread_context["messages"][0]["recipient_count"], 2);
+                assert_eq!(thread_context["messages"][0]["body_md"], "Hidden body.");
+                assert!(!thread_context.to_string().contains(&hidden.name));
             });
         });
     }
@@ -6170,11 +9156,13 @@ mod resource_shape_tests {
 
                 let config_value = parse_json(&config_environment(&ctx).expect("config env"));
                 assert!(config_value.is_object());
+                assert_eq!(config_value["inbox_priority_snapshot"], "priority_v1");
                 let config_query_value = parse_json(
                     &config_environment_query(&ctx, "format=json".to_string())
                         .expect("config env query"),
                 );
                 assert!(config_query_value.is_object());
+                assert_eq!(config_query_value["inbox_priority_snapshot"], "priority_v1");
 
                 let identity_value =
                     parse_json(&identity_project(&ctx, project_ref.clone()).expect("identity"));
@@ -6956,6 +9944,109 @@ mod resource_shape_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn acknowledgement_views_include_shared_mail_and_keep_receipts_per_viewer() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project_key = format!("/tmp/resources-shared-acks-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let viewer = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                register_agent(&cx, &pool, project_id, "GreenStone").await;
+                let message = queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    "Shared acknowledgement",
+                    "All eligible project readers need their own acknowledgement.",
+                    None,
+                    None,
+                    None,
+                    "high",
+                    true,
+                    "[]",
+                    &[],
+                    Some("to"),
+                )
+                .await
+                .into_result()
+                .expect("create shared message through the normal send query");
+                let message_id = message.id.unwrap();
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE agents SET inception_ts = 0 WHERE project_id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = created_ts - ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .unwrap();
+                drop(conn);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                for agent in ["RedPeak", "GreenStone"] {
+                    let stale = parse_json(
+                        &views_acks_stale(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_seconds=60"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(stale["count"], 1);
+                    assert_eq!(stale["messages"][0]["id"], message_id);
+                    assert_eq!(stale["messages"][0]["kind"], "project");
+                    assert!(stale["messages"][0].get("read_at").is_none());
+                    let overdue = parse_json(
+                        &views_ack_overdue(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_minutes=1"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(overdue["count"], 1);
+                    assert_eq!(overdue["messages"][0]["id"], message_id);
+                    assert_eq!(overdue["messages"][0]["kind"], "project");
+                }
+
+                queries::acknowledge_message(&cx, &pool, viewer.id.unwrap(), message_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                for (agent, expected_count) in [("RedPeak", 0), ("GreenStone", 1)] {
+                    let stale = parse_json(
+                        &views_acks_stale(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_seconds=60"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(stale["count"], expected_count);
+                    let overdue = parse_json(
+                        &views_ack_overdue(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_minutes=1"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(overdue["count"], expected_count);
+                }
+            });
+        });
+    }
+
+    #[test]
     fn resources_surface_malformed_message_metadata() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
@@ -7437,8 +10528,35 @@ mod resource_shape_tests {
                     with_bodies_value["messages"][0]["body_md"],
                     "Thread toggle body text"
                 );
+
+                let context = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&context=true&limit=0"),
+                    )
+                    .await
+                    .expect("count-only complete context"),
+                );
+                assert_eq!(context["message_count"], 1);
+                assert_eq!(context["omitted_older"], 1);
+                assert_eq!(context["messages"], serde_json::json!([]));
+                assert_eq!(context["participants"].as_array().map(Vec::len), Some(2));
+                for invalid_limit in ["1001", "-1", "not-a-number"] {
+                    assert!(thread_details(&ctx, format!(
+                        "{thread_id}?project={project_ref}&context=true&limit={invalid_limit}"
+                    )).await.is_err());
+                }
             });
         });
+    }
+
+    #[test]
+    fn context_snapshot_rejects_json_escape_expansion() {
+        let payload = serde_json::json!({"body": "\u{0001}".repeat(
+            mcp_agent_mail_db::message_context::MAX_CONTEXT_BYTES / 2
+        )});
+        assert!(context_snapshot_json(&payload).is_err());
+        assert!(context_snapshot_json(&serde_json::json!({"complete":true})).is_ok());
     }
 
     #[test]

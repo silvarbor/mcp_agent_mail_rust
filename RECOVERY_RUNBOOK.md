@@ -18,6 +18,89 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Metrics-index growth and memory exhaustion (GH#372)
+
+Upgrade to an Agent Mail build using FrankenSQLite **0.4.13** before repairing
+a mailbox affected by [issue #372](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/372).
+The corrected B-tree insertion prevents new index bloat, but upgrading does
+not reclaim existing sparse pages. `PRAGMA integrity_check = ok` does not
+rule out this problem.
+
+**Stop every server using the mailbox first, and keep it stopped for the
+entire operation.** With the affected server's `DATABASE_URL` and
+`STORAGE_ROOT`, confirm `am doctor drain --json` reports
+`safe_to_mutate=true`, preview with `am doctor vacuum`, then apply with
+**`am doctor vacuum --yes`**. The default without `--yes` only previews.
+The command refuses ownership overrides, holds exclusive mailbox locks,
+retains a verified standalone backup including committed WAL rows, and checks
+message/recipient contents as well as integrity after compaction. It never
+automatically rebuilds an active mailbox or reconstructs messages from the
+archive. Keep the server stopped on any error.
+
+See the [complete offline procedure](docs/RECOVERY_RUNBOOK.md#metrics-index-growth-and-memory-exhaustion-gh372)
+for supervisor/container guidance, backup locations, disk-space requirements,
+verification, temporary metrics-disable mitigation, and failure handling.
+
+## Keep pre-incident backups before restarting
+
+A cold start of the HTTP/TUI server (no Agent Mail server already answering on
+the port) rotates the backup files next to `storage.sqlite3`. It keeps the
+newest `AM_BACKUP_KEEP_COUNT` (default 3, minimum 1) of each kind: `.bak*` and
+`manual-backup-*`, `corrupt-*`, `reconstruct-*`, `archive-reconcile-*`,
+`salvage-*`, and `pre-migrate*` / `pre-python-import*` / `pre-acfs-import*` /
+`pre-reindex*`. Incident evidence is moved to
+`<storage_root>/doctor/reclaimable/rotation-<timestamp>/`. Archive-reconcile
+evidence remains owned by the separate recovery-retention planner.
+
+Periodic dated `.bak.YYYYMMDD_HHMMSS[-NN]` generations have a different policy
+on Unix: excess generations are deleted only when a newer hash-bound snapshot
+passes full integrity verification under exclusive snapshot admission. The
+exact `.bak` publication slot and the verified source are always retained.
+Old `rotation-*` directories are swept with the same checks, one strict periodic
+file at a time; incident files, unknown names, nested directories, symlinks and
+hard-linked aliases are never automatically removed by this sweep.
+Empty native rotation directories are removed separately in bounded passes,
+including previously accumulated empty directories. Active staging leases,
+unknown directories, nested trees and recorded recovery evidence are preserved.
+
+Retention shares recovery's durable election. An active recovery, any occupied
+legacy `.recovery.lock`, or an unresolved `.pending` recovery receipt prevents
+reclamation. Explicit CLI restore acquires the election before staging its
+source. These references are recovery evidence even when the original process
+has exited; resolve the interrupted operation before retrying cleanup.
+
+Unset `AM_BACKUP_ROTATION_DELETE` enables this periodic reclamation. Explicit
+false preserves move-only retention. Explicit true also permits verified
+incident deletion, requiring a fully verified successor, matching mailbox
+lineage or duplicate bytes, and no live readers, aliases or companion state.
+Unsupported platforms preserve incident evidence. Without safe reclamation,
+automatic publication refuses at `max(1, AM_BACKUP_KEEP_COUNT) + 3` existing
+periodic images, including prior rotation staging, or when retained logical
+bytes plus the estimated new export exceed the larger of 512 MiB and
+`(max(1, AM_BACKUP_KEEP_COUNT) + 3) × (current database bytes + WAL bytes)`.
+The full observed reclaimable directory footprint spends that byte allowance.
+A durable journal permits at most one extra repair export to restore missing
+verification authority; a crash or failed export does not reset that allowance.
+The periodic producer therefore stops adding copies when safe reclamation
+cannot progress. Existing over-budget evidence is preserved. These admission
+bounds apply to cooperating automatic exporters; they are not a filesystem
+quota covering database growth, operator exports, or other programs. See the
+[operator cookbook](docs/OPERATOR_COOKBOOK.md#13-run-doctor-checks-and-inspect-backups-read-only)
+for the complete retention and repair policy.
+When admission warns that its retention budget is exhausted, repair snapshot
+authority or explicitly reclaim retained backups; the guard backs off without
+classifying the mailbox as corrupt or stopping message writes.
+
+A restart after an integrity incident writes new backups, which can rotate the
+last pre-incident backup out (GH#278). Before restarting a server that reported
+corruption, copy the backups somewhere outside the storage root:
+
+```bash
+db=$(am doctor locks --json | jq -r .database_path)   # read-only
+mkdir -p ~/am-incident-backups
+cp -p "$db".bak* ~/am-incident-backups/
+```
+
 ---
 
 ## Git 2.51.0 Index Race
@@ -82,7 +165,7 @@ am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_IN
 
    ```bash
    # Dry-run (default): see what would be pruned
-   am doctor fix-orphan-refs --all --dry-run --format json
+   am doctor fix-orphan-refs --all --format json
 
    # Review, then apply
    am doctor fix-orphan-refs --all --apply
