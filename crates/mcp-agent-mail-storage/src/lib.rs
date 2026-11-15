@@ -10449,6 +10449,11 @@ fn merge_agent_profile_publication(
     // Working extensions supersede committed extensions; explicit incoming
     // fields supersede both. Credentials are never carried into a new commit.
     merged.extend(fields.clone());
+    // A display label is cleared by leaving it out of the incoming profile,
+    // so a published label must not survive the merge.
+    if !fields.contains_key("display_name") {
+        merged.remove("display_name");
+    }
     merged.remove("registration_token");
     let bytes = serde_json::to_vec_pretty(&merged)?;
     if bytes.len() as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
@@ -19086,6 +19091,28 @@ mod tests {
                 assert_eq!(committed_publication_profile(&archive), before);
             }
         }
+    }
+
+    #[test]
+    fn agent_profile_publication_drops_a_display_name_the_update_leaves_out() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-labels").unwrap();
+        let mut labelled = publication_agent_profile();
+        labelled["display_name"] = serde_json::json!("Officer Alpha");
+        labelled["extension"] = serde_json::json!({"operator_note": "retain"});
+        write_agent_profile_with_config(&archive, &config, &labelled).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert_eq!(stored["display_name"], "Officer Alpha");
+
+        // Clearing a label omits the field. Other published fields stay.
+        write_agent_profile_with_config(&archive, &config, &publication_agent_profile()).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert!(stored.get("display_name").is_none());
+        assert_eq!(stored["extension"], labelled["extension"]);
     }
 
     #[test]
