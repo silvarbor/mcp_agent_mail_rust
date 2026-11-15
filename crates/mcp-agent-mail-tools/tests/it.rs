@@ -17,6 +17,7 @@ mod idempotency_tool_acceptance;
 mod lifecycle_auth_transport;
 mod messaging_error_parity;
 mod project_mailbox;
+mod recipient_addressing;
 mod registration_proof_gate;
 mod reservation_error_parity;
 mod reservation_regression_fixtures;

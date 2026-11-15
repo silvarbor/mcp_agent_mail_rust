@@ -22,6 +22,7 @@ mod health_sweep_orphan_refs;
 mod http_logging;
 mod observability_schemas;
 mod pty_e2e_search;
+mod recipient_addressing;
 mod segfault_toast;
 mod startup_compat;
 mod truthfulness_integration;

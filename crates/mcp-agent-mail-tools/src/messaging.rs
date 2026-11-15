@@ -312,7 +312,7 @@ fn contact_blocked_error() -> McpError {
     )
 }
 
-fn agent_retired_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
+pub(crate) fn agent_retired_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
     legacy_tool_error(
         "AGENT_RETIRED",
         format!(
@@ -1864,7 +1864,11 @@ fn normalize_send_message_to_argument(
             Ok(())
         }
         Value::Array(items) => {
-            if let Some(invalid_item) = items.iter().find(|item| !item.is_string()) {
+            crate::recipient_addressing::validate_recipient_objects("to", &items)?;
+            if let Some(invalid_item) = items
+                .iter()
+                .find(|item| !item.is_string() && !item.is_object())
+            {
                 return Err(legacy_tool_error(
                     "INVALID_ARGUMENT",
                     format!(
@@ -1913,7 +1917,11 @@ fn normalize_send_message_cc_bcc_argument(
             Ok(())
         }
         Value::Array(items) => {
-            if let Some(invalid_item) = items.iter().find(|item| !item.is_string()) {
+            crate::recipient_addressing::validate_recipient_objects(field, &items)?;
+            if let Some(invalid_item) = items
+                .iter()
+                .find(|item| !item.is_string() && !item.is_object())
+            {
                 return Err(legacy_tool_error(
                     "INVALID_ARGUMENT",
                     format!(

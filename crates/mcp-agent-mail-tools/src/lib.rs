@@ -420,6 +420,7 @@ pub mod messaging;
 pub mod metrics;
 pub mod products;
 pub mod proof_gate;
+pub mod recipient_addressing;
 pub mod reservation_index;
 pub mod reservation_parity;
 pub mod reservations;
@@ -626,6 +627,7 @@ pub mod tool_util {
                 | "CONTACT_BLOCKED"
                 | "CONTACTS_ONLY"
                 | "CROSS_PROJECT_RECIPIENT"
+                | "RECIPIENT_DISPLAY_NAME_AMBIGUOUS"
                 // Feature-disabled refusals.
                 | "BROADCAST_DISABLED"
                 | "FEATURE_DISABLED"
