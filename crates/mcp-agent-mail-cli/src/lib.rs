@@ -2166,9 +2166,17 @@ pub enum MailCommand {
         /// Sender agent name.
         #[arg(long = "from")]
         sender: String,
-        /// Primary recipients (comma-separated agent names).
-        #[arg(long)]
-        to: String,
+        /// Primary recipients (comma-separated agent names). Required unless
+        /// a display-name flag names a recipient.
+        #[arg(
+            long,
+            required_unless_present_any = ["to_display_name", "cc_display_name"]
+        )]
+        to: Option<String>,
+        /// Primary recipient by display name. Repeat the flag for several;
+        /// each value is one label, taken whole (commas are part of it).
+        #[arg(long = "to-display-name", value_name = "LABEL")]
+        to_display_name: Vec<String>,
         /// Subject line.
         #[arg(long, short = 's')]
         subject: String,
@@ -2178,6 +2186,10 @@ pub enum MailCommand {
         /// CC recipients (comma-separated).
         #[arg(long)]
         cc: Option<String>,
+        /// CC recipient by display name. Repeat the flag for several; each
+        /// value is one label, taken whole (commas are part of it).
+        #[arg(long = "cc-display-name", value_name = "LABEL")]
+        cc_display_name: Vec<String>,
         /// Importance: low, normal, high, urgent.
         #[arg(long, default_value = "normal")]
         importance: String,
@@ -2268,6 +2280,10 @@ pub enum MailCommand {
         /// Override recipients (comma-separated; defaults to original sender).
         #[arg(long)]
         to: Option<String>,
+        /// Override recipient by display name. Repeat the flag for several;
+        /// each value is one label, taken whole (commas are part of it).
+        #[arg(long = "to-display-name", value_name = "LABEL")]
+        to_display_name: Vec<String>,
         /// Sender token proving ownership of --from, as for `mail send`
         /// (prefer --sender-token-file or AGENT_MAIL_SENDER_TOKEN; a token
         /// persisted by `am agents register` / `am macros start-session` is
@@ -2410,6 +2426,13 @@ struct PendingMailSendEnvelope {
     thread_id: Option<String>,
     #[serde(default)]
     topic: Option<String>,
+    /// Primary recipients by display name. Left out of the artifact when
+    /// empty, so an envelope without them keeps its content hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    to_display_names: Vec<String>,
+    /// CC recipients by display name; see `to_display_names`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cc_display_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40024,6 +40047,54 @@ fn split_optional_cli_agent_list(value: Option<&String>) -> Vec<String> {
     value.map_or_else(Vec::new, |items| split_cli_agent_list(items))
 }
 
+/// Add display-name recipients to one recipient list of a `send_message` or
+/// `reply_message` call. Each label becomes a `{"display_name": ...}`
+/// selector, which the server resolves.
+fn append_display_name_recipients(
+    arguments: &mut serde_json::Value,
+    field: &str,
+    display_names: &[String],
+) {
+    if display_names.is_empty() {
+        return;
+    }
+    let Some(arguments) = arguments.as_object_mut() else {
+        return;
+    };
+    let list = arguments
+        .entry(field.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(items) = list.as_array_mut() {
+        items.extend(
+            display_names
+                .iter()
+                .map(|label| serde_json::json!({ "display_name": label })),
+        );
+    }
+}
+
+/// The stable names that display names address in one project, for a send or
+/// a reply that runs in this process instead of through the server.
+async fn resolve_display_names_locally(
+    project_key: &str,
+    display_names: &[String],
+) -> CliResult<Vec<String>> {
+    if display_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx = McpContext::new(
+        mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+        1,
+    );
+    mcp_agent_mail_tools::recipient_addressing::resolve_display_names(
+        &ctx,
+        project_key,
+        display_names,
+    )
+    .await
+    .map_err(mcp_error_to_cli_error)
+}
+
 fn cli_output_to_display_recipients(payload: &serde_json::Value, fallback: &[String]) -> String {
     payload
         .get("to")
@@ -40052,26 +40123,22 @@ async fn send_mail_envelope_via_server_or_local(
     } else {
         Some(envelope.cc.as_slice())
     };
-    match try_call_server_tool(
-        server_url,
-        bearer,
-        "send_message",
-        build_server_send_message_arguments(
-            &envelope.project_key,
-            &envelope.sender,
-            &envelope.to,
-            &envelope.subject,
-            &envelope.body_md,
-            cc_names,
-            &envelope.importance,
-            envelope.ack_required,
-            envelope.thread_id.as_deref(),
-            envelope.topic.as_deref(),
-            sender_token,
-        ),
-    )
-    .await
-    {
+    let mut server_arguments = build_server_send_message_arguments(
+        &envelope.project_key,
+        &envelope.sender,
+        &envelope.to,
+        &envelope.subject,
+        &envelope.body_md,
+        cc_names,
+        &envelope.importance,
+        envelope.ack_required,
+        envelope.thread_id.as_deref(),
+        envelope.topic.as_deref(),
+        sender_token,
+    );
+    append_display_name_recipients(&mut server_arguments, "to", &envelope.to_display_names);
+    append_display_name_recipients(&mut server_arguments, "cc", &envelope.cc_display_names);
+    match try_call_server_tool(server_url, bearer, "send_message", server_arguments).await {
         ServerToolCall::Success(result) => {
             let payload = coerce_tool_result_json_or_error("send_message", result)?;
             return server_message_payload_to_cli_json(payload).ok_or_else(|| {
@@ -40100,10 +40167,25 @@ async fn send_mail_envelope_via_server_or_local(
         }
     }
 
+    // In this process the tool takes stable names only: resolve the display
+    // names here, as the server's handler does for a call that reaches it.
+    let mut local_to = envelope.to.clone();
+    local_to.extend(
+        resolve_display_names_locally(&envelope.project_key, &envelope.to_display_names).await?,
+    );
+    let mut local_cc = envelope.cc.clone();
+    local_cc.extend(
+        resolve_display_names_locally(&envelope.project_key, &envelope.cc_display_names).await?,
+    );
+    let cc_names = if local_cc.is_empty() {
+        None
+    } else {
+        Some(local_cc.as_slice())
+    };
     let local_send_future = Box::pin(call_send_message_tool_locally(
         &envelope.project_key,
         &envelope.sender,
-        &envelope.to,
+        &local_to,
         &envelope.subject,
         &envelope.body_md,
         cc_names,
@@ -40749,9 +40831,11 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             project_key,
             sender,
             to,
+            to_display_name,
             subject,
             body,
             cc,
+            cc_display_name,
             importance,
             ack_required,
             thread_id,
@@ -40769,8 +40853,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 sender_token.as_deref(),
                 sender_token_file.as_deref(),
             )?;
-            let to_names = split_cli_agent_list(&to);
-            if to_names.is_empty() {
+            let to_names = split_optional_cli_agent_list(to.as_ref());
+            if to_names.is_empty() && to_display_name.is_empty() && cc_display_name.is_empty() {
                 return Err(CliError::InvalidArgument(
                     "--to requires at least one recipient".into(),
                 ));
@@ -40789,6 +40873,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 ack_required,
                 thread_id,
                 topic,
+                to_display_names: to_display_name,
+                cc_display_names: cc_display_name,
             };
             let data = send_mail_envelope_via_server_or_local(
                 &server_config,
@@ -40961,6 +41047,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             message_id,
             body,
             to,
+            to_display_name,
             sender_token,
             sender_token_file,
             format,
@@ -40984,18 +41071,20 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 sender_token.as_deref(),
                 sender_token_file.as_deref(),
             )?;
+            let mut server_arguments = build_server_reply_message_arguments(
+                &project_key,
+                message_id,
+                &sender,
+                &body,
+                explicit_to.as_deref(),
+                resolved_sender_token.as_deref(),
+            );
+            append_display_name_recipients(&mut server_arguments, "to", &to_display_name);
             match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
                 "reply_message",
-                build_server_reply_message_arguments(
-                    &project_key,
-                    message_id,
-                    &sender,
-                    &body,
-                    explicit_to.as_deref(),
-                    resolved_sender_token.as_deref(),
-                ),
+                server_arguments,
             )
             .await
             {
@@ -41038,12 +41127,20 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
             }
 
+            // In this process the tool takes stable names only.
+            let local_to = if to_display_name.is_empty() {
+                explicit_to
+            } else {
+                let mut names = explicit_to.unwrap_or_default();
+                names.extend(resolve_display_names_locally(&project_key, &to_display_name).await?);
+                Some(names)
+            };
             let payload = call_reply_message_tool_locally(
                 &project_key,
                 message_id,
                 &sender,
                 &body,
-                explicit_to.as_deref(),
+                local_to.as_deref(),
                 resolved_sender_token.as_deref(),
             )
             .await?;
@@ -44179,7 +44276,87 @@ mod mail_server_cli_bridge_tests {
             ack_required: false,
             thread_id: Some("br-test".to_string()),
             topic: Some("br-test.1".to_string()),
+            to_display_names: Vec::new(),
+            cc_display_names: Vec::new(),
         }
+    }
+
+    #[test]
+    fn display_name_recipients_reach_the_server_as_selector_objects() {
+        use super::append_display_name_recipients as append;
+
+        let mut arguments = build_server_send_message_arguments(
+            "/tmp/proj",
+            "BlueLake",
+            &["RedFox".to_string()],
+            "Release",
+            "Ready",
+            None,
+            "normal",
+            false,
+            None,
+            None,
+            None,
+        );
+        let unchanged = arguments.clone();
+        append(&mut arguments, "to", &[]);
+        append(&mut arguments, "cc", &[]);
+        assert_eq!(arguments, unchanged, "no display name changes nothing");
+
+        append(&mut arguments, "to", &["Team A, B".to_string()]);
+        append(&mut arguments, "cc", &["Auditor".to_string()]);
+        assert_eq!(
+            arguments["to"],
+            serde_json::json!(["RedFox", { "display_name": "Team A, B" }])
+        );
+        assert_eq!(
+            arguments["cc"],
+            serde_json::json!([{ "display_name": "Auditor" }])
+        );
+
+        let mut reply =
+            build_server_reply_message_arguments("/tmp/proj", 7, "BlueLake", "ok", None, None);
+        append(&mut reply, "to", &["Team A, B".to_string()]);
+        assert_eq!(
+            reply["to"],
+            serde_json::json!([{ "display_name": "Team A, B" }])
+        );
+    }
+
+    #[test]
+    fn pending_send_envelope_carries_display_names_only_when_present() {
+        let plain = pending_send_test_envelope();
+        let serialized = serde_json::to_value(&plain).expect("serialize envelope");
+        let fields = serialized.as_object().expect("envelope object");
+        assert!(!fields.contains_key("to_display_names"));
+        assert!(!fields.contains_key("cc_display_names"));
+        // An artifact written before display names existed still loads.
+        let reloaded: PendingMailSendEnvelope =
+            serde_json::from_value(serialized).expect("load an envelope without the fields");
+        assert_eq!(reloaded, plain);
+
+        let labelled = PendingMailSendEnvelope {
+            to_display_names: vec!["Team A, B".to_string()],
+            cc_display_names: vec!["Auditor".to_string()],
+            ..plain.clone()
+        };
+        let serialized = serde_json::to_value(&labelled).expect("serialize envelope");
+        assert_eq!(
+            serialized["to_display_names"],
+            serde_json::json!(["Team A, B"])
+        );
+        assert_eq!(
+            serialized["cc_display_names"],
+            serde_json::json!(["Auditor"])
+        );
+        let reloaded: PendingMailSendEnvelope =
+            serde_json::from_value(serialized).expect("load an envelope with the fields");
+        assert_eq!(reloaded, labelled);
+        assert_ne!(
+            pending_send_content_hash(&labelled).expect("hash"),
+            pending_send_content_hash(&plain).expect("hash"),
+            "a different recipient is a different queued send"
+        );
     }
 
     #[test]
@@ -75152,6 +75329,134 @@ startup_timeout_sec = 42
                 action: MailCommand::Send { topic, .. },
             } => assert_eq!(topic.as_deref(), Some("release.v31")),
             other => panic!("expected Mail Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_send_display_name_recipients() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "send",
+            "--project",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--to-display-name",
+            "Team A, B",
+            "--to-display-name",
+            "SPX Maintainer",
+            "--cc-display-name",
+            "Night Reviewer",
+            "--subject",
+            "Release",
+            "--body",
+            "Ready",
+        ])
+        .expect("mail send needs no --to when a display-name flag names a recipient");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action:
+                    MailCommand::Send {
+                        to,
+                        to_display_name,
+                        cc,
+                        cc_display_name,
+                        ..
+                    },
+            } => {
+                assert_eq!(to, None);
+                // Each value is one label: the comma is part of the first.
+                assert_eq!(to_display_name, ["Team A, B", "SPX Maintainer"]);
+                assert_eq!(cc, None);
+                assert_eq!(cc_display_name, ["Night Reviewer"]);
+            }
+            other => panic!("expected Mail Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_requires_a_mail_send_recipient_of_either_kind() {
+        let base = [
+            "am",
+            "mail",
+            "send",
+            "--project",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--subject",
+            "Release",
+            "--body",
+            "Ready",
+        ];
+        let error = Cli::try_parse_from(base).expect_err("mail send needs a recipient");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let with_to = base.into_iter().chain(["--to", "RedFox"]);
+        match Cli::try_parse_from(with_to)
+            .expect("--to alone is enough")
+            .command
+            .expect("expected command")
+        {
+            Commands::Mail {
+                action:
+                    MailCommand::Send {
+                        to,
+                        to_display_name,
+                        cc_display_name,
+                        ..
+                    },
+            } => {
+                assert_eq!(to.as_deref(), Some("RedFox"));
+                assert!(to_display_name.is_empty());
+                assert!(cc_display_name.is_empty());
+            }
+            other => panic!("expected Mail Send, got {other:?}"),
+        }
+
+        let with_cc_label = base.into_iter().chain(["--cc-display-name", "Auditor"]);
+        Cli::try_parse_from(with_cc_label).expect("a cc display name is a recipient");
+    }
+
+    #[test]
+    fn clap_parses_mail_reply_display_name_recipient() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "reply",
+            "--project",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--message-id",
+            "7",
+            "--body",
+            "ok",
+            "--to",
+            "RedFox",
+            "--to-display-name",
+            "Team A, B",
+        ])
+        .expect("mail reply should accept --to-display-name");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action:
+                    MailCommand::Reply {
+                        to,
+                        to_display_name,
+                        ..
+                    },
+            } => {
+                assert_eq!(to.as_deref(), Some("RedFox"));
+                assert_eq!(to_display_name, ["Team A, B"]);
+            }
+            other => panic!("expected Mail Reply, got {other:?}"),
         }
     }
 

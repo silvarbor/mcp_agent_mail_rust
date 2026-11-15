@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
 use serde_json::{Value, json};
 
+mod recipient_addressing;
+
 fn am_bin() -> PathBuf {
     // Cargo sets this for integration tests.
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
