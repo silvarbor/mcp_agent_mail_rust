@@ -1,0 +1,28 @@
+# Tests that pass on Linux and fail on macOS for reasons that are in upstream's
+# code, not in the fork's changes. The macOS test job leaves them out, in
+# addition to the tests in `upstream-failures.txt`.
+#
+# Upstream does not build its tests on macOS, so no upstream run can serve as
+# a macOS baseline. When a test fails only in the macOS job, build the upstream
+# commit in `upstream-base` plus the fork's macOS portability commit on a Mac,
+# without `-D warnings`, and run that test there. If it fails there too, add
+# it here. If it passes there, the failure is the fork's to fix. One test per
+# line: nextest binary id, a space, the test name.
+#
+# Source: upstream 9ba8eede54a42f9adc1f34603f40244d09781fed plus fork commit
+# ee4b6f8e, macOS 27.2 on Apple Silicon, 15 November 2026. The same tests fail
+# on the fork on a GitHub-hosted macOS runner, run
+# https://github.com/silvarbor/mcp_agent_mail_rust/actions/runs/43657307449.
+
+# The test server reads from an accepted socket that inherits the listener's
+# non-blocking mode on macOS and gets `WouldBlock`.
+mcp-agent-mail-cli reservation_read::tests::health_probe_refuses_rejections_malformed_replies_and_identity_drift
+
+# Two of its 22 Python cases assume Linux: a file name with the byte 0xff,
+# which APFS refuses, and a repository created with `core.ignorecase` off.
+mcp-agent-mail-guard tests::guard_commit_admission_runs_native_rendered_programs_against_real_git
+
+# The startup probe reports the fixture database as locked by another process.
+mcp-agent-mail-server tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes
+mcp-agent-mail-server tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness
+mcp-agent-mail-server tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes

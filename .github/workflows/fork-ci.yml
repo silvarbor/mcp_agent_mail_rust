@@ -15,7 +15,9 @@
 #     relative to the upstream commit in `.github/fork-ci/upstream-base`. A
 #     failure there is the fork's to fix. Tests that already fail on that
 #     upstream commit are listed in `.github/fork-ci/upstream-failures.txt`
-#     and left out.
+#     and left out. The macOS job also leaves out the tests in
+#     `.github/fork-ci/macos-failures.txt`, which upstream's code fails on
+#     macOS.
 #   - On a `ci-baseline/**` branch, or started by hand with `full`: the whole
 #     workspace suite. It takes over an hour and fails for upstream's reasons
 #     too, so it is the tool for an upstream sync, not for every change.
@@ -48,9 +50,20 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   # Decide freshness by file content, not by timestamp. A fresh checkout gives
   # every source file a new timestamp, which would otherwise rebuild all of the
-  # workspace's own crates even when the cache holds them.
+  # workspace's own crates even when the cache holds them. Cargo needs both
+  # settings: the first permits the second.
   CARGO_UNSTABLE_CHECKSUM_FRESHNESS: "true"
+  CARGO_BUILD_FINGERPRINT: content
   RUSTFLAGS: "-D warnings"
+  # The `tru` dependency's build script embeds a commit id and reads it from
+  # `GITHUB_SHA` when this variable is unset. `GITHUB_SHA` differs on every run,
+  # which reruns that script and then recompiles `tru` and every crate that
+  # depends on it, the CLI among them. A constant keeps the cached build valid.
+  VERGEN_GIT_SHA: fork-ci
+  # The `native_*_gate` tests each run one shell end-to-end suite and reserve
+  # every test thread for up to ten minutes per attempt. End-to-end runs start
+  # by hand in this workflow, so the test jobs leave these tests out.
+  E2E_WRAPPERS: "test(/::native_[a-z_]+_gate$/)"
 
 jobs:
   allowlist:
@@ -159,9 +172,13 @@ jobs:
       - name: Select the tests in files the fork changed
         run: |
           set -euo pipefail
+          excludes=(--exclude .github/fork-ci/upstream-failures.txt)
+          if [ "$RUNNER_OS" = macOS ]; then
+            excludes+=(--exclude .github/fork-ci/macos-failures.txt)
+          fi
           python3 .github/fork-ci/select_tests.py \
             --base "$(cat .github/fork-ci/upstream-base)" \
-            --exclude .github/fork-ci/upstream-failures.txt \
+            "${excludes[@]}" \
             --explain > "${RUNNER_TEMP}/nextest-filter.txt"
       - name: Run the selected tests
         env:
@@ -170,7 +187,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$STORAGE_ROOT"
           cargo nextest run --workspace --locked --profile ci --no-fail-fast --no-tests=pass \
-            -E "$(cat "${RUNNER_TEMP}/nextest-filter.txt")"
+            -E "($(cat "${RUNNER_TEMP}/nextest-filter.txt")) & not ${E2E_WRAPPERS}"
 
   full:
     name: Whole suite / ubuntu-latest
@@ -204,7 +221,8 @@ jobs:
           # have been listed, so a failing suite must not stop this step.
           set +e
           mkdir -p "$STORAGE_ROOT"
-          cargo nextest run --workspace --locked --profile ci --no-fail-fast 2>&1 \
+          cargo nextest run --workspace --locked --profile ci --no-fail-fast \
+            -E "not ${E2E_WRAPPERS}" 2>&1 \
             | tee "${RUNNER_TEMP}/nextest.log"
           echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
       - name: List the failed tests

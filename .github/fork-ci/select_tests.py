@@ -10,7 +10,7 @@ fix. A test in a file the fork never touched can only fail for upstream's
 reasons or the runner's, so it is left to the full-suite job.
 
 Usage:
-    select_tests.py --base <upstream-commit> [--exclude <file>] [--explain]
+    select_tests.py --base <upstream-commit> [--exclude <file>]... [--explain]
 
 The repository must be the current directory, and both the base commit and
 HEAD must be present in it.
@@ -172,7 +172,7 @@ def test_prefix(module: str) -> str:
     return "^" + re.escape(module).replace("\\:", ":") + "::"
 
 
-def build_filter(base: str, exclude_file: str | None, explain: bool) -> str:
+def build_filter(base: str, exclude_files: list[str], explain: bool) -> str:
     changed = changed_files(base)
     if any(
         name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml") for name in changed
@@ -235,7 +235,7 @@ def build_filter(base: str, exclude_file: str | None, explain: bool) -> str:
                 print(f"{name} -> no workspace target", file=sys.stderr)
 
     excluded: dict[str, list[str]] = defaultdict(list)
-    if exclude_file and os.path.isfile(exclude_file):
+    for exclude_file in exclude_files:
         with open(exclude_file, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -286,7 +286,10 @@ def main() -> int:
         help="print the failed tests of a nextest log, in the --exclude file format",
     )
     parser.add_argument(
-        "--exclude", help="file listing tests that fail on the upstream commit"
+        "--exclude",
+        action="append",
+        default=[],
+        help="file listing tests to leave out; may be given more than once",
     )
     parser.add_argument(
         "--explain",
