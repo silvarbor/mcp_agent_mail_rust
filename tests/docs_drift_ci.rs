@@ -23,6 +23,7 @@ mod container_release_contract {
     fn read(relative: &str) -> String {
         let path = workspace_root().join(relative);
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required repository fixture cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 
@@ -114,8 +115,22 @@ mod container_release_contract {
             "if printf '%s' \"${AM_REF}\" | grep -Eq '^[0-9a-f]{40}$'; then",
             "git fetch --depth 1 origin \"${AM_REF}\";",
             "git checkout -q FETCH_HEAD;",
+            "    cargo build --release --locked \\\n",
         ] {
             require_exactly_once(source_dockerfile, needle)?;
+        }
+        for obsolete in [
+            "SIBLING_REF",
+            "FRANKENSEARCH_COMMIT",
+            "/build/frankensearch-rel-0332",
+            "/build/beads_rust",
+        ] {
+            if source_dockerfile.contains(obsolete) {
+                return Err(format!("obsolete container dependency input: {obsolete}"));
+            }
+        }
+        if workflow.contains("sibling_ref") {
+            return Err("obsolete sibling_ref workflow input remains".to_string());
         }
 
         let release_instructions = release_dockerfile
@@ -144,8 +159,7 @@ mod container_release_contract {
 
     /// Extract the value assigned on the first line starting with `prefix`.
     ///
-    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
-    /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
+    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a workflow.
     fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
         text.lines().map(str::trim).find_map(|line| {
             line.strip_prefix(prefix)
@@ -154,41 +168,56 @@ mod container_release_contract {
         })
     }
 
-    /// The source Dockerfile must build against the frankensearch revision
-    /// dist.yml pins.
-    ///
-    /// Cloning the sibling at a floating ref broke
-    /// every `docker build` once the live frankensearch tree moved to a
-    /// newer asupersync than the rest of the workspace can follow.
+    /// Check Cargo's actual workspace declarations against the release pin.
+    /// The source container consumes these declarations with `--locked`.
     #[test]
-    fn source_dockerfile_pins_frankensearch_to_the_dist_commit() {
+    fn cargo_frankensearch_declarations_match_the_dist_commit() {
         let dist = read(".github/workflows/dist.yml");
-        let dockerfile = read("Dockerfile");
-
         let dist_commit = assigned_value(&dist, "FRANKENSEARCH_COMMIT", ':')
             .expect("dist.yml declares FRANKENSEARCH_COMMIT");
-        let dockerfile_commit = assigned_value(&dockerfile, "ARG FRANKENSEARCH_COMMIT", '=')
-            .expect("Dockerfile declares ARG FRANKENSEARCH_COMMIT");
-
         assert_eq!(dist_commit.len(), 40, "dist.yml commit must be a full SHA");
         assert!(
-            dist_commit.bytes().all(|b| b.is_ascii_hexdigit()),
-            "dist.yml commit must be hex"
+            dist_commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "dist.yml commit must be lowercase hex"
         );
-        assert_eq!(
-            dockerfile_commit, dist_commit,
-            "Dockerfile ARG FRANKENSEARCH_COMMIT drifted from dist.yml"
-        );
+        let result = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+                "--no-deps",
+            ])
+            .current_dir(workspace_root())
+            .output()
+            .expect("Cargo must be available for workspace dependency inspection");
         assert!(
-            dockerfile.contains(
-                "frankensearch.git \"${FRANKENSEARCH_COMMIT}\" /build/frankensearch-rel-0332"
-            ),
-            "Dockerfile must clone frankensearch at FRANKENSEARCH_COMMIT, not a sibling ref"
+            result.status.success(),
+            "Cargo metadata failed: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
-        assert!(
-            !dockerfile.contains("frankensearch.git \"${SIBLING_REF}\""),
-            "frankensearch must not float with SIBLING_REF"
-        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&result.stdout).expect("Cargo emits valid metadata JSON");
+        let expected =
+            format!("git+https://github.com/Dicklesworthstone/frankensearch?rev={dist_commit}");
+        let mut declarations = 0;
+        for package in metadata["packages"].as_array().expect("workspace packages") {
+            for dependency in package["dependencies"].as_array().expect("dependencies") {
+                let name = dependency["name"].as_str().expect("dependency name");
+                if name == "frankensearch" || name.starts_with("frankensearch-") {
+                    assert_eq!(
+                        dependency["source"].as_str(),
+                        Some(expected.as_str()),
+                        "Cargo declaration for {name} drifted from dist.yml"
+                    );
+                    declarations += 1;
+                }
+            }
+        }
+        assert!(declarations > 0, "no FrankenSearch declarations inspected");
     }
 
     #[test]
@@ -302,16 +331,25 @@ mod container_release_contract {
             );
         }
 
-        let source_dockerfile_mutation =
-            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
-        assert_ne!(
-            source_dockerfile_mutation, source_dockerfile,
-            "source Dockerfile mutation anchor must exist"
-        );
-        assert!(
-            validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
-            "source Dockerfile checkout mutation unexpectedly passed"
-        );
+        let source_dockerfile_mutations = [
+            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1),
+            source_dockerfile.replacen(
+                "cargo build --release --locked",
+                "cargo build --release",
+                1,
+            ),
+            format!("{source_dockerfile}\nARG SIBLING_REF=main\n"),
+        ];
+        for mutation in source_dockerfile_mutations {
+            assert_ne!(
+                mutation, source_dockerfile,
+                "source Dockerfile mutation anchor must exist"
+            );
+            assert!(
+                validate(&workflow, &release_dockerfile, &mutation).is_err(),
+                "source Dockerfile contract mutation unexpectedly passed"
+            );
+        }
     }
 }
 
@@ -326,9 +364,6 @@ mod dist_release_contract {
     const DOWNLOAD_ACTION: &str =
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093";
     const SETUP_ZIG_ACTION: &str = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29";
-    // Must match the `BEADS_RUST_COMMIT` env pin in .github/workflows/dist.yml
-    // (beads_rust 0.5.4 source, pinned in 4e8c661a).
-    const BEADS_RUST_COMMIT: &str = "ba6ff75da25529c8cad8395352f5c5fc2162ee95";
     const RELEASE_TARGETS: [&str; 6] = [
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
@@ -357,6 +392,7 @@ mod dist_release_contract {
     fn read_workflow() -> String {
         let path = workspace_root().join(".github/workflows/dist.yml");
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required release workflow cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 
@@ -500,6 +536,10 @@ mod dist_release_contract {
             "            target: x86_64-pc-windows-msvc",
         );
         require_once(workflow, exact_matrix)?;
+        require_once(
+            workflow,
+            "    runs-on: ${{ matrix.os }}\n    timeout-minutes: 180\n    defaults:\n      run:\n        shell: bash",
+        )?;
         require_exactly(workflow, "            target: ", RELEASE_TARGETS.len())?;
         for target in RELEASE_TARGETS {
             require_once(workflow, &format!("            target: {target}"))?;
@@ -691,7 +731,30 @@ mod dist_release_contract {
             "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
-        require_exactly(workflow, "set -euo pipefail", 19)?;
+        for step in workflow.split("\n      - ").skip(1) {
+            let mut powershell = false;
+            let mut lines = step.lines();
+            while let Some(line) = lines.next() {
+                let trimmed = line.trim();
+                powershell |= trimmed == "shell: pwsh";
+                let Some(run) = trimmed.strip_prefix("run:") else {
+                    continue;
+                };
+                if run.trim().starts_with('|') || run.trim().starts_with('>') {
+                    let expected = if powershell {
+                        "$ErrorActionPreference = \"Stop\""
+                    } else {
+                        "set -euo pipefail"
+                    };
+                    let first_command =
+                        lines.find(|body| !body.trim().is_empty() && !body.trim().starts_with('#'));
+                    if first_command.is_none_or(|body| body.trim() != expected) {
+                        return Err(format!("multiline release step must start with {expected}"));
+                    }
+                }
+                break;
+            }
+        }
         require_exactly(workflow, "assert_glibc_floor() {", 2)?;
         require_exactly(
             workflow,
@@ -872,17 +935,19 @@ mod dist_release_contract {
             workflow,
             "'.id == $id and .tag_name == $tag and .name == $tag and .draft == $draft and .prerelease == $prerelease'",
         )?;
-        require_once(workflow, &format!("BEADS_RUST_COMMIT: {BEADS_RUST_COMMIT}"))?;
-        require_exactly(
-            workflow,
-            "# Retain this pin for the installer's source-receipt contract.",
-            3,
-        )?;
-        require_exactly(
-            workflow,
-            "checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust \"$BEADS_RUST_COMMIT\"",
-            3,
-        )?;
+        for obsolete in [
+            "checkout_pinned",
+            "../frankensearch-rel-0332",
+            "../fast_cmaes",
+            "../beads_rust",
+        ] {
+            if workflow.contains(obsolete) {
+                return Err(format!(
+                    "release workflow still provisions unused sibling: {obsolete}"
+                ));
+            }
+        }
+        require_once(workflow, "git config --global core.longpaths true")?;
         require_in_order(
             workflow,
             &[
@@ -1016,6 +1081,24 @@ mod dist_release_contract {
             mutate(&workflow, "set -euo pipefail", "set -eu"),
             mutate(
                 &workflow,
+                "    defaults:\n      run:\n        shell: bash",
+                "    defaults:\n      run:\n        shell: pwsh",
+            ),
+            {
+                let mut compensated = mutate(
+                    &workflow,
+                    "      - name: Configure Git long paths\n        shell: bash\n        run: |\n          set -euo pipefail",
+                    "      - name: Configure Git long paths\n        shell: bash\n        run: |\n          : # strict mode removed",
+                );
+                compensated.push_str("\n# set -euo pipefail\n");
+                assert_eq!(
+                    compensated.matches("set -euo pipefail").count(),
+                    workflow.matches("set -euo pipefail").count()
+                );
+                compensated
+            },
+            mutate(
+                &workflow,
                 "needs: [release_contract, lint, test, build, linux_portability]",
                 "needs: [release_contract, build]",
             ),
@@ -1082,8 +1165,8 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                BEADS_RUST_COMMIT,
-                "b5dc5444270d82218e8de6bb4c6320731e0bdd00",
+                "- name: Configure Git long paths",
+                "- name: checkout_pinned obsolete sibling",
             ),
             mutate(
                 &workflow,
@@ -1467,6 +1550,7 @@ mod notify_acfs_contract {
     fn read_workflow() -> String {
         let path = workspace_root().join(".github/workflows/notify-acfs.yml");
         fs::read_to_string(&path)
+            // ubs:ignore — fail this test if its required notification workflow cannot be read.
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
     }
 

@@ -586,12 +586,28 @@ fn publish_sqlite_snapshot_image(
     destination: &Path,
     sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), ShareError> {
-    // Staging uses synchronous=OFF, so flush the completed image first. Windows
-    // FlushFileBuffers requires write access; File::open is read-only there.
-    let image = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(staged)?;
+    // SQLite may create the image with group/world-readable permissions. The
+    // private staging directory hides those bytes only until publication;
+    // full archives and pre-scrub projections can contain registration tokens.
+    // Bind permission changes to a regular, unaliased handle before exposing
+    // another name. Windows FlushFileBuffers also requires write access.
+    let image = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(staged)?;
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt as _;
+        image.metadata()?.nlink()
+    };
+    #[cfg(windows)]
+    let links = mcp_agent_mail_core::disk::windows_file_link_count(&image)?;
+    #[cfg(any(unix, windows))]
+    if links != 1 {
+        return Err(ShareError::Validation {
+            message: "snapshot staging image must have exactly one hard link".to_string(),
+        });
+    }
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&image)?;
+    // Staging uses synchronous=OFF, so persist both data and private metadata
+    // before the no-clobber link makes the completed image visible.
     image.sync_all()?;
 
     // Unlike rename, hard_link atomically refuses every occupied destination,
@@ -2084,6 +2100,339 @@ mod tests {
             copied
                 .execute_raw("INSERT INTO future_state(name,payload) VALUES('two',X'02')")
                 .expect_err("restored unique constraint must still apply");
+        }
+    }
+
+    fn archive_generation(path: &Path) -> (i64, i64, String, String) {
+        // Inspect the published, neutralized private image through independent
+        // canonical SQLite, rather than the source engine's cached header.
+        let conn = private_source(path);
+        let row = conn
+            .query_sync(
+                "SELECT label, hex(payload) AS payload FROM archive_generation",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(row.len(), 1);
+        (
+            conn.query_sync("PRAGMA user_version", &[]).unwrap()[0]
+                .get_named("user_version")
+                .unwrap(),
+            conn.query_sync("PRAGMA application_id", &[]).unwrap()[0]
+                .get_named("application_id")
+                .unwrap(),
+            row[0].get_named("label").unwrap(),
+            row[0].get_named("payload").unwrap(),
+        )
+    }
+
+    const ARCHIVE_FAMILY_CHILD_ENV: &str = "MCP_AGENT_MAIL_ARCHIVE_FAMILY_WITNESS_CHILD";
+
+    fn archive_source_family_child() -> bool {
+        use sha2::Digest as _;
+        let Some(path) = std::env::var_os(ARCHIVE_FAMILY_CHILD_ENV) else {
+            return false;
+        };
+        let path = PathBuf::from(path);
+        let fingerprints = [
+            "",
+            "-wal",
+            "-shm",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-journal",
+        ]
+        .map(|suffix| {
+            match std::fs::read(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+                &path, suffix,
+            )) {
+                Ok(bytes) => Some(hex::encode(sha2::Sha256::digest(bytes))),
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                    None
+                }
+            }
+        });
+        println!(
+            "archive_source_family_witness={}",
+            serde_json::to_string(&fingerprints).unwrap()
+        );
+        true
+    }
+
+    fn archive_source_family(path: &Path) -> [Option<String>; 8] {
+        // A raw descriptor opened and closed here could release this
+        // process's live SQLite locks. Read bytes only in the child PID.
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(ARCHIVE_FAMILY_CHILD_ENV, path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "family witness child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("archive_source_family_witness=")
+                    .map(|(_, value)| value)
+            })
+            .expect("child emits a real family witness");
+        let witness: [Option<String>; 8] = serde_json::from_str(json).unwrap();
+        assert!(witness[0].is_some(), "the source main file must exist");
+        witness
+    }
+
+    #[test]
+    fn full_archive_preserves_zero_headers_with_populated_data() {
+        if archive_source_family_child() {
+            return;
+        }
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("zero-source.sqlite3");
+            let destination = directory.path().join("zero-copy.sqlite3");
+            let conn: Box<dyn SnapshotSource> = if live {
+                Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                Box::new(private_source(&source))
+            };
+            conn.execute_snapshot(
+                "PRAGMA user_version=0; PRAGMA application_id=0; \
+                 CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                 INSERT INTO archive_generation VALUES('zero-header-generation',X'00FF')",
+            )
+            .unwrap();
+            drop(conn);
+            let before = archive_source_family(&source);
+            if live {
+                create_full_archive_snapshot_with_progress(&source, &destination, &mut |_| Ok(()))
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                archive_generation(&destination),
+                (0, 0, "zero-header-generation".into(), "00FF".into())
+            );
+            assert_eq!(archive_source_family(&source), before);
+        }
+    }
+
+    #[test]
+    fn full_archive_headers_and_payload_follow_the_same_committed_generation() {
+        if archive_source_family_child() {
+            return;
+        }
+        for live in [false, true] {
+            for mutation_cut in [
+                FullArchiveProgressState::Started,
+                FullArchiveProgressState::Finished,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("generation-source.sqlite3");
+                let destination = directory.path().join("generation-copy.sqlite3");
+                let open_writer = || -> Box<dyn SnapshotSource> {
+                    if live {
+                        Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+                    } else {
+                        Box::new(private_source(&source))
+                    }
+                };
+                let writer = open_writer();
+                if !live {
+                    // Keep WAL/SHM alive so the guarded canonical reader uses
+                    // its locking read-only path. A sidecar-free source is
+                    // opened immutable and must not be changed under it.
+                    writer.execute_snapshot("PRAGMA journal_mode=WAL").unwrap();
+                }
+                writer
+                    .execute_snapshot(
+                        "PRAGMA user_version=231; PRAGMA application_id=4242; \
+                     CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                     INSERT INTO archive_generation VALUES('generation-one',X'00FF')",
+                    )
+                    .unwrap();
+                let mut committed_family = None;
+                let mut progress = |event: FullArchiveProgress| {
+                    if event.phase == "snapshot_full_copy" && event.state == mutation_cut {
+                        assert!(committed_family.is_none(), "mutation cut must occur once");
+                        writer.execute_snapshot(
+                            "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
+                             UPDATE archive_generation SET label='generation-two',payload=X'0102'; \
+                             COMMIT",
+                        ).unwrap();
+                        // Verify the actual committed input and establish its
+                        // canonical WAL read mark before measuring neutrality.
+                        let rows = writer
+                            .query_snapshot("SELECT label FROM archive_generation", &[])
+                            .unwrap();
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(
+                            rows[0].get_named::<String>("label").unwrap(),
+                            "generation-two"
+                        );
+                        for (pragma, expected) in [("user_version", 232), ("application_id", 4343)]
+                        {
+                            assert_eq!(
+                                writer
+                                    .query_snapshot(&format!("PRAGMA {pragma}"), &[])
+                                    .unwrap()[0]
+                                    .get_named::<i64>(pragma)
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                        committed_family = Some(archive_source_family(&source));
+                    }
+                    Ok(())
+                };
+                if live {
+                    create_full_archive_snapshot_with_progress(&source, &destination, &mut progress)
+                } else {
+                    create_private_canonical_full_archive_snapshot_with_progress(
+                        &source,
+                        &destination,
+                        &mut progress,
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    archive_source_family(&source),
+                    committed_family.expect("source mutation must actually commit")
+                );
+                let first = (231, 4242, "generation-one".into(), "00FF".into());
+                let second = (232, 4343, "generation-two".into(), "0102".into());
+                let copied = archive_generation(&destination);
+                assert!(
+                    copied == first || copied == second,
+                    "runtime_source={live} cut={mutation_cut:?}: headers and payload must belong to one committed generation: {copied:?}"
+                );
+                if mutation_cut == FullArchiveProgressState::Finished {
+                    assert_eq!(
+                        copied, first,
+                        "a completed copy cannot include a later commit"
+                    );
+                }
+
+                // Plant the tempting broken workaround: overwrite a completed
+                // image's header with metadata read from the other generation.
+                // The independently reopened artifact must match neither real
+                // committed source state. The positive copy assertion above
+                // would fail if production performed this outside-snapshot read.
+                let wrong_header = if copied.0 == first.0 {
+                    "PRAGMA user_version=232; PRAGMA application_id=4343"
+                } else {
+                    "PRAGMA user_version=231; PRAGMA application_id=4242"
+                };
+                private_source(&destination)
+                    .execute_raw(wrong_header)
+                    .unwrap();
+                let mixed = archive_generation(&destination);
+                assert_ne!(mixed, first);
+                assert_ne!(mixed, second);
+                assert_eq!((&mixed.2, &mixed.3), (&copied.2, &copied.3));
+            }
+        }
+    }
+
+    #[test]
+    fn full_archive_cannot_mix_an_active_writers_uncommitted_header_and_payload() {
+        if archive_source_family_child() {
+            return;
+        }
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("active-writer.sqlite3");
+            let destination = directory.path().join("active-writer-copy.sqlite3");
+            let writer: Box<dyn SnapshotSource> = if live {
+                Box::new(DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                Box::new(private_source(&source))
+            };
+            if !live {
+                writer.execute_snapshot("PRAGMA journal_mode=WAL").unwrap();
+            }
+            writer
+                .execute_snapshot(
+                    "PRAGMA user_version=231; PRAGMA application_id=4242; \
+                     CREATE TABLE archive_generation(label TEXT NOT NULL, payload BLOB NOT NULL); \
+                     INSERT INTO archive_generation VALUES('committed',X'00FF')",
+                )
+                .unwrap();
+            // Establish the committed WAL read mark before the transaction
+            // and byte baseline; the copy must not advance or rewrite it.
+            let rows = writer
+                .query_snapshot("SELECT label FROM archive_generation", &[])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_named::<String>("label").unwrap(), "committed");
+            // Keep this transaction alive for the entire actual VACUUM, not
+            // merely a before/after phase callback. No scheduling or timing
+            // assumption is needed to overlap the writer with the copy.
+            writer
+                .execute_snapshot(
+                    "BEGIN IMMEDIATE; PRAGMA user_version=232; PRAGMA application_id=4343; \
+                     UPDATE archive_generation SET label='uncommitted',payload=X'0102'",
+                )
+                .unwrap();
+            let before = archive_source_family(&source);
+            let result = if live {
+                create_full_archive_snapshot_with_progress(&source, &destination, &mut |_| Ok(()))
+            } else {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+            };
+            let after = archive_source_family(&source);
+            // End our owned transaction before assertions can unwind.
+            writer.execute_snapshot("ROLLBACK").unwrap();
+            drop(writer);
+            assert_eq!(
+                after, before,
+                "the reader must not change the writer's family"
+            );
+
+            if result.is_ok() {
+                assert_eq!(
+                    archive_generation(&destination),
+                    (231, 4242, "committed".into(), "00FF".into()),
+                    "a copy may not expose any part of the uncommitted transaction"
+                );
+                eprintln!("archive_writer_overlap runtime_source={live} outcome=copied_committed");
+            } else {
+                // Some source engines refuse a concurrent writer. That is
+                // permitted only as a lock/busy refusal before publication.
+                let busy = match &result {
+                    Err(ShareError::Sqlite { message }) => {
+                        let message = message.to_ascii_lowercase();
+                        message.contains("busy") || message.contains("locked")
+                    }
+                    Err(ShareError::Io(error)) => matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                    _ => false,
+                };
+                assert!(busy, "unexpected active-writer refusal: {result:?}");
+                assert!(matches!(
+                    std::fs::symlink_metadata(&destination),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                eprintln!("archive_writer_overlap runtime_source={live} outcome=busy_refusal");
+            }
         }
     }
 
@@ -4106,6 +4455,157 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_applies_private_mode_before_linking() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for mode in [0o644, 0o664, 0o666] {
+            let dir = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+            let staged = stage_dir.path().join("private.sqlite3");
+            let destination = dir.path().join("published.sqlite3");
+            let conn = private_source(&staged);
+            conn.execute_raw(
+                "CREATE TABLE private_state(value TEXT); \
+                 INSERT INTO private_state VALUES('synthetic registration token')",
+            )
+            .unwrap();
+            drop(conn);
+            let expected = std::fs::read(&staged).unwrap();
+            // Model SQLite's creation mode explicitly, independently of the
+            // test runner's umask and without changing process-global state.
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            publish_sqlite_snapshot(stage_dir, &staged, &destination, |parent| {
+                assert_eq!(
+                    std::fs::metadata(&destination)?.permissions().mode() & 0o777,
+                    0o600,
+                    "the published link must already be private at the durability barrier"
+                );
+                sync_snapshot_parent(parent)
+            })
+            .unwrap();
+
+            assert_eq!(std::fs::read(&destination).unwrap(), expected);
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                private_source(&destination)
+                    .query_sync("SELECT value FROM private_state", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("value")
+                    .unwrap(),
+                "synthetic registration token"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_refuses_aliased_staging_without_changing_target() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        for symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let stage_dir = tempfile::tempdir_in(dir.path()).unwrap();
+            let staged = stage_dir.path().join("private.sqlite3");
+            let destination = dir.path().join("published.sqlite3");
+            let target = dir.path().join("unrelated.sqlite3");
+            std::fs::write(&target, b"unrelated private bytes").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&target, &staged).unwrap();
+            } else {
+                std::fs::hard_link(&target, &staged).unwrap();
+            }
+            let before = std::fs::metadata(&target).unwrap();
+
+            publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
+                panic!("aliased staging must fail before publication");
+            })
+            .expect_err("staging must not change permissions through an alias");
+
+            let after = std::fs::metadata(&target).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"unrelated private bytes");
+            assert_eq!(after.permissions().mode(), before.permissions().mode());
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(after.nlink(), before.nlink());
+            assert_eq!(
+                std::fs::symlink_metadata(&staged)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                symlink,
+                "refused staging must remain available for inspection"
+            );
+            assert!(matches!(
+                std::fs::symlink_metadata(&destination),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_pipelines_publish_private_database_images() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let conn = private_source(&source);
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token='synthetic registration token'",
+        )
+        .unwrap();
+        drop(conn);
+        let source_before = std::fs::read(&source).unwrap();
+
+        for full in [false, true] {
+            let destination = dir.path().join(if full {
+                "full.sqlite3"
+            } else {
+                "projected.sqlite3"
+            });
+            if full {
+                create_private_canonical_full_archive_snapshot_with_progress(
+                    &source,
+                    &destination,
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            } else {
+                create_private_canonical_sqlite_snapshot(&source, &destination, false).unwrap();
+            }
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "both full archives and pre-scrub projections must be private"
+            );
+            assert_eq!(
+                private_source(&destination)
+                    .query_sync("SELECT registration_token FROM agents", &[])
+                    .unwrap()[0]
+                    .get_named::<String>("registration_token")
+                    .unwrap(),
+                "synthetic registration token"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        }
+    }
+
     #[test]
     fn snapshot_publication_preserves_raced_destination_and_private_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -4115,6 +4615,13 @@ mod tests {
         std::fs::write(&staged, b"complete private snapshot").unwrap();
         assert!(!destination.exists(), "name was available when selected");
         std::fs::write(&destination, b"another publisher won").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o664)).unwrap();
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
 
         let error = publish_sqlite_snapshot(stage_dir, &staged, &destination, |_| {
             panic!("a collision must fail before the success durability barrier")
@@ -4133,6 +4640,25 @@ mod tests {
             std::fs::read(&staged).unwrap(),
             b"complete private snapshot"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "a refused publication must retain a private image"
+            );
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o664,
+                "the winning publisher's permissions must remain unchanged"
+            );
+        }
     }
 
     #[cfg(unix)]

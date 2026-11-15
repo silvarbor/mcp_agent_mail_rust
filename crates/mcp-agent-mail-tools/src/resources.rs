@@ -15,17 +15,19 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbError, iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
     tool_util::{
-        db_error_to_mcp_error, db_outcome_to_mcp_result, parse_attachment_metadata_json,
-        parse_recipients_json_value,
+        db_error_to_mcp_error, db_outcome_to_mcp_result, ensure_request_live,
+        parse_attachment_metadata_json, parse_recipients_json_value,
     },
 };
 
@@ -380,13 +382,18 @@ fn resource_live_database_missing_without_archive_state() -> bool {
         return false;
     };
     let resolved_path = PathBuf::from(&resolved.canonical_path);
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        &config.storage_root,
+        &resolved_path,
+    ) {
+        return !resolved_path.exists();
+    }
+
     let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
-    let archive_has_authoritative_state =
-        crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-            &config.storage_root,
-            &resolved_path,
-        ) && crate::tool_util::read_archive_inventory_has_state(&archive);
-    !resolved_path.exists() && !archive_has_authoritative_state
+    // An unreadable authoritative archive is unknown, not an empty mailbox.
+    !resolved_path.exists()
+        && archive.parse_errors == 0
+        && !crate::tool_util::read_archive_inventory_has_state(&archive)
 }
 
 // Intentionally async despite containing no awaits: this is the resource
@@ -4771,10 +4778,53 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 pub(crate) struct ReservationPatternActivity {
     pub(crate) matches: bool,
     pub(crate) fs_activity_micros: Option<i64>,
+    /// Failed or bounded filesystem inspection cannot prove inactivity.
+    pub(crate) fs_activity_incomplete: bool,
     pub(crate) git_activity_micros: Option<i64>,
+    /// A bounded read did not establish whether recent Git activity exists.
+    /// This is not evidence that the reservation is stale.
+    pub(crate) git_activity_incomplete: bool,
 }
 
 const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '[', '{'];
+const RESERVATION_ACTIVITY_SCAN_BUDGET: usize = 1_000;
+pub(crate) const RESERVATION_ACTIVITY_TIME_BUDGET: Duration = Duration::from_millis(100);
+
+/// Dropping a running `spawn_blocking` future does not stop its closure.
+/// Keep ownership of the stop signal in the read future, not in the worker.
+struct ReservationActivityCancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReservationActivityCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Run optional activity enrichment within the caller's lifetime and a shared
+/// wall-time budget. Individual filesystem/libgit2 calls are cooperative: they
+/// cannot be interrupted, but no further scan work starts after a checkpoint
+/// observes cancellation or the deadline. The budget includes queueing time.
+pub(crate) async fn reservation_activity_blocking<T: Send + 'static>(
+    ctx: &McpContext,
+    budget: Duration,
+    operation: impl FnOnce(&mut dyn FnMut() -> bool) -> T + Send + 'static,
+) -> McpResult<T> {
+    ensure_request_live(ctx)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = ReservationActivityCancelOnDrop(Arc::clone(&stop));
+    let worker_ctx = ctx.clone();
+    let started = Instant::now();
+    let result = asupersync::runtime::spawn_blocking(move || {
+        operation(&mut || {
+            !stop.load(Ordering::Acquire)
+                && started.elapsed() < budget
+                && ensure_request_live(&worker_ctx).is_ok()
+        })
+    })
+    .await;
+    ensure_request_live(ctx)?;
+    Ok(result)
+}
 
 fn reservation_contains_glob(pattern: &str) -> bool {
     RESERVATION_GLOB_MARKERS
@@ -4782,7 +4832,7 @@ fn reservation_contains_glob(pattern: &str) -> bool {
         .any(|m| pattern.contains(*m))
 }
 
-fn reservation_normalize_pattern(pattern: &str) -> String {
+pub(crate) fn reservation_normalize_pattern(pattern: &str) -> String {
     let mut s = pattern.trim();
     while let Some(rest) = s.strip_prefix("./") {
         s = rest;
@@ -4842,6 +4892,7 @@ fn reservation_git_pathspec(workspace_rel: &Path, normalized_pattern: &str) -> S
 /// `(path, modified_micros)` tuples for every tracked + untracked file
 /// matching `pathspec` that is NOT gitignored. Matches the semantics
 /// of `git ls-files -c -o --exclude-standard -- :(glob)<spec>`.
+#[cfg(test)]
 fn reservation_pathspec_ls_files_libgit2(
     repo_root: &Path,
     pathspec: &str,
@@ -4911,6 +4962,7 @@ fn reservation_pathspec_ls_files_libgit2(
 }
 
 /// CLI fallback for the pathspec walk, gated by `AM_GIT_LS_FILES_SHELL=1`.
+#[cfg(test)]
 fn reservation_pathspec_ls_files_cli_fallback(
     repo_root: &Path,
     git_glob: &str,
@@ -4964,6 +5016,7 @@ fn reservation_pathspec_ls_files_cli_fallback(
 /// Setting `AM_GIT_RESERVATION_ACTIVITY_SHELL=1` re-enables the legacy
 /// CLI shell-out for one release cycle. Emits a WARN log on each call
 /// so ops know they're on the legacy path.
+#[cfg(test)]
 fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]) -> Option<i64> {
     if pathspecs.is_empty() {
         return None;
@@ -4997,6 +5050,7 @@ fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]
 }
 
 /// libgit2-backed implementation.
+#[cfg(test)]
 fn reservation_git_latest_activity_micros_libgit2(
     repo_root: &Path,
     pathspecs: &[String],
@@ -5100,6 +5154,7 @@ fn reservation_git_latest_activity_micros_libgit2(
 
 /// Legacy CLI path, kept for the one-release feature-flag escape hatch
 /// (`AM_GIT_RESERVATION_ACTIVITY_SHELL=1`). Removed in a follow-up bead.
+#[cfg(test)]
 fn reservation_git_latest_activity_micros_cli_fallback(
     repo_root: &Path,
     pathspecs: &[String],
@@ -5144,40 +5199,79 @@ fn reservation_glob_walk_latest_micros(
     workspace: &Path,
     start_dir: &Path,
     matcher: &globset::GlobMatcher,
-) -> (bool, Option<i64>) {
+    include_directory_activity: bool,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> (bool, Option<i64>, bool) {
     let mut stack = vec![start_dir.to_path_buf()];
     let mut matched_any = false;
     let mut fs_latest: Option<i64> = None;
     let mut visited_entries = 0usize;
+    let mut incomplete = false;
 
     while let Some(dir) = stack.pop() {
+        if !keep_going() {
+            return (matched_any, fs_latest, true);
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+            incomplete = true;
+            continue;
+        };
+        if !meta.is_dir() {
+            incomplete = true;
+            continue;
+        }
+        // Renaming a child preserves its file mtime and changes only its
+        // immediate directory. Literal directory leases cover that activity
+        // throughout the subtree, including directories with no files left.
+        if include_directory_activity {
+            if let Ok(modified) = meta.modified()
+                && let Some(micros) = reservation_system_time_to_micros(modified)
+            {
+                fs_latest = Some(fs_latest.map_or(micros, |previous| previous.max(micros)));
+            } else {
+                incomplete = true;
+            }
+        }
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            incomplete = true;
             continue;
         };
 
-        for entry in read_dir.flatten() {
-            if visited_entries >= 20_000 {
-                return (matched_any, fs_latest);
+        for entry in read_dir {
+            if visited_entries >= 20_000 || !keep_going() {
+                return (matched_any, fs_latest, true);
             }
             visited_entries += 1;
+            let Ok(entry) = entry else {
+                incomplete = true;
+                continue;
+            };
 
             let Ok(file_type) = entry.file_type() else {
+                incomplete = true;
                 continue;
             };
             if file_type.is_symlink() {
+                incomplete = true;
                 continue;
             }
 
             let path = entry.path();
+            if path.to_str().is_none() {
+                incomplete = true;
+                continue;
+            }
             if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
             if !file_type.is_file() {
+                incomplete = true;
                 continue;
             }
 
             let Ok(rel) = path.strip_prefix(workspace) else {
+                incomplete = true;
                 continue;
             };
             let rel = reservation_path_to_slash_string(rel);
@@ -5185,21 +5279,29 @@ fn reservation_glob_walk_latest_micros(
                 continue;
             }
 
-            let Ok(meta) = std::fs::metadata(&path) else {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                incomplete = true;
                 continue;
             };
+            if !meta.is_file() {
+                incomplete = true;
+                continue;
+            }
             matched_any = true;
             if let Ok(modified) = meta.modified()
                 && let Some(micros) = reservation_system_time_to_micros(modified)
             {
                 fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+            } else {
+                incomplete = true;
             }
         }
     }
 
-    (matched_any, fs_latest)
+    (matched_any, fs_latest, incomplete)
 }
 
+#[cfg(test)]
 pub(crate) fn reservation_compute_pattern_activity(
     workspace: Option<&Path>,
     repo_root: Option<&Path>,
@@ -5257,15 +5359,21 @@ pub(crate) fn reservation_compute_pattern_activity(
         }
 
         if !matched_paths && let Some(matcher) = reservation_glob_matcher(&normalized) {
-            let (fallback_matches, fallback_latest) =
-                reservation_glob_walk_latest_micros(workspace, workspace, &matcher);
+            let (fallback_matches, fallback_latest, _) = reservation_glob_walk_latest_micros(
+                workspace,
+                workspace,
+                &matcher,
+                false,
+                &mut || true,
+            );
             matched_paths = fallback_matches;
             fs_latest = fallback_latest;
         } else if !matched_paths {
             return ReservationPatternActivity::default();
         }
     } else {
-        (matched_paths, fs_latest) = reservation_literal_fs_activity(workspace, &normalized);
+        (matched_paths, fs_latest, _) =
+            reservation_literal_fs_activity(workspace, &normalized, &mut || true);
     }
 
     let git_activity = if matched_paths && want_git {
@@ -5289,94 +5397,285 @@ pub(crate) fn reservation_compute_pattern_activity(
     ReservationPatternActivity {
         matches: matched_paths,
         fs_activity_micros: fs_latest,
+        fs_activity_incomplete: false,
         git_activity_micros: git_activity,
+        git_activity_incomplete: false,
     }
 }
 
-/// Filesystem activity for a literal (non-glob) reservation pattern: the
-/// file's mtime, or the newest mtime under a directory (falling back to the
-/// directory's own mtime).
-fn reservation_literal_fs_activity(workspace: &Path, normalized: &str) -> (bool, Option<i64>) {
-    let candidate = workspace.join(normalized);
-    if !candidate.exists() {
-        return (false, None);
+/// Resolve only ordinary paths below a readable workspace. A missing child
+/// is known absent; a symlink, inaccessible ancestor, or escaped path is not.
+fn reservation_path_metadata(
+    workspace: &Path,
+    relative: &Path,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<Option<std::fs::Metadata>, ()> {
+    if !keep_going() {
+        return Err(());
     }
-    let mut fs_latest = None;
-    if candidate.is_dir() {
-        // For directory reservations, scan contents for most recent modification
-        // to avoid missing activity because the directory mtime didn't update.
+    let mut meta = std::fs::symlink_metadata(workspace).map_err(|_| ())?;
+    if !meta.is_dir() {
+        return Err(());
+    }
+    let mut candidate = workspace.to_path_buf();
+    for component in relative.components() {
+        if !keep_going() {
+            return Err(());
+        }
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => candidate.push(name),
+            _ => return Err(()),
+        }
+        meta = match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        if !meta.is_file() && !meta.is_dir() {
+            return Err(());
+        }
+    }
+    Ok(Some(meta))
+}
+
+/// Filesystem activity for a literal reservation: its own mtime and the
+/// newest file or directory mtime below it. Incomplete reads cannot prove quiet.
+fn reservation_literal_fs_activity(
+    workspace: &Path,
+    normalized: &str,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> (bool, Option<i64>, bool) {
+    let meta = match reservation_path_metadata(workspace, Path::new(normalized), keep_going) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return (false, None, false),
+        Err(()) => return (false, None, true),
+    };
+    let mut fs_latest = meta
+        .modified()
+        .ok()
+        .and_then(reservation_system_time_to_micros);
+    let mut incomplete = fs_latest.is_none();
+    if meta.is_dir() {
         let pattern_with_glob = if normalized.ends_with('/') {
             format!("{normalized}**")
         } else {
             format!("{normalized}/**")
         };
         if let Some(matcher) = reservation_glob_matcher(&pattern_with_glob) {
-            let (_, latest) = reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
-            fs_latest = latest;
+            let (_, latest, partial) = reservation_glob_walk_latest_micros(
+                workspace,
+                &workspace.join(normalized),
+                &matcher,
+                true,
+                keep_going,
+            );
+            if let Some(latest) = latest {
+                fs_latest = Some(fs_latest.map_or(latest, |previous| previous.max(latest)));
+            }
+            incomplete |= partial;
+        } else {
+            incomplete = true;
         }
-        // Fallback to directory mtime if scan found nothing or failed
-        if fs_latest.is_none()
-            && let Ok(meta) = std::fs::metadata(&candidate)
-            && let Ok(modified) = meta.modified()
-        {
-            fs_latest = reservation_system_time_to_micros(modified);
-        }
-    } else if let Ok(meta) = std::fs::metadata(&candidate)
-        && let Ok(modified) = meta.modified()
-    {
-        fs_latest = reservation_system_time_to_micros(modified);
     }
-    (true, fs_latest)
+    (true, fs_latest, incomplete || !keep_going())
 }
 
-/// Upper bound on untracked/modified status entries collected once per
-/// listing request (tracked entries come from the index and are not capped).
-const RESERVATION_STATUS_LISTING_MAX: usize = 100_000;
+/// Bound work while discovering untracked paths, including directories and
+/// ignored entries. Limiting an already-built Git status list is too late.
+const RESERVATION_WORKTREE_ENTRY_BUDGET: usize = 100_000;
 
 /// Repository paths (relative to the repo root) that a glob reservation can
-/// match: every index entry plus untracked/modified, non-ignored files.
+/// match: every index entry plus untracked, non-ignored files.
 ///
 /// GH #337: built once per `file_reservations` read and shared by every glob
-/// pattern, instead of one index scan and one full `statuses()` walk of the
-/// working tree per pattern.
-fn reservation_repo_candidate_paths(repo: &git2::Repository) -> Vec<String> {
+/// pattern. GH #385: discover worktree paths lazily, checking the request
+/// budget before each entry instead of building an eager `statuses()` list.
+/// Status also hashes tracked files with stale stat information; neither
+/// contents nor a diff are needed to inspect their modification times.
+fn reservation_repo_candidate_paths(
+    repo: &git2::Repository,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> (Vec<String>, bool) {
     let mut paths = Vec::new();
+    let mut incomplete = false;
+    let mut tracked = HashSet::new();
+    if !keep_going() {
+        return (paths, true);
+    }
     if let Ok(index) = repo.index() {
         for entry in index.iter() {
+            if !keep_going() {
+                return (paths, true);
+            }
             if let Ok(rel) = std::str::from_utf8(&entry.path) {
                 paths.push(rel.to_string());
+                tracked.insert(rel.to_string());
+                // A gitlink represents an opaque worktree. Its root mtime
+                // does not reveal edits to files inside the submodule.
+                incomplete |= entry.mode == 0o160_000;
+            } else {
+                incomplete = true;
             }
         }
+    } else {
+        incomplete = true;
     }
-    let mut status_opts = git2::StatusOptions::new();
-    status_opts
-        .include_untracked(true)
-        .include_ignored(false)
-        .recurse_untracked_dirs(true)
-        .include_unmodified(false);
-    if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
-        for entry in statuses.iter().take(RESERVATION_STATUS_LISTING_MAX) {
-            if let Ok(rel) = entry.path() {
-                paths.push(rel.to_string());
-            }
-        }
+    if !keep_going() {
+        return (paths, true);
     }
-    paths
+    incomplete |= reservation_untracked_candidate_paths(
+        repo,
+        &tracked,
+        &mut paths,
+        RESERVATION_WORKTREE_ENTRY_BUDGET,
+        keep_going,
+    );
+    (paths, incomplete)
 }
 
-/// Latest commit time (micros) touching each pathspec, from ONE history walk
-/// shared by all of them (GH #337).
+/// Discover paths without hashing tracked file contents. The index supplies
+/// every tracked path, including ignored tracked files and submodules. Native
+/// Git ignore checks preserve repository, per-directory, and global excludes.
+/// Any refused or unfinished inspection remains unknown to force-release.
+fn reservation_untracked_candidate_paths(
+    repo: &git2::Repository,
+    tracked: &HashSet<String>,
+    paths: &mut Vec<String>,
+    entry_budget: usize,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> bool {
+    if !keep_going() {
+        return true;
+    }
+    let Some(root) = repo.workdir() else {
+        return true;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true;
+    };
+    let mut stack = vec![entries];
+    let mut visited = 0usize;
+    let mut incomplete = false;
+    while let Some(entries) = stack.last_mut() {
+        // Check before advancing ReadDir: reaching a cap cannot trigger a
+        // subsequent entry read or descend into another directory.
+        if visited >= entry_budget || !keep_going() {
+            return true;
+        }
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        visited += 1;
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            incomplete = true;
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            incomplete = true;
+            continue;
+        };
+        #[cfg(windows)]
+        let relative = relative.replace('\\', "/");
+        #[cfg(not(windows))]
+        let relative = relative.to_string();
+        if tracked.contains(&relative) {
+            continue;
+        }
+        match repo.status_should_ignore(Path::new(&relative)) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        }
+        if !keep_going() {
+            return true;
+        }
+        let Ok(kind) = entry.file_type() else {
+            incomplete = true;
+            continue;
+        };
+        if kind.is_dir() {
+            // Git reports untracked nested repositories as one directory.
+            // Do not inspect another repository's metadata or silently use
+            // just its directory mtime as proof that its contents are quiet.
+            match std::fs::symlink_metadata(path.join(".git")) {
+                Ok(_) => {
+                    paths.push(format!("{relative}/"));
+                    incomplete = true;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
+            }
+            match std::fs::read_dir(&path) {
+                Ok(entries) => stack.push(entries),
+                Err(_) => incomplete = true,
+            }
+        } else if kind.is_file() || kind.is_symlink() {
+            // Retain symlink names for the existing no-follow metadata probe,
+            // which marks their activity unknown without following the link.
+            paths.push(relative);
+        } else {
+            incomplete = true;
+        }
+    }
+    incomplete
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReservationGitActivity {
+    micros: Option<i64>,
+    incomplete: bool,
+}
+
+#[derive(Debug)]
+struct ReservationGitActivityScan {
+    activities: Vec<ReservationGitActivity>,
+    scanned_commits: usize,
+}
+
+/// Recent activity hints from one lazy, bounded history walk per read.
 ///
-/// Per pathspec this matches `reservation_git_latest_activity_micros`:
-/// commits are visited newest-first and a pathspec takes the first commit
-/// whose diff against its first parent (or, for a root commit, whose tree)
-/// has a matching path. The walk stops once every pathspec is resolved.
+/// Diffs compare against the first parent (or the empty tree for a root),
+/// restricted to pending pathspecs. The traversal retains merged histories,
+/// but is not globally timestamp-sorted. A recent touch proves activity;
+/// exhausting the budget without one leaves the result explicitly unknown.
 fn reservation_git_latest_activity_micros_batch(
     repo: &git2::Repository,
     pathspecs: &[String],
-) -> Vec<Option<i64>> {
-    let mut results = vec![None; pathspecs.len()];
-    let mut pending: Vec<(usize, git2::Pathspec)> = pathspecs
+    recent_since_micros: i64,
+    scan_budget: usize,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> ReservationGitActivityScan {
+    let mut scan = ReservationGitActivityScan {
+        activities: vec![
+            ReservationGitActivity {
+                micros: None,
+                incomplete: true,
+            };
+            pathspecs.len()
+        ],
+        scanned_commits: 0,
+    };
+    if pathspecs.is_empty() || scan_budget == 0 || !keep_going() {
+        return scan;
+    }
+    let mut pending: Vec<(usize, &str, git2::Pathspec)> = pathspecs
         .iter()
         .enumerate()
         .filter_map(|(slot, spec)| {
@@ -5386,82 +5685,131 @@ fn reservation_git_latest_activity_micros_batch(
                 .unwrap_or(spec);
             git2::Pathspec::new(std::iter::once(spec))
                 .ok()
-                .map(|pathspec| (slot, pathspec))
+                .map(|pathspec| (slot, spec, pathspec))
         })
         .collect();
     if pending.is_empty() {
-        return results;
+        return scan;
+    }
+    match repo.head() {
+        Ok(_) => {}
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {
+            for (slot, _, _) in &pending {
+                scan.activities[*slot].incomplete = false;
+            }
+            return scan;
+        }
+        Err(_) => return scan,
+    }
+    if !keep_going() {
+        return scan;
     }
     let Ok(mut revwalk) = repo.revwalk() else {
-        return results;
+        return scan;
     };
-    if revwalk.push_head().is_err() || revwalk.set_sorting(git2::Sort::TIME).is_err() {
-        return results;
+    // TIME sorting pre-walks the entire history before yielding even once.
+    // NONE keeps the first step bounded too (GH #385; also archive GH #361).
+    if revwalk.set_sorting(git2::Sort::NONE).is_err() || revwalk.push_head().is_err() {
+        return scan;
     }
 
-    let mut changed: Vec<PathBuf> = Vec::new();
-    for oid_result in revwalk {
-        let Ok(oid) = oid_result else { continue };
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
+    while !pending.is_empty() {
+        // A for loop would fetch the next Git object before checking the cap.
+        if scan.scanned_commits >= scan_budget || !keep_going() {
+            break;
+        }
+        let Some(oid_result) = revwalk.next() else {
+            for (slot, _, _) in &pending {
+                scan.activities[*slot].incomplete = false;
+            }
+            break;
         };
-        let Ok(commit_tree) = commit.tree() else {
+        let Ok(oid) = oid_result else { break };
+        if !keep_going() {
+            break;
+        }
+        let Ok(commit) = repo.find_commit(oid) else {
+            break;
+        };
+        scan.scanned_commits += 1;
+        let micros = commit.time().seconds().saturating_mul(1_000_000);
+        if micros < recent_since_micros {
+            // Do not stop at an old timestamp: a skewed clock or merged
+            // branch can hide a newer ancestor later in the lazy traversal.
             continue;
+        }
+        if !keep_going() {
+            break;
+        }
+        let Ok(commit_tree) = commit.tree() else {
+            break;
         };
         let parent_tree = if commit.parent_count() == 0 {
             None
         } else {
+            if !keep_going() {
+                break;
+            }
             let Ok(parent) = commit.parent(0) else {
-                continue;
+                break;
             };
-            let Ok(tree) = parent.tree() else { continue };
+            if !keep_going() {
+                break;
+            }
+            let Ok(tree) = parent.tree() else { break };
             Some(tree)
         };
-        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None)
-        else {
-            continue;
-        };
-        changed.clear();
-        for delta in diff.deltas() {
-            for path in [delta.new_file().path(), delta.old_file().path()]
-                .into_iter()
-                .flatten()
-            {
-                changed.push(path.to_path_buf());
-            }
-        }
-        if changed.is_empty() {
-            continue;
-        }
-        let micros = commit.time().seconds().saturating_mul(1_000_000);
-        pending.retain(|(slot, pathspec)| {
-            let touched = changed
-                .iter()
-                .any(|path| pathspec.matches_path(path, git2::PathspecFlags::DEFAULT));
-            if touched {
-                results[*slot] = Some(micros);
-            }
-            !touched
-        });
-        if pending.is_empty() {
+        if !keep_going() {
             break;
         }
+        let mut diff_opts = git2::DiffOptions::new();
+        for (_, spec, _) in &pending {
+            diff_opts.pathspec(*spec);
+        }
+        let Ok(diff) = repo.diff_tree_to_tree(
+            parent_tree.as_ref(),
+            Some(&commit_tree),
+            Some(&mut diff_opts),
+        ) else {
+            break;
+        };
+        for delta in diff.deltas() {
+            if !keep_going() {
+                return scan;
+            }
+            pending.retain(|(slot, _, pathspec)| {
+                let touched = [delta.new_file().path(), delta.old_file().path()]
+                    .into_iter()
+                    .flatten()
+                    .any(|path| pathspec.matches_path(path, git2::PathspecFlags::DEFAULT));
+                if touched {
+                    scan.activities[*slot] = ReservationGitActivity {
+                        micros: Some(micros),
+                        incomplete: false,
+                    };
+                }
+                !touched
+            });
+            if pending.is_empty() {
+                break;
+            }
+        }
     }
-    results
+    scan
 }
 
 /// Activity for every distinct pattern of one `file_reservations` read.
 ///
-/// Gives the same per-pattern result as `reservation_compute_pattern_activity`,
-/// but the repository is opened once, its candidate path list is built once,
-/// and one history walk serves every pattern. GH #337: the per-pattern index
-/// scans, working-tree status walks and history walks made each read cost
-/// seconds of CPU per live reservation on a large repository.
+/// The repository and candidate paths are shared across the page (GH #337).
+/// Both optional read enrichment and force-release checks use this bounded
+/// probe. A partial scan can prove recent activity, but cannot prove inactivity.
 pub(crate) fn reservation_compute_patterns_activity(
     workspace: Option<&Path>,
     repo_root: Option<&Path>,
     workspace_rel: Option<&Path>,
     patterns: &[String],
+    recent_since_micros: i64,
+    keep_going: &mut dyn FnMut() -> bool,
 ) -> HashMap<String, ReservationPatternActivity> {
     let mut out: HashMap<String, ReservationPatternActivity> =
         HashMap::with_capacity(patterns.len());
@@ -5471,34 +5819,28 @@ pub(crate) fn reservation_compute_patterns_activity(
         }
         return out;
     };
-    let ls_files_shell = std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref() == Some("1");
-    let activity_shell = std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL")
-        .ok()
-        .as_deref()
-        == Some("1");
-    if ls_files_shell || activity_shell {
-        // The CLI escape hatches keep their per-pattern behaviour.
-        for pattern in patterns {
-            let activity = reservation_compute_pattern_activity(
-                Some(workspace),
-                repo_root,
-                workspace_rel,
-                pattern,
-            );
-            out.insert(pattern.clone(), activity);
-        }
-        return out;
-    }
-
-    let repo = repo_root.and_then(|root| git2::Repository::open(root).ok());
+    let repo = repo_root
+        .filter(|_| keep_going())
+        .and_then(|root| git2::Repository::open(root).ok());
     let rel_base = workspace_rel.unwrap_or_else(|| Path::new(""));
     let want_git = repo_root.is_some() && workspace_rel.is_some();
-    let mut candidate_paths: Option<Vec<String>> = None;
-    // (pattern, git pathspec) for every matched pattern that needs git activity.
+    let mut candidate_paths: Option<(Vec<String>, bool)> = None;
+    // Missing working-tree paths can still have a recent committed deletion.
     let mut git_specs: Vec<(String, String)> = Vec::new();
 
     for pattern in patterns {
         if out.contains_key(pattern) {
+            continue;
+        }
+        if !keep_going() {
+            out.insert(
+                pattern.clone(),
+                ReservationPatternActivity {
+                    fs_activity_incomplete: true,
+                    git_activity_incomplete: true,
+                    ..ReservationPatternActivity::default()
+                },
+            );
             continue;
         }
         let normalized = reservation_normalize_pattern(pattern);
@@ -5507,42 +5849,62 @@ pub(crate) fn reservation_compute_patterns_activity(
             continue;
         }
         let has_glob = reservation_contains_glob(&normalized);
-        let (matches, fs_latest) = if has_glob {
+        let (matches, fs_latest, fs_incomplete) = if has_glob {
             let mut matched_paths = false;
             let mut fs_latest: Option<i64> = None;
+            let mut incomplete = false;
             if let (Some(repo), Some(root)) = (repo.as_ref(), repo_root) {
                 let spec = reservation_git_pathspec(rel_base, &normalized);
                 if let Ok(pathspec) = git2::Pathspec::new(std::iter::once(spec.as_str())) {
                     let candidates = candidate_paths
-                        .get_or_insert_with(|| reservation_repo_candidate_paths(repo));
-                    for rel in candidates.iter() {
+                        .get_or_insert_with(|| reservation_repo_candidate_paths(repo, keep_going));
+                    incomplete |= candidates.1;
+                    for rel in &candidates.0 {
+                        if !keep_going() {
+                            incomplete = true;
+                            break;
+                        }
                         if !pathspec
                             .matches_path(Path::new(rel), git2::PathspecFlags::NO_MATCH_ERROR)
                         {
                             continue;
                         }
                         matched_paths = true;
-                        if let Some(micros) = std::fs::metadata(root.join(rel))
-                            .ok()
-                            .and_then(|meta| meta.modified().ok())
-                            .and_then(reservation_system_time_to_micros)
-                        {
-                            fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+                        match reservation_path_metadata(root, Path::new(rel), keep_going) {
+                            Ok(Some(meta)) => {
+                                if let Some(micros) = meta
+                                    .modified()
+                                    .ok()
+                                    .and_then(reservation_system_time_to_micros)
+                                {
+                                    fs_latest =
+                                        Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+                                } else {
+                                    incomplete = true;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(()) => incomplete = true,
                         }
                     }
+                } else {
+                    incomplete = true;
                 }
             }
             if matched_paths {
-                (true, fs_latest)
+                (true, fs_latest, incomplete)
             } else if let Some(matcher) = reservation_glob_matcher(&normalized) {
-                reservation_glob_walk_latest_micros(workspace, workspace, &matcher)
+                let (matches, latest, partial) = reservation_glob_walk_latest_micros(
+                    workspace, workspace, &matcher, false, keep_going,
+                );
+                (matches, latest, incomplete || partial)
             } else {
-                (false, None)
+                (false, None, true)
             }
         } else {
-            reservation_literal_fs_activity(workspace, &normalized)
+            reservation_literal_fs_activity(workspace, &normalized, keep_going)
         };
-        if matches && want_git {
+        if want_git {
             let spec = reservation_git_pathspec(rel_base, &normalized);
             let spec = if has_glob {
                 format!(":(glob){spec}")
@@ -5556,7 +5918,9 @@ pub(crate) fn reservation_compute_patterns_activity(
             ReservationPatternActivity {
                 matches,
                 fs_activity_micros: fs_latest,
+                fs_activity_incomplete: fs_incomplete || !keep_going(),
                 git_activity_micros: None,
+                git_activity_incomplete: want_git || !keep_going(),
             },
         );
     }
@@ -5566,17 +5930,26 @@ pub(crate) fn reservation_compute_patterns_activity(
     {
         let specs: Vec<String> = git_specs.iter().map(|(_, spec)| spec.clone()).collect();
         let start = std::time::Instant::now();
-        let latest = reservation_git_latest_activity_micros_batch(repo, &specs);
+        let scan = reservation_git_latest_activity_micros_batch(
+            repo,
+            &specs,
+            recent_since_micros,
+            RESERVATION_ACTIVITY_SCAN_BUDGET,
+            keep_going,
+        );
         tracing::debug!(
             target: "mcp_agent_mail::tools::reservations::activity",
             patterns = specs.len(),
+            scanned_commits = scan.scanned_commits,
+            incomplete_patterns = scan.activities.iter().filter(|a| a.incomplete).count(),
             duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             via = "libgit2_batch",
             "reservation_activity_batch_result"
         );
-        for ((pattern, _), micros) in git_specs.iter().zip(latest) {
+        for ((pattern, _), git_activity) in git_specs.iter().zip(scan.activities) {
             if let Some(activity) = out.get_mut(pattern) {
-                activity.git_activity_micros = micros;
+                activity.git_activity_micros = git_activity.micros;
+                activity.git_activity_incomplete = git_activity.incomplete;
             }
         }
     }
@@ -5599,6 +5972,391 @@ mod reservation_activity_tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ActivityReadEnd {
+        AmbientCancellation,
+        RequestCancellation,
+        RequestDeadline,
+        DroppedFuture,
+    }
+
+    fn assert_activity_read_stops(ending: ActivityReadEnd) {
+        use std::future::Future;
+        use std::sync::mpsc;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("activity test runtime");
+        runtime.block_on(async {
+            let request_cx = asupersync::Cx::for_testing();
+            let ctx = McpContext::new(request_cx.clone(), 1);
+            let sibling = McpContext::new(request_cx.clone(), 2);
+            let caller_thread = std::thread::current().id();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            // A long enrichment budget keeps its normal timeout from masking
+            // missing cancellation propagation or a missing drop guard.
+            let mut read = Box::pin(reservation_activity_blocking(
+                &ctx,
+                Duration::from_secs(30),
+                move |keep_going| {
+                    entered_tx
+                        .send((std::thread::current().id(), keep_going()))
+                        .expect("signal running activity worker");
+                    let resumed = resume_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                    let continued = keep_going();
+                    finished_tx
+                        .send((resumed, continued))
+                        .expect("signal activity worker completion");
+                    continued
+                },
+            ));
+            let first_poll =
+                std::future::poll_fn(|task_cx| Poll::Ready(read.as_mut().poll(task_cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "worker must run on the blocking pool"
+            );
+            let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+            match ending {
+                ActivityReadEnd::AmbientCancellation => request_cx.set_cancel_requested(true),
+                ActivityReadEnd::RequestCancellation => {
+                    ctx.request_cancellation().cancel();
+                }
+                ActivityReadEnd::RequestDeadline => {
+                    // Tighten the real clone-shared request ceiling after the
+                    // worker has entered, without cancelling its ambient Cx.
+                    drop(ctx.clone().with_budget_ceiling(
+                        asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                    ));
+                }
+                ActivityReadEnd::DroppedFuture => {}
+            }
+            let response = if matches!(ending, ActivityReadEnd::DroppedFuture) {
+                drop(read);
+                let _ = resume_tx.send(());
+                None
+            } else {
+                let _ = resume_tx.send(());
+                Some(read.await)
+            };
+            let finished = finished_rx.recv_timeout(Duration::from_secs(2));
+            let (worker_thread, initially_live) = entered.expect("activity worker entered");
+            assert_ne!(worker_thread, caller_thread, "must exercise a real worker");
+            assert!(initially_live, "request must be live before ending it");
+            assert_eq!(
+                finished.expect("abandoned activity worker must exit promptly"),
+                (true, false),
+                "{ending:?} must stop the running worker at its next checkpoint"
+            );
+            if let Some(response) = response {
+                assert_eq!(
+                    response
+                        .expect_err("ended request cannot publish activity")
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+            } else {
+                assert!(
+                    ctx.ensure_live().is_ok(),
+                    "dropping a read only stops its worker"
+                );
+            }
+            let ambient_cancelled = matches!(ending, ActivityReadEnd::AmbientCancellation);
+            assert_eq!(request_cx.is_cancel_requested(), ambient_cancelled);
+            assert_eq!(sibling.ensure_live().is_err(), ambient_cancelled);
+            assert_eq!(
+                ctx.deadline_expired(),
+                matches!(ending, ActivityReadEnd::RequestDeadline)
+            );
+        });
+    }
+
+    #[test]
+    fn reservation_activity_worker_observes_dispatch_cancellation() {
+        assert_activity_read_stops(ActivityReadEnd::AmbientCancellation);
+    }
+
+    #[test]
+    fn reservation_activity_worker_observes_request_cancellation() {
+        assert_activity_read_stops(ActivityReadEnd::RequestCancellation);
+    }
+
+    #[test]
+    fn reservation_activity_worker_observes_request_deadline() {
+        assert_activity_read_stops(ActivityReadEnd::RequestDeadline);
+    }
+
+    #[test]
+    fn reservation_activity_worker_stops_when_read_future_is_dropped() {
+        assert_activity_read_stops(ActivityReadEnd::DroppedFuture);
+    }
+
+    #[test]
+    fn reservation_activity_budget_expiry_preserves_request_liveness() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("activity test runtime");
+        runtime.block_on(async {
+            let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
+            let continued =
+                reservation_activity_blocking(&ctx, Duration::ZERO, |keep_going| keep_going())
+                    .await
+                    .expect("optional enrichment expiry is not a failed resource read");
+            assert!(
+                !continued,
+                "exhausted enrichment cannot start more scan work"
+            );
+            assert!(ctx.ensure_live().is_ok());
+            assert!(!ctx.cx().is_cancel_requested());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reservation_candidate_inventory_does_not_read_tracked_file_contents() {
+        fn thread_read_chars() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io")
+                .expect("read current thread I/O counters")
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .expect("rchar counter")
+                .parse()
+                .expect("numeric rchar counter")
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = reservation_scan_repo(root);
+        let file = std::fs::File::create(root.join("large.bin")).expect("create sparse file");
+        file.set_len(16 * 1024 * 1024).expect("size sparse file");
+        run_git(root, &["add", "large.bin"]);
+        // Identical bytes with different stat information force a Git status
+        // diff to read/hash the entire file. Reservation activity only needs
+        // the path and mtime, even when the file is much larger than its budget.
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        )
+        .expect("invalidate index stat information");
+
+        let before = thread_read_chars();
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        let read_chars = thread_read_chars().saturating_sub(before);
+
+        assert!(!incomplete);
+        assert!(paths.iter().any(|path| path == "large.bin"));
+        assert!(
+            read_chars < 1024 * 1024,
+            "metadata inventory must not read the 16 MiB tracked payload: read {read_chars} bytes"
+        );
+    }
+
+    #[test]
+    fn reservation_candidate_inventory_preserves_git_ignore_and_tracked_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).expect("create workspace");
+        let repo = reservation_scan_repo(&root);
+        for directory in ["ignored", "src", "untracked/deep"] {
+            std::fs::create_dir_all(root.join(directory)).expect("create directory");
+        }
+        for path in [
+            "tracked.rs",
+            "ignored/tracked.rs",
+            "ignored/untracked.rs",
+            "src/kept.rs",
+            "src/local.log",
+            "from-info.txt",
+            "from-global.txt",
+            "untracked/deep/new.rs",
+        ] {
+            std::fs::write(root.join(path), path).expect("write fixture");
+        }
+        std::fs::write(root.join(".gitignore"), "ignored/\n").expect("repository ignores");
+        std::fs::write(root.join("src/.gitignore"), "*.log\n").expect("nested ignores");
+        std::fs::write(repo.path().join("info/exclude"), "from-info.txt\n")
+            .expect("local excludes");
+        let global = tmp.path().join("global-excludes");
+        std::fs::write(&global, "from-global.txt\n").expect("global excludes");
+        repo.config()
+            .expect("repository config")
+            .set_str("core.excludesFile", global.to_str().expect("fixture path"))
+            .expect("configure global excludes");
+        run_git(&root, &["add", "tracked.rs"]);
+        run_git(&root, &["add", "-f", "ignored/tracked.rs"]);
+        // Tracked paths stay candidates independently of their current Git
+        // status or ignore rules. Contents are irrelevant to the inventory.
+        std::fs::write(root.join("tracked.rs"), "modified\n").expect("modify tracked file");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        let actual: std::collections::BTreeSet<_> = paths.into_iter().collect();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["ls-files", "-c", "-o", "--exclude-standard"])
+            .output()
+            .expect("query real Git path inventory");
+        assert!(output.status.success());
+        let expected: std::collections::BTreeSet<_> = String::from_utf8(output.stdout)
+            .expect("UTF-8 fixture paths")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(!incomplete);
+        assert_eq!(actual, expected);
+        assert!(actual.contains("ignored/tracked.rs"));
+        assert!(actual.contains("untracked/deep/new.rs"));
+        assert!(!actual.contains("ignored/untracked.rs"));
+        assert!(!actual.contains("src/local.log"));
+        assert!(!actual.contains("from-info.txt"));
+        assert!(!actual.contains("from-global.txt"));
+        assert!(actual.iter().all(|path| !path.starts_with(".git/")));
+    }
+
+    #[test]
+    fn reservation_untracked_inventory_stops_on_entry_budget_and_cancellation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        for index in 0..32 {
+            std::fs::write(tmp.path().join(format!("untracked-{index}.rs")), "x\n")
+                .expect("write untracked file");
+        }
+        let tracked = HashSet::new();
+        let mut paths = Vec::new();
+        assert!(reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            4,
+            &mut || true,
+        ));
+        assert!(paths.len() <= 4, "entry budget must bound discovery itself");
+
+        paths.clear();
+        let mut checkpoints = 0;
+        assert!(reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            usize::MAX,
+            &mut || {
+                checkpoints += 1;
+                checkpoints < 5
+            },
+        ));
+        assert_eq!(checkpoints, 5, "no work starts after cancellation");
+        assert!(paths.len() < 32);
+
+        paths.clear();
+        assert!(!reservation_untracked_candidate_paths(
+            &repo,
+            &tracked,
+            &mut paths,
+            64,
+            &mut || true,
+        ));
+        assert_eq!(paths.len(), 32, "a later read can finish the inventory");
+    }
+
+    #[test]
+    fn reservation_untracked_nested_repository_cannot_prove_inactivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested workspace");
+        let _nested_repo = reservation_scan_repo(&nested);
+        std::fs::write(nested.join("active.rs"), "new work\n").expect("nested work");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+
+        assert_eq!(paths, vec!["nested/".to_string()]);
+        assert!(
+            incomplete,
+            "a nested repository's root mtime cannot prove its contents are quiet"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reservation_glob_activity_preserves_literal_backslashes_in_unix_filenames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let repo = reservation_scan_repo(root);
+        let old = std::fs::File::create(root.join("old.rs")).expect("create stale tracked file");
+        old.set_times(
+            std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        )
+        .expect("old tracked mtime");
+        run_git(root, &["add", "old.rs"]);
+        let recent = std::fs::File::create(root.join("recent\\edit.rs"))
+            .expect("create literal backslash filename");
+        recent
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + Duration::from_mins(28_333_335)),
+            )
+            .expect("more recent untracked mtime");
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+        assert!(!incomplete);
+        assert!(paths.iter().any(|path| path == "recent\\edit.rs"));
+        assert!(!paths.iter().any(|path| path == "recent/edit.rs"));
+        let patterns = ["*.rs".to_string()];
+        let activity = reservation_compute_patterns_activity(
+            Some(root),
+            Some(root),
+            Some(Path::new("")),
+            &patterns,
+            i64::MIN,
+            &mut || true,
+        );
+        assert!(activity[&patterns[0]].matches);
+        assert!(!activity[&patterns[0]].fs_activity_incomplete);
+        assert_eq!(
+            activity[&patterns[0]].fs_activity_micros,
+            Some(1_700_000_100_000_000),
+            "a stale tracked match must not hide a more recent literal-backslash path"
+        );
+    }
+
+    #[test]
+    fn reservation_tracked_submodule_cannot_prove_inactivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).expect("create submodule workspace");
+        let nested_repo = reservation_scan_repo(&nested);
+        std::fs::write(nested.join("active.rs"), "nested work\n").expect("nested work");
+        let mut nested_index = nested_repo.index().expect("submodule index");
+        nested_index
+            .add_path(Path::new("active.rs"))
+            .expect("stage nested work");
+        let tree_id = nested_index.write_tree().expect("nested tree");
+        let tree = nested_repo.find_tree(tree_id).expect("nested tree object");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
+        nested_repo
+            .commit(Some("HEAD"), &signature, &signature, "nested", &tree, &[])
+            .expect("commit nested work");
+        run_git(tmp.path(), &["add", "nested"]);
+        let index = repo.index().expect("outer index");
+        assert_eq!(
+            index
+                .get_path(Path::new("nested"), 0)
+                .expect("gitlink")
+                .mode,
+            0o160_000
+        );
+
+        let (paths, incomplete) = reservation_repo_candidate_paths(&repo, &mut || true);
+
+        assert!(paths.iter().any(|path| path == "nested"));
+        assert!(incomplete, "opaque tracked submodule activity is unknown");
     }
 
     #[test]
@@ -5758,6 +6516,8 @@ mod reservation_activity_tests {
             Some(repo_root.as_path()),
             Some(workspace_rel.as_path()),
             &patterns,
+            i64::MIN,
+            &mut || true,
         );
         for pattern in &patterns {
             let single = reservation_compute_pattern_activity(
@@ -5789,7 +6549,14 @@ mod reservation_activity_tests {
     #[test]
     fn reservation_compute_patterns_activity_without_workspace_or_repo() {
         let patterns = vec!["src/**".to_string(), "a.rs".to_string()];
-        let none = reservation_compute_patterns_activity(None, None, None, &patterns);
+        let none = reservation_compute_patterns_activity(
+            None,
+            None,
+            None,
+            &patterns,
+            i64::MIN,
+            &mut || true,
+        );
         assert_eq!(none.len(), 2);
         assert!(
             none.values()
@@ -5798,7 +6565,14 @@ mod reservation_activity_tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a.rs"), "x\n").expect("write");
-        let plain = reservation_compute_patterns_activity(Some(tmp.path()), None, None, &patterns);
+        let plain = reservation_compute_patterns_activity(
+            Some(tmp.path()),
+            None,
+            None,
+            &patterns,
+            i64::MIN,
+            &mut || true,
+        );
         for pattern in &patterns {
             let single =
                 reservation_compute_pattern_activity(Some(tmp.path()), None, None, pattern);
@@ -5806,6 +6580,637 @@ mod reservation_activity_tests {
         }
         assert!(plain["a.rs"].matches);
         assert_eq!(plain["a.rs"].git_activity_micros, None);
+    }
+
+    fn reservation_scan_repo(root: &Path) -> git2::Repository {
+        let mut options = git2::RepositoryInitOptions::new();
+        options.initial_head("main");
+        git2::Repository::init_opts(root, &options).expect("initialize scan fixture")
+    }
+
+    fn reservation_scan_add_file(
+        repo: &git2::Repository,
+        index: &mut git2::Index,
+        path: &str,
+        content: &str,
+        mode: u32,
+    ) {
+        let id = repo.blob(content.as_bytes()).expect("write fixture blob");
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                file_size: u32::try_from(content.len()).expect("fixture file size"),
+                id,
+                flags: 0,
+                flags_extended: 0,
+                path: path.as_bytes().to_vec(),
+            })
+            .expect("add fixture index entry");
+    }
+
+    fn reservation_scan_commit(
+        repo: &git2::Repository,
+        index: &mut git2::Index,
+        parents: &[git2::Oid],
+        seconds: i64,
+    ) -> git2::Oid {
+        let tree_id = index.write_tree_to(repo).expect("write fixture tree");
+        let tree = repo.find_tree(tree_id).expect("load fixture tree");
+        let parents: Vec<_> = parents
+            .iter()
+            .map(|id| repo.find_commit(*id).expect("load fixture parent"))
+            .collect();
+        let parent_refs: Vec<_> = parents.iter().collect();
+        let signature = git2::Signature::new(
+            "Reservation Scan Test",
+            "scan@example.com",
+            &git2::Time::new(seconds, 0),
+        )
+        .expect("fixture signature");
+        repo.commit(
+            None,
+            &signature,
+            &signature,
+            "reservation scan fixture",
+            &tree,
+            &parent_refs,
+        )
+        .expect("write fixture commit")
+    }
+
+    fn reservation_scan_set_head(repo: &git2::Repository, head: git2::Oid) {
+        repo.reference("refs/heads/main", head, true, "scan fixture")
+            .expect("set fixture branch");
+    }
+
+    #[test]
+    fn reservation_activity_keeps_filesystem_failure_after_complete_git_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(&repo, &mut index, "target.rs", "tracked\n", 0o100_644);
+        let head = reservation_scan_commit(&repo, &mut index, &[], epoch);
+        reservation_scan_set_head(&repo, head);
+        std::fs::write(tmp.path().join("target.rs"), "tracked\n").expect("working file");
+        // Git history remains readable while path enumeration cannot establish
+        // which tracked or untracked files the glob covers.
+        std::fs::write(repo.path().join("index"), b"invalid index").expect("corrupt fixture index");
+
+        let activities = reservation_compute_patterns_activity(
+            Some(tmp.path()),
+            Some(tmp.path()),
+            Some(Path::new("")),
+            &["*.rs".to_string()],
+            epoch * 1_000_000,
+            &mut || true,
+        );
+        let activity = &activities["*.rs"];
+        assert!(activity.matches);
+        assert!(activity.fs_activity_incomplete);
+        assert_eq!(activity.git_activity_micros, Some(epoch * 1_000_000));
+        assert!(!activity.git_activity_incomplete);
+    }
+
+    #[test]
+    fn reservation_activity_checks_recent_committed_deletions_of_missing_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(&repo, &mut index, "removed.rs", "old\n", 0o100_644);
+        let first = reservation_scan_commit(&repo, &mut index, &[], epoch);
+        index
+            .remove_path(Path::new("removed.rs"))
+            .expect("remove only in-memory fixture entry");
+        let head = reservation_scan_commit(&repo, &mut index, &[first], epoch + 10);
+        reservation_scan_set_head(&repo, head);
+
+        let patterns = ["removed.rs".to_string(), "removed.*".to_string()];
+        let activities = reservation_compute_patterns_activity(
+            Some(tmp.path()),
+            Some(tmp.path()),
+            Some(Path::new("")),
+            &patterns,
+            (epoch + 1) * 1_000_000,
+            &mut || true,
+        );
+        for pattern in patterns {
+            let activity = &activities[&pattern];
+            assert!(!activity.matches, "{pattern}");
+            assert!(!activity.fs_activity_incomplete, "{pattern}");
+            assert_eq!(
+                activity.git_activity_micros,
+                Some((epoch + 10) * 1_000_000),
+                "{pattern}"
+            );
+            assert!(!activity.git_activity_incomplete, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn reservation_activity_distinguishes_missing_child_from_unavailable_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            reservation_literal_fs_activity(tmp.path(), "missing.rs", &mut || true),
+            (false, None, false)
+        );
+        assert_eq!(
+            reservation_literal_fs_activity(
+                &tmp.path().join("missing-workspace"),
+                "missing.rs",
+                &mut || true,
+            ),
+            (false, None, true)
+        );
+        assert_eq!(
+            reservation_literal_fs_activity(tmp.path(), "missing.rs", &mut || false),
+            (false, None, true)
+        );
+        assert_eq!(
+            reservation_literal_fs_activity(tmp.path(), "../outside.rs", &mut || true),
+            (false, None, true)
+        );
+        let matcher = reservation_glob_matcher("**/*.rs").expect("fixture glob");
+        let (_, _, incomplete) = reservation_glob_walk_latest_micros(
+            tmp.path(),
+            &tmp.path().join("unavailable"),
+            &matcher,
+            false,
+            &mut || true,
+        );
+        assert!(incomplete, "failed directory reads cannot prove inactivity");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reservation_activity_does_not_follow_symlinks_or_lossy_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let external = tempfile::tempdir().expect("external directory");
+        symlink(external.path(), tmp.path().join("linked")).expect("fixture symlink");
+        assert_eq!(
+            reservation_literal_fs_activity(tmp.path(), "linked/missing.rs", &mut || true),
+            (false, None, true)
+        );
+        let matcher = reservation_glob_matcher("**/*.rs").expect("fixture glob");
+        let (_, _, incomplete) = reservation_glob_walk_latest_micros(
+            tmp.path(),
+            tmp.path(),
+            &matcher,
+            false,
+            &mut || true,
+        );
+        assert!(
+            incomplete,
+            "skipping a linked subtree leaves its activity unknown"
+        );
+
+        let names = tempfile::tempdir().expect("non-UTF8 fixture");
+        std::fs::write(
+            names.path().join(OsString::from_vec(vec![0xff])),
+            "activity",
+        )
+        .expect("non-UTF8 fixture file");
+        let (_, _, incomplete) = reservation_glob_walk_latest_micros(
+            names.path(),
+            names.path(),
+            &matcher,
+            false,
+            &mut || true,
+        );
+        assert!(
+            incomplete,
+            "lossy path conversion cannot establish a complete scan"
+        );
+    }
+
+    #[test]
+    fn reservation_git_scan_bounds_deep_and_uncommitted_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(&repo, &mut index, "src/target.rs", "root only\n", 0o100_644);
+        // Unrelated wide trees used to be diffed on every commit while the
+        // read searched for the root-only reservation or an uncommitted file.
+        for number in 0..256 {
+            reservation_scan_add_file(
+                &repo,
+                &mut index,
+                &format!("docs/plans/plan-{number}.md"),
+                "initial\n",
+                0o100_644,
+            );
+        }
+        let mut head = reservation_scan_commit(&repo, &mut index, &[], epoch);
+        for number in 1..=64 {
+            reservation_scan_add_file(
+                &repo,
+                &mut index,
+                &format!("docs/plans/plan-{number}.md"),
+                "updated\n",
+                0o100_644,
+            );
+            head = reservation_scan_commit(&repo, &mut index, &[head], epoch + number);
+        }
+        reservation_scan_set_head(&repo, head);
+        std::fs::write(tmp.path().join("untracked.rs"), "not committed\n")
+            .expect("write untracked fixture");
+
+        let specs = [
+            "src/target.rs",
+            "untracked.rs",
+            "docs/plans/plan-64.md",
+            "missing.rs",
+        ]
+        .map(str::to_string);
+        let scan = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            epoch * 1_000_000,
+            8,
+            &mut || true,
+        );
+
+        assert_eq!(scan.scanned_commits, 8);
+        assert_eq!(scan.activities.len(), specs.len());
+        assert_eq!(scan.activities[2].micros, Some((epoch + 64) * 1_000_000));
+        assert!(!scan.activities[2].incomplete);
+        for slot in [0, 1, 3] {
+            assert_eq!(scan.activities[slot].micros, None, "{}", specs[slot]);
+            assert!(scan.activities[slot].incomplete, "{}", specs[slot]);
+        }
+    }
+
+    #[test]
+    fn reservation_git_scan_tracks_root_globs_directories_modes_and_deletions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        for path in [
+            "src/root_only.rs",
+            "src/deleted.rs",
+            "scripts/run.sh",
+            "docs/deep/guide.md",
+            "docs-other/guide.md",
+        ] {
+            reservation_scan_add_file(&repo, &mut index, path, "original\n", 0o100_644);
+        }
+        let mut head = reservation_scan_commit(&repo, &mut index, &[], epoch);
+        // Same blob, different executable bit: an OID-only comparison misses it.
+        reservation_scan_add_file(&repo, &mut index, "scripts/run.sh", "original\n", 0o100_755);
+        head = reservation_scan_commit(&repo, &mut index, &[head], epoch + 10);
+        reservation_scan_add_file(
+            &repo,
+            &mut index,
+            "docs/deep/guide.md",
+            "changed\n",
+            0o100_644,
+        );
+        head = reservation_scan_commit(&repo, &mut index, &[head], epoch + 20);
+        // Remove only the in-memory index entry to model a committed deletion.
+        index
+            .remove_path(Path::new("src/deleted.rs"))
+            .expect("remove fixture index entry");
+        head = reservation_scan_commit(&repo, &mut index, &[head], epoch + 30);
+        reservation_scan_add_file(
+            &repo,
+            &mut index,
+            "docs-other/guide.md",
+            "later\n",
+            0o100_644,
+        );
+        head = reservation_scan_commit(&repo, &mut index, &[head], epoch + 40);
+        reservation_scan_set_head(&repo, head);
+
+        let specs = [
+            "src/root_only.rs",
+            ":(glob)src/root_*.rs",
+            "scripts/run.sh",
+            "docs",
+            "docs/",
+            ":(glob)docs/**/*.md",
+            "src/deleted.rs",
+            ":(glob)src/deleted.*",
+            "docs-other/guide.md",
+            "missing.rs",
+        ]
+        .map(str::to_string);
+        let expected_seconds = [
+            Some(epoch),
+            Some(epoch),
+            Some(epoch + 10),
+            Some(epoch + 20),
+            Some(epoch + 20),
+            Some(epoch + 20),
+            Some(epoch + 30),
+            Some(epoch + 30),
+            Some(epoch + 40),
+            None,
+        ];
+        let scan = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            epoch * 1_000_000,
+            16,
+            &mut || true,
+        );
+
+        assert_eq!(scan.scanned_commits, 5);
+        assert_eq!(scan.activities.len(), specs.len());
+        for ((activity, expected), spec) in scan.activities.iter().zip(expected_seconds).zip(specs)
+        {
+            assert_eq!(activity.micros, expected.map(|ts| ts * 1_000_000), "{spec}");
+            assert!(!activity.incomplete, "{spec}");
+        }
+    }
+
+    #[test]
+    fn reservation_git_scan_keeps_recent_ancestors_behind_older_children() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(
+            &repo,
+            &mut index,
+            "target.rs",
+            "recent ancestor\n",
+            0o100_644,
+        );
+        let ancestor = reservation_scan_commit(&repo, &mut index, &[], epoch + 100);
+        reservation_scan_add_file(&repo, &mut index, "other.rs", "older child\n", 0o100_644);
+        let head = reservation_scan_commit(&repo, &mut index, &[ancestor], epoch - 100);
+        reservation_scan_set_head(&repo, head);
+
+        let scan = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &["target.rs".to_string(), "other.rs".to_string()],
+            epoch * 1_000_000,
+            8,
+            &mut || true,
+        );
+
+        assert_eq!(scan.scanned_commits, 2);
+        assert_eq!(scan.activities[0].micros, Some((epoch + 100) * 1_000_000));
+        assert!(!scan.activities[0].incomplete);
+        assert_eq!(scan.activities[1].micros, None);
+        assert!(!scan.activities[1].incomplete);
+    }
+
+    #[test]
+    fn reservation_git_scan_visits_merged_side_history() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(&repo, &mut index, "root.rs", "root\n", 0o100_644);
+        let root = reservation_scan_commit(&repo, &mut index, &[], epoch - 300);
+        let root_tree = repo
+            .find_commit(root)
+            .expect("root commit")
+            .tree()
+            .expect("root tree");
+        reservation_scan_add_file(&repo, &mut index, "main.rs", "main\n", 0o100_644);
+        let main = reservation_scan_commit(&repo, &mut index, &[root], epoch - 200);
+        let mut side_index = git2::Index::new().expect("side index");
+        side_index.read_tree(&root_tree).expect("copy root tree");
+        reservation_scan_add_file(&repo, &mut side_index, "side.rs", "side\n", 0o100_644);
+        let side = reservation_scan_commit(&repo, &mut side_index, &[root], epoch + 100);
+        // Keep the first parent's tree, so only a visit to the merged side
+        // commit can find side.rs. The merge's own clock is older as well.
+        let merge = reservation_scan_commit(&repo, &mut index, &[main, side], epoch - 100);
+        reservation_scan_set_head(&repo, merge);
+
+        let scan = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &["side.rs".to_string(), "missing.rs".to_string()],
+            epoch * 1_000_000,
+            8,
+            &mut || true,
+        );
+
+        assert_eq!(scan.scanned_commits, 4);
+        assert_eq!(scan.activities[0].micros, Some((epoch + 100) * 1_000_000));
+        assert!(!scan.activities[0].incomplete);
+        assert_eq!(scan.activities[1].micros, None);
+        assert!(!scan.activities[1].incomplete);
+    }
+
+    #[test]
+    fn reservation_git_scan_cutoff_is_inclusive_and_zero_budget_is_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let mut index = git2::Index::new().expect("fixture index");
+        let epoch = 1_700_000_000;
+        reservation_scan_add_file(&repo, &mut index, "target.rs", "at cutoff\n", 0o100_644);
+        let head = reservation_scan_commit(&repo, &mut index, &[], epoch);
+        reservation_scan_set_head(&repo, head);
+        let specs = ["target.rs".to_string()];
+        for (cutoff, expected) in [
+            (epoch * 1_000_000, Some(epoch * 1_000_000)),
+            (epoch * 1_000_000 + 1, None),
+        ] {
+            let scan =
+                reservation_git_latest_activity_micros_batch(&repo, &specs, cutoff, 8, &mut || {
+                    true
+                });
+            assert_eq!(scan.scanned_commits, 1);
+            assert_eq!(scan.activities[0].micros, expected);
+            assert!(!scan.activities[0].incomplete);
+        }
+
+        let scan = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &specs,
+            epoch * 1_000_000,
+            0,
+            &mut || true,
+        );
+        assert_eq!(scan.scanned_commits, 0);
+        assert_eq!(scan.activities[0].micros, None);
+        assert!(scan.activities[0].incomplete);
+    }
+
+    #[test]
+    fn reservation_git_scan_empty_patterns_and_unborn_head_are_complete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let empty = reservation_git_latest_activity_micros_batch(&repo, &[], 0, 8, &mut || true);
+        assert!(empty.activities.is_empty());
+        assert_eq!(empty.scanned_commits, 0);
+
+        let unborn = reservation_git_latest_activity_micros_batch(
+            &repo,
+            &["target.rs".to_string()],
+            0,
+            8,
+            &mut || true,
+        );
+        assert_eq!(unborn.scanned_commits, 0);
+        assert_eq!(unborn.activities.len(), 1);
+        assert_eq!(unborn.activities[0].micros, None);
+        assert!(!unborn.activities[0].incomplete);
+    }
+
+    // Preserve the additional real-Git regressions from the concurrent GH#385
+    // fix while exercising the lazy scanner's recent-cutoff/keep-going API.
+    fn bounded_activity_history() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run_git(root, &["init", "-q", "-b", "main"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        std::fs::write(root.join("cold.rs"), "old\n").expect("write cold");
+        std::fs::write(root.join("hot.rs"), "0\n").expect("write hot");
+        run_git(root, &["add", "."]);
+        commit_at(root, "root", 1_700_000_000);
+        for revision in 1..=3 {
+            std::fs::write(root.join("hot.rs"), format!("{revision}\n")).expect("update hot");
+            run_git(root, &["add", "hot.rs"]);
+            commit_at(root, "hot", 1_700_000_000 + revision * 100);
+        }
+        tmp
+    }
+
+    #[test]
+    fn reservation_git_activity_budget_preserves_partial_results() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec![
+            "hot.rs".to_string(),
+            "cold.rs".to_string(),
+            "never.rs".to_string(),
+        ];
+        let bounded =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 1, &mut || true);
+        assert_eq!(bounded.scanned_commits, 1);
+        assert_eq!(bounded.activities[0].micros, Some(1_700_000_300_000_000));
+        assert!(!bounded.activities[0].incomplete);
+        for activity in &bounded.activities[1..] {
+            assert_eq!(activity.micros, None);
+            assert!(activity.incomplete);
+        }
+
+        // Real history exhaustion, not a cutoff, proves no matching commit.
+        let complete =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
+        assert_eq!(complete.scanned_commits, 4);
+        assert!(
+            complete
+                .activities
+                .iter()
+                .all(|activity| !activity.incomplete)
+        );
+        assert_eq!(complete.activities[0].micros, bounded.activities[0].micros);
+        assert_eq!(complete.activities[1].micros, Some(1_700_000_000_000_000));
+        assert_eq!(complete.activities[2].micros, None);
+    }
+
+    #[test]
+    fn reservation_git_activity_cancellation_keeps_already_resolved_patterns() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec!["hot.rs".to_string(), "cold.rs".to_string()];
+        // Establish the checkpoints needed for one completed commit, rather
+        // than coupling cancellation to a hardcoded number of object loads.
+        let mut first_commit_checkpoints = 0;
+        let first_commit =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 1, &mut || {
+                first_commit_checkpoints += 1;
+                true
+            });
+        assert_eq!(first_commit.scanned_commits, 1);
+        assert_eq!(
+            first_commit.activities[0].micros,
+            Some(1_700_000_300_000_000)
+        );
+        assert!(!first_commit.activities[0].incomplete);
+        assert!(first_commit.activities[1].incomplete);
+
+        let mut checkpoints = 0;
+        let interrupted =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
+                checkpoints += 1;
+                checkpoints <= first_commit_checkpoints
+            });
+        assert!(checkpoints > first_commit_checkpoints);
+        assert_eq!(interrupted.scanned_commits, 1);
+        assert_eq!(
+            interrupted.activities[0].micros,
+            Some(1_700_000_300_000_000)
+        );
+        assert!(!interrupted.activities[0].incomplete);
+        assert_eq!(interrupted.activities[1].micros, None);
+        assert!(interrupted.activities[1].incomplete);
+    }
+
+    #[test]
+    fn reservation_git_activity_deadline_and_dropped_request_leave_history_unknown() {
+        let tmp = bounded_activity_history();
+        let repo = git2::Repository::open(tmp.path()).expect("open");
+        let specs = vec!["cold.rs".to_string()];
+        let deadline = Instant::now();
+        let expired =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
+                Instant::now() < deadline
+            });
+        assert_eq!(expired.scanned_commits, 0);
+        assert_eq!(expired.activities[0].micros, None);
+        assert!(expired.activities[0].incomplete);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let awaiting_request = ReservationActivityCancelOnDrop(Arc::clone(&cancelled));
+        drop(awaiting_request);
+        let dropped =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || {
+                !cancelled.load(Ordering::Acquire)
+            });
+        assert_eq!(dropped.scanned_commits, 0);
+        assert_eq!(dropped.activities[0].micros, None);
+        assert!(dropped.activities[0].incomplete);
+    }
+
+    #[test]
+    fn reservation_git_activity_distinguishes_unborn_history_from_missing_objects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = reservation_scan_repo(tmp.path());
+        let specs = vec!["cold.rs".to_string()];
+        let unborn =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
+        assert_eq!(unborn.scanned_commits, 0);
+        assert_eq!(unborn.activities[0].micros, None);
+        assert!(!unborn.activities[0].incomplete);
+
+        // A real commit with an unavailable tree is not an empty history.
+        // Keep the object intact as evidence; no fixture object is removed.
+        let commit = repo
+            .odb()
+            .expect("odb")
+            .write(
+                git2::ObjectType::Commit,
+                b"tree 1111111111111111111111111111111111111111\nauthor Test <test@example.com> 1700000000 +0000\ncommitter Test <test@example.com> 1700000000 +0000\n\nbroken tree\n",
+            )
+            .expect("write commit");
+        repo.reference("refs/heads/main", commit, true, "missing tree fixture")
+            .expect("reference");
+        repo.set_head("refs/heads/main").expect("head");
+        let broken =
+            reservation_git_latest_activity_micros_batch(&repo, &specs, i64::MIN, 8, &mut || true);
+        assert_eq!(broken.scanned_commits, 1);
+        assert_eq!(broken.activities[0].micros, None);
+        assert!(broken.activities[0].incomplete);
     }
 }
 
@@ -5824,6 +7229,9 @@ pub struct FileReservationResourceEntry {
     pub stale_reasons: Vec<String>,
     pub last_agent_activity_ts: Option<String>,
     pub last_mail_activity_ts: Option<String>,
+    /// Recent activity observed within a bounded Git scan; null can mean the
+    /// scan was incomplete, as reported by `git_activity_unknown` in
+    /// `stale_reasons`. It is not an exhaustive last-touch history lookup.
     pub last_git_activity_ts: Option<String>,
     pub last_filesystem_activity_ts: Option<String>,
 }
@@ -5852,10 +7260,12 @@ fn reservation_row_is_active_at(
 /// zero-based `offset`; independent ordinary pages are not a snapshot.
 /// `snapshot_pages=true` instead materializes one bounded database snapshot,
 /// then serves immutable pages through authenticated requests for five minutes.
+/// Ordinary activity hints share a 1,000-commit / 100 ms cooperative budget.
+/// Unresolved Git activity is null and cannot establish staleness.
 #[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
-    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nsnapshot_pages : bool\n    If true, captures one immutable database snapshot of at most 100000 reservations or holder identities and 64 MiB, including repeated page metadata. Pages contain at most 250 rows and 4 MiB JSON. All pages are prepared before the first is returned. Does not accept snapshot or limit. One oversized row or holder roster is rejected.\nsnapshot_token, offset : str, int\n    Continue snapshot_pages=true with its opaque token and exact next_offset. Keep active_only and project unchanged. Every request is authenticated. Tokens expire five minutes after publication without renewal; server restart or mailbox replacement invalidates them. Unknown/expired tokens and invalid page boundaries are errors; restart from page zero rather than combining reads.\nsnapshot_release : bool\n    If true, releases cached pages after a completed or abandoned read; reservation rows are unchanged. Requires snapshot_pages=true and snapshot_token, and forbids offset, limit and snapshot. Only literal true or false is accepted. Every release is authenticated and an existing token must match the mailbox, project and active_only scope. Unknown, expired or already released tokens acknowledge released=false.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout either snapshot mode: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\nWith snapshot_pages=true: { schema_version: 1, consistency: materialized_snapshot, supports_release: true, snapshot_token, project, agents, active_only, captured_ts, total_count, offset, count, next_offset, reservations }. Ordering is ascending (created_ts, id). next_offset is null only on the final page, including an empty history. A partial page can have a continuation. Individual pages never claim complete=true; verify all pages and total_count before treating their union as the complete captured database snapshot. captured_ts marks capture start; it is not an exact historical query timestamp. Concurrent grants, releases, renewals and deletions do not change a captured snapshot.\nWith snapshot_release=true: { schema_version: 1, snapshot_token, released }. Pages remain repeatable until explicit release or expiry. Only request release when the first validated page advertises supports_release=true; older servers may omit that capability.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nFor large histories, start with snapshot_pages=true&active_only=false&format=json, then repeat that request with snapshot_token and the returned next_offset. After completion, release the token with snapshot_pages=true&active_only=false&snapshot_token=<token>&snapshot_release=true. Ordinary historical pages remain available with active_only=false&limit=250&offset=0, without snapshot guarantees."
+    description = "List file_reservations for a project, optionally filtering to active-only.\n\nWhy this exists\n---------------\n- File reservations communicate edit intent and reduce collisions across agents.\n- Surfacing them helps humans review ongoing work and resolve contention.\n\nParameters\n----------\nslug : str\n    Project slug or human key.\nactive_only : bool\n    If true (default), returns only unreleased, unexpired reservations.\nsnapshot : bool\n    If true, returns the complete bounded reservation set and project/holder identities from one database read snapshot. Retired holders remain resolvable. Does not accept limit or offset. Refuses more than 10000 reservations or holder identities, or more than 4 MiB JSON.\nsnapshot_pages : bool\n    If true, captures one immutable database snapshot of at most 100000 reservations or holder identities and 64 MiB, including repeated page metadata. Pages contain at most 250 rows and 4 MiB JSON. All pages are prepared before the first is returned. Does not accept snapshot or limit. One oversized row or holder roster is rejected.\nsnapshot_token, offset : str, int\n    Continue snapshot_pages=true with its opaque token and exact next_offset. Keep active_only and project unchanged. Every request is authenticated. Tokens expire five minutes after publication without renewal; server restart or mailbox replacement invalidates them. Unknown/expired tokens and invalid page boundaries are errors; restart from page zero rather than combining reads.\nsnapshot_release : bool\n    If true, releases cached pages after a completed or abandoned read; reservation rows are unchanged. Requires snapshot_pages=true and snapshot_token, and forbids offset, limit and snapshot. Only literal true or false is accepted. Every release is authenticated and an existing token must match the mailbox, project and active_only scope. Unknown, expired or already released tokens acknowledge released=false.\nlimit, offset : int\n    Pagination for ordinary reads; each page is capped at 250 rows. Independent pages are not a consistent snapshot.\n\nReturns\n-------\nWithout either snapshot mode: list[dict], each with { id, agent, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts } and activity hints. Activity enrichment shares a 100 ms cooperative budget and scans at most 1000 Git commits per page. last_git_activity_ts is a recent touch found within the configured activity grace period, not an exhaustive last-touch lookup. It is null when no recent touch was established. If filesystem or Git evidence is incomplete, stale_reasons includes filesystem_activity_unknown or git_activity_unknown and stale remains false. Cancelled or abandoned reads stop enrichment at its next checkpoint.\nWith snapshot=true: { schema_version: 1, complete: true, project, agents, active_only, captured_ts, count, reservations }. Each reservation also includes project_id and agent_id. Activity hints are omitted.\nWith snapshot_pages=true: { schema_version: 1, consistency: materialized_snapshot, supports_release: true, snapshot_token, project, agents, active_only, captured_ts, total_count, offset, count, next_offset, reservations }. Ordering is ascending (created_ts, id). next_offset is null only on the final page, including an empty history. A partial page can have a continuation. Individual pages never claim complete=true; verify all pages and total_count before treating their union as the complete captured database snapshot. captured_ts marks capture start; it is not an exact historical query timestamp. Concurrent grants, releases, renewals and deletions do not change a captured snapshot.\nWith snapshot_release=true: { schema_version: 1, snapshot_token, released }. Pages remain repeatable until explicit release or expiry. Only request release when the first validated page advertises supports_release=true; older servers may omit that capability.\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r4\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://file_reservations/backend-abc123?snapshot=true&active_only=true&format=json\"}}\n```\n\nFor large histories, start with snapshot_pages=true&active_only=false&format=json, then repeat that request with snapshot_token and the returned next_offset. After completion, release the token with snapshot_pages=true&active_only=false&snapshot_token=<token>&snapshot_release=true. Ordinary historical pages remain available with active_only=false&limit=250&offset=0, without snapshot guarantees."
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);
@@ -5964,23 +7374,26 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             distinct_patterns.push(row.path_pattern.clone());
         }
     }
-    let pattern_activity: HashMap<String, ReservationPatternActivity> =
-        if distinct_patterns.is_empty() {
-            HashMap::new()
-        } else {
-            let workspace_clone = workspace.clone();
-            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
-            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
-            asupersync::runtime::spawn_blocking(move || {
-                reservation_compute_patterns_activity(
-                    workspace_clone.as_deref(),
-                    repo_root_clone.as_deref(),
-                    workspace_rel_clone.as_deref(),
-                    &distinct_patterns,
-                )
-            })
-            .await
-        };
+    let pattern_activity: HashMap<String, ReservationPatternActivity> = if distinct_patterns
+        .is_empty()
+    {
+        HashMap::new()
+    } else {
+        let workspace_clone = workspace.clone();
+        let repo_root_clone = repo_root.map(std::path::PathBuf::from);
+        let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
+        reservation_activity_blocking(ctx, RESERVATION_ACTIVITY_TIME_BUDGET, move |keep_going| {
+            reservation_compute_patterns_activity(
+                workspace_clone.as_deref(),
+                repo_root_clone.as_deref(),
+                workspace_rel_clone.as_deref(),
+                &distinct_patterns,
+                now_micros.saturating_sub(grace_micros),
+                keep_going,
+            )
+        })
+        .await?
+    };
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -6026,6 +7439,8 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
         let stale = reservation_row_is_logically_unreleased(&row)
             && workspace_available
+            && !pat_activity.fs_activity_incomplete
+            && !pat_activity.git_activity_incomplete
             && (agent_missing || agent_inactive)
             && !(recent_mail || recent_fs || recent_git);
 
@@ -6042,21 +7457,25 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         } else {
             stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
         }
-        if !workspace_available {
-            stale_reasons.push("workspace_unavailable".to_string());
-        } else if pat_activity.matches {
-            if recent_fs {
+        if workspace_available {
+            if pat_activity.fs_activity_incomplete {
+                stale_reasons.push("filesystem_activity_unknown".to_string());
+            } else if recent_fs {
                 stale_reasons.push("filesystem_activity_recent".to_string());
-            } else {
+            } else if pat_activity.matches {
                 stale_reasons.push(format!("no_recent_filesystem_activity>{grace_seconds}s"));
+            } else {
+                stale_reasons.push("path_pattern_unmatched".to_string());
             }
-            if recent_git {
+            if pat_activity.git_activity_incomplete {
+                stale_reasons.push("git_activity_unknown".to_string());
+            } else if recent_git {
                 stale_reasons.push("git_activity_recent".to_string());
             } else {
                 stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
             }
         } else {
-            stale_reasons.push("path_pattern_unmatched".to_string());
+            stale_reasons.push("workspace_unavailable".to_string());
         }
 
         reservations.push(FileReservationResourceEntry {
@@ -6788,6 +8207,7 @@ mod resource_shape_tests {
                     created_ts: 2_000_000,
                     expires_ts: 4_000_000,
                     released_ts: Some(3_000_000),
+                    revision: 0,
                 })
                 .collect(),
             captured_ts: 5_000_000,
@@ -7914,6 +9334,7 @@ mod resource_shape_tests {
             ],
             || {
                 run_async(|cx| async move {
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = seed_pool();
                     let project = ensure_project(&cx, &pool, "/priority inbox resource").await;
                     let project_id = project.id.expect("project id");
@@ -8212,6 +9633,7 @@ mod resource_shape_tests {
             ],
             || {
                 run_async(|cx| async move {
+                    crate::test_support::prepare_mailbox_before_outage(&cx).await;
                     let pool = seed_pool();
                     let project = ensure_project(&cx, &pool, "/retired-priority-history").await;
                     let project_id = project.id.unwrap();
@@ -8362,6 +9784,7 @@ mod resource_shape_tests {
                 ],
                 || {
                     run_async(|cx| async move {
+                        crate::test_support::prepare_mailbox_before_outage(&cx).await;
                         let pool = seed_pool();
                         let project =
                             ensure_project(&cx, &pool, "/resource-session-identity").await;
@@ -10775,6 +12198,198 @@ mod resource_shape_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn file_reservations_deep_git_history_is_bounded_without_false_staleness() {
+        with_serialized_resources_env(
+            &[
+                // This fixture registers a real tempdir in its private mailbox.
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("FILE_RESERVATION_INACTIVITY_SECONDS", "1800"),
+                ("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "900"),
+            ],
+            || {
+                run_async(|cx| async move {
+                    let workspace = tempfile::tempdir().expect("workspace");
+                    let root = workspace.path();
+                    let paths = ["src/target.rs", "src/untracked.rs", "src/recent.rs"];
+                    let old_seconds = 1_700_000_000_i64;
+                    let recent_seconds = mcp_agent_mail_db::now_micros() / 1_000_000;
+                    std::fs::create_dir_all(root.join("src")).expect("source directory");
+                    std::fs::write(root.join(paths[0]), "root-only target\n").expect("target");
+                    std::fs::write(root.join(paths[2]), "old control\n").expect("control");
+                    let mut options = git2::RepositoryInitOptions::new();
+                    options.initial_head("main");
+                    let repo = git2::Repository::init_opts(root, &options).expect("repository");
+                    let mut index = repo.index().expect("index");
+                    index.add_path(Path::new(paths[0])).expect("index target");
+                    index.add_path(Path::new(paths[2])).expect("index control");
+                    let tree = repo
+                        .find_tree(index.write_tree().expect("root tree"))
+                        .expect("load root tree");
+                    let old_signature = git2::Signature::new(
+                        "Reservation Resource Test",
+                        "resource@example.com",
+                        &git2::Time::new(old_seconds, 0),
+                    )
+                    .expect("old signature");
+                    let mut head = repo
+                        .commit(None, &old_signature, &old_signature, "root", &tree, &[])
+                        .expect("root commit");
+                    // Reuse the same tree: only history depth matters here.
+                    // The root target lies beyond the production commit cap.
+                    for _ in 0..=RESERVATION_ACTIVITY_SCAN_BUDGET {
+                        let parent = repo.find_commit(head).expect("parent");
+                        head = repo
+                            .commit(
+                                None,
+                                &old_signature,
+                                &old_signature,
+                                "unrelated history",
+                                &tree,
+                                &[&parent],
+                            )
+                            .expect("history commit");
+                    }
+                    std::fs::write(root.join(paths[2]), "recent control\n").expect("edit control");
+                    index
+                        .add_path(Path::new(paths[2]))
+                        .expect("index recent control");
+                    index.write().expect("persist index");
+                    let recent_tree = repo
+                        .find_tree(index.write_tree().expect("recent tree"))
+                        .expect("load recent tree");
+                    let recent_signature = git2::Signature::new(
+                        "Reservation Resource Test",
+                        "resource@example.com",
+                        &git2::Time::new(recent_seconds, 0),
+                    )
+                    .expect("recent signature");
+                    let parent = repo.find_commit(head).expect("last old commit");
+                    head = repo
+                        .commit(
+                            None,
+                            &recent_signature,
+                            &recent_signature,
+                            "recent control",
+                            &recent_tree,
+                            &[&parent],
+                        )
+                        .expect("control commit");
+                    repo.reference("refs/heads/main", head, true, "resource fixture")
+                        .expect("publish fixture history");
+                    std::fs::write(root.join(paths[1]), "never committed\n").expect("untracked");
+                    let old_mtime = UNIX_EPOCH
+                        + Duration::from_secs(u64::try_from(old_seconds).expect("positive epoch"));
+                    for path in paths {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(root.join(path))
+                            .expect("open working file")
+                            .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+                            .expect("backdate working file without changing contents");
+                    }
+
+                    let pool = seed_pool();
+                    let project = ensure_project(&cx, &pool, &root.to_string_lossy()).await;
+                    let project_id = project.id.expect("project id");
+                    let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                    let agent_id = agent.id.expect("agent id");
+                    let created = match queries::create_file_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        &paths,
+                        3600,
+                        true,
+                        "deep-history resource regression",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("create reservations failed: {other:?}"),
+                    };
+                    let conn = match pool.acquire(&cx).await {
+                        Outcome::Ok(conn) => conn,
+                        Outcome::Err(error) => panic!("acquire failed: {error}"),
+                        Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                        Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                    };
+                    conn.execute_sync(
+                        "UPDATE agents SET last_active_ts = 0 WHERE id = ?",
+                        &[mcp_agent_mail_db::sqlmodel::Value::BigInt(agent_id)],
+                    )
+                    .expect("backdate agent activity");
+                    drop(conn);
+                    // The fixture's direct SQL bypasses the normal write-path
+                    // invalidation; the read must observe the aged holder.
+                    mcp_agent_mail_db::read_cache().invalidate_agent_scoped(
+                        &pool.sqlite_identity_key(),
+                        project_id,
+                        &agent.name,
+                        agent.id,
+                    );
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let payload = file_reservations(&ctx, project.slug)
+                        .await
+                        .expect("ordinary read of deep Git history");
+                    let reservations = parse_json(&payload);
+                    let entries = reservations.as_array().expect("reservation array");
+                    assert_eq!(entries.len(), paths.len());
+                    for path in paths {
+                        let entry = entries
+                            .iter()
+                            .find(|entry| entry["path_pattern"] == path)
+                            .expect("reserved path remains visible");
+                        assert_eq!(entry["last_agent_activity_ts"], micros_to_iso(0));
+                        assert_eq!(
+                            entry["last_filesystem_activity_ts"],
+                            micros_to_iso(old_seconds * 1_000_000)
+                        );
+                        assert!(entry["last_mail_activity_ts"].is_null());
+                        assert_eq!(entry["stale"], false, "{path}");
+                        assert!(entry["released_ts"].is_null(), "{path}");
+                        let reasons = entry["stale_reasons"].as_array().expect("stale reasons");
+                        assert!(reasons.contains(&serde_json::json!("agent_inactive>1800s")));
+                        if path == paths[2] {
+                            assert_eq!(
+                                entry["last_git_activity_ts"],
+                                micros_to_iso(recent_seconds * 1_000_000)
+                            );
+                            assert!(reasons.contains(&serde_json::json!("git_activity_recent")));
+                        } else {
+                            assert!(entry["last_git_activity_ts"].is_null(), "{path}");
+                            assert!(
+                                reasons.contains(&serde_json::json!("git_activity_unknown")),
+                                "{path}: {reasons:?}"
+                            );
+                        }
+                    }
+                    let rows = match queries::list_file_reservations(&cx, &pool, project_id, false)
+                        .await
+                    {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("list reservations failed: {other:?}"),
+                    };
+                    assert_eq!(rows.len(), created.len());
+                    for before in &created {
+                        let after = rows
+                            .iter()
+                            .find(|row| row.id == before.id)
+                            .expect("reservation retained");
+                        assert_eq!(
+                            serde_json::to_value(after).unwrap(),
+                            serde_json::to_value(before).unwrap(),
+                            "activity enrichment must not mutate reservation rows"
+                        );
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
     fn file_reservations_read_does_not_release_orphaned_holder_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
@@ -11094,6 +12709,85 @@ mod resource_shape_tests {
                 assert_eq!(agent_count, 0);
             });
         });
+    }
+
+    #[test]
+    fn resources_refuse_incomplete_empty_archive_instead_of_serving_empty_mailbox() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let config = Config::from_env();
+                let db_path = PathBuf::from(
+                    mcp_agent_mail_db::DbPoolConfig::from_env()
+                        .sqlite_path()
+                        .expect("resource fixture sqlite path"),
+                );
+                assert!(!db_path.exists());
+                assert!(resource_live_database_missing_without_archive_state());
+
+                std::fs::create_dir_all(&config.storage_root).expect("create archive root");
+                let obstruction = config.storage_root.join("projects");
+                std::fs::write(&obstruction, b"retained directory obstruction")
+                    .expect("obstruct projects directory");
+                let inventory = crate::tool_util::read_archive_inventory(&config.storage_root);
+                assert_eq!(inventory.projects, 0);
+                assert_eq!(inventory.unique_message_ids, 0);
+                assert_eq!(inventory.parse_errors, 1);
+                assert!(!resource_live_database_missing_without_archive_state());
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let error = projects_list(&ctx)
+                    .await
+                    .expect_err("an incomplete authoritative archive must not appear empty");
+                let data = error.data.as_ref().expect("structured database error");
+                assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+                assert!(error.message.contains("read-only sqlite source not found"));
+                assert!(
+                    !db_path.exists(),
+                    "resource read must not create the live DB"
+                );
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("retained archive obstruction"),
+                    b"retained directory obstruction"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn resources_ignore_incomplete_unrelated_default_archive_for_missing_custom_db() {
+        let _guard = RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("custom.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("DATABASE_URL", database_url.as_str())],
+            |_isolated_default_root| {
+                Config::reset_cached();
+                let storage_root = Config::from_env().storage_root;
+                std::fs::create_dir_all(&storage_root).expect("create unrelated archive root");
+                let obstruction = storage_root.join("projects");
+                std::fs::write(&obstruction, b"unrelated directory obstruction")
+                    .expect("obstruct unrelated projects directory");
+                let inventory = crate::tool_util::read_archive_inventory(&storage_root);
+                assert_eq!(inventory.parse_errors, 1);
+
+                assert!(resource_live_database_missing_without_archive_state());
+                let pool = open_live_resource_read_pool()
+                    .expect("unrelated archive must not block the empty resource lane");
+                drop(pool);
+                assert!(
+                    !db_path.exists(),
+                    "resource read must not create the custom DB"
+                );
+                assert_eq!(
+                    std::fs::read(&obstruction).expect("retained unrelated obstruction"),
+                    b"unrelated directory obstruction"
+                );
+            },
+        );
     }
 
     #[test]
@@ -11898,6 +13592,7 @@ mod query_param_tests {
             created_ts: 1,
             expires_ts,
             released_ts,
+            revision: 0,
         }
     }
 

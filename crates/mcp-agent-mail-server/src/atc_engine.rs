@@ -709,13 +709,17 @@ pub struct EventDecisionBuilder<'a> {
 impl EvidenceLedger {
     fn make_trace_id(
         id: u64,
+        timestamp_micros: i64,
         subsystem: AtcSubsystem,
         decision_class: &str,
         subject: &str,
         action: &str,
         policy_id: Option<&str>,
     ) -> String {
-        let mut seed = format!("{id}:{subsystem}:{decision_class}:{subject}:{action}");
+        // Numeric IDs are local to one ledger lifetime. Bind durable identity to
+        // the recorded decision time while keeping replay of that event stable.
+        let mut seed =
+            format!("{id}:{timestamp_micros}:{subsystem}:{decision_class}:{subject}:{action}");
         if let Some(policy_id) = policy_id {
             seed.push(':');
             seed.push_str(policy_id);
@@ -764,6 +768,7 @@ impl EvidenceLedger {
         let policy_id = builder.policy_id.map(ToOwned::to_owned);
         let trace_id = Self::make_trace_id(
             id,
+            builder.timestamp_micros,
             builder.subsystem,
             builder.decision_class,
             builder.subject,
@@ -806,6 +811,7 @@ impl EvidenceLedger {
         self.next_id += 1;
         let trace_id = Self::make_trace_id(
             id,
+            builder.timestamp_micros,
             builder.subsystem,
             builder.decision_class,
             builder.subject,
@@ -1065,6 +1071,47 @@ mod tests {
             policy_id: None,
             fallback_reason: None,
             timestamp_micros: ts,
+        }
+    }
+
+    #[test]
+    fn restarted_ledgers_distinguish_new_decisions_and_preserve_replay_identity() {
+        let core = default_liveness_core();
+        for event_style in [false, true] {
+            let record_at = |timestamp_micros| {
+                let mut ledger = EvidenceLedger::new(1);
+                let id = if event_style {
+                    ledger.record_event(&EventDecisionBuilder {
+                        subsystem: AtcSubsystem::Liveness,
+                        decision_class: "test",
+                        subject: "RestartAgent",
+                        policy_id: None,
+                        posterior: core.posterior_summary(),
+                        action: "DeclareAlive",
+                        expected_loss: 1.0,
+                        runner_up_loss: 2.0,
+                        loss_table: Vec::new(),
+                        evidence_summary: "test",
+                        calibration_healthy: true,
+                        safe_mode_active: false,
+                        fallback_reason: None,
+                        timestamp_micros,
+                    })
+                } else {
+                    ledger.record(&test_decision(&core, "RestartAgent", timestamp_micros))
+                };
+                ledger.get(id).expect("recorded decision").clone()
+            };
+
+            let first = record_at(1_000_000);
+            let restarted = record_at(2_000_000);
+            let replayed = record_at(1_000_000);
+            assert_eq!(
+                first.id, restarted.id,
+                "numeric IDs restart with the ledger"
+            );
+            assert_ne!(first.trace_id, restarted.trace_id);
+            assert_eq!(first.trace_id, replayed.trace_id);
         }
     }
 
@@ -1804,6 +1851,10 @@ struct PendingLivenessFeedback {
     action: LivenessAction,
     expected_loss: f64,
     issued_at_micros: i64,
+    /// Score independent Alive observations using the policy that issued the
+    /// decision, even if tuning or reload changes the policy before feedback.
+    alive_loss_at_issue: f64,
+    correct_if_alive_at_issue: bool,
 }
 
 /// Infer a reasonable inter-activity prior from program name.
@@ -2592,16 +2643,20 @@ impl OnsState {
 
     /// Update this e-process with a new observation.
     fn update(&mut self, centered: f64, alpha: f64) {
-        self.sum_centered += centered;
-        self.sum_sq += centered * centered;
-
+        // A test-martingale bet must be predictable: choose it using only
+        // earlier observations. Including this outcome before placing its bet
+        // makes both possible first outcomes increase the evidence, even under
+        // the calibrated null (85% accuracy gives E[E_1] = 1.0816, not 1).
         let lambda = self.adaptive_bet_size(alpha);
         let factor = lambda.mul_add(centered, 1.0);
         // factor is guaranteed non-negative by the lambda bounds.
-        // Cap at 1e100 to prevent f64 overflow during sustained miscalibration
-        // (the e-value is evidence, not a probability — any value > threshold
-        // is equally actionable, so capping doesn't lose information).
-        self.e_value = (self.e_value * factor).clamp(1e-30, 1e100);
+        // Upper truncation preserves the supermartingale inequality while
+        // preventing overflow. A positive lower floor would create evidence
+        // after ruin; zero must remain absorbing. Clamp rounding at zero only.
+        self.e_value = (self.e_value * factor).clamp(0.0, 1e100);
+
+        self.sum_centered += centered;
+        self.sum_sq += centered * centered;
     }
 
     /// ONS adaptive bet sizing with CORRECT bounds for non-negative factors.
@@ -2996,6 +3051,79 @@ mod martingale_tests {
         let monitor = EProcessMonitor::new(0.85, 20.0);
         assert!((monitor.e_value() - 1.0).abs() < f64::EPSILON);
         assert!(!monitor.miscalibrated());
+    }
+
+    #[test]
+    fn eprocess_first_outcome_cannot_choose_its_own_bet() {
+        for correct in [false, true] {
+            let mut monitor = EProcessMonitor::new(0.85, 20.0);
+            monitor.update(correct, AtcSubsystem::Liveness, Some("BlueLake"));
+
+            // All three independent processes have no prior observations.
+            // Neither first outcome can finance a bet on itself.
+            for state in [
+                &monitor.global,
+                &monitor.per_subsystem[&AtcSubsystem::Liveness],
+                &monitor.per_agent["BlueLake"],
+            ] {
+                assert!((state.e_value - 1.0).abs() < f64::EPSILON);
+                assert!(state.sum_sq > 0.0, "learn the outcome for the next bet");
+            }
+        }
+    }
+
+    #[test]
+    fn ons_conditional_null_expectation_never_increases_evidence() {
+        // Enumerate both possible next observations after every short history,
+        // not just one conveniently ordered stream at the nominal accuracy.
+        // Under the null P(error | history) = alpha, each conditional expected
+        // next value must be no greater than the current value.
+        for alpha in [0.0, 0.01, 0.15, 0.5, 0.99, 1.0] {
+            let mut histories = vec![OnsState::new()];
+            for _ in 0..10 {
+                let mut next = Vec::with_capacity(histories.len() * 2);
+                for state in histories {
+                    let mut correct = state.clone();
+                    correct.update(-alpha, alpha);
+                    let mut incorrect = state.clone();
+                    incorrect.update(1.0 - alpha, alpha);
+
+                    let expectation =
+                        (1.0 - alpha).mul_add(correct.e_value, alpha * incorrect.e_value);
+                    let tolerance = 1e-12 * state.e_value.max(1.0);
+                    assert!(
+                        expectation <= state.e_value + tolerance,
+                        "alpha={alpha}, history={state:?}, conditional mean={expectation}"
+                    );
+                    assert!(correct.e_value.is_finite() && correct.e_value >= 0.0);
+                    assert!(incorrect.e_value.is_finite() && incorrect.e_value >= 0.0);
+                    next.extend([correct, incorrect]);
+                }
+                histories = next;
+            }
+        }
+    }
+
+    #[test]
+    fn ons_does_not_create_evidence_with_a_positive_floor() {
+        for initial in [0.0, 1e-40] {
+            for centered in [-0.15, 0.85] {
+                let mut state = OnsState {
+                    e_value: initial,
+                    ..OnsState::new()
+                };
+                state.update(centered, 0.15);
+                assert_eq!(state.e_value.to_bits(), initial.to_bits());
+            }
+        }
+
+        let mut exhausted = OnsState {
+            e_value: 0.0,
+            sum_centered: 10.0,
+            sum_sq: 1.0,
+        };
+        exhausted.update(0.85, 0.15);
+        assert_eq!(exhausted.e_value.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
@@ -4080,6 +4208,9 @@ pub struct AtcEngine {
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
     dirty_agents: BTreeSet<String>,
+    /// Alternate eligible schedule and policy work, including across ticks
+    /// whose review budget is one. Each queue retains its own ordering.
+    dirty_review_next: bool,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
     /// Total edges across all projects, bounded by `max_tracked_agents`.
@@ -4141,6 +4272,9 @@ pub struct AtcEngine {
     snapshot_seq: u64,
     /// Number of feedback resolutions received (resolved experiences).
     resolved_experience_count: u64,
+    /// Feedback windows closed without an independent outcome observation.
+    /// Expiration and supersession are censored, never successful predictions.
+    censored_experience_count: u64,
     /// Per-agent intervention counts for concentration detection.
     agent_intervention_counts: HashMap<String, u64>,
     /// Cached state from the previous snapshot for delta computation.
@@ -4275,6 +4409,7 @@ impl AtcEngine {
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
             dirty_agents: BTreeSet::new(),
+            dirty_review_next: false,
             conflict_graphs: HashMap::new(),
             conflict_edge_count: 0,
             conflict_capacity_refusals: 0,
@@ -4308,6 +4443,7 @@ impl AtcEngine {
             tick_count: 0,
             snapshot_seq: 0,
             resolved_experience_count: 0,
+            censored_experience_count: 0,
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
             reservation_event_log: VecDeque::new(),
@@ -4798,14 +4934,30 @@ impl AtcEngine {
         if action == LivenessAction::DeclareAlive {
             return;
         }
-        self.pending_liveness_feedback.insert(
-            agent.to_string(),
-            PendingLivenessFeedback {
-                action,
-                expected_loss,
-                issued_at_micros,
-            },
-        );
+        if self
+            .pending_liveness_feedback
+            .insert(
+                agent.to_string(),
+                PendingLivenessFeedback {
+                    action,
+                    expected_loss,
+                    issued_at_micros,
+                    alive_loss_at_issue: self
+                        .liveness_core
+                        .loss_entry(action, LivenessState::Alive),
+                    correct_if_alive_at_issue: action
+                        == self
+                            .liveness_core
+                            .best_action_for_state(LivenessState::Alive),
+                },
+            )
+            .is_some()
+        {
+            // The bounded per-agent frontier retains the newest decision. A
+            // superseded decision has no attributable outcome; replacing it
+            // must not silently turn it into resolved learning evidence.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+        }
     }
 
     fn apply_liveness_feedback(
@@ -4886,63 +5038,47 @@ impl AtcEngine {
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
-        let (actual_loss, correct) = match pending.action {
-            LivenessAction::ReleaseReservations => (100.0, false),
-            LivenessAction::Suspect => (2.0, true),
-            LivenessAction::DeclareAlive => (0.0, true),
-        };
+        if timestamp_micros.saturating_sub(pending.issued_at_micros)
+            >= self.liveness_feedback_window_micros()
+        {
+            // Use observation time as well as the periodic sweep. Otherwise
+            // the same late activity trains or does not train depending only
+            // on whether an operator tick happened to run first.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+            return;
+        }
+        // Independent activity establishes Alive. Score the issued action
+        // against that state using the issued policy's costs: suspecting a live
+        // agent is not a correct Flaky prediction merely because it replied.
         self.apply_liveness_feedback(
             agent,
             pending.action,
             LivenessState::Alive,
             pending.expected_loss,
-            actual_loss,
-            correct,
+            pending.alive_loss_at_issue,
+            pending.correct_if_alive_at_issue,
             timestamp_micros,
         );
     }
 
-    fn resolve_stale_liveness_feedback(&mut self, now_micros: i64) {
-        let feedback_window_micros = self.config.probe_interval_micros.max(60_000_000);
-        let expired_agents: Vec<String> = self
-            .pending_liveness_feedback
-            .iter()
-            .filter_map(|(agent, pending)| {
-                (now_micros.saturating_sub(pending.issued_at_micros) >= feedback_window_micros)
-                    .then_some(agent.clone())
-            })
-            .collect();
-        for agent in expired_agents {
-            let Some(pending) = self.pending_liveness_feedback.remove(&agent) else {
-                continue;
-            };
-            let true_state = self
-                .agents
-                .get(&agent)
-                .map_or(LivenessState::Dead, |entry| entry.state);
-            let (actual_loss, correct) = match pending.action {
-                LivenessAction::ReleaseReservations => match true_state {
-                    LivenessState::Dead => (1.0, true),
-                    LivenessState::Flaky => (20.0, false),
-                    LivenessState::Alive => (100.0, false),
-                },
-                LivenessAction::Suspect => match true_state {
-                    LivenessState::Alive => (8.0, false),
-                    LivenessState::Flaky => (2.0, true),
-                    LivenessState::Dead => (6.0, true),
-                },
-                LivenessAction::DeclareAlive => (0.0, true),
-            };
-            self.apply_liveness_feedback(
-                &agent,
-                pending.action,
-                true_state,
-                pending.expected_loss,
-                actual_loss,
-                correct,
-                now_micros,
-            );
-        }
+    fn liveness_feedback_window_micros(&self) -> i64 {
+        self.config.probe_interval_micros.max(60_000_000)
+    }
+
+    fn expire_stale_liveness_feedback(&mut self, now_micros: i64) {
+        let feedback_window_micros = self.liveness_feedback_window_micros();
+        let before = self.pending_liveness_feedback.len();
+        self.pending_liveness_feedback.retain(|_, pending| {
+            now_micros.saturating_sub(pending.issued_at_micros) < feedback_window_micros
+        });
+        // An agent's inferred Dead/Flaky state is the prediction under review,
+        // not ground truth. Silence alone cannot validate that prediction or
+        // train calibration, adaptive thresholds, survival, or the loss tuner.
+        // The bounded frontier can expire while the outcome remains unknown.
+        let expired = before.saturating_sub(self.pending_liveness_feedback.len());
+        self.censored_experience_count = self
+            .censored_experience_count
+            .saturating_add(u64::try_from(expired).unwrap_or(u64::MAX));
     }
 
     fn prune_stale_conflicts(&mut self, now_micros: i64) {
@@ -5155,13 +5291,37 @@ impl AtcEngine {
     fn pop_due_agents(&mut self, now_micros: i64, max_reviews: usize) -> Vec<String> {
         let mut due = Vec::with_capacity(max_reviews);
         let mut seen = HashSet::with_capacity(max_reviews);
-        while due.len() < max_reviews
-            && let Some(Reverse(next)) = self.liveness_schedule.peek().cloned()
-        {
-            if next.review_at_micros > now_micros {
+        let mut schedule_pops = 0;
+        while due.len() < max_reviews {
+            let scheduled_due = schedule_pops < MAX_LIVENESS_SCHEDULE_POPS_PER_TICK
+                && self
+                    .liveness_schedule
+                    .peek()
+                    .is_some_and(|Reverse(next)| next.review_at_micros <= now_micros);
+            if !scheduled_due && self.dirty_agents.is_empty() {
                 break;
             }
-            self.liveness_schedule.pop();
+
+            // A continuously overdue population must not starve agents that
+            // need policy reevaluation but have no ordinary deadline. Likewise,
+            // policy changes must not consume every slot ahead of timed work.
+            if !self.dirty_agents.is_empty() && (self.dirty_review_next || !scheduled_due) {
+                if let Some(agent) = self.dirty_agents.pop_first()
+                    && seen.insert(agent.clone())
+                {
+                    due.push(agent);
+                    self.dirty_review_next = false;
+                }
+                continue;
+            }
+
+            let Some(Reverse(next)) = self.liveness_schedule.pop() else {
+                break;
+            };
+            // Stale and duplicate entries consume work even though they do
+            // not consume review slots. Leave excess cleanup for later ticks
+            // instead of scanning the whole heap under the engine mutex.
+            schedule_pops += 1;
             let Some(entry) = self.agents.get(&next.agent) else {
                 continue;
             };
@@ -5176,35 +5336,21 @@ impl AtcEngine {
                 // together so the next batch cannot evaluate it twice.
                 self.dirty_agents.remove(&next.agent);
                 due.push(next.agent);
-            }
-        }
-        while due.len() < max_reviews {
-            let Some(agent) = self.dirty_agents.iter().next().cloned() else {
-                break;
-            };
-            self.dirty_agents.remove(&agent);
-            if seen.insert(agent.clone()) {
-                due.push(agent);
+                self.dirty_review_next = true;
             }
         }
         due
     }
 
-    fn next_scheduled_review_micros(&mut self) -> Option<i64> {
-        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
-            let Some(entry) = self.agents.get(&next.agent) else {
-                self.liveness_schedule.pop();
-                continue;
-            };
-            let stale_version = entry.schedule_version != next.schedule_version;
-            let stale_review_time = entry.next_review_micros != next.review_at_micros;
-            if stale_version || stale_review_time {
-                self.liveness_schedule.pop();
-                continue;
-            }
-            return Some(next.review_at_micros);
-        }
-        None
+    fn next_scheduled_review_micros(&self) -> Option<i64> {
+        // This is a conservative wake deadline, not proof that the head still
+        // represents a live review. Cleanup belongs to pop_due_agents's bounded
+        // work budget. An overdue stale head keeps the operator at its resume
+        // floor until cleanup catches up; removing it here would silently do
+        // an unbounded second heap walk while publishing the health snapshot.
+        self.liveness_schedule
+            .peek()
+            .map(|Reverse(next)| next.review_at_micros)
     }
 
     fn normalize_deadlock_cycles(mut cycles: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -5658,10 +5804,22 @@ impl AtcEngine {
         self.refresh_incumbent_policy_from_core();
     }
 
-    fn absorb_population_snapshot(&self, population: &mut HierarchicalAgentModel) {
-        for entry in self.agents.values() {
-            population.absorb_agent(&entry.program, &entry.rhythm);
+    fn refresh_population_snapshot(&mut self, population: &mut HierarchicalAgentModel) {
+        // Rhythms already summarize each agent's observations. Reabsorbing
+        // their full counts into the previous population would count quiet
+        // agents again every 50 ticks, teaching stronger priors without any
+        // new activity. Rebuild the bounded current population instead: one
+        // contribution per agent, including program changes and rhythm resets.
+        // Reuse the cached stable order so floating-point pooling is also
+        // independent of HashMap iteration and registration order.
+        self.sorted_agent_names();
+        let mut refreshed = HierarchicalAgentModel::new();
+        for name in &self.sorted_agent_names {
+            if let Some(entry) = self.agents.get(name) {
+                refreshed.absorb_agent(&entry.program, &entry.rhythm);
+            }
         }
+        *population = refreshed;
     }
 
     fn build_summary_snapshot_with(
@@ -5814,6 +5972,7 @@ impl AtcEngine {
             decisions_total: self.ledger.latest_id(),
             experiences_open: self.pending_liveness_feedback.len(),
             experiences_resolved: self.resolved_experience_count,
+            experiences_censored: self.censored_experience_count,
             calibration_consecutive_correct: self.calibration.consecutive_correct(),
             calibration_recovery_target: self.calibration.recovery_count(),
             regime_state,
@@ -6055,7 +6214,7 @@ impl AtcEngine {
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
-        self.resolve_stale_liveness_feedback(now_micros);
+        self.expire_stale_liveness_feedback(now_micros);
         self.prune_stale_conflicts(now_micros);
 
         let decision_fallback_reason = self.current_release_guard_reason();
@@ -6479,7 +6638,7 @@ impl AtcEngine {
             && let Some(pop_lock) = ATC_POPULATION.get()
             && let Ok(mut pop) = pop_lock.lock()
         {
-            self.absorb_population_snapshot(&mut pop);
+            self.refresh_population_snapshot(&mut pop);
         }
         let pre_summary_total_micros = elapsed_micros(total_started);
         let budget_exceeded = pre_summary_total_micros > self.config.tick_budget_micros;
@@ -6500,7 +6659,8 @@ impl AtcEngine {
         // their ordinary liveness deadlines. If a bounded tick leaves dirty
         // work behind, publish an already-due deadline so the operator loop
         // resumes at its 250ms floor instead of sleeping until the earliest
-        // (possibly hours-away) scheduled review.
+        // (possibly hours-away) scheduled review. An overdue stale heap head
+        // also retains a due wake time until bounded cleanup reaches it.
         let next_due_micros = if self.dirty_agents.is_empty() {
             self.next_scheduled_review_micros()
         } else {
@@ -7967,6 +8127,267 @@ mod engine_tests {
                 .contains_key("FeedbackAgent")
         );
         assert_eq!(engine.resolved_experience_count, 1);
+    }
+
+    fn isolated_liveness_feedback_test() -> bool {
+        // Calibration also updates process-global conformal, threshold, and
+        // loss-tuner state. Other local engine tests can feed those globals,
+        // so verify their invariance in a real, otherwise empty test process.
+        const CHILD: &str = "AM_TEST_LIVENESS_FEEDBACK_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let log = output.reopen().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{name} exceeded its watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let log = std::fs::read_to_string(output.path()).unwrap();
+        assert!(
+            status.success() && log.contains("1 passed; 0 failed"),
+            "{name}: {log}"
+        );
+        true
+    }
+
+    #[test]
+    fn liveness_feedback_expiration_is_censored_not_ground_truth() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, state, action) in [
+            (
+                "PredictedDead",
+                LivenessState::Dead,
+                LivenessAction::ReleaseReservations,
+            ),
+            (
+                "PredictedFlaky",
+                LivenessState::Flaky,
+                LivenessAction::Suspect,
+            ),
+            (
+                "PredictedAlive",
+                LivenessState::Alive,
+                LivenessAction::Suspect,
+            ),
+        ] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = state;
+            engine.record_pending_liveness_feedback(name, action, 7.0, issued_at);
+        }
+        engine.set_safe_mode(true, issued_at);
+        let policy_revision = engine.policy_revision;
+        let loss_matrix = engine.liveness_core.loss_matrix.clone();
+
+        engine.expire_stale_liveness_feedback(expires_at - 1);
+        assert_eq!(engine.pending_liveness_feedback.len(), 3);
+        assert_eq!(engine.censored_experience_count, 0);
+        engine.expire_stale_liveness_feedback(expires_at);
+        engine.expire_stale_liveness_feedback(i64::MAX);
+
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.censored_experience_count, 3);
+        assert_eq!(engine.resolved_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "silence cannot satisfy safe-mode recovery"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert!(engine.eprocess.per_agent.is_empty());
+        assert_eq!(engine.cusum.s_pos.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.cusum.s_neg.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.regret.outcome_count(), 0);
+        assert!(engine.agent_intervention_counts.is_empty());
+        assert_eq!(engine.policy_revision, policy_revision);
+        assert_eq!(engine.liveness_core.loss_matrix, loss_matrix);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 0);
+        assert!(tuner.regret_accum.is_empty());
+        drop(tuner);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        assert!(conformal.sets[&AtcSubsystem::Liveness].scores.is_empty());
+        drop(conformal);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 2.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        assert!(ATC_SURVIVAL.get().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn liveness_feedback_uses_observation_time_at_expiration_boundary() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new_for_testing();
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, offset) in [("Observed", -1), ("AtDeadline", 0), ("AfterDeadline", 1)] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = LivenessState::Dead;
+            engine.record_pending_liveness_feedback(
+                name,
+                LivenessAction::ReleaseReservations,
+                1.0,
+                issued_at,
+            );
+            engine.observe_activity(name, None, expires_at + offset);
+            assert_eq!(engine.agent_liveness(name), Some(LivenessState::Alive));
+        }
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.resolved_experience_count, 1);
+        assert_eq!(engine.censored_experience_count, 2);
+        assert!(engine.eprocess.per_agent.contains_key("Observed"));
+        assert!(!engine.eprocess.per_agent.contains_key("AtDeadline"));
+        assert!(!engine.eprocess.per_agent.contains_key("AfterDeadline"));
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds["Observed"].precision_estimate() < 0.5);
+        assert_eq!(
+            thresholds["AtDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        assert_eq!(
+            thresholds["AfterDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        drop(thresholds);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 1);
+        assert_eq!(
+            tuner.regret_accum[&(LivenessAction::ReleaseReservations, LivenessState::Alive)].1,
+            1
+        );
+    }
+
+    #[test]
+    fn liveness_feedback_scores_observed_alive_against_issued_policy() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        engine.set_safe_mode(true, 1);
+        for (name, alive_loss) in [("DefaultPolicy", 8.0), ("TunedPolicy", 23.0)] {
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                alive_loss,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                0.0,
+            );
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.record_pending_liveness_feedback(name, LivenessAction::Suspect, 2.0, 1);
+            // Both the incurred cost and best action change while the outcome
+            // is pending. Neither may rewrite the issued decision's score.
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                99.0,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                1000.0,
+            );
+            assert_eq!(
+                engine
+                    .liveness_core
+                    .best_action_for_state(LivenessState::Alive),
+                LivenessAction::Suspect
+            );
+            engine.observe_activity(name, None, 2);
+        }
+
+        assert_eq!(engine.resolved_experience_count, 2);
+        assert_eq!(engine.censored_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "a false suspicion cannot recover calibration"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 3.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        let scores = &conformal.sets[&AtcSubsystem::Liveness].scores;
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].to_bits(), 6.0_f64.to_bits());
+        assert_eq!(scores[1].to_bits(), 21.0_f64.to_bits());
+        drop(conformal);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        let (regret, count) = tuner.regret_accum[&(LivenessAction::Suspect, LivenessState::Alive)];
+        assert_eq!(count, 2);
+        assert_eq!(regret.to_bits(), 27.0_f64.to_bits());
+    }
+
+    #[test]
+    fn liveness_feedback_tick_publishes_censorship_and_supersession() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Silent", "codex-cli", None);
+        engine.agents.get_mut("Silent").unwrap().state = LivenessState::Dead;
+        engine.record_pending_liveness_feedback("Silent", LivenessAction::Suspect, 2.0, 1);
+        engine.record_pending_liveness_feedback(
+            "Silent",
+            LivenessAction::ReleaseReservations,
+            1.0,
+            2,
+        );
+        assert_eq!(engine.censored_experience_count, 1);
+        let report = engine.run_tick(2 + engine.liveness_feedback_window_micros());
+        assert_eq!(report.summary.experiences_open, 0);
+        assert_eq!(report.summary.experiences_resolved, 0);
+        assert_eq!(report.summary.experiences_censored, 2);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -11780,6 +12201,10 @@ pub struct AtcPopulationSyncStats {
 /// probes, deadlock advisories, and HTTP/MCP work.
 const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
 
+/// Includes stale versions and duplicates, not just completed reviews. Heap
+/// memory is separately bounded; this cap limits cleanup work in one tick.
+const MAX_LIVENESS_SCHEDULE_POPS_PER_TICK: usize = 64;
+
 /// Hydrate the ATC engine from the durable DB snapshot.
 ///
 /// This seeds pre-existing agents on cold start and refreshes their latest
@@ -12714,10 +13139,13 @@ pub struct AtcSummarySnapshot {
     pub regret_trend: TrendDirection,
     /// Total decisions recorded in the evidence ledger.
     pub decisions_total: u64,
-    /// Open experiences (decisions awaiting ground-truth feedback).
+    /// Process-local liveness decisions awaiting independent feedback.
     pub experiences_open: usize,
-    /// Resolved experiences (decisions with feedback received).
+    /// Process-local liveness decisions with independent feedback received.
     pub experiences_resolved: u64,
+    /// Process-local liveness decisions expired or superseded without an
+    /// independent outcome. These do not update any learning controller.
+    pub experiences_censored: u64,
 
     // ── calibration & regime (operator-facing) ───────────────────────
     /// Calibration guard state: consecutive correct predictions toward
@@ -13013,7 +13441,7 @@ mod alien_enhancement_tests {
         }
 
         let mut population = HierarchicalAgentModel::new();
-        engine.absorb_population_snapshot(&mut population);
+        engine.refresh_population_snapshot(&mut population);
 
         let (claude_mean, _) = population.prior_for("claude-code");
         let (codex_mean, _) = population.prior_for("codex-cli");
@@ -13024,6 +13452,159 @@ mod alien_enhancement_tests {
         assert!(
             (codex_mean - 120_000_000.0).abs() < 1.0,
             "codex prior should stay near baseline when cadence matches it: {codex_mean}"
+        );
+    }
+
+    fn population_snapshot_values(population: &HierarchicalAgentModel) -> BTreeMap<&str, [u64; 4]> {
+        population
+            .populations
+            .iter()
+            .map(|(program, stats)| {
+                (
+                    program.as_str(),
+                    [
+                        stats.mean.to_bits(),
+                        stats.variance.to_bits(),
+                        stats.n.to_bits(),
+                        stats.agent_count,
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn engine_population_refresh_counts_each_observed_interval_once() {
+        let mut engine = AtcEngine::new_for_testing();
+        for (name, interval) in [("Quiet", 30_000_000), ("Busy", 90_000_000)] {
+            assert!(engine.register_agent(name, "claude-code", None));
+            // Use explicit priors so unrelated global ATC tests cannot seed
+            // this fixture's local rhythms with a learned population.
+            engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+            for i in 1..=4 {
+                engine.observe_activity(name, None, i * interval);
+            }
+        }
+        assert!(engine.register_agent("Unobserved", "claude-code", None));
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        let first = population.clone();
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2, "unobserved agents add no evidence");
+        assert_eq!(stats.n.to_bits(), 9.0_f64.to_bits()); // 3 prior + 3 + 3 intervals
+
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&first),
+                "an idle population refresh must not manufacture observations"
+            );
+        }
+
+        engine.observe_activity("Busy", None, 450_000_000);
+        engine.refresh_population_snapshot(&mut population);
+        let quiet = &engine.agents["Quiet"].rhythm;
+        let busy = &engine.agents["Busy"].rhythm;
+        assert_eq!((quiet.observation_count, busy.observation_count), (3, 4));
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2);
+        assert_eq!(stats.n.to_bits(), 10.0_f64.to_bits());
+        // Independent pooled-moment oracle: the fixed prior plus the current
+        // three quiet and four busy observations, never the old snapshot too.
+        let expected_mean =
+            (3.0 * 60_000_000.0 + 3.0 * quiet.avg_interval + 4.0 * busy.avg_interval) / 10.0;
+        let expected_variance = (3.0 * (30_000_000.0_f64.powi(2) + 60_000_000.0_f64.powi(2))
+            + 3.0 * (quiet.var_interval + quiet.avg_interval.powi(2))
+            + 4.0 * (busy.var_interval + busy.avg_interval.powi(2)))
+            / 10.0
+            - expected_mean.powi(2);
+        assert!((stats.mean - expected_mean).abs() < 1.0);
+        assert!((stats.variance - expected_variance).abs() < expected_variance * 1e-12);
+        let updated = population.clone();
+        engine.observe_activity("Busy", None, 450_000_000); // replayed activity
+        engine.observe_activity("Busy", None, 440_000_000); // stale activity
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&updated)
+            );
+        }
+    }
+
+    #[test]
+    fn engine_population_refresh_replaces_changed_program_and_reset_rhythm() {
+        let mut engine = AtcEngine::new_for_testing();
+        assert!(engine.register_agent("Agent", "claude-code", None));
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(60.0);
+        for i in 1..=6 {
+            engine.observe_activity("Agent", None, i * 30_000_000);
+        }
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(population.populations["claude-code"].agent_count, 1);
+
+        assert!(engine.register_agent("Agent", "codex_cli", None));
+        engine.refresh_population_snapshot(&mut population);
+        let defaults = HierarchicalAgentModel::new();
+        assert_eq!(
+            population_snapshot_values(&population)["claude-code"],
+            population_snapshot_values(&defaults)["claude-code"],
+            "reclassification must not leave stale evidence in the old cohort"
+        );
+        assert_eq!(population.populations["codex-cli"].agent_count, 1);
+        assert_eq!(
+            population.populations["codex-cli"].n.to_bits(),
+            8.0_f64.to_bits()
+        );
+
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(120.0);
+        engine.observe_activity("Agent", None, 1_000_000); // anchor, not an interval
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(
+            population_snapshot_values(&population),
+            population_snapshot_values(&defaults),
+            "a reset rhythm must not retain its previous lifetime's evidence"
+        );
+    }
+
+    #[test]
+    fn engine_population_refresh_is_independent_of_registration_order() {
+        let cases = [
+            ("Zeta", "claude-code", 17_000_003, 12),
+            ("Alpha", "claude_code", 921_001, 23),
+            ("Mu", "CLAUDE_CODE", 90_123_456, 7),
+            ("Beta", "claude-code", 1_700_900_013, 49),
+        ];
+        let build = |cases: &[(&str, &str, i64, i64)]| {
+            let mut engine = AtcEngine::new_for_testing();
+            for &(name, program, interval, count) in cases {
+                assert!(engine.register_agent(name, program, None));
+                engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+                for i in 1..=count {
+                    engine.observe_activity(name, None, i * interval);
+                }
+            }
+            engine
+        };
+        let mut forward = build(&cases);
+        let mut reverse_cases = cases;
+        reverse_cases.reverse();
+        let mut reverse = build(&reverse_cases);
+        let mut forward_population = HierarchicalAgentModel::new();
+        let mut reverse_population = HierarchicalAgentModel::new();
+        forward.refresh_population_snapshot(&mut forward_population);
+        reverse.refresh_population_snapshot(&mut reverse_population);
+        assert_eq!(
+            population_snapshot_values(&forward_population),
+            population_snapshot_values(&reverse_population),
+            "equivalent agent histories must produce bit-identical population priors"
+        );
+        assert_eq!(forward_population.populations["claude-code"].agent_count, 4);
+        assert_eq!(
+            forward_population.populations["claude-code"].n.to_bits(),
+            90.0_f64.to_bits()
         );
     }
 
@@ -13556,6 +14137,183 @@ mod alien_enhancement_tests {
         }
 
         assert_eq!(reviewed.len(), POPULATION);
+    }
+
+    #[test]
+    fn policy_dirty_reviews_progress_under_continuously_due_work() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now_micros = 42_000_000;
+        for index in 0..MAX_LIVENESS_REVIEWS_PER_TICK {
+            let agent = format!("Scheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, now_micros);
+        }
+        let policy_agents: Vec<_> = (0..12).map(|index| format!("Policy{index:04}")).collect();
+        for agent in &policy_agents {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.dirty_agents.insert(agent.clone());
+        }
+
+        let mut policy_reviews = Vec::new();
+        let mut scheduled_reviews = HashSet::new();
+        for _ in 0..3 {
+            let due = engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.iter().collect::<HashSet<_>>().len(), due.len());
+            let before = policy_reviews.len();
+            for agent in due {
+                if agent.starts_with("Scheduled") {
+                    scheduled_reviews.insert(agent.clone());
+                    // Keep real scheduler work overdue on every pass. Simply
+                    // draining a fixed heap cannot expose queue starvation.
+                    engine.schedule_entry_for_push(&agent, now_micros);
+                } else {
+                    policy_reviews.push(agent);
+                }
+            }
+            assert_eq!(
+                policy_reviews.len() - before,
+                MAX_LIVENESS_REVIEWS_PER_TICK / 2
+            );
+        }
+        assert_eq!(
+            policy_reviews, policy_agents,
+            "retain policy queue ordering"
+        );
+        assert_eq!(scheduled_reviews.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert!(engine.dirty_agents.is_empty());
+    }
+
+    #[test]
+    fn one_review_budget_alternates_between_ready_queues() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["Scheduled", "PolicyA", "PolicyB"] {
+            engine.register_agent(agent, "codex-cli", None);
+        }
+        engine.schedule_entry_for_push("Scheduled", 1);
+        engine
+            .dirty_agents
+            .extend(["PolicyA".to_string(), "PolicyB".to_string()]);
+
+        for expected in ["Scheduled", "PolicyA", "Scheduled", "PolicyB"] {
+            let dirty_before = engine.dirty_agents.clone();
+            let heap_before = engine.liveness_schedule.len();
+            let turn_before = engine.dirty_review_next;
+            assert_eq!(engine.pop_due_agents(1, 0), [] as [String; 0]);
+            assert_eq!(engine.dirty_agents, dirty_before);
+            assert_eq!(engine.liveness_schedule.len(), heap_before);
+            assert_eq!(engine.dirty_review_next, turn_before);
+
+            assert_eq!(engine.pop_due_agents(1, 1), vec![expected]);
+            if expected == "Scheduled" {
+                engine.schedule_entry_for_push(expected, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_and_timed_review_of_the_same_agent_is_not_duplicated() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["AgentA", "AgentB", "AgentC"] {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.schedule_entry_for_push(agent, 1);
+        }
+        engine.mark_agents_dirty();
+        let due = engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert_eq!(due, vec!["AgentA", "AgentB", "AgentC"]);
+        assert!(engine.dirty_agents.is_empty());
+        assert!(engine.liveness_schedule.is_empty());
+        assert_eq!(
+            engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK),
+            [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn stale_schedule_cleanup_yields_and_keeps_a_due_resume_deadline() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("Rescheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            // These are active, recently probed agents. Otherwise the full
+            // tick legitimately selects never-probed identities and replaces
+            // their artificial deadlines while this test counts heap pops.
+            let entry = engine.agents.get_mut(&agent).expect("registered agent");
+            entry.rhythm.observe(1);
+            entry.probe_sent_at = 1;
+            // Use the production reschedule path to retain two obsolete
+            // versions ahead of the actual future review for each identity.
+            engine.schedule_entry_for_push(&agent, 1);
+            engine.schedule_entry_for_push(&agent, 2);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+        let original_entries = engine.liveness_schedule.len();
+        assert_eq!(original_entries, POPULATION * 3);
+
+        let now_micros = 3;
+        let report = engine.run_tick(now_micros);
+        assert!(engine.agents.values().all(|entry| entry.probe_sent_at == 1));
+        assert_eq!(report.summary.kernel.due_agents, 0);
+        assert_eq!(report.summary.kernel.scheduled_agents, POPULATION);
+        assert_eq!(
+            original_entries - engine.liveness_schedule.len(),
+            MAX_LIVENESS_SCHEDULE_POPS_PER_TICK,
+            "a tick must bound stale work as well as completed reviews"
+        );
+        assert!(
+            report
+                .summary
+                .kernel
+                .next_due_micros
+                .is_some_and(|due| due <= now_micros)
+        );
+
+        let remaining_entries = engine.liveness_schedule.len();
+        for _ in 0..100 {
+            assert!(
+                engine
+                    .next_scheduled_review_micros()
+                    .is_some_and(|due| due <= now_micros)
+            );
+        }
+        assert_eq!(
+            engine.liveness_schedule.len(),
+            remaining_entries,
+            "health/deadline observation must not drain deferred cleanup"
+        );
+
+        let mut passes = 1;
+        while engine.liveness_schedule.len() > POPULATION {
+            let before = engine.liveness_schedule.len();
+            assert_eq!(
+                engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK),
+                [] as [String; 0]
+            );
+            let popped = before - engine.liveness_schedule.len();
+            assert!((1..=MAX_LIVENESS_SCHEDULE_POPS_PER_TICK).contains(&popped));
+            passes += 1;
+            assert!(passes <= (POPULATION * 2).div_ceil(MAX_LIVENESS_SCHEDULE_POPS_PER_TICK));
+        }
+        assert_eq!(engine.next_scheduled_review_micros(), Some(1_000_000));
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
+
+        let mut reviewed = HashSet::new();
+        while !engine.liveness_schedule.is_empty() {
+            let due = engine.pop_due_agents(1_000_000, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_ne!(due, [] as [String; 0]);
+            for agent in due {
+                assert!(
+                    reviewed.insert(agent),
+                    "cleanup must not duplicate valid work"
+                );
+            }
+        }
+        assert_eq!(
+            reviewed.len(),
+            POPULATION,
+            "cleanup must preserve every valid review"
+        );
     }
 
     #[test]
@@ -14574,6 +15332,164 @@ mod alien_enhancement_tests {
         assert!(release.semantics.high_risk_intervention);
         assert_eq!(release.semantics.family, "reservation_release");
         assert_eq!(advisory.semantics.family, "release_notice");
+    }
+
+    fn restarted_identity_effect(
+        config: &mcp_agent_mail_core::Config,
+        timestamp_micros: i64,
+    ) -> AtcEffectPlan {
+        reset_global_atc_state_for_test(config);
+        let mut engine = ATC_ENGINE
+            .get()
+            .expect("engine initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        engine.register_agent("RestartAgent", "claude-code", Some("/tmp/atc-restart"));
+        let core = default_liveness_core();
+        let decision_id = engine.ledger.record(&DecisionBuilder {
+            subsystem: AtcSubsystem::Liveness,
+            decision_class: "liveness_transition",
+            subject: "RestartAgent",
+            core: &core,
+            action: LivenessAction::ReleaseReservations,
+            expected_loss: 0.5,
+            runner_up_loss: 1.5,
+            evidence_summary: "posterior dead state crossed release threshold",
+            calibration_healthy: true,
+            safe_mode_active: false,
+            policy_id: Some("policy-test"),
+            fallback_reason: None,
+            timestamp_micros,
+        });
+        engine
+            .effect_plan_for_decision_id(
+                decision_id,
+                timestamp_micros,
+                "release_reservations_requested",
+                "liveness",
+                "reservation_release",
+                "RestartAgent".to_string(),
+                Some("/tmp/atc-restart".to_string()),
+                None,
+            )
+            .expect("release effect")
+    }
+
+    fn reopened_identity_rows(
+        db_path: &std::path::Path,
+    ) -> Vec<mcp_agent_mail_db::sqlmodel_core::Row> {
+        let sidecar = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path.to_string_lossy());
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(sidecar.as_str())
+            .expect("reopen durable experience sidecar");
+        conn.query_sync(
+            "SELECT experience_id, decision_id, trace_id, state, outcome_json \
+             FROM atc_experiences ORDER BY experience_id",
+            &[],
+        )
+        .expect("read persisted decision lifetimes")
+    }
+
+    #[test]
+    fn restarted_decisions_preserve_independent_durable_outcomes() {
+        use mcp_agent_mail_core::{AtcWriteMode, ExperienceOutcome, ExperienceState};
+
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            atc_write_mode: AtcWriteMode::Live,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-restart.sqlite3");
+        let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create file-backed pool");
+        assert!(crate::atc_durable_writes_enabled(
+            config.atc_write_mode,
+            crate::AtcExecutorMode::Live,
+            Some(&pool),
+            false,
+        ));
+
+        let first_ts = 1_700_000_000_000_000;
+        let first_effect = restarted_identity_effect(&config, first_ts);
+        let first = crate::append_atc_experience_for_effect(&pool, &first_effect)
+            .expect("append first lifetime");
+        assert_eq!(first.state, ExperienceState::Planned);
+        crate::capture_atc_execution_result(
+            &pool,
+            Some(first.experience_id),
+            "live",
+            "executed",
+            first_ts + 1_000,
+        );
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: first_ts + 2_000,
+            label: "clean_release".to_string(),
+            correct: true,
+            actual_loss: Some(0.0),
+            regret: Some(0.0),
+            evidence: None,
+        };
+        crate::block_on(mcp_agent_mail_db::queries::resolve_atc_observed_outcome(
+            &asupersync::Cx::for_testing(),
+            &pool,
+            first.experience_id,
+            &outcome,
+        ))
+        .into_result()
+        .expect("resolve first lifetime");
+        let first_rows = reopened_identity_rows(&db_path);
+        assert_eq!(first_rows.len(), 1);
+        let first_outcome = first_rows[0]
+            .get_named::<String>("outcome_json")
+            .expect("persisted first outcome");
+
+        let second_ts = first_ts + 1_000_000;
+        let second_effect = restarted_identity_effect(&config, second_ts);
+        assert_eq!(first_effect.decision_id, second_effect.decision_id);
+        assert_ne!(first_effect.trace_id, second_effect.trace_id);
+        assert_ne!(first_effect.effect_id, second_effect.effect_id);
+        let stale_error = crate::append_atc_experience_for_effect(&pool, &first_effect)
+            .expect_err("a stale effect cannot attach to a reused decision ID");
+        assert!(stale_error.contains("no longer matches"));
+        let second = crate::append_atc_experience_for_effect(&pool, &second_effect)
+            .expect("append second lifetime");
+        assert_ne!(first.experience_id, second.experience_id);
+        assert_eq!(second.state, ExperienceState::Planned);
+        let repeated = crate::append_atc_experience_for_effect(&pool, &second_effect)
+            .expect("repeated append is idempotent");
+        assert_eq!(repeated.experience_id, second.experience_id);
+        crate::capture_atc_execution_result(
+            &pool,
+            Some(second.experience_id),
+            "live",
+            "executed",
+            second_ts + 1_000,
+        );
+        drop(pool);
+
+        let rows = reopened_identity_rows(&db_path);
+        assert_eq!(rows.len(), 2);
+        let old = &rows[0];
+        let new = &rows[1];
+        let old_outcome: String = old.get_named("outcome_json").unwrap();
+        let new_outcome: Option<String> = new.get_named("outcome_json").unwrap();
+        let old_trace: String = old.get_named("trace_id").unwrap();
+        let new_trace: String = new.get_named("trace_id").unwrap();
+        assert_eq!(old.get_named::<String>("state").unwrap(), "resolved");
+        assert_eq!(old_outcome, first_outcome);
+        assert_eq!(new.get_named::<String>("state").unwrap(), "executed");
+        assert_eq!(new_outcome, None);
+        assert_eq!(old_trace, first_effect.trace_id);
+        assert_eq!(new_trace, second_effect.trace_id);
     }
 
     #[test]

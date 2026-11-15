@@ -31,8 +31,12 @@ pub mod staging;
 
 pub use staging::{ProactiveBackupStagingInventory, inspect_proactive_backup_staging};
 
+// Only a Unix test builds raw staging names from the prefix. The fork runs
+// that test on macOS too, with a name the filesystem accepts.
+#[cfg(all(test, unix))]
+use staging::PROACTIVE_STAGING_PREFIX;
 #[cfg(test)]
-use staging::{PROACTIVE_STAGING_PREFIX, inspect_proactive_backup_staging_with_limit};
+use staging::inspect_proactive_backup_staging_with_limit;
 
 #[cfg(unix)]
 pub use namespace::{

@@ -116,6 +116,9 @@ pub enum DbErrorClass {
     MainDbBtreeCorruption,
     /// WAL/SHM sidecar corruption or truncation, distinct from main DB damage.
     WalSidecarCorruption,
+    /// The engine cannot validate a WAL commit certificate. Its bytes may
+    /// still authorize committed data, so generic sidecar repair is unsafe.
+    WalCertificateCorruption,
     /// Schema drift, missing tables/columns, or migration shape mismatch.
     SchemaDriftOrMissingTables,
     /// The engine/probe failed in a way that is not enough to diagnose DB damage.
@@ -149,6 +152,7 @@ impl DbErrorClass {
         match self {
             Self::MainDbBtreeCorruption => "main_db_btree_corruption",
             Self::WalSidecarCorruption => "wal_sidecar_corruption",
+            Self::WalCertificateCorruption => "wal_certificate_corruption",
             Self::SchemaDriftOrMissingTables => "schema_drift_or_missing_tables",
             Self::EngineProbeLimitation => "engine_probe_limitation",
             Self::ForeignKeyInconsistency => "foreign_key_inconsistency",
@@ -163,6 +167,17 @@ impl DbErrorClass {
         }
     }
 }
+
+/// Operator guidance for an unreadable commit-certificate family (GH#387).
+///
+/// Listing backups is diagnostic only; it neither opens the mailbox nor
+/// authorizes restoring an older generation over uncheckpointed commits.
+pub const WAL_CERTIFICATE_RECOVERY_GUIDANCE: &str = "Keep the database and its -wal, -shm, -wal-cert, and -wal-cert-head files intact \
+     for recovery from a preserved copy. Do not delete or truncate certificate sidecars: \
+     they may carry proof of committed WAL data. Automatic repair/reconstruction is \
+     not authorized by this failure. Run `am doctor backups --json` to inventory existing \
+     backups without opening or changing the mailbox; a listed backup is not proof \
+     that it contains the newest commits.";
 
 /// Severity attached to a [`DbErrorClass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +242,17 @@ impl DbErrorClassification {
                 safe_to_continue_read_only: true,
                 blocks_edits: true,
                 recommended_command: "am doctor health",
+            },
+            DbErrorClass::WalCertificateCorruption => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                // A certificate refusal does not prove that dropping a
+                // sidecar or rebuilding from the archive preserves commits.
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: false,
+                blocks_edits: true,
+                recommended_command: "am doctor backups --json",
             },
             DbErrorClass::SchemaDriftOrMissingTables => Self {
                 class,
@@ -603,7 +629,9 @@ impl DbError {
     pub fn is_corruption(&self) -> bool {
         match self {
             Self::Sqlite(msg) | Self::Pool(msg) | Self::Schema(msg) => is_corruption_error(msg),
-            Self::IntegrityCorruption { .. } => true,
+            Self::IntegrityCorruption { .. } => {
+                self.classification_from_error().class != DbErrorClass::WalCertificateCorruption
+            }
             Self::RetryBudgetExhausted { inner, .. } => inner.is_corruption(),
             _ => false,
         }
@@ -642,13 +670,24 @@ impl DbError {
             }
             Self::IntegrityCorruption { message, details } => {
                 let joined_details = details.join("\n");
-                let class = if contains_fts_index_corruption(message)
+                let certificate_failure = contains_wal_certificate_corruption(message)
+                    || contains_wal_certificate_corruption(&joined_details);
+                let main_file_damage = contains_main_db_corruption(message)
+                    || contains_main_db_corruption(&joined_details);
+                let class = if certificate_failure {
+                    // A wrapped certificate open/probe refusal is not itself
+                    // an integrity verdict about the main file. Independent
+                    // main-file damage still retains its original authority.
+                    if main_file_damage {
+                        DbErrorClass::MainDbBtreeCorruption
+                    } else {
+                        DbErrorClass::WalCertificateCorruption
+                    }
+                } else if contains_fts_index_corruption(message)
                     || contains_fts_index_corruption(&joined_details)
                 {
                     DbErrorClass::FtsIndexCorruption
-                } else if contains_main_db_corruption(message)
-                    || contains_main_db_corruption(&joined_details)
-                {
+                } else if main_file_damage {
                     DbErrorClass::MainDbBtreeCorruption
                 } else if contains_foreign_key_inconsistency(message)
                     || contains_foreign_key_inconsistency(&joined_details)
@@ -1151,6 +1190,13 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_mvcc_conflict(msg) || contains_lock_or_busy(msg) {
         return DbErrorClass::BusyRetryable;
     }
+    if contains_wal_certificate_corruption(msg) {
+        return if contains_main_db_corruption(msg) {
+            DbErrorClass::MainDbBtreeCorruption
+        } else {
+            DbErrorClass::WalCertificateCorruption
+        };
+    }
     if contains_wal_sidecar_corruption(msg) {
         return DbErrorClass::WalSidecarCorruption;
     }
@@ -1177,7 +1223,19 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_foreign_key_inconsistency(msg) {
         return DbErrorClass::ForeignKeyInconsistency;
     }
+    // A bounded waiter has not observed a database failure: another checkout
+    // still owns startup. Keep this after actual failure diagnoses so a joined
+    // probe error cannot hide corruption behind its earlier wait (GH#382).
+    if contains_initialization_gate_wait(msg) {
+        return DbErrorClass::BusyRetryable;
+    }
     DbErrorClass::ConnectionOrConfigError
+}
+
+fn contains_initialization_gate_wait(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("database initialization still in progress after ")
+        && lower.contains("(bounded init-gate wait, gh#245)")
 }
 
 fn contains_lock_or_busy(msg: &str) -> bool {
@@ -1259,6 +1317,14 @@ fn is_cursor_type_mismatch_detail(detail: &str) -> bool {
             number.bytes().all(|byte| byte.is_ascii_digit())
                 && number.parse::<u32>().is_ok_and(|value| value > 0)
         })
+}
+
+fn contains_wal_certificate_corruption(msg: &str) -> bool {
+    // The native engine wraps certificate validation failures in WalCorrupt.
+    // Require that complete diagnostic prefix: merely mentioning WAL or a
+    // -wal-cert path does not establish a failed commit certificate.
+    msg.to_ascii_lowercase()
+        .contains("wal file is corrupt: parallel wal certificate ")
 }
 
 fn contains_wal_sidecar_corruption(msg: &str) -> bool {
@@ -1461,6 +1527,49 @@ mod tests {
         assert!(!is_corruption_error(message));
     }
 
+    #[test]
+    fn initialization_gate_timeout_is_retryable_without_repair() {
+        let message = "database initialization still in progress after 30s; \
+             the mailbox is warming up or its archive reconcile is \
+             slow — retry shortly (bounded init-gate wait, GH#245)";
+        for detail in [message.to_string(), format!("Custom error: {message}")] {
+            let classification = assert_class(&detail, DbErrorClass::BusyRetryable);
+            assert!(classification.safe_to_retry);
+            assert!(!classification.repairable);
+            assert!(is_lock_error(&detail));
+            assert!(!is_corruption_error(&detail));
+            assert!(DbError::Sqlite(detail.clone()).is_retryable());
+            assert!(DbError::Pool(detail).is_retryable());
+        }
+
+        // Initialization failures must retain their underlying diagnosis.
+        for (detail, expected) in [
+            (
+                "database initialization failed: database disk image is malformed",
+                DbErrorClass::MainDbBtreeCorruption,
+            ),
+            (
+                "database initialization failed: no such table: messages",
+                DbErrorClass::SchemaDriftOrMissingTables,
+            ),
+            (
+                "database initialization failed: permission denied",
+                DbErrorClass::ConnectionOrConfigError,
+            ),
+        ] {
+            assert!(!assert_class(detail, expected).safe_to_retry);
+            assert!(!DbError::Sqlite(detail.to_string()).is_retryable());
+        }
+
+        assert_class(
+            "database initialization still in progress after 30s",
+            DbErrorClass::ConnectionOrConfigError,
+        );
+        let mixed = format!("{message}; integrity_check failed: database disk image is malformed");
+        assert!(!assert_class(&mixed, DbErrorClass::MainDbBtreeCorruption).safe_to_retry);
+        assert!(!is_lock_error(&mixed));
+    }
+
     /// GH#312: a multi-form integrity probe joins every form's error into one
     /// message. On current SQLite the table-valued `pragma_integrity_check(N)`
     /// form fails first with "no such table: N" (the argument is quoted and
@@ -1594,6 +1703,141 @@ mod tests {
             assert_class(message, DbErrorClass::WalSidecarCorruption);
             assert!(!is_corruption_error(message), "{message}");
         }
+    }
+
+    #[test]
+    fn wal_certificate_failures_preserve_committed_data_authority() {
+        for detail in [
+            "suffix does not start at a record boundary",
+            "suffix has unsupported record version 99",
+            "suffix is invalid: certificate record CRC mismatch",
+            "footer declares invalid record length 0",
+            "record ending at 3 has no length footer",
+            "checkpoint handoff is invalid: certificate record footer length mismatch",
+            "sidecar has no valid append boundary within its bounded 262292-byte recovery suffix",
+        ] {
+            let message =
+                format!("Connection error: WAL file is corrupt: parallel WAL certificate {detail}");
+            for wrapped in [message.clone(), format!("internal error: {message}")] {
+                let classification = assert_class(&wrapped, DbErrorClass::WalCertificateCorruption);
+                assert_eq!(classification.severity, DbErrorSeverity::P1);
+                assert!(!classification.repairable, "{wrapped}");
+                assert!(!classification.safe_to_retry, "{wrapped}");
+                assert!(!classification.safe_to_continue_read_only, "{wrapped}");
+                assert!(classification.blocks_edits, "{wrapped}");
+                assert_eq!(
+                    classification.recommended_command,
+                    "am doctor backups --json"
+                );
+                assert!(!is_corruption_error(&wrapped), "{wrapped}");
+                assert!(
+                    !crate::pool::is_corruption_error_message(&wrapped),
+                    "{wrapped}"
+                );
+                assert!(
+                    !crate::pool::is_sqlite_recovery_error_message(&wrapped),
+                    "{wrapped}"
+                );
+                assert!(
+                    !crate::pool::private_copy_integrity_probe_failure_is_verdict(&format!(
+                        "every integrity_check probe form failed — {wrapped}"
+                    )),
+                    "an exhausted certificate probe is still not a main-file integrity verdict"
+                );
+
+                let error = DbError::Sqlite(wrapped);
+                assert!(!error.is_retryable());
+                assert!(!error.is_corruption());
+                let envelope = error.failure_envelope();
+                assert_eq!(envelope.class, "wal_certificate_corruption");
+                assert!(!envelope.policy.repairable);
+                assert!(!envelope.policy.safe_to_continue_read_only);
+            }
+        }
+    }
+
+    #[test]
+    fn wal_certificate_classification_requires_engine_validation_prefix() {
+        for message in [
+            "parallel WAL certificate append completed",
+            "checking /tmp/storage.sqlite3-wal-cert",
+            "WAL certificate verification completed",
+            "TLS certificate is invalid",
+            "WAL file is corrupt: invalid checksum",
+            "WAL file too small for header during rebuild: read 0, need 32",
+        ] {
+            assert_ne!(
+                classify_db_error_message(message).class,
+                DbErrorClass::WalCertificateCorruption,
+                "{message}"
+            );
+        }
+        assert_class(
+            "CONNECTION ERROR: WAL FILE IS CORRUPT: PARALLEL WAL CERTIFICATE SUFFIX DOES NOT START AT A RECORD BOUNDARY",
+            DbErrorClass::WalCertificateCorruption,
+        );
+    }
+
+    #[test]
+    fn wal_certificate_classification_preserves_resource_and_main_damage_precedence() {
+        let certificate = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
+        for (other, expected) in [
+            ("database is locked", DbErrorClass::BusyRetryable),
+            (
+                "Too many open files (os error 24)",
+                DbErrorClass::FdExhaustion,
+            ),
+            ("QueuePool limit reached", DbErrorClass::PoolExhaustion),
+            ("database or disk is full", DbErrorClass::HostPressure),
+            (
+                "mailbox mutation refused: another Agent Mail server owns this mailbox",
+                DbErrorClass::LiveOwnerNoActivityLock,
+            ),
+            (
+                "database disk image is malformed",
+                DbErrorClass::MainDbBtreeCorruption,
+            ),
+        ] {
+            for message in [
+                format!("{certificate}; {other}"),
+                format!("{other}; {certificate}"),
+            ] {
+                assert_class(&message, expected);
+            }
+        }
+        let main_damage = format!("{certificate}; database disk image is malformed");
+        assert!(is_corruption_error(&main_damage));
+        assert!(crate::pool::is_sqlite_recovery_error_message(&main_damage));
+    }
+
+    #[test]
+    fn wal_certificate_only_integrity_wrapper_does_not_authorize_recovery() {
+        let certificate = "WAL file is corrupt: parallel WAL certificate suffix does not start at a record boundary";
+        for (message, details) in [
+            (certificate.to_string(), Vec::new()),
+            (
+                "integrity probe could not open the database".to_string(),
+                vec![certificate.to_string()],
+            ),
+        ] {
+            let error = DbError::IntegrityCorruption { message, details };
+            assert_eq!(
+                error.classification().class,
+                DbErrorClass::WalCertificateCorruption
+            );
+            assert!(!error.is_corruption());
+            assert!(!error.is_retryable());
+            assert!(!error.failure_envelope().policy.repairable);
+        }
+        let independently_damaged = DbError::IntegrityCorruption {
+            message: certificate.to_string(),
+            details: vec!["database disk image is malformed".to_string()],
+        };
+        assert_eq!(
+            independently_damaged.classification().class,
+            DbErrorClass::MainDbBtreeCorruption
+        );
+        assert!(independently_damaged.is_corruption());
     }
 
     #[test]

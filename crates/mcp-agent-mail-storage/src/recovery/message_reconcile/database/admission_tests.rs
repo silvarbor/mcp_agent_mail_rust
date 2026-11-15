@@ -188,6 +188,51 @@ fn with_queued_archive_lag(config: &Config, age: Duration, test: impl FnOnce()) 
 }
 
 #[test]
+fn unavailable_archive_queue_defers_without_consuming_cursor_then_repairs() {
+    if isolated() {
+        return;
+    }
+    for checkpointed in [false, true] {
+        fixture(|cx, pool, config| {
+            let before = database_evidence(cx, pool);
+            let mut cursor = if checkpointed {
+                ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros())
+            } else {
+                ReconcileCursor::default()
+            };
+            let cursor_before = format!("{cursor:?}");
+            let stop = AtomicBool::new(false);
+
+            // Hold the actual global queue on this thread. A blocking sampler
+            // would deadlock here and hit the unchanged nextest watchdog.
+            let queue = crate::ARCHIVE_BACKLOG.queue.lock().unwrap();
+            let error = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap_err();
+            assert_eq!(
+                error,
+                "message reconciliation deferred: recovery promotion or admission contention"
+            );
+            assert_eq!(format!("{cursor:?}"), cursor_before);
+            assert_eq!(database_evidence(cx, pool), before);
+
+            stop.store(true, Ordering::Release);
+            let interrupted =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(interrupted.interrupted);
+            assert_eq!((interrupted.scanned, interrupted.repaired), (0, 0));
+            assert_eq!(format!("{cursor:?}"), cursor_before);
+            drop(queue);
+
+            stop.store(false, Ordering::Release);
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((report.repaired, report.deferred), (2, 0));
+            assert_recovered(cx, pool, config, 901, false);
+            assert_recovered(cx, pool, config, 902, false);
+            assert_eq!(database_evidence(cx, pool), before);
+        });
+    }
+}
+
+#[test]
 fn archive_lag_grace_leaves_queued_mail_to_drain_then_reconciles_orphans() {
     fixture(|cx, pool, config| {
         let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;
@@ -1326,6 +1371,201 @@ fn large_retained_lock_refusals_cannot_starve_fresh_mail_for_another_project() {
         assert!(!archive.root.join("messages").exists());
         assert_eq!(database_evidence(cx, pool), before);
         drop(owner);
+    });
+}
+
+#[test]
+fn slow_fence_refusal_cools_from_completion_while_other_mail_progresses() {
+    fixture(|cx, pool, config| {
+        let before = database_evidence(cx, pool);
+        let started = Instant::now();
+        let completed = started + MAX_BATCH_TURN * 2;
+        let stop = AtomicBool::new(false);
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            tail_after: Some(900),
+            backfill_ceiling: Some(900),
+            next_lane_is_retry: true,
+            ..Default::default()
+        };
+        cursor.defer_transient(901, started);
+        let mut first_sample = true;
+        let refused = crate::with_archive_snapshot_publication_fence(|| {
+            reconcile_message_batch_with_clock(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                mcp_agent_mail_db::now_micros(),
+                || {
+                    // Advance only the monotonic observation across a real
+                    // native-fence refusal. No sleep or relaxed turn is needed.
+                    if std::mem::replace(&mut first_sample, false) {
+                        started
+                    } else {
+                        completed
+                    }
+                },
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            (
+                refused.scanned,
+                refused.repaired,
+                refused.deferred_transient,
+                refused.retry_len
+            ),
+            (1, 0, 1, 1)
+        );
+        assert!(
+            refused.budget_exhausted,
+            "the slow attempt must still spend the original turn"
+        );
+        assert_eq!(
+            cursor.tail_after,
+            Some(900),
+            "the next scan item was not consumed"
+        );
+        assert_eq!(cursor.retries[0].attempts, 1);
+        let retry_at = completed + Duration::from_secs(1);
+        assert_eq!(cursor.next_retry_at(), Some(retry_at));
+        assert!(!config.storage_root.join(".git").exists());
+        assert_eq!(database_evidence(cx, pool), before);
+
+        let cooling = reconcile_message_batch_with_clock(
+            cx,
+            pool,
+            config,
+            &mut cursor,
+            &stop,
+            mcp_agent_mail_db::now_micros(),
+            || retry_at.checked_sub(Duration::from_nanos(1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (cooling.repaired, cooling.deferred, cooling.retry_len),
+            (1, 0, 1)
+        );
+        assert_eq!(cursor.next_retry_at(), Some(retry_at));
+        assert_recovered(cx, pool, config, 902, false);
+        assert!(crate::open_archive(config, "project").unwrap().is_none());
+
+        let resumed = reconcile_message_batch_with_clock(
+            cx,
+            pool,
+            config,
+            &mut cursor,
+            &stop,
+            mcp_agent_mail_db::now_micros(),
+            || retry_at,
+        )
+        .unwrap();
+        assert_eq!(
+            (resumed.repaired, resumed.deferred, resumed.retry_len),
+            (1, 0, 0)
+        );
+        assert_eq!(cursor.next_retry_at(), None);
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn slow_conflict_keeps_its_full_cooldown_without_blocking_other_mail() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let (path, _) = seed_outbox(config, &prepared);
+        let conflict =
+            crate::render_message_bundle_content(&prepared.message, "conflicting body").unwrap();
+        fs::write(&path, &conflict).unwrap();
+        crate::flush_async_commits();
+        let before = database_evidence(cx, pool);
+        let started = Instant::now();
+        let completed = started + MAX_BATCH_TURN * 2;
+        let stop = AtomicBool::new(false);
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            tail_after: Some(900),
+            backfill_ceiling: Some(900),
+            ..Default::default()
+        };
+        let mut first_sample = true;
+        let refused = reconcile_message_batch_with_clock(
+            cx,
+            pool,
+            config,
+            &mut cursor,
+            &stop,
+            mcp_agent_mail_db::now_micros(),
+            || {
+                if std::mem::replace(&mut first_sample, false) {
+                    started
+                } else {
+                    completed
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                refused.scanned,
+                refused.repaired,
+                refused.deferred_conflict,
+                refused.retry_len
+            ),
+            (1, 0, 1, 0)
+        );
+        assert!(refused.budget_exhausted);
+        assert_eq!(cursor.tail_after, Some(901));
+        let retry_at = completed + MAX_RETRY_BACKOFF;
+        assert_eq!(cursor.conflict_backoff, VecDeque::from([(901, retry_at)]));
+        assert_eq!(fs::read(&path).unwrap(), conflict.as_bytes());
+
+        let cooling = reconcile_message_batch_with_clock(
+            cx,
+            pool,
+            config,
+            &mut cursor,
+            &stop,
+            mcp_agent_mail_db::now_micros(),
+            || retry_at.checked_sub(Duration::from_nanos(1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (cooling.repaired, cooling.deferred, cooling.retry_len),
+            (1, 0, 0)
+        );
+        assert_eq!(cursor.conflict_backoff, VecDeque::from([(901, retry_at)]));
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(fs::read(&path).unwrap(), conflict.as_bytes());
+
+        // Preserve the ordinary empty boundary pass before history wraps.
+        // At the deadline the real conflict becomes eligible exactly once.
+        let mut conflicts = 0;
+        for _ in 0..2 {
+            let resumed = reconcile_message_batch_with_clock(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                mcp_agent_mail_db::now_micros(),
+                || retry_at,
+            )
+            .unwrap();
+            conflicts += resumed.deferred_conflict;
+            assert_eq!(resumed.retry_len, 0);
+        }
+        assert_eq!(conflicts, 1);
+        assert_eq!(
+            cursor.conflict_backoff,
+            VecDeque::from([(901, retry_at + MAX_RETRY_BACKOFF)])
+        );
+        assert_eq!(fs::read(&path).unwrap(), conflict.as_bytes());
+        assert_eq!(database_evidence(cx, pool), before);
     });
 }
 

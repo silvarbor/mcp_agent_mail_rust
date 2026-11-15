@@ -46,13 +46,16 @@ use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{
     RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiLoopHeartbeatKind, TuiSharedState,
 };
-use crate::tui_compose::{ComposeAction, ComposePanel, ComposeState};
+use crate::tui_compose::{
+    ComposeAction, ComposeEnvelope, ComposePanel, ComposeProject, ComposeState,
+};
 use crate::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState as TuiDiffFrameState};
 use crate::tui_events::{EventSeverity, MailEvent};
 use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg,
+    ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, OperatorTaskResult,
+    PendingOperatorTask,
     agents::AgentsScreen,
     analytics::AnalyticsScreen,
     archive_browser::ArchiveBrowserScreen,
@@ -636,6 +639,26 @@ pub enum MailMsg {
     HousekeepingTick,
     /// Forwarded screen-level message.
     Screen(MailScreenMsg),
+    /// Project catalog loaded for one global compose draft.
+    ComposeProjectsLoaded {
+        draft_id: u64,
+        request_id: u64,
+        result: Result<Vec<ComposeProject>, String>,
+    },
+    /// Current recipients loaded for one explicitly selected project.
+    ComposeRecipientsLoaded {
+        draft_id: u64,
+        request_id: u64,
+        project: ComposeProject,
+        /// Routing name and optional display label of each active agent.
+        result: Result<Vec<(String, Option<String>)>, String>,
+    },
+    /// Normal messaging-tool delivery completed for a global compose draft.
+    ComposeSent {
+        draft_id: u64,
+        request_id: u64,
+        result: Result<OperatorTaskResult, String>,
+    },
     /// Switch to a specific screen.
     SwitchScreen(MailScreenId),
     /// Toggle the help overlay.
@@ -648,6 +671,25 @@ impl From<Event> for MailMsg {
     fn from(event: Event) -> Self {
         Self::Terminal(event)
     }
+}
+
+/// A draft's source and task identities outlive individual background calls.
+/// Roster refreshes never establish authority to write to another mailbox.
+struct ComposeContext {
+    draft_id: u64,
+    config: mcp_agent_mail_core::Config,
+    source: (String, PathBuf),
+    loading: Option<PendingOperatorTask>,
+    submitting: Option<PendingOperatorTask>,
+    /// Reuse the tool's retry key when an uncertain response is retried without
+    /// changing the envelope. Editing the payload starts a new submission.
+    last_submission: Option<(ComposeEnvelope, String)>,
+}
+
+fn compose_task_result<T>(run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|_| {
+        Err("Compose task stopped unexpectedly; the draft is retained. Check mailbox state before retrying".to_string())
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1607,7 +1649,8 @@ pub struct MailAppModel {
     quit_confirm_source: Option<QuitConfirmSource>,
     /// Compose message overlay state (`Ctrl+N` to open, `Esc` to close).
     compose_state: Option<ComposeState>,
-    compose_db_stats_gen: u64,
+    compose_context: Option<ComposeContext>,
+    compose_sequence: u64,
     /// Global widget-tree inspector state (debug-only; gated by `AM_TUI_DEBUG`).
     inspector: InspectorState,
     /// Flattened inspector tree size from the most recent frame.
@@ -1743,7 +1786,8 @@ impl MailAppModel {
             quit_confirm_armed_at: None,
             quit_confirm_source: None,
             compose_state: None,
-            compose_db_stats_gen: u64::MAX,
+            compose_context: None,
+            compose_sequence: 0,
             contrast_guard_cache: RefCell::new(ContrastGuardCache::default()),
             contrast_guard_pending: Cell::new(true),
             contrast_guard_last_tick: Cell::new(u64::MAX),
@@ -2529,8 +2573,16 @@ impl MailAppModel {
                 ));
                 Cmd::none()
             }
-            "compose_result" => {
-                self.notify_compose_result(arg == "ok", context);
+            "compose_result" | "quick_reply_result" => {
+                if arg == "pending" {
+                    self.notifications.notify(
+                        Toast::new(context)
+                            .icon(ToastIcon::Info)
+                            .duration(Duration::from_secs(4)),
+                    );
+                } else {
+                    self.notify_compose_result(arg == "ok", context);
+                }
                 Cmd::none()
             }
             "reservation_create_result" => {
@@ -2596,7 +2648,13 @@ impl MailAppModel {
                 Cmd::none()
             }
             "compose_discard" => {
-                self.compose_state = None;
+                if self
+                    .compose_context
+                    .as_ref()
+                    .is_some_and(|draft| context.parse::<u64>().ok() == Some(draft.draft_id))
+                {
+                    self.dismiss_compose();
+                }
                 Cmd::none()
             }
 
@@ -2648,13 +2706,15 @@ impl MailAppModel {
             }
             ActionOutcome::InFlight { .. } => {}
         }
-        // Remove any prior InFlight for the same operation.
+        // Settle one invocation. Other tasks with the same operation may
+        // still be running after the UI has accepted another action.
         if let ActionOutcome::Success { ref operation, .. }
         | ActionOutcome::Failure { ref operation, .. } = outcome
+            && let Some(index) = self.action_outcomes.iter().position(
+                |o| matches!(o, ActionOutcome::InFlight { operation: op } if op == operation),
+            )
         {
-            self.action_outcomes.retain(
-                |o| !matches!(o, ActionOutcome::InFlight { operation: op } if op == operation),
-            );
+            self.action_outcomes.remove(index);
         }
         // Cap outcome history to 20 entries.
         if self.action_outcomes.len() >= 20 {
@@ -3660,40 +3720,352 @@ impl MailAppModel {
     }
 
     /// Open the compose message overlay (`Ctrl+N`).
-    fn open_compose(&mut self) {
+    fn open_compose(&mut self) -> Cmd<MailMsg> {
         if self.compose_state.is_some() {
-            return; // Already open.
+            return Cmd::none();
         }
-        let mut cs = ComposeState::new();
-        if let Some(agents) = compose_agent_profiles(&self.state) {
-            cs.set_available_agent_profiles(agents);
-        }
-        self.compose_db_stats_gen = self.state.data_generation().db_stats_gen;
-        self.compose_state = Some(cs);
+        let draft_id = match self.next_compose_request_id() {
+            Ok(id) => id,
+            Err(error) => return self.compose_error(error),
+        };
+        let snapshot = self.state.config_snapshot();
+        let mut config = mcp_agent_mail_core::Config::get();
+        config.database_url = snapshot.raw_database_url;
+        config.storage_root = PathBuf::from(snapshot.storage_root);
+        let source = (config.database_url.clone(), config.storage_root.clone());
+        self.compose_context = Some(ComposeContext {
+            draft_id,
+            config,
+            source,
+            loading: None,
+            submitting: None,
+            last_submission: None,
+        });
+        self.compose_state = Some(ComposeState::new());
+        self.load_compose_projects()
     }
 
-    /// Dispatch a composed message for sending via the server control channel.
-    fn dispatch_compose_send(
-        &mut self,
-        envelope: crate::tui_compose::ComposeEnvelope,
-    ) -> Cmd<MailMsg> {
-        let recipients = envelope.to.join(", ");
-        if self
-            .state
-            .try_send_server_control(ServerControlMsg::ComposeEnvelope(envelope))
-        {
+    fn next_compose_request_id(&mut self) -> Result<u64, String> {
+        self.compose_sequence = self.compose_sequence.checked_add(1).ok_or_else(|| {
+            "Compose request limit reached; restart the console before submitting again".to_string()
+        })?;
+        Ok(self.compose_sequence)
+    }
+
+    fn compose_error(&mut self, error: String) -> Cmd<MailMsg> {
+        if let Some(form) = self.compose_state.as_mut() {
+            form.error = Some(error.clone());
+        }
+        self.notifications.notify(
+            Toast::new(error)
+                .icon(ToastIcon::Error)
+                .duration(Duration::from_secs(6)),
+        );
+        Cmd::none()
+    }
+
+    fn dismiss_compose(&mut self) {
+        if self.compose_context.as_ref().is_some_and(|context| {
+            context
+                .submitting
+                .as_ref()
+                .is_some_and(PendingOperatorTask::is_active)
+        }) {
             self.notifications.notify(
-                Toast::new(format!("Sending to: {recipients}"))
+                Toast::new("Compose dismissed; the submitted message is still sending")
                     .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(3)),
-            );
-        } else {
-            self.notifications.notify(
-                Toast::new("No server channel — message not sent")
-                    .icon(ToastIcon::Error)
                     .duration(Duration::from_secs(5)),
             );
         }
+        self.compose_state = None;
+        self.compose_context = None;
+    }
+
+    /// A task executor can discard a command before starting it. Its start
+    /// guard releases admission so neither loading nor sending strands a draft.
+    fn refresh_compose_admission(&mut self) {
+        let (Some(context), Some(form)) =
+            (self.compose_context.as_mut(), self.compose_state.as_mut())
+        else {
+            return;
+        };
+        if context
+            .loading
+            .as_ref()
+            .is_some_and(|pending| !pending.is_active())
+        {
+            context.loading = None;
+            form.loading = false;
+            form.error =
+                Some("Recipient loading did not start. Press Ctrl+R to retry.".to_string());
+        }
+        if context
+            .submitting
+            .as_ref()
+            .is_some_and(|pending| !pending.is_active())
+        {
+            context.submitting = None;
+            form.sending = false;
+            form.error = Some("Sending did not start; your draft is ready to retry.".to_string());
+        }
+    }
+
+    fn load_compose_projects(&mut self) -> Cmd<MailMsg> {
+        if self.compose_state.as_ref().is_none_or(|form| form.sending)
+            || self.compose_context.as_ref().is_some_and(|context| {
+                context
+                    .loading
+                    .as_ref()
+                    .is_some_and(PendingOperatorTask::is_active)
+            })
+        {
+            return Cmd::none();
+        }
+        let request_id = match self.next_compose_request_id() {
+            Ok(id) => id,
+            Err(error) => return self.compose_error(error),
+        };
+        let Some(context) = self.compose_context.as_mut() else {
+            return Cmd::none();
+        };
+        let draft_id = context.draft_id;
+        let config = context.config.clone();
+        let source = context.source.clone();
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        context.loading = Some(pending);
+        if let Some(form) = self.compose_state.as_mut() {
+            form.loading = true;
+            form.error = None;
+        }
+        Cmd::task_named("global_compose:projects", move || {
+            start_guard.started();
+            MailMsg::ComposeProjectsLoaded {
+                draft_id,
+                request_id,
+                result: compose_task_result(|| {
+                    crate::tui_operator_message::load_projects(&config, Some(&source))
+                }),
+            }
+        })
+    }
+
+    fn load_compose_recipients(&mut self) -> Cmd<MailMsg> {
+        let Some(project) = self
+            .compose_state
+            .as_ref()
+            .filter(|form| !form.sending)
+            .and_then(ComposeState::selected_project)
+            .cloned()
+        else {
+            return Cmd::none();
+        };
+        let request_id = match self.next_compose_request_id() {
+            Ok(id) => id,
+            Err(error) => return self.compose_error(error),
+        };
+        let Some(context) = self.compose_context.as_mut() else {
+            return Cmd::none();
+        };
+        let draft_id = context.draft_id;
+        let config = context.config.clone();
+        let source = context.source.clone();
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        context.loading = Some(pending);
+        if let Some(form) = self.compose_state.as_mut() {
+            form.loading = true;
+            form.error = None;
+        }
+        Cmd::task_named("global_compose:recipients", move || {
+            start_guard.started();
+            let result = compose_task_result(|| {
+                crate::tui_operator_message::load_recipient_profiles(
+                    &config,
+                    Some(&source),
+                    &project,
+                )
+            });
+            MailMsg::ComposeRecipientsLoaded {
+                draft_id,
+                request_id,
+                project,
+                result,
+            }
+        })
+    }
+
+    fn compose_load_matches(&self, draft_id: u64, request_id: u64) -> bool {
+        self.compose_state.is_some()
+            && self.compose_context.as_ref().is_some_and(|context| {
+                context.draft_id == draft_id
+                    && context
+                        .loading
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id() == request_id)
+            })
+    }
+
+    fn complete_compose_projects(
+        &mut self,
+        draft_id: u64,
+        request_id: u64,
+        result: Result<Vec<ComposeProject>, String>,
+    ) -> Cmd<MailMsg> {
+        if !self.compose_load_matches(draft_id, request_id) {
+            return Cmd::none();
+        }
+        if let Some(context) = self.compose_context.as_mut() {
+            context.loading = None;
+        }
+        if let Some(form) = self.compose_state.as_mut() {
+            form.loading = false;
+            match result {
+                Ok(projects) => {
+                    form.set_available_projects(projects);
+                    return self.load_compose_recipients();
+                }
+                Err(error) => return self.compose_error(error),
+            }
+        }
+        Cmd::none()
+    }
+
+    fn complete_compose_recipients(
+        &mut self,
+        draft_id: u64,
+        request_id: u64,
+        project: &ComposeProject,
+        result: Result<Vec<(String, Option<String>)>, String>,
+    ) -> Cmd<MailMsg> {
+        if !self.compose_load_matches(draft_id, request_id)
+            || self
+                .compose_state
+                .as_ref()
+                .and_then(ComposeState::selected_project)
+                != Some(project)
+        {
+            return Cmd::none();
+        }
+        if let Some(context) = self.compose_context.as_mut() {
+            context.loading = None;
+        }
+        if let Some(form) = self.compose_state.as_mut() {
+            form.loading = false;
+            match result {
+                Ok(agents) => {
+                    form.set_available_agent_profiles(agents);
+                    if form.recipients.is_empty() {
+                        form.error = Some("No active agents in this project. Register or unretire an agent, then press Ctrl+R.".to_string());
+                    }
+                }
+                Err(error) => return self.compose_error(error),
+            }
+        }
+        Cmd::none()
+    }
+
+    /// Submit through the same tool path as other operator sends, away from
+    /// both terminal input and the HTTP supervisor's control loop.
+    fn dispatch_compose_send(&mut self, envelope: ComposeEnvelope) -> Cmd<MailMsg> {
+        if self
+            .compose_state
+            .as_ref()
+            .is_none_or(|form| form.sending || form.loading)
+        {
+            return Cmd::none();
+        }
+        let request_id = match self.next_compose_request_id() {
+            Ok(id) => id,
+            Err(error) => return self.compose_error(error),
+        };
+        let Some(context) = self.compose_context.as_mut() else {
+            return self.compose_error(
+                "The draft has no mailbox source. Reopen compose before sending.".to_string(),
+            );
+        };
+        let snapshot = self.state.config_snapshot();
+        if crate::resolve_server_database_url_sqlite_path(&snapshot.raw_database_url)
+            != crate::resolve_server_database_url_sqlite_path(&context.source.0)
+            || Path::new(&snapshot.storage_root) != context.source.1.as_path()
+        {
+            return self.compose_error("The displayed mailbox changed while drafting. Reopen compose in the intended mailbox before sending.".to_string());
+        }
+        let idempotency_key = context
+            .last_submission
+            .as_ref()
+            .filter(|(previous, _)| previous == &envelope)
+            .map_or_else(
+                || {
+                    format!(
+                        "tui-compose-{}-{}-{request_id}",
+                        std::process::id(),
+                        now_micros()
+                    )
+                },
+                |(_, key)| key.clone(),
+            );
+        context.last_submission = Some((envelope.clone(), idempotency_key.clone()));
+        let draft_id = context.draft_id;
+        let config = context.config.clone();
+        let source = context.source.clone();
+        let (pending, mut start_guard) = PendingOperatorTask::new(request_id);
+        context.submitting = Some(pending);
+        if let Some(form) = self.compose_state.as_mut() {
+            form.sending = true;
+            form.error = None;
+        }
+        Cmd::task_named("global_compose:send", move || {
+            start_guard.started();
+            MailMsg::ComposeSent {
+                draft_id,
+                request_id,
+                result: compose_task_result(|| {
+                    crate::tui_operator_message::send_compose(
+                        &config,
+                        Some(&source),
+                        envelope,
+                        idempotency_key,
+                    )
+                }),
+            }
+        })
+    }
+
+    fn complete_compose_send(
+        &mut self,
+        draft_id: u64,
+        request_id: u64,
+        result: Result<OperatorTaskResult, String>,
+    ) -> Cmd<MailMsg> {
+        let matches = self.compose_context.as_ref().is_some_and(|context| {
+            context.draft_id == draft_id
+                && context
+                    .submitting
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id() == request_id)
+        });
+        let (text, icon) = match result {
+            Ok(outcome) => {
+                if matches {
+                    self.compose_state = None;
+                    self.compose_context = None;
+                }
+                (outcome.summary, ToastIcon::Success)
+            }
+            Err(error) => {
+                if matches {
+                    if let Some(context) = self.compose_context.as_mut() {
+                        context.submitting = None;
+                    }
+                    if let Some(form) = self.compose_state.as_mut() {
+                        form.sending = false;
+                        form.error = Some(error.clone());
+                    }
+                }
+                (format!("Compose: {error}"), ToastIcon::Error)
+            }
+        };
+        self.notifications
+            .notify(Toast::new(text).icon(icon).duration(Duration::from_secs(6)));
         Cmd::none()
     }
 
@@ -4304,15 +4676,6 @@ impl MailAppModel {
 
     #[allow(clippy::too_many_lines)]
     fn run_housekeeping_tick(&mut self, elapsed_tick: Duration) -> Cmd<MailMsg> {
-        let db_stats_gen = self.state.data_generation().db_stats_gen;
-        if self.compose_state.is_some() && self.compose_db_stats_gen != db_stats_gen {
-            if let Some(agents) = compose_agent_profiles(&self.state)
-                && let Some(compose) = &mut self.compose_state
-            {
-                compose.set_available_agent_profiles(agents);
-                self.compose_db_stats_gen = db_stats_gen;
-            }
-        }
         if let Some(mut transition) = self.screen_transition {
             transition.ticks_remaining = transition.ticks_remaining.saturating_sub(1);
             self.screen_transition = if transition.ticks_remaining == 0 {
@@ -4508,7 +4871,26 @@ impl Model for MailAppModel {
             return Cmd::quit();
         }
 
+        self.refresh_compose_admission();
+
         match msg {
+            MailMsg::ComposeProjectsLoaded {
+                draft_id,
+                request_id,
+                result,
+            } => self.complete_compose_projects(draft_id, request_id, result),
+            MailMsg::ComposeRecipientsLoaded {
+                draft_id,
+                request_id,
+                project,
+                result,
+            } => self.complete_compose_recipients(draft_id, request_id, &project, result),
+            MailMsg::ComposeSent {
+                draft_id,
+                request_id,
+                result,
+            } => self.complete_compose_send(draft_id, request_id, result),
+
             // ── Tick ────────────────────────────────────────────────
             MailMsg::Terminal(Event::Tick) => {
                 let elapsed_tick = self.scheduled_tick_interval;
@@ -4617,11 +4999,17 @@ impl Model for MailAppModel {
                     {
                         match compose.handle_key(key) {
                             ComposeAction::Consumed | ComposeAction::Ignored => {}
-                            ComposeAction::Close => {
-                                self.compose_state = None;
+                            ComposeAction::Close => self.dismiss_compose(),
+                            ComposeAction::ProjectChanged => {
+                                return self.load_compose_recipients();
                             }
+                            ComposeAction::Reload => return self.load_compose_projects(),
                             ComposeAction::ConfirmClose => {
                                 let action_tx = self.action_tx.clone();
+                                let draft_id = self
+                                    .compose_context
+                                    .as_ref()
+                                    .map(|context| context.draft_id);
                                 self.modal_manager.show_confirmation(
                                     "Discard Message",
                                     "You have unsaved changes. Discard them?",
@@ -4630,30 +5018,17 @@ impl Model for MailAppModel {
                                         if matches!(result, DialogResult::Ok) {
                                             let _ = action_tx.send((
                                                 "compose_discard".to_string(),
-                                                String::new(),
+                                                draft_id
+                                                    .map_or_else(String::new, |id| id.to_string()),
                                             ));
                                         }
                                     },
                                 );
                             }
-                            ComposeAction::Send => {
-                                if let Some(mut cs) = self.compose_state.take() {
-                                    match cs.build_envelope() {
-                                        Ok(envelope) => {
-                                            return self.dispatch_compose_send(envelope);
-                                        }
-                                        Err(err) => {
-                                            // Put state back so user can fix.
-                                            self.compose_state = Some(cs);
-                                            self.notifications.notify(
-                                                Toast::new(format!("Compose error: {err}"))
-                                                    .icon(ToastIcon::Error)
-                                                    .duration(Duration::from_secs(5)),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            ComposeAction::Send => match compose.build_envelope() {
+                                Ok(envelope) => return self.dispatch_compose_send(envelope),
+                                Err(error) => return self.compose_error(error),
+                            },
                         }
                     }
                     return Cmd::none();
@@ -4856,8 +5231,7 @@ impl Model for MailAppModel {
                     let is_ctrl_n = key.modifiers.contains(Modifiers::CTRL)
                         && matches!(key.code, KeyCode::Char('n'));
                     if is_ctrl_n && !text_mode {
-                        self.open_compose();
-                        return Cmd::none();
+                        return self.open_compose();
                     }
                     // Ctrl+T / Shift+T: cycle theme globally.
                     let is_ctrl_t = (key.modifiers.contains(Modifiers::CTRL)
@@ -5053,6 +5427,49 @@ impl Model for MailAppModel {
             MailMsg::Screen(MailScreenMsg::Noop) => Cmd::none(),
             MailMsg::Screen(MailScreenMsg::DeepLink(ref target)) => {
                 self.apply_deep_link_with_transition(target);
+                Cmd::none()
+            }
+            MailMsg::Screen(MailScreenMsg::OperatorCompleted {
+                screen,
+                operation,
+                result,
+            }) => {
+                // Navigation must not send a late result to a different
+                // screen or bring the operator back to the old screen.
+                if let Some(origin) = self.screen_manager.existing_mut(screen) {
+                    origin.handle_operator_result(&operation, &result);
+                }
+                // Forms retain their own pending request identity and their
+                // existing success/error presentation. A completed reservation
+                // request with conflicts must still produce a warning.
+                if operation.starts_with("reservation_create:") {
+                    match result {
+                        Ok(result) => self.notify_reservation_create_result(
+                            if result.data["status"] == "warn" {
+                                "warn"
+                            } else {
+                                "ok"
+                            },
+                            &result.summary,
+                        ),
+                        Err(error) => self.notify_reservation_create_result("error", &error),
+                    }
+                    return Cmd::none();
+                }
+                if operation.starts_with("compose:") || operation.starts_with("quick_reply:") {
+                    match result {
+                        Ok(result) => self.notify_compose_result(true, &result.summary),
+                        Err(error) => self.notify_compose_result(false, &error),
+                    }
+                    return Cmd::none();
+                }
+                self.record_action_outcome(match result {
+                    Ok(result) => ActionOutcome::Success {
+                        operation,
+                        summary: result.summary,
+                    },
+                    Err(error) => ActionOutcome::Failure { operation, error },
+                });
                 Cmd::none()
             }
             MailMsg::Screen(MailScreenMsg::ActionExecute(ref op, ref ctx)) => {
@@ -6044,56 +6461,6 @@ struct AmbientEventSignalSummary {
 
 type PaletteAgentDisplayMap = HashMap<String, (String, String)>;
 type PaletteDbData = (PaletteAgentDisplayMap, Vec<PaletteMessageSummary>);
-
-/// Compose dispatch uses the first project; load exactly that project's roster.
-fn compose_agent_profiles(state: &TuiSharedState) -> Option<Vec<(String, Option<String>)>> {
-    let snapshot = state.config_snapshot();
-    let db = crate::open_observability_sync_db_connection(
-        &snapshot.raw_database_url,
-        std::path::Path::new(&snapshot.storage_root),
-        "compose recipient profiles",
-    )
-    .ok()??;
-    compose_agent_profiles_from_db(db.conn())
-}
-
-fn compose_agent_profiles_from_db(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Option<Vec<(String, Option<String>)>> {
-    let columns = conn.query_sync("PRAGMA table_info(agents)", &[]).ok()?;
-    let has_column = |name: &str| {
-        columns.iter().any(|row| {
-            row.get_named::<String>("name")
-                .is_ok_and(|column| column == name)
-        })
-    };
-    let display_name = if has_column("display_name") {
-        "a.display_name"
-    } else {
-        "NULL AS display_name"
-    };
-    let lifecycle = if has_column("retired_at") {
-        "AND a.retired_at IS NULL"
-    } else {
-        ""
-    };
-    let has_ledger = conn
-        .query_sync(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_deregistrations'",
-            &[],
-        )
-        .is_ok_and(|rows| !rows.is_empty());
-    let ledger = if has_ledger {
-        "AND NOT EXISTS (SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id)"
-    } else {
-        ""
-    };
-    conn.query_sync(&format!(
-        "SELECT a.name, {display_name} FROM agents a WHERE a.project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) {lifecycle} {ledger} ORDER BY a.name LIMIT {PALETTE_DYNAMIC_AGENT_CAP}"
-    ), &[]).ok().map(|rows| rows.into_iter().filter_map(|row| {
-        Some((row.get_named::<String>("name").ok()?, row.get_named::<String>("display_name").ok()))
-    }).collect())
-}
 
 fn query_palette_db_data(
     state: &TuiSharedState,
@@ -7767,30 +8134,6 @@ mod tests {
         MailAppModel::new(state)
     }
 
-    #[test]
-    fn display_name_compose_profiles_match_dispatch_project() {
-        let conn = mcp_agent_mail_db::DbConn::open_memory().unwrap();
-        conn.execute_sync("CREATE TABLE projects (id INTEGER PRIMARY KEY)", &[])
-            .unwrap();
-        conn.execute_sync("CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, display_name TEXT)", &[]).unwrap();
-        conn.execute_sync("INSERT INTO projects VALUES (1), (2)", &[])
-            .unwrap();
-        conn.execute_sync("INSERT INTO agents VALUES (1, 1, 'BlueLake', 'Reviewer'), (2, 1, 'RedStone', 'Reviewer'), (3, 2, 'BlueLake', 'Other project reviewer')", &[]).unwrap();
-        assert_eq!(
-            compose_agent_profiles_from_db(&conn).unwrap(),
-            vec![
-                ("BlueLake".into(), Some("Reviewer".into())),
-                ("RedStone".into(), Some("Reviewer".into())),
-            ]
-        );
-        conn.execute_sync("UPDATE agents SET display_name = NULL WHERE id = 1", &[])
-            .unwrap();
-        assert_eq!(
-            compose_agent_profiles_from_db(&conn).unwrap()[0],
-            ("BlueLake".into(), None)
-        );
-    }
-
     fn test_model_with_debug(debug: bool) -> MailAppModel {
         let config = Config {
             tui_debug: debug,
@@ -9126,6 +9469,431 @@ mod tests {
         let tab = Event::Key(ftui::KeyEvent::new(KeyCode::Tab));
         let _ = model.update(MailMsg::Terminal(tab));
         assert_eq!(model.active_screen(), initial_screen);
+    }
+
+    fn compose_test_project(id: i64, slug: &str) -> ComposeProject {
+        ComposeProject {
+            id,
+            slug: slug.to_string(),
+            human_key: format!("/projects/{slug}"),
+        }
+    }
+
+    fn ready_global_compose_model() -> MailAppModel {
+        let mut model = test_model();
+        drop(model.open_compose());
+        model.refresh_compose_admission();
+        let form = model.compose_state.as_mut().unwrap();
+        form.set_available_projects(vec![compose_test_project(1, "alpha")]);
+        form.set_available_agents(vec!["BlueLake".to_string(), "RedFox".to_string()]);
+        form.recipients[0].selected = true;
+        form.subject = "Operator request".to_string();
+        form.body = "Keep this complete draft".to_string();
+        form.error = None;
+        model
+    }
+
+    fn compose_pending_ids(model: &MailAppModel, sending: bool) -> (u64, u64) {
+        let context = model.compose_context.as_ref().unwrap();
+        let pending = if sending {
+            context.submitting.as_ref()
+        } else {
+            context.loading.as_ref()
+        }
+        .unwrap();
+        (context.draft_id, pending.request_id())
+    }
+
+    fn run_global_compose_task(cmd: Cmd<MailMsg>) -> MailMsg {
+        let Cmd::Task(_, run) = cmd else {
+            panic!("expected deferred global compose task");
+        };
+        run()
+    }
+
+    #[test]
+    fn global_compose_catalog_is_deferred_and_dropped_loading_can_retry() {
+        let mut model = test_model();
+        let queued = model.open_compose();
+        assert!(matches!(&queued, Cmd::Task(..)));
+        assert!(model.compose_state.as_ref().unwrap().loading);
+        assert!(model.compose_state.as_ref().unwrap().recipients.is_empty());
+        assert!(matches!(model.load_compose_projects(), Cmd::None));
+        drop(queued);
+        model.refresh_compose_admission();
+        assert!(!model.compose_state.as_ref().unwrap().loading);
+        assert!(
+            model
+                .compose_state
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Ctrl+R")
+        );
+
+        let retry = model.update(MailMsg::Terminal(Event::Key(
+            KeyEvent::new(KeyCode::Char('r')).with_modifiers(Modifiers::CTRL),
+        )));
+        assert!(matches!(&retry, Cmd::Task(..)));
+        assert!(model.compose_state.as_ref().unwrap().loading);
+    }
+
+    #[test]
+    fn global_compose_ignores_stale_catalog_and_project_roster_results() {
+        let mut model = ready_global_compose_model();
+        let alpha = compose_test_project(1, "alpha");
+        let beta = compose_test_project(2, "beta");
+        model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .set_available_projects(vec![alpha.clone(), beta.clone()]);
+
+        let first = model.load_compose_recipients();
+        let (draft_id, first_id) = compose_pending_ids(&model, false);
+        assert!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .set_selected_project(&beta)
+        );
+        let second = model.load_compose_recipients();
+        let (_, second_id) = compose_pending_ids(&model, false);
+        assert!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .set_selected_project(&alpha)
+        );
+        let third = model.load_compose_recipients();
+        let (_, third_id) = compose_pending_ids(&model, false);
+
+        // A -> B -> A still rejects the old A result by request identity.
+        for (request_id, project) in [(first_id, alpha.clone()), (second_id, beta)] {
+            let _ = model.update(MailMsg::ComposeRecipientsLoaded {
+                draft_id,
+                request_id,
+                project,
+                result: Ok(vec![("WrongRecipient".to_string(), None)]),
+            });
+        }
+        assert!(model.compose_state.as_ref().unwrap().recipients.is_empty());
+        let _ = model.update(MailMsg::ComposeRecipientsLoaded {
+            draft_id,
+            request_id: third_id,
+            project: alpha,
+            result: Ok(vec![("BlueLake".to_string(), None)]),
+        });
+        assert_eq!(
+            model.compose_state.as_ref().unwrap().recipients[0].name,
+            "BlueLake"
+        );
+
+        let old_catalog = model.load_compose_projects();
+        let (old_draft, old_request) = compose_pending_ids(&model, false);
+        model.dismiss_compose();
+        let new_catalog = model.open_compose();
+        let new_draft = model.compose_context.as_ref().unwrap().draft_id;
+        assert_ne!(old_draft, new_draft);
+        let _ = model.update(MailMsg::ComposeProjectsLoaded {
+            draft_id: old_draft,
+            request_id: old_request,
+            result: Ok(vec![compose_test_project(99, "wrong-project")]),
+        });
+        assert!(
+            model
+                .compose_state
+                .as_ref()
+                .unwrap()
+                .selected_project()
+                .is_none()
+        );
+        assert!(model.compose_state.as_ref().unwrap().loading);
+        drop((first, second, third, old_catalog, new_catalog));
+    }
+
+    #[test]
+    fn global_compose_retains_draft_and_retry_identity_after_failure_or_queue_drop() {
+        let mut model = ready_global_compose_model();
+        {
+            let form = model.compose_state.as_mut().unwrap();
+            form.recipients[1].selected = true;
+            form.recipients[1].kind = crate::tui_compose::RecipientKind::Bcc;
+            form.ack_required = true;
+            form.importance = crate::tui_compose::Importance::Urgent;
+        }
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
+        assert!(
+            envelope.thread_id.is_none(),
+            "blank threads stay stable across retries"
+        );
+        let first = model.dispatch_compose_send(envelope.clone());
+        let (draft_id, request_id) = compose_pending_ids(&model, true);
+        let first_key = model
+            .compose_context
+            .as_ref()
+            .unwrap()
+            .last_submission
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+        assert!(model.compose_state.as_ref().unwrap().sending);
+        assert!(matches!(
+            model.dispatch_compose_send(envelope.clone()),
+            Cmd::None
+        ));
+        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char(
+            'x',
+        )))));
+        assert_eq!(model.compose_state.as_ref().unwrap().body, envelope.body_md);
+
+        let _ = model.update(MailMsg::ComposeSent {
+            draft_id,
+            request_id,
+            result: Err("delivery response unavailable".to_string()),
+        });
+        assert!(!model.compose_state.as_ref().unwrap().sending);
+        assert_eq!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .build_envelope()
+                .unwrap(),
+            envelope
+        );
+        drop(first);
+
+        let retry = model.dispatch_compose_send(envelope.clone());
+        assert_eq!(
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
+            first_key
+        );
+        drop(retry);
+        model.refresh_compose_admission();
+        assert!(!model.compose_state.as_ref().unwrap().sending);
+        let retry_after_drop = model.dispatch_compose_send(envelope);
+        assert_eq!(
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
+            first_key
+        );
+        drop(retry_after_drop);
+        model.refresh_compose_admission();
+
+        model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .body
+            .push_str(" (edited)");
+        let edited = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
+        let edited_send = model.dispatch_compose_send(edited);
+        assert_ne!(
+            model
+                .compose_context
+                .as_ref()
+                .unwrap()
+                .last_submission
+                .as_ref()
+                .unwrap()
+                .1,
+            first_key,
+            "a deliberate payload change starts a different delivery"
+        );
+        drop(edited_send);
+    }
+
+    #[test]
+    fn global_compose_late_send_results_and_discard_cannot_replace_a_new_draft() {
+        let mut model = ready_global_compose_model();
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
+        let old_send = model.dispatch_compose_send(envelope);
+        let (old_draft, old_request) = compose_pending_ids(&model, true);
+        let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Escape,
+        ))));
+        assert!(model.compose_state.is_none());
+
+        let new_load = model.open_compose();
+        model.compose_state.as_mut().unwrap().subject = "New draft".to_string();
+        let new_draft = model.compose_context.as_ref().unwrap().draft_id;
+        let _ = model.dispatch_execute_operation("compose_discard", &old_draft.to_string());
+        assert_eq!(model.compose_context.as_ref().unwrap().draft_id, new_draft);
+        for result in [
+            Err("old send failed".to_string()),
+            Ok(OperatorTaskResult {
+                summary: "old send succeeded".to_string(),
+                data: serde_json::Value::Null,
+            }),
+        ] {
+            let _ = model.update(MailMsg::ComposeSent {
+                draft_id: old_draft,
+                request_id: old_request,
+                result,
+            });
+            assert_eq!(model.compose_state.as_ref().unwrap().subject, "New draft");
+            assert_eq!(model.compose_context.as_ref().unwrap().draft_id, new_draft);
+            assert!(model.compose_state.as_ref().unwrap().error.is_none());
+        }
+        drop((old_send, new_load));
+    }
+
+    #[test]
+    fn global_compose_refuses_changed_displayed_mailbox_without_dropping_draft() {
+        let mut model = ready_global_compose_model();
+        let envelope = model
+            .compose_state
+            .as_mut()
+            .unwrap()
+            .build_envelope()
+            .unwrap();
+        let mut snapshot = model.state.config_snapshot();
+        snapshot.storage_root.push_str("-other");
+        model.state.update_config_snapshot(snapshot);
+        assert!(matches!(
+            model.dispatch_compose_send(envelope.clone()),
+            Cmd::None
+        ));
+        assert!(!model.compose_state.as_ref().unwrap().sending);
+        assert_eq!(
+            model
+                .compose_state
+                .as_mut()
+                .unwrap()
+                .build_envelope()
+                .unwrap(),
+            envelope
+        );
+        assert!(model.compose_context.as_ref().unwrap().submitting.is_none());
+    }
+
+    #[test]
+    fn global_compose_task_panics_settle_as_errors() {
+        let result: Result<(), String> = compose_task_result(|| panic!("operator worker failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Check mailbox state before retrying")
+        );
+    }
+
+    #[test]
+    fn global_compose_delivers_through_background_tool_without_server_channel() {
+        use crate::tui_screens::{
+            seed_operator_test_project, with_operator_test_conn, with_operator_test_mailbox,
+        };
+        with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let config = Config::from_env();
+            let state = TuiSharedState::new(&config);
+            let mut model = MailAppModel::new(state);
+
+            let catalog = model.open_compose();
+            assert!(
+                model
+                    .compose_state
+                    .as_ref()
+                    .unwrap()
+                    .selected_project()
+                    .is_none()
+            );
+            let catalog_result = run_global_compose_task(catalog);
+            let roster = model.update(catalog_result);
+            assert_eq!(
+                model
+                    .compose_state
+                    .as_ref()
+                    .unwrap()
+                    .selected_project()
+                    .unwrap()
+                    .slug,
+                slug
+            );
+            let roster_result = run_global_compose_task(roster);
+            let _ = model.update(roster_result);
+            let form = model.compose_state.as_mut().unwrap();
+            assert_eq!(form.recipients.len(), 1);
+            form.recipients[0].selected = true;
+            form.subject = "Deferred operator delivery".to_string();
+            form.body = "Sent through the ordinary message tool".to_string();
+            form.ack_required = true;
+
+            let queued = model.update(MailMsg::Terminal(Event::Key(
+                KeyEvent::new(KeyCode::Enter).with_modifiers(Modifiers::CTRL),
+            )));
+            assert!(model.compose_state.as_ref().unwrap().sending);
+            with_operator_test_conn(|conn| {
+                assert_eq!(
+                    conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap(),
+                    0,
+                    "the UI must not execute delivery while building the command"
+                );
+            });
+            let completion = run_global_compose_task(queued);
+            assert!(matches!(
+                &completion,
+                MailMsg::ComposeSent { result: Ok(_), .. }
+            ));
+            assert!(
+                model.compose_state.is_some(),
+                "confirmation settles the draft on update"
+            );
+            let _ = model.update(completion);
+            assert!(model.compose_state.is_none());
+            with_operator_test_conn(|conn| {
+                let rows = conn
+                    .query_sync(
+                        "SELECT m.subject, m.ack_required, p.slug FROM messages m \
+                     JOIN projects p ON p.id = m.project_id",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<String>("subject").unwrap(),
+                    "Deferred operator delivery"
+                );
+                assert_eq!(rows[0].get_named::<i64>("ack_required").unwrap(), 1);
+                assert_eq!(rows[0].get_named::<String>("slug").unwrap(), slug);
+            });
+        });
     }
 
     #[test]
@@ -14543,6 +15311,185 @@ first body
     }
 
     // ── ActionOutcome tests ─────────────────────────────────────
+
+    #[test]
+    fn operator_task_completion_reaches_origin_after_navigation() {
+        struct CompletionScreen {
+            received: Rc<RefCell<Vec<(String, bool)>>>,
+        }
+        impl MailScreen for CompletionScreen {
+            fn update(&mut self, _: &Event, _: &TuiSharedState) -> Cmd<MailScreenMsg> {
+                Cmd::none()
+            }
+
+            fn view(&self, _: &mut Frame<'_>, _: Rect, _: &TuiSharedState) {}
+
+            fn title(&self) -> &'static str {
+                "Completion probe"
+            }
+
+            fn handle_operator_result(
+                &mut self,
+                operation: &str,
+                result: &Result<crate::tui_screens::OperatorTaskResult, String>,
+            ) {
+                self.received
+                    .borrow_mut()
+                    .push((operation.to_string(), result.is_ok()));
+            }
+        }
+
+        let mut model = test_model();
+        let origin = Rc::new(RefCell::new(Vec::new()));
+        let other = Rc::new(RefCell::new(Vec::new()));
+        model.set_screen(
+            MailScreenId::Messages,
+            Box::new(CompletionScreen {
+                received: Rc::clone(&origin),
+            }),
+        );
+        model.set_screen(
+            MailScreenId::Threads,
+            Box::new(CompletionScreen {
+                received: Rc::clone(&other),
+            }),
+        );
+        model.activate_screen(MailScreenId::Messages);
+        for failed in [false, true] {
+            model.record_action_outcome(ActionOutcome::InFlight {
+                operation: "acknowledge".to_string(),
+            });
+            let cmd = map_screen_cmd(crate::tui_screens::operator_task(
+                MailScreenId::Messages,
+                "acknowledge",
+                move || {
+                    if failed {
+                        Err("a later recipient became unavailable".to_string())
+                    } else {
+                        Ok(crate::tui_screens::OperatorTaskResult {
+                            summary: "receipt recorded".to_string(),
+                            data: serde_json::Value::Null,
+                        })
+                    }
+                },
+            ));
+            model.update(MailMsg::SwitchScreen(MailScreenId::Threads));
+            let Cmd::Task(_, run) = cmd else {
+                panic!("mapping a screen command must preserve deferred work");
+            };
+            model.update(run());
+            assert_eq!(model.active_screen(), MailScreenId::Threads);
+            assert!(other.borrow().is_empty());
+            assert!(
+                !model
+                    .action_outcomes
+                    .iter()
+                    .any(|outcome| { matches!(outcome, ActionOutcome::InFlight { .. }) })
+            );
+        }
+        assert_eq!(
+            origin.borrow().as_slice(),
+            [
+                ("acknowledge".to_string(), true),
+                ("acknowledge".to_string(), false),
+            ]
+        );
+        assert!(matches!(
+            model.action_outcomes.back(),
+            Some(ActionOutcome::Failure { .. })
+        ));
+    }
+
+    #[test]
+    fn an_operator_completion_keeps_other_invocations_in_flight() {
+        let mut model = test_model();
+        for _ in 0..2 {
+            model.record_action_outcome(ActionOutcome::InFlight {
+                operation: "summarize".to_string(),
+            });
+        }
+        model.record_action_outcome(ActionOutcome::Success {
+            operation: "summarize".to_string(),
+            summary: "first thread".to_string(),
+        });
+        assert_eq!(model.action_outcomes.iter().filter(|outcome| {
+            matches!(outcome, ActionOutcome::InFlight { operation } if operation == "summarize")
+        }).count(), 1);
+    }
+
+    #[test]
+    fn completed_forms_preserve_conflict_and_failure_notifications_after_navigation() {
+        use crate::tui_screens::OperatorTaskResult;
+
+        let cases = [
+            (
+                MailScreenId::Reservations,
+                "reservation_create:11",
+                Ok(OperatorTaskResult {
+                    summary: "1 granted, 1 conflicts".to_string(),
+                    data: serde_json::json!({ "status": "warn" }),
+                }),
+                ToastIcon::Warning,
+                "Reservation created with conflicts: 1 granted, 1 conflicts",
+            ),
+            (
+                MailScreenId::Reservations,
+                "reservation_create:12",
+                Err("holder was deregistered".to_string()),
+                ToastIcon::Error,
+                "Reservation create failed: holder was deregistered",
+            ),
+            (
+                MailScreenId::Messages,
+                "compose:13",
+                Ok(OperatorTaskResult {
+                    summary: "to BlueLake".to_string(),
+                    data: serde_json::Value::Null,
+                }),
+                ToastIcon::Info,
+                "Message sent: to BlueLake",
+            ),
+            (
+                MailScreenId::Messages,
+                "quick_reply:14",
+                Err("recipient is no longer active".to_string()),
+                ToastIcon::Error,
+                "Message send failed: recipient is no longer active",
+            ),
+        ];
+        for (screen, operation, result, icon, message) in cases {
+            let mut model = test_model();
+            // Completion must remain visible without bringing the operator
+            // back to the form's screen.
+            assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+            model.update(MailMsg::Screen(MailScreenMsg::OperatorCompleted {
+                screen,
+                operation: operation.to_string(),
+                result,
+            }));
+            model.notifications.tick(Duration::from_millis(16));
+            assert!(
+                model.notifications.visible().iter().any(|toast| {
+                    toast.content.message == message && toast.content.icon == Some(icon)
+                }),
+                "missing notification for {operation}"
+            );
+            assert_eq!(model.active_screen(), MailScreenId::Dashboard);
+        }
+    }
+
+    #[test]
+    fn dismissing_a_pending_send_reports_that_it_continues() {
+        for operation in ["compose_result:pending", "quick_reply_result:pending"] {
+            let mut model = test_model();
+            let message = "Draft dismissed; the send continues in the background";
+            model.dispatch_execute_operation(operation, message);
+            model.notifications.tick(Duration::from_millis(16));
+            assert!(model.notifications.visible().iter().any(|toast| {
+                toast.content.message == message && toast.content.icon == Some(ToastIcon::Info)
+            }));
+        }
+    }
 
     #[test]
     fn operator_result_settles_the_in_flight_action() {

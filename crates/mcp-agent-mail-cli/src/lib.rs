@@ -1148,6 +1148,9 @@ pub enum AtcCommand {
         /// Decision ID from `atc_experiences.decision_id`.
         #[arg(value_name = "decision_id", value_parser = parse_positive_u64_arg)]
         decision_id: u64,
+        /// Select a decision trace when its numeric ID was reused after restart.
+        #[arg(long, value_name = "trace_id")]
+        trace_id: Option<String>,
         /// Output JSON instead of human-readable text.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -3685,7 +3688,11 @@ pub enum ServiceCommand {
     /// Remove the service configuration and stop the running service.
     Uninstall,
     /// Check if the service is running, show PID, uptime, and port.
-    Status,
+    Status {
+        /// Emit native supervisor state and TCP reachability as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Tail service logs (journalctl --user on Linux, log show on macOS).
     Logs {
         /// Number of recent log lines to show (default: 50).
@@ -3994,7 +4001,7 @@ fn command_requires_trusted_user_env(command: Option<&Commands>) -> bool {
                 }
                 | Commands::Setup { .. }
                 | Commands::Service {
-                    action: ServiceCommand::Status
+                    action: ServiceCommand::Status { .. }
                         | ServiceCommand::Logs { .. }
                         | ServiceCommand::Restart,
                 }
@@ -12571,6 +12578,11 @@ fn is_sqlite_corruption_error_message(message: &str) -> bool {
 }
 
 fn is_sqlite_recovery_error_message(message: &str) -> bool {
+    if mcp_agent_mail_db::classify_db_error_message(message).class
+        == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     is_sqlite_corruption_error_message(message)
         || lower.contains("out of memory")
@@ -15111,6 +15123,15 @@ where
         Err(error @ CliError::Io(_)) => return Err(error),
         Err(e) => {
             let msg = e.to_string();
+            if mcp_agent_mail_db::classify_db_error_message(&msg).class
+                == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+            {
+                return Err(CliError::Other(format!(
+                    "database health probe failed for {}: {msg}; {}",
+                    selected_path.display(),
+                    mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+                )));
+            }
             if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
                 probe_error_was_inconclusive = true;
                 false
@@ -15141,6 +15162,15 @@ where
             Err(error @ CliError::Io(_)) => return Err(error),
             Err(e) => {
                 let msg = e.to_string();
+                if mcp_agent_mail_db::classify_db_error_message(&msg).class
+                    == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
+                {
+                    return Err(CliError::Other(format!(
+                        "database health probe failed for absolute fallback {}: {msg}; {}",
+                        absolute_path.display(),
+                        mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+                    )));
+                }
                 if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
                     probe_error_was_inconclusive = true;
                 } else if mcp_agent_mail_db::is_lock_error(&msg) {
@@ -19269,6 +19299,7 @@ struct AtcSimulateStratumSummary {
 #[derive(Debug, Clone, serde::Serialize)]
 struct AtcSimulateDecisionDelta {
     decision_id: u64,
+    trace_id: String,
     subject: String,
     project_key: Option<String>,
     created_at: String,
@@ -19493,12 +19524,16 @@ fn format_atc_json_value(value: &serde_json::Value) -> String {
 fn query_atc_decision_rows(
     conn: &mcp_agent_mail_db::CanonicalDbConn,
     decision_id: u64,
+    trace_id: Option<&str>,
 ) -> CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>> {
     let sql_decision_id = i64::try_from(decision_id).map_err(|_| {
         CliError::InvalidArgument(format!(
             "decision_id exceeds SQLite INTEGER range: {decision_id}"
         ))
     })?;
+    let trace_value = trace_id.map_or(mcp_agent_mail_db::sqlmodel_core::Value::Null, |value| {
+        mcp_agent_mail_db::sqlmodel_core::Value::Text(value.to_string())
+    });
     conn.query_sync(
         "SELECT \
             experience_id, effect_id, state, subsystem, decision_class, subject, project_key, \
@@ -19508,11 +19543,13 @@ fn query_atc_decision_rows(
             resolved_ts, context_json, claim_id, evidence_id, trace_id, posterior_json, \
             non_execution_json \
          FROM atc_experiences \
-         WHERE decision_id = ? \
+         WHERE decision_id = ? AND (? IS NULL OR trace_id = ?) \
          ORDER BY experience_id ASC",
-        &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
-            sql_decision_id,
-        )],
+        &[
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(sql_decision_id),
+            trace_value.clone(),
+            trace_value,
+        ],
     )
     .map_err(|error| {
         CliError::Other(format!(
@@ -19525,6 +19562,16 @@ fn build_atc_explain_report(
     decision_id: u64,
     rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
 ) -> CliResult<AtcExplainReport> {
+    let trace_ids = rows
+        .iter()
+        .map(|row| atc_row_text_idx(row, 27))
+        .collect::<BTreeSet<_>>();
+    if trace_ids.len() > 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "ATC decision {decision_id} matches multiple traces; select one with --trace-id: {}",
+            trace_ids.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
     let latest = rows
         .last()
         .ok_or_else(|| CliError::Other(format!("ATC decision {decision_id} not found")))?;
@@ -20096,7 +20143,8 @@ fn build_atc_simulation_report(
     let subject_filter = subject.map(str::trim).filter(|value| !value.is_empty());
     let simulated_policy = bundle.candidate.as_ref().unwrap_or(&bundle.incumbent);
 
-    let mut latest_by_decision = BTreeMap::<u64, mcp_agent_mail_core::ExperienceRow>::new();
+    let mut latest_by_decision =
+        BTreeMap::<(u64, String), mcp_agent_mail_core::ExperienceRow>::new();
     let mut experiences_considered = 0usize;
     for row in rows {
         if row.created_ts_micros < since_micros {
@@ -20110,7 +20158,7 @@ fn build_atc_simulation_report(
         }
         experiences_considered += 1;
         latest_by_decision
-            .entry(row.decision_id)
+            .entry((row.decision_id, row.trace_id.clone()))
             .and_modify(|current| {
                 if row.experience_id > current.experience_id {
                     *current = row.clone();
@@ -20184,6 +20232,7 @@ fn build_atc_simulation_report(
 
         deltas.push(AtcSimulateDecisionDelta {
             decision_id: row.decision_id,
+            trace_id: row.trace_id.clone(),
             subject: row.subject.clone(),
             project_key: row.project_key.clone(),
             created_at: mcp_agent_mail_db::micros_to_iso(row.created_ts_micros),
@@ -20230,6 +20279,7 @@ fn build_atc_simulation_report(
                     .total_cmp(&left.expected_loss_delta.abs())
             })
             .then_with(|| left.decision_id.cmp(&right.decision_id))
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
     });
     let notable_divergences = deltas.iter().take(10).cloned().collect::<Vec<_>>();
 
@@ -20359,8 +20409,9 @@ fn render_atc_simulate_report(report: &AtcSimulateReport) {
         ftui_runtime::ftui_println!("Notable divergences");
         for delta in &report.notable_divergences {
             ftui_runtime::ftui_println!(
-                "  decision {} {} {} -> {} (delta {:.3})",
+                "  decision {} trace {} {} {} -> {} (delta {:.3})",
                 delta.decision_id,
+                delta.trace_id,
                 delta.subject,
                 delta.recorded_action,
                 delta.proposed_action,
@@ -20390,7 +20441,11 @@ fn render_atc_simulate_report(report: &AtcSimulateReport) {
 
 fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
-        AtcCommand::Explain { decision_id, json } => {
+        AtcCommand::Explain {
+            decision_id,
+            trace_id,
+            json,
+        } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             // Preserve the precondition that the mailbox DB is openable (fail
             // fast with the usual diagnostics if not), but read ATC telemetry
@@ -20403,17 +20458,22 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
                     mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
                 });
             let rows = match atc_conn.as_ref() {
-                Some(conn) => query_atc_decision_rows(conn, decision_id)?,
+                Some(conn) => query_atc_decision_rows(conn, decision_id, trace_id.as_deref())?,
                 None => Vec::new(),
             };
             if rows.is_empty() {
+                let message = trace_id.as_ref().map_or_else(
+                    || format!("ATC decision not found: {decision_id}"),
+                    |trace_id| format!("ATC decision not found: {decision_id} (trace {trace_id})"),
+                );
                 let payload = serde_json::json!({
                     "decision_id": decision_id,
+                    "trace_id": trace_id,
                     "found": false,
-                    "error": format!("ATC decision not found: {decision_id}"),
+                    "error": message,
                 });
                 output::json_or_table(json, &payload, || {
-                    ftui_runtime::ftui_println!("ATC decision not found: {decision_id}");
+                    ftui_runtime::ftui_println!("{message}");
                 });
                 return Err(CliError::ExitCode(1));
             }
@@ -22792,10 +22852,15 @@ fn discover_beads_dir_via_cli(start: &Path, pinned: Option<&Path>) -> CliResult<
             command
         };
         let value = br_command_json(command)?;
-        let config_path = value
-            .get("project_config")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "br reported no project config path".to_string())?;
+        let config_path = match value.get("project_config") {
+            Some(serde_json::Value::String(path)) => path.as_str(),
+            Some(serde_json::Value::Null) => {
+                return Err(
+                    "no beads directory found; run br init in the project directory".to_string(),
+                );
+            }
+            _ => return Err("br reported no project config path".to_string()),
+        };
         // br prints paths with Path::display(), which loses invalid UTF-8.
         // Implicit discovery cannot distinguish that spelling from a different
         // real workspace. Exact mode can verify even a literal U+FFFD name
@@ -34876,9 +34941,16 @@ fn doctor_require_recoverable_probe_error(error: &CliError) -> CliResult<()> {
         }
         _ => detail.as_str(),
     };
-    if matches!(error, CliError::Io(_))
-        || !mcp_agent_mail_db::classify_db_error_message(classification_detail).repairable
+    let classification = mcp_agent_mail_db::classify_db_error_message(classification_detail);
+    if !matches!(error, CliError::Io(_))
+        && classification.class == mcp_agent_mail_db::DbErrorClass::WalCertificateCorruption
     {
+        return Err(CliError::Other(format!(
+            "Database probe cannot validate WAL commit certificates: {detail}; {}",
+            mcp_agent_mail_db::error::WAL_CERTIFICATE_RECOVERY_GUIDANCE,
+        )));
+    }
+    if matches!(error, CliError::Io(_)) || !classification.repairable {
         return Err(CliError::Other(format!(
             "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: {detail}"
         )));
@@ -46268,7 +46340,7 @@ fn handle_service(action: ServiceCommand) -> CliResult<()> {
             no_auth,
         } => handle_service_install(host, port, no_auth),
         ServiceCommand::Uninstall => handle_service_uninstall(),
-        ServiceCommand::Status => handle_service_status(),
+        ServiceCommand::Status { json } => handle_service_status(json),
         ServiceCommand::Logs { lines, follow } => handle_service_logs(lines, follow),
         ServiceCommand::Restart => handle_service_restart(),
     }
@@ -46860,8 +46932,502 @@ fn service_uninstall_launchd() -> CliResult<()> {
 
 // -- Status -----------------------------------------------------------------
 
-fn handle_service_status() -> CliResult<()> {
+/// Machine-readable native supervisor state. This path never opens the mailbox.
+mod service_status {
+    use super::{CliError, CliResult, ManagedServiceBinding, ServiceBackend};
+    use serde::Serialize;
+
+    #[derive(Debug, Serialize)]
+    struct Report {
+        schema_version: u32,
+        manager: &'static str,
+        service: &'static str,
+        installed: Option<bool>,
+        manager_available: bool,
+        /// The manager's native state, retained when classification is unknown.
+        state: Option<String>,
+        pid: Option<u32>,
+        host: Option<String>,
+        port: Option<u16>,
+        /// A TCP connection only; it does not establish service identity or health.
+        port_reachable: Option<bool>,
+        error: Option<String>,
+    }
+
+    impl Report {
+        fn unknown(manager: &'static str, installed: Option<bool>, error: String) -> Self {
+            Self {
+                schema_version: 1,
+                manager,
+                service: "unknown",
+                // A missing generated config does not exclude a service loaded
+                // from another path when its manager cannot be queried.
+                installed: installed.filter(|present| *present),
+                manager_available: false,
+                state: None,
+                pid: None,
+                host: None,
+                port: None,
+                port_reachable: None,
+                error: Some(error),
+            }
+        }
+
+        fn not_loaded(manager: &'static str, installed: Option<bool>) -> Self {
+            Self {
+                service: match installed {
+                    Some(false) => "not_installed",
+                    Some(true) => "not_loaded",
+                    None => "unknown",
+                },
+                installed,
+                manager_available: true,
+                state: Some("not_loaded".to_string()),
+                error: None,
+                ..Self::unknown(manager, installed, String::new())
+            }
+        }
+
+        fn with_binding(mut self, binding: Option<ManagedServiceBinding>) -> Self {
+            if let Some(binding) = binding {
+                self.port_reachable = Some(super::process_owner_port_reachable(
+                    &binding.host,
+                    binding.port,
+                ));
+                self.host = Some(binding.host);
+                self.port = Some(binding.port);
+            }
+            self
+        }
+    }
+
+    fn configured(path: Option<std::path::PathBuf>) -> Option<bool> {
+        path.and_then(|path| path.try_exists().ok())
+    }
+
+    fn command_error(command: &str, stderr: &str) -> String {
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            format!("{command} did not return usable service state")
+        } else {
+            format!("{command}: {detail}")
+        }
+    }
+
+    fn systemd_report(
+        success: bool,
+        stdout: &str,
+        stderr: &str,
+        installed: Option<bool>,
+    ) -> Report {
+        let mut load_state = None;
+        let mut active_state = None;
+        let mut sub_state = None;
+        let mut pid = None;
+        for line in stdout.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "LoadState" => load_state = Some(value),
+                "ActiveState" => active_state = Some(value),
+                "SubState" => sub_state = Some(value),
+                "MainPID" => pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
+                _ => {}
+            }
+        }
+
+        // An absent user bus or executable is not evidence of an absent unit.
+        // Some systemctl versions exit nonzero for a missing unit but still
+        // provide the explicit LoadState=not-found property.
+        if load_state == Some("not-found") {
+            return Report::not_loaded("systemd", installed);
+        }
+        if !success || load_state.is_none_or(str::is_empty) {
+            return Report::unknown("systemd", installed, command_error("systemctl", stderr));
+        }
+        let mut report = Report {
+            installed: Some(true),
+            manager_available: true,
+            state: active_state
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            pid,
+            error: None,
+            ..Report::unknown("systemd", installed, String::new())
+        };
+        report.service = match (active_state, sub_state, pid) {
+            (Some("active"), Some("running"), Some(_)) => "running",
+            (Some("inactive"), _, _) | (Some("active"), Some("exited"), _) => "stopped",
+            (Some("failed"), _, _) => "failed",
+            (Some("activating"), _, _) => "starting",
+            (Some("deactivating"), _, _) => "stopping",
+            (Some("reloading"), _, Some(_)) => "reloading",
+            _ => "unknown",
+        };
+        if report.service == "unknown" {
+            report.error = Some(
+                "systemctl returned incomplete or unrecognized service properties".to_string(),
+            );
+        }
+        report
+    }
+
+    /// Read only the service object's own fields. Nested environment, resource
+    /// coalition and endpoint blocks can also contain state or pid entries.
+    fn launchd_fields(stdout: &str) -> (Option<&str>, Option<u32>) {
+        let root_suffix = format!("/{} = {{", super::LAUNCHD_LABEL);
+        let mut depth = 0_usize;
+        let mut state = None;
+        let mut pid = None;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if depth == 0 {
+                if line.ends_with(&root_suffix) {
+                    depth = 1;
+                }
+                continue;
+            }
+            if line == "}" {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            if line.ends_with(" = {") || line.ends_with(" => {") {
+                depth = depth.saturating_add(1);
+                continue;
+            }
+            if depth != 1 {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(" = ") else {
+                continue;
+            };
+            let value = value.trim();
+            match key {
+                "state" if !value.is_empty() => state = Some(value),
+                "pid" => pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
+                _ => {}
+            }
+        }
+        (state, pid)
+    }
+
+    fn launchd_report(
+        success: bool,
+        stdout: &str,
+        stderr: &str,
+        installed: Option<bool>,
+    ) -> Report {
+        if !success {
+            // A missing GUI domain, denied access or another launchctl error
+            // cannot establish that this specific service is not installed.
+            let missing_service = format!("Could not find service \"{}\"", super::LAUNCHD_LABEL);
+            if stderr.contains(&missing_service) {
+                return Report::not_loaded("launchd", installed);
+            }
+            return Report::unknown("launchd", installed, command_error("launchctl", stderr));
+        }
+
+        let (state, pid) = launchd_fields(stdout);
+        let mut report = Report {
+            installed: Some(true),
+            manager_available: true,
+            state: state.map(str::to_string),
+            pid,
+            error: None,
+            ..Report::unknown("launchd", installed, String::new())
+        };
+        report.service = match (state, pid) {
+            (Some("running"), Some(_)) => "running",
+            (Some("not running" | "waiting" | "exited"), _) => "stopped",
+            (Some("spawn scheduled" | "starting"), _) => "starting",
+            _ => "unknown",
+        };
+        if report.service == "unknown" {
+            report.error =
+                Some("launchctl returned incomplete or unrecognized service state".to_string());
+        }
+        report
+    }
+
+    fn systemd() -> Report {
+        let installed = configured(super::systemd_unit_path());
+        let mut command = std::process::Command::new("systemctl");
+        command.args([
+            "--user",
+            "--no-pager",
+            "--no-ask-password",
+            "show",
+            super::SYSTEMD_UNIT_NAME,
+            "--property=LoadState,ActiveState,SubState,MainPID",
+        ]);
+        command.env("LC_ALL", "C");
+        for (key, value) in super::systemd_user_env_best_effort() {
+            command.env(key, value);
+        }
+        match command.output() {
+            Ok(output) => systemd_report(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                installed,
+            ),
+            Err(error) => Report::unknown("systemd", installed, format!("systemctl: {error}")),
+        }
+    }
+
+    fn launchd() -> Report {
+        let installed = configured(super::launchd_plist_path());
+        let uid = match super::current_uid() {
+            Ok(uid) => uid,
+            Err(error) => {
+                return Report::unknown("launchd", installed, error.to_string());
+            }
+        };
+        match std::process::Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{}", super::LAUNCHD_LABEL)])
+            .env("LC_ALL", "C")
+            .output()
+        {
+            Ok(output) => launchd_report(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                installed,
+            ),
+            Err(error) => Report::unknown("launchd", installed, format!("launchctl: {error}")),
+        }
+    }
+
+    pub(super) fn print(backend: ServiceBackend) -> CliResult<()> {
+        let report = match backend {
+            ServiceBackend::Systemd => {
+                systemd().with_binding(super::systemd_service_configured_bind())
+            }
+            ServiceBackend::Launchd => {
+                launchd().with_binding(super::launchd_service_configured_bind())
+            }
+        };
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|error| CliError::Format(format!("serialize service status: {error}")))?;
+        ftui_runtime::ftui_println!("{json}");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use clap::Parser;
+
+        #[test]
+        fn service_status_json_flag_preserves_the_human_default() {
+            for (args, expected) in [
+                (vec!["am", "service", "status"], false),
+                (vec!["am", "service", "status", "--json"], true),
+            ] {
+                let cli = crate::Cli::try_parse_from(args).expect("service status arguments");
+                assert!(!crate::command_requires_trusted_user_env(
+                    cli.command.as_ref()
+                ));
+                assert!(matches!(
+                    cli.command,
+                    Some(crate::Commands::Service {
+                        action: crate::ServiceCommand::Status { json },
+                    }) if json == expected
+                ));
+            }
+        }
+
+        #[test]
+        fn systemd_named_properties_report_running_stopped_failed_and_missing() {
+            let running = systemd_report(
+                true,
+                "MainPID=8123\nSubState=running\nLoadState=loaded\nActiveState=active\n",
+                "",
+                Some(false),
+            );
+            assert_eq!(running.service, "running");
+            assert_eq!(running.pid, Some(8123));
+            assert_eq!(running.installed, Some(true));
+            assert!(running.manager_available);
+
+            for (active, sub, expected) in [
+                ("inactive", "dead", "stopped"),
+                ("failed", "failed", "failed"),
+                ("activating", "auto-restart", "starting"),
+                ("active", "exited", "stopped"),
+            ] {
+                let report = systemd_report(
+                    true,
+                    &format!("LoadState=loaded\nActiveState={active}\nSubState={sub}\nMainPID=0\n"),
+                    "",
+                    Some(true),
+                );
+                assert_eq!(report.service, expected);
+                assert_eq!(report.pid, None);
+            }
+
+            for (installed, expected) in [
+                (Some(false), "not_installed"),
+                (Some(true), "not_loaded"),
+                (None, "unknown"),
+            ] {
+                let report = systemd_report(
+                    false,
+                    "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n",
+                    "Unit agent-mail.service could not be found.",
+                    installed,
+                );
+                assert_eq!(report.service, expected);
+                assert!(report.manager_available);
+            }
+        }
+
+        #[test]
+        fn unavailable_managers_and_malformed_output_remain_unknown() {
+            for installed in [Some(false), Some(true), None] {
+                let report = systemd_report(
+                    false,
+                    "",
+                    "Failed to connect to user scope bus: No medium found",
+                    installed,
+                );
+                assert_eq!(report.service, "unknown");
+                assert!(!report.manager_available);
+                assert_eq!(report.installed, installed.filter(|present| *present));
+                assert!(report.error.as_deref().unwrap().contains("user scope bus"));
+
+                let report = launchd_report(
+                    false,
+                    "",
+                    "Could not find domain for user gui: 501",
+                    installed,
+                );
+                assert_eq!(report.service, "unknown");
+                assert!(!report.manager_available);
+                assert_eq!(report.installed, installed.filter(|present| *present));
+            }
+            let report = systemd_report(true, "active\nrunning\n8123\n", "", Some(true));
+            assert_eq!(report.service, "unknown");
+            assert_eq!(report.pid, None);
+
+            let report = systemd_report(
+                true,
+                "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=invalid\n",
+                "",
+                Some(true),
+            );
+            assert_eq!(report.service, "unknown");
+            assert_eq!(report.pid, None);
+        }
+
+        #[test]
+        fn launchd_uses_only_top_level_service_state_and_pid() {
+            let text = r#"gui/501/com.agent-mail = {
+    active count = 1
+    environment = {
+        state = running
+        pid = 99999
+        DESCRIPTION => value with { braces }
+    }
+    state = running
+    pid = 8123
+    resource coalition = {
+        state = active
+        pid = 11111
+    }
+}
+"#;
+            let report = launchd_report(true, text, "", Some(false));
+            assert_eq!(report.service, "running");
+            assert_eq!(report.state.as_deref(), Some("running"));
+            assert_eq!(report.pid, Some(8123));
+            assert_eq!(report.installed, Some(true));
+
+            let stopped = r#"gui/501/com.agent-mail = {
+    environment = {
+        state = running
+        pid = 99999
+    }
+    state = not running
+}
+"#;
+            let report = launchd_report(true, stopped, "", Some(true));
+            assert_eq!(report.service, "stopped");
+            assert_eq!(report.pid, None);
+
+            for text in [
+                "gui/501/com.agent-mail = {\n    state = running\n    pid = 0\n}\n",
+                "environment = {\n    state = running\n    pid = 8123\n}\n",
+            ] {
+                let report = launchd_report(true, text, "", Some(true));
+                assert_eq!(report.service, "unknown");
+                assert_eq!(report.pid, None);
+            }
+        }
+
+        #[test]
+        fn launchd_missing_service_is_distinct_from_an_unavailable_manager() {
+            let stderr = "Bad request.\nCould not find service \"com.agent-mail\" in domain for user gui: 501";
+            for (installed, expected) in [
+                (Some(false), "not_installed"),
+                (Some(true), "not_loaded"),
+                (None, "unknown"),
+            ] {
+                let report = launchd_report(false, "", stderr, installed);
+                assert_eq!(report.service, expected);
+                assert!(report.manager_available);
+            }
+            let report = launchd_report(
+                false,
+                "",
+                "Could not find service \"another-service\" in domain for user gui: 501",
+                Some(false),
+            );
+            assert_eq!(report.service, "unknown");
+            assert!(!report.manager_available);
+        }
+
+        #[test]
+        fn loopback_listener_reachability_does_not_establish_service_state() {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("listener address").port();
+            let report = systemd_report(
+                true,
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\n",
+                "",
+                Some(true),
+            )
+            .with_binding(Some(ManagedServiceBinding {
+                host: "0.0.0.0".to_string(),
+                port,
+            }));
+            assert_eq!(report.service, "stopped");
+            assert_eq!(report.pid, None);
+            assert_eq!(report.port_reachable, Some(true));
+            assert_eq!(report.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(report.port, Some(port));
+
+            let unknown = Report::unknown("systemd", None, "manager unavailable".to_string())
+                .with_binding(None);
+            let json = serde_json::to_value(&unknown).expect("serialize report");
+            assert_eq!(json["schema_version"], 1);
+            assert_eq!(json["service"], "unknown");
+            assert!(json["pid"].is_null());
+            assert!(json["host"].is_null());
+            assert!(json["port"].is_null());
+            assert!(json["port_reachable"].is_null());
+        }
+    }
+}
+
+fn handle_service_status(json: bool) -> CliResult<()> {
     let backend = detect_service_backend()?;
+    if json {
+        return service_status::print(backend);
+    }
     let result = match backend {
         ServiceBackend::Systemd => service_status_systemd(),
         ServiceBackend::Launchd => service_status_launchd(),
@@ -47470,7 +48036,7 @@ mod tests {
             },
         };
         let service_status = Commands::Service {
-            action: ServiceCommand::Status,
+            action: ServiceCommand::Status { json: false },
         };
         let service_logs = Commands::Service {
             action: ServiceCommand::Logs {
@@ -48187,6 +48753,49 @@ mod tests {
                 &cx, &pool, row,
             )),
             "insert ATC explain seed row",
+        );
+    }
+
+    fn append_atc_decision_copy(
+        db_path: &Path,
+        storage_root: &Path,
+        decision_id: u64,
+        effect_id: u64,
+        trace_id: &str,
+    ) {
+        let pool = atc_explain_test_pool(db_path, storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC fixture runtime");
+        let cx = asupersync::Cx::for_testing();
+        let stream = expect_db_outcome(
+            runtime.block_on(mcp_agent_mail_db::atc_queries::replay(
+                &cx,
+                &pool,
+                mcp_agent_mail_db::SequenceRange::default(),
+            )),
+            "read ATC fixture rows",
+        );
+        let mut row = stream
+            .rows
+            .into_iter()
+            .find(|row| row.decision_id == decision_id)
+            .expect("source decision");
+        row.experience_id = 0;
+        row.effect_id = effect_id;
+        row.trace_id = trace_id.to_string();
+        row.created_ts_micros += 10_000_000;
+        row.dispatched_ts_micros = row.dispatched_ts_micros.map(|ts| ts + 10_000_000);
+        row.executed_ts_micros = row.executed_ts_micros.map(|ts| ts + 10_000_000);
+        row.resolved_ts_micros = row.resolved_ts_micros.map(|ts| ts + 10_000_000);
+        if let Some(outcome) = row.outcome.as_mut() {
+            outcome.observed_ts_micros += 10_000_000;
+        }
+        expect_db_outcome(
+            runtime.block_on(mcp_agent_mail_db::queries::insert_experience(
+                &cx, &pool, row,
+            )),
+            "append ATC decision copy",
         );
     }
 
@@ -53159,12 +53768,46 @@ http_headers = { Authorization = "Bearer secret" }
             .expect("failed to parse atc explain");
         match cli.command.expect("expected command") {
             Commands::Atc { action } => match action {
-                AtcCommand::Explain { decision_id, json } => {
+                AtcCommand::Explain {
+                    decision_id,
+                    trace_id,
+                    json,
+                } => {
                     assert_eq!(decision_id, 77);
+                    assert_eq!(trace_id, None);
                     assert!(json);
                 }
                 other => panic!("unexpected atc action: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_atc_explain_trace_id() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "atc",
+            "explain",
+            "77",
+            "--trace-id",
+            "trc-atc-explain-77",
+            "--json",
+        ])
+        .expect("failed to parse trace-qualified atc explain");
+        match cli.command.expect("expected command") {
+            Commands::Atc {
+                action:
+                    AtcCommand::Explain {
+                        decision_id,
+                        trace_id,
+                        json,
+                    },
+            } => {
+                assert_eq!(decision_id, 77);
+                assert_eq!(trace_id.as_deref(), Some("trc-atc-explain-77"));
+                assert!(json);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -53193,6 +53836,7 @@ http_headers = { Authorization = "Bearer secret" }
         let (result, output) = run_atc_cmd_with_env_capture(
             AtcCommand::Explain {
                 decision_id: 77,
+                trace_id: None,
                 json: true,
             },
             &database_url,
@@ -53239,6 +53883,7 @@ http_headers = { Authorization = "Bearer secret" }
         let (result, output) = run_atc_cmd_with_env_capture(
             AtcCommand::Explain {
                 decision_id: 999,
+                trace_id: None,
                 json: false,
             },
             &database_url,
@@ -53253,6 +53898,72 @@ http_headers = { Authorization = "Bearer secret" }
             output.contains("ATC decision not found: 999"),
             "unexpected not-found output:\n{output}"
         );
+    }
+
+    #[test]
+    fn handle_atc_explain_requires_trace_for_reused_decision_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-explain-restart.sqlite3");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_explain_db(&db_path, &storage_root);
+        let first_trace = "trc-atc-explain-77";
+        let second_trace = "trc-atc-explain-77-restarted";
+        append_atc_decision_copy(&db_path, &storage_root, 77, 178, second_trace);
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        let (result, _) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 77,
+                trace_id: None,
+                json: true,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        let error = result
+            .expect_err("numeric ID alone is ambiguous")
+            .to_string();
+        assert!(error.contains("--trace-id"));
+        assert!(error.contains(first_trace));
+        assert!(error.contains(second_trace));
+
+        for (trace_id, experience_id) in [(first_trace, 1), (second_trace, 2)] {
+            let (result, output) = run_atc_cmd_with_env_capture(
+                AtcCommand::Explain {
+                    decision_id: 77,
+                    trace_id: Some(trace_id.to_string()),
+                    json: true,
+                },
+                &database_url,
+                &storage_root_text,
+            );
+            assert!(result.is_ok(), "trace-qualified explain failed: {result:?}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(extract_json_block(&output).expect("explain JSON"))
+                    .expect("parse explain JSON");
+            assert_eq!(parsed["inputs"]["trace_id"], trace_id);
+            assert_eq!(parsed["effect_count"], 1);
+            assert_eq!(parsed["latest_experience_id"], experience_id);
+            assert_eq!(parsed["ledger"][0]["experience_id"], experience_id);
+        }
+
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 77,
+                trace_id: Some("missing-trace".to_string()),
+                json: true,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        assert!(matches!(result, Err(CliError::ExitCode(1))));
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("missing trace JSON"))
+                .expect("parse missing trace JSON");
+        assert_eq!(parsed["found"], false);
+        assert_eq!(parsed["trace_id"], "missing-trace");
     }
 
     #[test]
@@ -53350,6 +54061,56 @@ http_headers = { Authorization = "Bearer secret" }
             report_path.exists(),
             "simulation artifact should be written"
         );
+    }
+
+    #[test]
+    fn handle_atc_simulate_keeps_restarted_decisions_and_deduplicates_their_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-sim-restart.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let policy_path = temp.path().join("policy.json");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_simulate_db(&db_path, &storage_root);
+        let first_trace = "trc-atc-sim-100";
+        let second_trace = "trc-atc-sim-100-restarted";
+        append_atc_decision_copy(&db_path, &storage_root, 100, 2100, first_trace);
+        append_atc_decision_copy(&db_path, &storage_root, 100, 2101, second_trace);
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], None);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Simulate {
+                scenario_id: "restart-identity".to_string(),
+                policy: policy_path.display().to_string(),
+                since: "2025-11-01T00:00:00Z".to_string(),
+                until: Some("2027-01-01T00:00:00Z".to_string()),
+                subject: None,
+                dry_run_confidence: 0.0,
+                output: None,
+                format: Some(output::CliOutputFormat::Json),
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        assert!(result.is_ok(), "restart simulation failed: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("simulate JSON"))
+                .expect("parse simulate JSON");
+        assert_eq!(parsed["experiences_considered"], 5);
+        assert_eq!(parsed["decisions_evaluated"], 3);
+        assert_eq!(parsed["same_action"], 3);
+        assert_eq!(parsed["different_action"], 0);
+        assert_eq!(parsed["rows_skipped_non_liveness"], 1);
+        let traces = parsed["notable_divergences"]
+            .as_array()
+            .expect("decision deltas")
+            .iter()
+            .filter(|delta| delta["decision_id"] == 100)
+            .map(|delta| delta["trace_id"].as_str().expect("trace ID"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(traces, BTreeSet::from([first_trace, second_trace]));
     }
 
     #[test]
@@ -75993,6 +76754,7 @@ startup_timeout_sec = 42
             || {
                 handle_atc(AtcCommand::Explain {
                     decision_id: 77,
+                    trace_id: None,
                     json: true,
                 })
             },
@@ -105714,28 +106476,36 @@ fn sqlite_message_stats(path: &Path) -> (i64, i64) {
 }
 
 #[cfg(test)]
-fn try_generate_age_recipient(dir: &Path) -> Option<String> {
+fn generate_age_recipient(dir: &Path) -> String {
     let identity_path = dir.join("age_identity.txt");
     let output = std::process::Command::new("age-keygen")
         .arg("-o")
         .arg(&identity_path)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .expect("encrypted-export test requires real age-keygen in PATH");
+    assert!(
+        output.status.success(),
+        "age-keygen fixture creation failed: {}",
+        output.status
+    );
     let output = std::process::Command::new("age-keygen")
         .arg("-y")
         .arg(&identity_path)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|recipient| recipient.trim().to_string())
-        .filter(|recipient| !recipient.is_empty())
+        .expect("run age-keygen to derive the fixture's public recipient");
+    assert!(
+        output.status.success(),
+        "age-keygen public recipient derivation failed: {}",
+        output.status
+    );
+    let recipient = String::from_utf8(output.stdout).expect("age-keygen recipient must be UTF-8");
+    let recipient = recipient.trim();
+    assert!(
+        recipient.starts_with("age1"),
+        "age-keygen did not produce an age recipient"
+    );
+    eprintln!("encrypted-export prerequisites: real age-keygen fixture and recipient created");
+    recipient.to_owned()
 }
 
 #[test]
@@ -105875,20 +106645,27 @@ fn run_share_export_reports_encrypted_archive_as_final_output() {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
 
-    if std::process::Command::new("age")
+    let age_version = std::process::Command::new("age")
         .arg("--version")
         .output()
-        .is_err()
-    {
-        eprintln!("Skipping: age CLI not available");
-        return;
-    }
+        .expect("encrypted-export test requires real age in PATH");
+    assert!(
+        age_version.status.success(),
+        "age --version failed: {}",
+        age_version.status
+    );
+    let version = if age_version.stdout.is_empty() {
+        &age_version.stderr
+    } else {
+        &age_version.stdout
+    };
+    eprintln!(
+        "encrypted-export prerequisites: age {}",
+        String::from_utf8_lossy(version).trim()
+    );
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let Some(recipient) = try_generate_age_recipient(temp.path()) else {
-        eprintln!("Skipping: age-keygen not available");
-        return;
-    };
+    let recipient = generate_age_recipient(temp.path());
 
     let source_db = temp.path().join("share-export-source.sqlite3");
     let storage_root = temp.path().join("storage");

@@ -1,5 +1,52 @@
 # Dependency Upgrade Log
 
+## November 13, 2026 — transaction-bound archive headers (br-kp1in.52)
+
+FrankenSQLite 0.4.13 could read a logical database header in one transaction
+and hydrate the archive's rows in another. A real WAL-only commit between
+those reads produced old `user_version`/`application_id` values with new rows
+and BLOBs. The core fix returns the header from the same transaction that
+hydrates the schema and rows. Existing source receipts and publication
+refusals remain in place.
+
+The core-only backport is
+[`64060b976`](https://github.com/Dicklesworthstone/frankensqlite/commit/64060b9763f91eeb8696fc6c4b5346a36b32233e),
+based on the exact published 0.4.13 source. Agent Mail selects its normalized
+Cargo package as an immutable Git dependency at
+[`4314e888`](https://github.com/Dicklesworthstone/frankensqlite/commit/4314e8880f61e23210435283041c0f5e78e97e6e).
+All 668 packaged Rust files match that backport. The selected source contains
+no submodules or sibling paths. Only `fsqlite-core` changes source and package
+version (to 0.4.14); the other 19 engine packages stay at registry 0.4.13.
+Every non-core lockfile package and dependency edge is preserved, including
+Asupersync 0.5.0 and the existing SQLModel pool/core patch. This is not a
+crates.io 0.4.14 release or a CLI version change.
+
+The local package archive's SHA-256 is
+`a64c39c1b2f7252011f9d6a4ad7c4de473931f89765ad9ba5f2ed83893e3d2ec`.
+The backport passed remote Cargo package verification (`publish --dry-run`,
+which explicitly aborted upload) and 19 existing concurrency cases. On the
+integrated upstream source `c2aab9fc4`, the new real-WAL regression passed,
+as did 49 existing VACUUM/reload cases, 7 empty/reset controls and all four
+workspace compiler/format gates. Later incoming peer WHERE optimizations
+are outside those earlier compiler results.
+
+Agent Mail's staged-package consumer passed all 53 selected native cases
+(including a successful consistent copy across the forced WAL commit) and
+3 real archive CLI cases. Public Cargo fetch and the installed DSR source
+capture/verification authenticate the final Git dependency graph: 812 resolved
+packages, with every non-core lock entry and edge unchanged. The delivered
+Agent Mail implementation `b6c624ba` passed all 53 selected native cases,
+3 real archive CLI cases, both workspace compiler graphs, strict Clippy and
+formatting through strict remote execution. The forced WAL commit produced
+a consistent copy; the original mixed-generation failure remains retained.
+
+After integrating three peer fixes at `33c4c6e0`, both compiler graphs,
+strict Clippy, formatting, the expanded 56-case DB/share cohort and the same
+3 archive CLI cases pass again. All 9 lexical routing/scope integration cases
+and 4 server cancellation/compose regressions also pass on that integrated
+source. These focused results do not close the broader private-cache,
+multi-platform release, soak, or performance gates.
+
 ## November 1, 2026 — FrankenSQLite 0.4.13 (GH#372)
 
 The runtime mailbox engine uses the published `fsqlite =0.4.13` and

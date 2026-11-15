@@ -2281,6 +2281,9 @@ struct AtcRobotSnapshot {
     experiences_open: usize,
     #[serde(default)]
     experiences_resolved: u64,
+    /// Current-process liveness feedback. Missing on older daemon snapshots.
+    #[serde(default)]
+    experiences_censored: Option<u64>,
     #[serde(default)]
     policy_revision: u64,
     #[serde(default)]
@@ -2503,6 +2506,13 @@ struct AtcRobotExecution {
 }
 
 #[derive(Debug, Serialize)]
+struct AtcLivenessFeedbackData {
+    open: usize,
+    resolved: u64,
+    censored: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AtcSummaryData {
     enabled: bool,
     source: String,
@@ -2515,6 +2525,10 @@ struct AtcSummaryData {
     experiences_resolved: u64,
     experiences_censored: u64,
     experiences_expired: u64,
+    /// Current-process liveness decisions, separate from durable experience
+    /// rollups. Absent when an older daemon or the local DB cannot report them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness_feedback: Option<AtcLivenessFeedbackData>,
     tracked_agents: usize,
     degraded_agents: usize,
     deadlock_cycles: usize,
@@ -8736,28 +8750,40 @@ fn search_message_ids_by_recipient_kind(
 
 fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (HealthProbe, bool) {
     let has_checks = metrics.checks_total > 0;
-    let last_check_failed = has_checks && metrics.last_ok_ts < metrics.last_check_ts;
+    let last_check_failed = metrics.last_check_outcome
+        == mcp_agent_mail_db::IntegrityCheckOutcome::Failed
+        || (has_checks && metrics.last_ok_ts < metrics.last_check_ts);
     let full_check_failed = matches!(
         metrics.last_full_check_outcome,
         mcp_agent_mail_db::IntegrityCheckOutcome::Failed
     );
     let runtime_failures_without_checks = !has_checks && metrics.failures_total > 0;
+    let current_failures = metrics.failures_since_last_ok > 0;
+    let integrity_failed = full_check_failed
+        || last_check_failed
+        || runtime_failures_without_checks
+        || current_failures;
     let detail = if full_check_failed {
         format!(
             "latest full integrity_check failed at {}; a later quick check cannot clear it",
             metrics.last_full_check_ts
         )
-    } else if !has_checks && metrics.failures_total == 0 {
+    } else if last_check_failed {
+        format!(
+            "last check failed; {} cumulative failures across {} checks",
+            metrics.failures_total, metrics.checks_total
+        )
+    } else if !has_checks && metrics.failures_total == 0 && !current_failures {
         "No checks run yet".to_string()
     } else if runtime_failures_without_checks {
         format!(
             "No integrity checks run yet; {} runtime corruption failures recorded",
             metrics.failures_total
         )
-    } else if last_check_failed {
+    } else if current_failures {
         format!(
-            "last check failed; {} cumulative failures across {} checks",
-            metrics.failures_total, metrics.checks_total
+            "{} failures since last clean check; {} lifetime failures across {} checks",
+            metrics.failures_since_last_ok, metrics.failures_total, metrics.checks_total
         )
     } else if metrics.failures_total == 0 {
         format!("{} checks, all passed", metrics.checks_total)
@@ -8774,9 +8800,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
 
     // GH#291: an accepted full check can still carry proven never-written
     // orphan pages. Say so; it is leaked space, not a failed probe.
-    let detail = if metrics.never_written_orphan_pages > 0
-        && !(full_check_failed || last_check_failed || runtime_failures_without_checks)
-    {
+    let detail = if metrics.never_written_orphan_pages > 0 && !integrity_failed {
         format!(
             "{detail}; {} never-written orphan page(s) (leaked space, not data damage)",
             metrics.never_written_orphan_pages
@@ -8788,16 +8812,11 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     (
         HealthProbe {
             name: "integrity".into(),
-            status: if full_check_failed || last_check_failed || runtime_failures_without_checks {
-                "warn"
-            } else {
-                "ok"
-            }
-            .into(),
+            status: if integrity_failed { "warn" } else { "ok" }.into(),
             latency_ms: 0.0,
             detail,
         },
-        !(full_check_failed || last_check_failed || runtime_failures_without_checks),
+        !integrity_failed,
     )
 }
 
@@ -9149,7 +9168,7 @@ struct LiveServerRobotHealthProbes {
     search_index_probe: HealthProbe,
     search_index_unhealthy: bool,
     search_index_degraded: bool,
-    integrity_metrics: Option<mcp_agent_mail_db::IntegrityMetrics>,
+    integrity_metrics: mcp_agent_mail_db::IntegrityMetrics,
 }
 
 fn live_server_archive_parity_probe_from_health(
@@ -9401,6 +9420,9 @@ fn synthesize_robot_health_probes_from_server(
     rpc_latency_ms: f64,
 ) -> Option<LiveServerRobotHealthProbes> {
     let typed = parse_health_check_response(server_health)?;
+    // Missing observations must take the local probe path. A fresh CLI's
+    // process-global counters cannot stand in for the serving daemon's state.
+    let server_integrity = typed.integrity.as_ref()?;
     if mailbox_database_identity(&config.database_url)
         != mailbox_database_identity(&typed.database_url)
         || mailbox_storage_identity(&config.storage_root)
@@ -9482,21 +9504,18 @@ fn synthesize_robot_health_probes_from_server(
         degraded: false,
     };
 
-    let integrity_metrics =
-        typed
-            .integrity
-            .map(|server_integrity| mcp_agent_mail_db::IntegrityMetrics {
-                last_ok_ts: server_integrity.last_ok_ts,
-                last_check_ts: server_integrity.last_check_ts,
-                last_full_check_ts: server_integrity.last_full_check_ts,
-                last_check_kind: server_integrity.last_check_kind,
-                last_check_outcome: server_integrity.last_check_outcome,
-                last_full_check_outcome: server_integrity.last_full_check_outcome,
-                checks_total: server_integrity.checks_total,
-                failures_total: server_integrity.failures_total,
-                failures_since_last_ok: 0,
-                never_written_orphan_pages: 0,
-            });
+    let integrity_metrics = mcp_agent_mail_db::IntegrityMetrics {
+        last_ok_ts: server_integrity.last_ok_ts,
+        last_check_ts: server_integrity.last_check_ts,
+        last_full_check_ts: server_integrity.last_full_check_ts,
+        last_check_kind: server_integrity.last_check_kind,
+        last_check_outcome: server_integrity.last_check_outcome,
+        last_full_check_outcome: server_integrity.last_full_check_outcome,
+        checks_total: server_integrity.checks_total,
+        failures_total: server_integrity.failures_total,
+        failures_since_last_ok: server_integrity.failures_since_last_ok,
+        never_written_orphan_pages: server_integrity.never_written_orphan_pages,
+    };
 
     Some(LiveServerRobotHealthProbes {
         db_file: resolved.canonical_path,
@@ -9531,7 +9550,7 @@ fn live_server_health_payload_proves_mailbox_healthy(
         || typed.verdicts.write_health.status != "green"
         || typed.verdicts.archive_db_parity.status == "red"
         || typed.semantic_readiness.status != "ok"
-        || typed.verdicts.integrity_check.status == "red"
+        || typed.verdicts.integrity_check.status != "green"
         || typed
             .verdicts
             .integrity_check
@@ -9540,10 +9559,16 @@ fn live_server_health_payload_proves_mailbox_healthy(
     {
         return false;
     }
-    if typed
-        .integrity
-        .as_ref()
-        .is_some_and(|integrity| integrity.failures_total > 0)
+    // A lifetime failure tally survives successful recovery. Reuse only
+    // affirmative current/full evidence; absent, pending or failed evidence
+    // and accepted leaked-space advisories require local doctor inspection.
+    let Some(integrity) = typed.integrity.as_ref() else {
+        return false;
+    };
+    if integrity.last_full_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.last_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.failures_since_last_ok > 0
+        || integrity.never_written_orphan_pages > 0
     {
         return false;
     }
@@ -15500,6 +15525,13 @@ fn atc_summary_data(
         experiences_resolved: resolved_total,
         experiences_censored: censored_total,
         experiences_expired: expired_total,
+        liveness_feedback: snapshot
+            .experiences_censored
+            .map(|censored| AtcLivenessFeedbackData {
+                open: snapshot.experiences_open,
+                resolved: snapshot.experiences_resolved,
+                censored,
+            }),
         tracked_agents: snapshot.tracked_agents.len(),
         degraded_agents: snapshot
             .tracked_agents
@@ -17254,7 +17286,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 let archive_db_parity_degraded = live.archive_db_parity.degraded;
                 probes.push(live.archive_db_parity.probe);
                 probes.push(live.search_index_probe);
-                integrity_override = live.integrity_metrics;
+                integrity_override = Some(live.integrity_metrics);
                 (
                     true,
                     db_file_sanity_unhealthy,
@@ -19750,6 +19782,7 @@ mod tests {
             tick_count: 7,
             experiences_open: 4,
             experiences_resolved: 9,
+            experiences_censored: None,
             policy_revision: 17,
             tracked_agents: vec![
                 AtcRobotAgent {
@@ -20298,6 +20331,40 @@ mod tests {
                 .map(|execution| execution.trace_id.as_str()),
             Some("atc-trace-12")
         );
+    }
+
+    #[test]
+    fn atc_summary_distinguishes_live_feedback_from_durable_experiences() {
+        let mut snapshot = sample_atc_snapshot();
+        snapshot.experiences_censored = Some(7);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        let live = summary.liveness_feedback.as_ref().unwrap();
+        assert_eq!(live.open, 4);
+        assert_eq!(live.resolved, 9);
+        assert_eq!(live.censored, 7);
+
+        snapshot.experiences_censored = Some(0);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_censored, 1);
+        assert_eq!(summary.liveness_feedback.as_ref().unwrap().censored, 0);
+        let payload = serde_json::to_value(summary).unwrap();
+        assert_eq!(payload["liveness_feedback"]["censored"], 0);
+
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("experiences_censored");
+        let legacy: AtcRobotSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.experiences_censored, None);
+        let summary = atc_summary_data(&legacy, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        assert!(summary.liveness_feedback.is_none());
+        let payload = serde_json::to_value(summary).unwrap();
+        assert!(payload.get("liveness_feedback").is_none());
     }
 
     #[test]
@@ -22157,6 +22224,61 @@ mod tests {
         );
         assert_eq!(probe.status, "warn");
         assert!(probe.detail.contains("later quick check cannot clear it"));
+
+        let current_evidence: Vec<_> = [
+            (
+                "failed outcome at equal timestamps",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                5,
+                2,
+            ),
+            (
+                "current failures after last check",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+                1,
+                5,
+                2,
+            ),
+            (
+                "failed outcome precedes the check counter",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                0,
+                0,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(name, outcome, failures_since_last_ok, checks_total, failures_total)| {
+                let first_check = checks_total == 0;
+                let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+                    last_ok_ts: if first_check { 0 } else { 3_000 },
+                    last_check_ts: 3_000,
+                    last_full_check_ts: if first_check { 0 } else { 2_000 },
+                    last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+                    last_check_outcome: outcome,
+                    last_full_check_outcome: if first_check {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Unknown
+                    } else {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+                    },
+                    checks_total,
+                    failures_total,
+                    failures_since_last_ok,
+                    never_written_orphan_pages: 0,
+                });
+                (name, ok, probe.status, probe.detail)
+            },
+        )
+        .collect();
+        assert!(
+            current_evidence
+                .iter()
+                .all(|(_, ok, status, _)| !ok && status == "warn"),
+            "explicit current integrity evidence must win over timestamps: {current_evidence:?}"
+        );
+        assert!(current_evidence[2].3.contains("last check failed"));
     }
 
     #[test]
@@ -29823,7 +29945,9 @@ mod tests {
                     "last_check_outcome": "passed",
                     "last_full_check_outcome": "passed",
                     "checks_total": 3,
-                    "failures_total": 0
+                    "failures_total": 0,
+                    "failures_since_last_ok": 0,
+                    "never_written_orphan_pages": 0
                 },
                 "lexical_backfill": {
                     "state": "fresh",
@@ -29867,13 +29991,7 @@ mod tests {
         assert_eq!(synthesized.search_index_probe.status, "ok");
         assert!(!synthesized.search_index_unhealthy);
         assert!(!synthesized.search_index_degraded);
-        assert_eq!(
-            synthesized
-                .integrity_metrics
-                .expect("integrity")
-                .checks_total,
-            3
-        );
+        assert_eq!(synthesized.integrity_metrics.checks_total, 3);
         assert!(live_server_health_payload_proves_mailbox_healthy(
             &db_url,
             &storage_root,
@@ -29884,6 +30002,128 @@ mod tests {
             .expect("matching live mailbox");
         assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
         assert_eq!(assessment.probe.status, "ok");
+
+        // Doctor may reuse affirmative current/full evidence after recovery;
+        // a lifetime tally is not a current failure. Missing or weaker evidence
+        // must still take the real local inspection path.
+        let mut recovered = healthy_payload.clone();
+        recovered["integrity"]["failures_total"] = 7.into();
+        let mut missing_integrity = healthy_payload.clone();
+        missing_integrity
+            .as_object_mut()
+            .unwrap()
+            .remove("integrity");
+        let mut pending_full = healthy_payload.clone();
+        pending_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        pending_full["integrity"]["last_full_check_outcome"] = "unknown".into();
+        pending_full["integrity"]["last_full_check_ts"] = 0.into();
+        pending_full["verdicts"]["integrity_check"]["status"] = "yellow".into();
+        pending_full["verdicts"]["integrity_check"]["detail"] =
+            "no full PRAGMA integrity_check has completed".into();
+        let mut failed_full = recovered.clone();
+        failed_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        failed_full["integrity"]["last_full_check_outcome"] = "failed".into();
+        let mut failed_latest = recovered.clone();
+        failed_latest["integrity"]["last_check_outcome"] = "failed".into();
+        let mut current_failures = recovered.clone();
+        current_failures["integrity"]["failures_since_last_ok"] = 1.into();
+        let mut accepted_orphans = healthy_payload.clone();
+        accepted_orphans["integrity"]["never_written_orphan_pages"] = 425.into();
+        let cases = [
+            ("recovered historical failures", recovered, true),
+            ("missing integrity object", missing_integrity, false),
+            ("pending full check", pending_full, false),
+            ("failed full after quick pass", failed_full, false),
+            ("latest check failed", failed_latest, false),
+            ("failures since last ok", current_failures, false),
+            ("accepted orphan-page advisory", accepted_orphans, false),
+        ];
+        let outcomes: Vec<_> = cases
+            .iter()
+            .map(|(name, payload, expected)| {
+                assert!(
+                    parse_health_check_response(payload).is_some(),
+                    "{name} must exercise a schema-valid health payload"
+                );
+                (
+                    *name,
+                    live_server_health_payload_proves_mailbox_healthy(
+                        &db_url,
+                        &storage_root,
+                        payload,
+                    ),
+                    *expected,
+                )
+            })
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, actual, expected)| actual == expected),
+            "doctor integrity attestation (name, actual, expected): {outcomes:?}"
+        );
+
+        let unavailable_integrity: Vec<_> = [
+            ("missing integrity object", None),
+            ("null integrity object", Some(serde_json::Value::Null)),
+        ]
+        .into_iter()
+        .map(|(name, integrity)| {
+            let mut payload = healthy_payload.clone();
+            let fields = payload.as_object_mut().unwrap();
+            if let Some(integrity) = integrity {
+                fields.insert("integrity".into(), integrity);
+            } else {
+                fields.remove("integrity");
+            }
+            assert!(
+                parse_health_check_response(&payload).is_some(),
+                "{name} must be a schema-valid unavailable observation"
+            );
+            (
+                name,
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+            )
+        })
+        .collect();
+        assert!(
+            unavailable_integrity.iter().all(|(_, accepted)| !accepted),
+            "unavailable daemon integrity must use local probes: {unavailable_integrity:?}"
+        );
+
+        // Retain the daemon's measured counters rather than manufacturing
+        // zeros in the CLI's fresh process. A real local DB remains required.
+        let mut counter_payload = healthy_payload.clone();
+        counter_payload["integrity"]["never_written_orphan_pages"] = 425.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .expect("matching real local mailbox")
+            .integrity_metrics;
+        assert_eq!(counters.never_written_orphan_pages, 425);
+        assert_eq!(counters.failures_since_last_ok, 0);
+        let (probe, _) = summarize_integrity_probe(&counters);
+        assert!(probe.detail.contains("425 never-written orphan page(s)"));
+        counter_payload["integrity"]["failures_since_last_ok"] = 2.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .unwrap()
+            .integrity_metrics;
+        assert_eq!(counters.failures_since_last_ok, 2);
+        for field in ["failures_since_last_ok", "never_written_orphan_pages"] {
+            let mut incomplete = counter_payload.clone();
+            incomplete["integrity"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                parse_health_check_response(&incomplete).is_none(),
+                "{field}"
+            );
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &incomplete, 0.5).is_none(),
+                "a missing {field} is unavailable evidence, never an attested zero"
+            );
+        }
 
         // Each of these faults lives in the daemon, not in the CLI's fresh
         // process-global counters. A successful local DB probe must not make
