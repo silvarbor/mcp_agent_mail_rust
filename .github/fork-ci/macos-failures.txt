@@ -31,3 +31,11 @@ mcp-agent-mail-tools resources::reservation_activity_tests::reservation_activity
 # Its shell suite passes every case and then exits nonzero: `scripts/e2e_lib.sh`
 # expands empty arrays under `set -u`, which the bash 3.2 of macOS rejects.
 mcp-agent-mail-cli::it integration_runs::reservation_parity_shell_suite_uses_cargo_built_binary
+
+# Intermittent on the macOS runner. The test gives the poller 150 milliseconds
+# to deliver a snapshot after the database is marked ready, and the runner
+# sometimes takes longer. In six macOS runs on 15 November 2026 it failed in
+# four of nine tries, and in both tries of the second attempt of run
+# 43767180406. The fork's changes to this file add the display-name column to
+# the agent list and leave the warm-up and interval logic as upstream wrote it.
+mcp-agent-mail-server tui_poller::tests::poller_pending_warmup_timeout_does_not_pay_interval_twice

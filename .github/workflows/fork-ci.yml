@@ -274,6 +274,10 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run == 'e2e' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The suite scripts build into `$TMPDIR/cargo-target` unless this is
+      # set, and would compile both binaries again from nothing.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -292,11 +296,23 @@ jobs:
         run: |
           cargo build --locked -p mcp-agent-mail-cli -p mcp-agent-mail
           echo "${GITHUB_WORKSPACE}/target/debug" >> "$GITHUB_PATH"
+      - name: Install age
+        # The share suite encrypts and decrypts with the real `age` and
+        # `age-keygen` programs and fails without them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends age
+          age --version
+          age-keygen --version
+      # Each suite script runs directly. Under `am e2e run` the HTTP and share
+      # suites ended at the runner's ten-minute limit on a GitHub-hosted
+      # runner without showing any output, while the HTTP script itself ends
+      # in under two minutes with every assertion passing.
       - name: HTTP suite
-        run: am e2e run --project . http
+        run: timeout --signal=TERM --kill-after=30 20m bash tests/e2e/test_http.sh
       - name: Dual-mode suite
         if: ${{ !cancelled() }}
-        run: am e2e run --project . dual_mode
+        run: timeout --signal=TERM --kill-after=30 20m bash tests/e2e/test_dual_mode.sh
       - name: Share suite
         if: ${{ !cancelled() }}
-        run: am e2e run --project . share
+        run: timeout --signal=TERM --kill-after=30 20m bash tests/e2e/test_share.sh
